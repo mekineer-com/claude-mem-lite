@@ -163,6 +163,20 @@ test('release workflow generates npm-shrinkwrap before smoke and publish', () =>
   expect(pkg.files, 'files[] must list npm-shrinkwrap.json or npm pack drops it').toContain('npm-shrinkwrap.json');
 });
 
+// Audit 2026-08-22 P2-3: the sandbox install harness now runs weekly in CI. The
+// workflow names its three entry scripts as plain strings, so renaming or moving a
+// phase leaves the schedule pointing at a file that no longer exists — and a weekly
+// job only tells you that a week later, in mail nobody expected. Fail here instead.
+test('weekly sandbox workflow points at phase scripts that exist', () => {
+  const wf = readFileSync(resolve(ROOT, '.github/workflows/sandbox-install.yml'), 'utf8');
+  const referenced = [...wf.matchAll(/tests\/sandbox\/(phase[A-Z][A-Za-z-]*\.mjs)/g)]
+    .map(m => m[1]);
+  expect(new Set(referenced)).toEqual(new Set(['phaseA-plugin.mjs', 'phaseB-npm.mjs', 'phaseC-update.mjs']));
+  for (const f of new Set(referenced)) {
+    expect(existsSync(resolve(ROOT, 'tests/sandbox', f)), `${f} referenced by the workflow but missing`).toBe(true);
+  }
+});
+
 // Blind-spot closer: the SOURCE_FILES coverage test above only walks the 5 main
 // ENTRY_MODULES, so a lib/ module imported ONLY by a standalone hook script (e.g.
 // scripts/pre-tool-recall.js) could be left out of SOURCE_FILES + files[] and

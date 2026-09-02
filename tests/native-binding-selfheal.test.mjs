@@ -238,12 +238,22 @@ describe('cli.mjs rebuild-binding — the local, network-free repair command', (
     // breakage marker, so the default (~/.claude-mem-lite) would contend with a
     // live session's lock — flaky here, and mutating real state from a test.
     const dataDir = mkdtempSync(join(tmpdir(), 'cml-rb-'));
+    // Isolated HOME too, since v3.70.0: rebuild-binding now repairs EVERY code home
+    // it can find, and with the real HOME that includes ~/.claude/plugins/cache/…,
+    // where a freshly-installed plugin version ships node_modules with no compiled
+    // binding (#10631). This test would then run a real
+    // `npm rebuild better-sqlite3 --dangerously-allow-all-scripts` inside ~/.claude
+    // and could fail its own exit-0 assertion — a unit test mutating user state
+    // (§8.V3). An empty HOME keeps the repo the only discoverable root, which is what
+    // the test's name promises.
+    const fakeHome = mkdtempSync(join(tmpdir(), 'cml-rb-home-'));
     const r = spawnSync(process.execPath, [join(REPO_ROOT, 'cli.mjs'), 'rebuild-binding'], {
       encoding: 'utf8',
       timeout: 300_000,
-      env: { ...process.env, CLAUDE_MEM_DIR: dataDir },
+      env: { ...process.env, CLAUDE_MEM_DIR: dataDir, HOME: fakeHome },
     });
     rmSync(dataDir, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
     const out = `${r.stdout}${r.stderr}`;
     expect(out).not.toMatch(/Unknown command/);
     expect(r.status).toBe(0);

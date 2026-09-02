@@ -21,8 +21,13 @@
 //
 // PER-SURFACE STDOUT CONTRACT (asserted by expectHookStdout, per Claude Code's hook I/O
 // rules and the shapes tests/e2e.test.mjs + the source comments pin):
-//   hook.mjs session-start      JSON envelope line(s) (hookEventName SessionStart) AND the
-//                               plain <claude-mem-context> block — both are context channels.
+//   hook.mjs session-start      EXACTLY ONE JSON envelope (hookEventName SessionStart),
+//                               carrying the dashboard, the <claude-mem-context> block and
+//                               the update banner in additionalContext. Pre-v3.70 these were
+//                               three separate writes; the trailing raw prose made stdout
+//                               un-parseable as a JSON document and the host delivered the
+//                               whole envelope to the model as literal escaped text with
+//                               suppressOutput ignored (tests/session-start-stdout-envelope).
 //   hook.mjs post-tool-use      JSON envelope line(s) ONLY (hookEventName PostToolUse).
 //                               Plain text here is the shipped `<text>{json}` corruption bug
 //                               (MED-3, audit 2026-07-16) — one stray line makes Claude Code's
@@ -71,7 +76,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
@@ -184,6 +189,8 @@ function fire(cmd, args, { cwd, stdin = '', env = {}, timeout = 30000 } = {}) {
 const hookEvent = (event, opts = {}) => fire(process.execPath, [HOOK_PATH, ...event.split(' ')], opts);
 const hookScript = (name, opts = {}) => fire(process.execPath, [join(REPO, 'scripts', name)], opts);
 const bashPrefilter = (opts = {}) => fire('bash', [join(REPO, 'scripts', 'post-tool-use.sh')], opts);
+/** Any bash-entry hook, run the way hooks.json registers it (audit P2-5 added a second). */
+const bashHook = (name, opts = {}) => fire('bash', [join(REPO, 'scripts', name)], opts);
 
 /** Seed rows through the real CLI (the sweep never hand-writes schema). */
 async function cli(args, cwd) {
@@ -232,14 +239,31 @@ function expectHookStdout(out, { event = null, plainAllowed = false, label }) {
   const jsonLines = [], plainLines = [];
   for (const line of out.split('\n')) {
     if (line === '') continue;
-    // An envelope that does not START its line is invisible to Claude Code's line-based
-    // parser — and takes the rest of the line with it. This is the exact shape of the
-    // PostToolUse error-recall bug fixed in v3.48 (raw text + JSON in one write).
+    // An envelope that does not START its line is invisible — and takes the rest of the
+    // line with it. This is the exact shape of the PostToolUse error-recall bug fixed in
+    // v3.48 (raw text + JSON in one write).
     expect(
       /^[^{].*[{,]\s*"(?:suppressOutput|hookSpecificOutput)"/.test(line),
       `${label}: JSON envelope is not at the start of its line — the host drops it:\n${line}`,
     ).toBe(false);
     (line.startsWith('{') ? jsonLines : plainLines).push(line);
+  }
+
+  // At most ONE envelope, and nothing else beside it. Claude Code parses hook stdout
+  // as a single JSON document (2.1.233 `Hxi`: `if(!t.startsWith("{")) return {plainText:e}`
+  // then JSON.parse of the WHOLE trimmed string, catch → plainText). This helper used to
+  // encode a line-based parser that does not exist, so two envelopes on two lines read as
+  // compliant while the host was actually discarding both. See lib/hook-stdout.mjs.
+  expect(
+    jsonLines.length,
+    `${label}: ${jsonLines.length} JSON envelopes on one stdout — the host JSON.parses the whole `
+    + `thing, so this degrades to plain text and every envelope is lost:\n${out}`,
+  ).toBeLessThanOrEqual(1);
+  if (jsonLines.length === 1) {
+    expect(
+      plainLines,
+      `${label}: prose alongside a JSON envelope makes stdout unparseable as one document`,
+    ).toEqual([]);
   }
 
   if (event === null) {
@@ -261,13 +285,18 @@ function expectHookStdout(out, { event = null, plainAllowed = false, label }) {
   return parsed;
 }
 
-// The four payload shapes a hook must survive. Claude Code should never send the last two,
+// The payload shapes a hook must survive. Claude Code should never send most of these,
 // but a truncated pipe, a protocol change or a third-party wrapper can — and a non-zero exit
 // or a crash here degrades the user's session with no error surface.
 const MALFORMED = [
   ['empty stdin', ''],
   ['invalid JSON', 'not json at all {{{'],
   ['valid JSON, required fields missing', '{}'],
+  // `'null'` is VALID JSON that parses to null, so it slips past the parse guard and
+  // reaches the destructure — which throws. Added after review found every handler here
+  // shares the hole and none of the four shapes above reaches it.
+  ['valid JSON that is null', 'null'],
+  ['valid JSON that is a scalar', '42'],
   ['unexpected types', JSON.stringify({
     session_id: [], tool_name: 42, tool_input: 'not-an-object', tool_response: { a: 1 },
     prompt: { b: 2 }, transcript_path: 17, source: false,
@@ -410,7 +439,7 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
     expect(r.code, `session-start exited ${r.code}\n${r.stderr}`).toBe(0);
 
     const envelopes = expectHookStdout(r.stdout, {
-      event: 'SessionStart', plainAllowed: true, label: 'hook.mjs session-start',
+      event: 'SessionStart', plainAllowed: false, label: 'hook.mjs session-start',
     });
     // The startup dashboard rides the JSON channel and must name the one event seeded above
     // (a dashboard computed over the wrong project — or over the live DB — says "0 entries"
@@ -418,11 +447,19 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
     expect(envelopes).toHaveLength(1);
     expect(envelopes[0].hookSpecificOutput.additionalContext).toContain('mem events: 1 entries');
     expect(envelopes[0].suppressOutput).toBe(true);
-    // …and the context block rides the plain channel, carrying the seeded memory.
-    expect(r.stdout).toContain('<claude-mem-context>');
-    expect(r.stdout).toContain('</claude-mem-context>');
-    expect(r.stdout).toContain('Session start sweep event');
-    expect(r.stdout).toContain('Fixed the widget cache invalidation race');
+    // …and the context block rides the SAME envelope, carrying the seeded memory.
+    // Asserted against additionalContext, not against raw stdout: `stdout` contains
+    // the block either way (JSON.stringify does not escape angle brackets), so a
+    // stdout-level toContain cannot tell the merged shape from the pre-v3.70 shape
+    // where a second raw write made the envelope unparseable for the host.
+    const ctx = envelopes[0].hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('<claude-mem-context>');
+    expect(ctx).toContain('</claude-mem-context>');
+    expect(ctx).toContain('Session start sweep event');
+    expect(ctx).toContain('Fixed the widget cache invalidation race');
+    // Nothing may ride outside the envelope on this surface.
+    expect(r.stdout.trim().split('\n').filter((l) => l.trim() && !l.startsWith('{')))
+      .toEqual([]);
 
     // Side effects landed in the SANDBOX, under the project derived from the sandbox cwd.
     expect(withDb((db) => db.prepare('SELECT status FROM sdk_sessions WHERE project = ?').get(project)))
@@ -434,7 +471,7 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
 
     await expectMalformedResilience(
       'hook.mjs session-start',
-      { event: 'SessionStart', plainAllowed: true },
+      { event: 'SessionStart', plainAllowed: false },
       (stdin, malCwd) => hookEvent('session-start', { cwd: malCwd, stdin }),
     );
   });
@@ -445,10 +482,12 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
     const LESSON = 'Invalidate the widget cache on write, never on read';
     const targetId = await seedObs(cwd, 'Fixed the widget cache invalidation race in lib/widget-cache.mjs',
       ['--type', 'bugfix', '--importance', '3', '--lesson', LESSON]);
-    // handleUserPrompt excludes the 5 most recent importance>=2 rows (its "key context" set)
-    // from the <memory-context> block. Five later, unrelated importance-2 rows fill that set
-    // so the target stays eligible — without them the case would assert an injection the
-    // handler suppresses by design.
+    // handleUserPrompt excludes ONLY ids actually rendered somewhere (the path-A
+    // UPS marker and the SessionStart keyctx marker — D#123: exclusion mirrors
+    // real injections, never a DB query). This sandbox has neither marker for
+    // this project+session, so the target is always eligible; the fillers just
+    // give the corpus enough rows that the adaptive BM25 threshold (>=5 obs)
+    // applies, matching real installs.
     for (const filler of [
       'Chose postgres over sqlite for the billing ledger store',
       'Renamed the deployment runbook chapter headings',
@@ -537,6 +576,67 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
     );
   });
 
+  itHook('hook.mjs post-tool-failure', async () => {
+    // D#170. The event PostToolUse never sees: Claude Code routes tool calls it judged
+    // FAILED here instead. The sibling case above proves the surface works on an exit-0
+    // command that printed error text; this one proves it works on the population that
+    // used to be invisible — and that it reads `error`, since the payload has no
+    // `tool_response` at all.
+    const NAME = 'hs-postfail';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const recallId = await seedObs(cwd, 'ENOENT on package.json means the build ran from the wrong cwd',
+      ['--type', 'bugfix', '--importance', '3', '--lesson', 'Run the build from the package root, not from scripts/']);
+
+    const fire = await hookEvent('post-tool-failure', {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-postfail', tool_name: 'Bash',
+        tool_input: { command: 'node scripts/build.mjs' },
+        tool_use_id: 'toolu_sweep_d170',
+        error: "Error: ENOENT: no such file or directory, open '/app/package.json'\n    at Object.openSync (node:fs:596:3)",
+      }),
+    });
+    expect(fire.code, `post-tool-failure exited ${fire.code}\n${fire.stderr}`).toBe(0);
+    const [recall] = expectHookStdout(fire.stdout, {
+      event: 'PostToolUseFailure', plainAllowed: false, label: 'hook.mjs post-tool-failure',
+    });
+    expect(recall, `no error-recall envelope emitted:\n${fire.stdout}`).toBeTruthy();
+    expect(recall.hookSpecificOutput.additionalContext).toContain('Related memories found for this error');
+    expect(recall.hookSpecificOutput.additionalContext).toContain(`#${recallId}`);
+
+    // Scope, asserted against the real subprocess rather than the manifest matcher: a
+    // tool-chain refusal is not a program failure, and 68.9% of host-flagged Bash
+    // failures on the maintainer's machine were of that kind.
+    // The refusal text must carry terms that WOULD match the row seeded above, or this
+    // asserts nothing: the first version used `§8 SAFETY … rm -rf`, on which
+    // planErrorRecall returns null, so the surface was silent no matter what the gate
+    // did. Mutation confirmed it survived. Same ENOENT/package.json vocabulary as the
+    // firing case, one marker added.
+    const refused = await hookEvent('post-tool-failure', {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-postfail', tool_name: 'Bash',
+        tool_input: { command: 'node scripts/build.mjs' },
+        error: '[claudemd] §11 memory-hint: refused — the ENOENT probe on package.json was blocked before it ran.\nError: command not executed.',
+      }),
+    });
+    expect(refused.code).toBe(0);
+    expect(refused.stdout, 'a denied command must not recall').toBe('');
+
+    // This path deliberately does NOT feed the episode buffer (scope: episode entries
+    // flow into LLM summarisation and the save-nudge, unmeasured under an influx of
+    // failures). The buffer must therefore hold nothing from either fire above.
+    expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`)),
+      'post-tool-failure must not write an episode entry').toBe(false);
+
+    await expectMalformedResilience(
+      'hook.mjs post-tool-failure',
+      { event: 'PostToolUseFailure', plainAllowed: false },
+      (stdin, malCwd) => hookEvent('post-tool-failure', { cwd: malCwd, stdin }),
+    );
+  });
+
   itHook('hook.mjs stop', async () => {
     const NAME = 'hs-stop';
     const cwd = workDir(NAME);
@@ -604,6 +704,263 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
       (stdin, malCwd) => hookEvent('pre-compact', { cwd: malCwd, stdin }),
     );
   });
+});
+
+// ─── episode.filesRead is a per-FLUSH slice, not a per-episode total (D#175) ────────
+// The one link in D#171's won't-fix chain that is a property of CODE rather than of a
+// corpus at a timestamp: flushEpisodeWithDb RENAMES reads-<project>.txt aside and then
+// UNLINKS the collected copy on every flush (hook.mjs:222-232), so `episode.filesRead`
+// only ever carries the Reads since the LAST flush. Every other figure in that docblock
+// (1861 Reads / 0.98 per episode / 1.8% of rows non-empty) is a measurement and correctly
+// ships as prose — a test over those would be a snapshot that rots. This one is different:
+// make the collect a copy instead of a rename and the whole "a threshold of 8 is out of
+// reach at ~1 Read per episode" rationale becomes false while nothing goes red.
+//
+// Not hypothetical hygiene. D#174 records that this exact axis already moved silently
+// once: files_read fed the threshold on 44-60% of rows for three straight months and
+// collapsed to 6.2% in 2026-05, cause never identified. This is the alarm that was
+// missing then.
+//
+// SHAPE — the discriminating pair is flush 1 vs flush 2, and flush 1 is not decoration.
+// Asserting only "flush 2 read nothing" passes just as well when the seeding never worked
+// at all, which is v3.79.0's "my assertion was satisfied by another cause" repeated; so
+// flush 1 must first prove both seeded paths reached the row.
+//
+// TWO INDEPENDENT MUTATIONS, because one assertion does not cover both statements:
+//   copy instead of rename  → flush 2 inherits the same paths  → the files_read equality fails.
+//   drop the unlinkSync     → flush 2 is STILL empty (the residue is named .collect-<ts>,
+//                             which no flush looks for) → only the residue sweep fails.
+
+describe('hook flush: the reads-file is consumed, not accumulated (D#175)', () => {
+  it('a flush consumes reads-<project>.txt and the next flush starts empty', async () => {
+    const NAME = 'hs-readslice';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const readsFile = join(RUNTIME_DIR, `reads-${project}.txt`);
+    const readsResidue = () => readdirSync(RUNTIME_DIR).filter((f) => f.startsWith(`reads-${project}`));
+
+    // The Read paths must differ from the file each episode WRITES: buildImmediateObservation
+    // subtracts modified files back out of filesRead (hook-llm.mjs:602), so reusing one name
+    // would empty the row for a reason that has nothing to do with the rename.
+    const readA = join(cwd, 'alpha-config.mjs');
+    const readB = join(cwd, 'beta-config.mjs');
+
+    // (1) Seed through the REAL bash prefilter — the only writer of this file, and the
+    // reason a Read never reaches Node at all (scripts/post-tool-use.sh:49-93).
+    for (const p of [readA, readB]) {
+      const r = await bashPrefilter({
+        cwd,
+        stdin: JSON.stringify({ session_id: 'cc-readslice-1', tool_name: 'Read', tool_input: { file_path: p } }),
+      });
+      expect(r.code, `post-tool-use.sh exited ${r.code}\n${r.stderr}`).toBe(0);
+    }
+    // Both halves of the seed asserted before anything downstream runs: a silently absent
+    // reads file would make every later assertion in this case vacuous.
+    expect(existsSync(readsFile), 'the bash prefilter wrote no reads file — the rest of this case would assert nothing').toBe(true);
+    expect(readFileSync(readsFile, 'utf8').split('\n').filter(Boolean)).toEqual([readA, readB]);
+
+    /** Buffer one significant Write, then Stop — the real flush path. */
+    async function writeThenFlush(session, schemaFile) {
+      // `…schema.sql` clears the write-side noise gate at rule importance 2, exactly as the
+      // `hook.mjs stop` case above relies on; a dropped row would leave nothing to read.
+      const post = await hookEvent('post-tool-use', {
+        cwd,
+        stdin: JSON.stringify({
+          session_id: session, tool_name: 'Write',
+          tool_input: { file_path: schemaFile, content: 'CREATE TABLE widgets (id INTEGER);\n' },
+          tool_response: `File created successfully at: ${schemaFile}`,
+        }),
+      });
+      expect(post.code, `post-tool-use exited ${post.code}\n${post.stderr}`).toBe(0);
+      expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`))).toBe(true);
+
+      const stop = await hookEvent('stop', {
+        cwd, stdin: JSON.stringify({ session_id: session, transcript_path: join(ROOT, 'no-such-transcript.jsonl') }),
+      });
+      expect(stop.code, `stop exited ${stop.code}\n${stop.stderr}`).toBe(0);
+      expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`))).toBe(false);
+
+      const row = withDb((db) => db.prepare(
+        'SELECT title, files_read, files_modified FROM observations WHERE project = ? AND files_modified LIKE ? ORDER BY id DESC LIMIT 1',
+      ).get(project, `%${schemaFile.split('/').pop()}%`));
+      expect(row, `no observation flushed for ${schemaFile}`).toBeTruthy();
+      return row;
+    }
+
+    // (2) First flush: it carries the seeded Reads …
+    const first = await writeThenFlush('cc-readslice-1', join(cwd, 'alpha-schema.sql'));
+    expect(JSON.parse(first.files_read)).toEqual([readA, readB]);
+
+    // … and consumed the file rather than reading it in place.
+    expect(existsSync(readsFile), 'the flush left reads-<project>.txt in place — filesRead would accumulate across flushes').toBe(false);
+    // The rename target too: a collect copy left behind is an unswept per-flush file that
+    // grows forever and leaks captured paths, and the emptiness assertion below cannot see it.
+    expect(readsResidue(), 'the flush left reads-file residue in RUNTIME_DIR').toEqual([]);
+
+    // (3) Second flush with no intervening Read — the assertion that actually pins the
+    // per-flush semantics. A row IS produced (files_modified proves it), and its read set
+    // is empty rather than inheriting round 1's.
+    const second = await writeThenFlush('cc-readslice-2', join(cwd, 'beta-schema.sql'));
+    expect(second.files_modified).toContain('beta-schema.sql');
+    expect(JSON.parse(second.files_read),
+      'the second flush inherited the first flush\'s Reads — filesRead is no longer a per-flush slice, and D#171\'s closure rationale is void').toEqual([]);
+    expect(readsResidue()).toEqual([]);
+  }, 60000);
+});
+
+// ─── an INSIGNIFICANT flush must not eat the accumulated Reads (D#178) ──────────────
+// The D#175 case above pins that a flush CONSUMES the reads file. This one pins the other
+// half of that statement, which was the defect: the consumption used to happen before
+// anything knew whether the flush would persist an observation, so a flush with entries
+// but no significance swallowed every Read since the last flush and dropped them. Measured
+// over 1121 real transcripts (benchmark/episode-flush-replay.mjs): 42.8% of all collected
+// reads died that way.
+//
+// TWO ARMS, and both are load-bearing:
+//   default (v3.83.0: ON) — the fix. Reverting the reorder in flushEpisodeWithDb makes BOTH
+//     of its assertions fail (the file is gone after the insignificant flush, and the later
+//     row's files_read is empty). Verified by mutation, not by reading.
+//   CLAUDE_MEM_READS_CARRY=0 — the off switch, pinned against the OLD behavior. Without
+//     this arm the switch is documentation: an off switch that silently stopped switching
+//     anything would keep the default arm green and nobody would know.
+//
+// The insignificant flush is a plain `echo` Bash entry: no edit (rule 1), not a test/build
+// error (rule 2), no important-looking file in the command (rule 3 reads episode.files via
+// extractFilePaths, so the command must contain no path), and one entry is far under the
+// research threshold (rule 4).
+describe('hook flush: an insignificant flush does not destroy accumulated Reads (D#178)', () => {
+  /** Seed Read paths through the REAL bash prefilter — the only writer of the reads file. */
+  async function seedReads(cwd, session, paths) {
+    for (const p of paths) {
+      const r = await bashPrefilter({
+        cwd,
+        stdin: JSON.stringify({ session_id: session, tool_name: 'Read', tool_input: { file_path: p } }),
+      });
+      expect(r.code, `post-tool-use.sh exited ${r.code}\n${r.stderr}`).toBe(0);
+    }
+  }
+
+  /** Buffer one entry, then Stop. `significant` picks which rule the entry trips. */
+  async function bufferThenFlush(cwd, session, { significant, env = {}, schemaFile }) {
+    const stdin = significant
+      ? JSON.stringify({
+        session_id: session, tool_name: 'Write',
+        tool_input: { file_path: schemaFile, content: 'CREATE TABLE widgets (id INTEGER);\n' },
+        tool_response: `File created successfully at: ${schemaFile}`,
+      })
+      : JSON.stringify({
+        session_id: session, tool_name: 'Bash',
+        tool_input: { command: 'echo hello from the harness' },
+        tool_response: 'hello from the harness\n',
+      });
+    const post = await hookEvent('post-tool-use', { cwd, stdin, env });
+    expect(post.code, `post-tool-use exited ${post.code}\n${post.stderr}`).toBe(0);
+    const stop = await hookEvent('stop', {
+      cwd, env,
+      stdin: JSON.stringify({ session_id: session, transcript_path: join(ROOT, 'no-such-transcript.jsonl') }),
+    });
+    expect(stop.code, `stop exited ${stop.code}\n${stop.stderr}`).toBe(0);
+  }
+
+  const rowFor = (project, schemaFile) => withDb((db) => db.prepare(
+    'SELECT title, files_read, files_modified FROM observations WHERE project = ? AND files_modified LIKE ? ORDER BY id DESC LIMIT 1',
+  ).get(project, `%${schemaFile.split('/').pop()}%`));
+
+  it('CLAUDE_MEM_READS_CARRY=0: the insignificant flush consumes and discards them (pre-D#178)', async () => {
+    const NAME = 'hs-readseat-off';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const readsFile = join(RUNTIME_DIR, `reads-${project}.txt`);
+    const readA = join(cwd, 'alpha-config.mjs');
+    const readB = join(cwd, 'beta-config.mjs');
+    const env = { CLAUDE_MEM_READS_CARRY: '0' };
+
+    await seedReads(cwd, 'cc-off-1', [readA, readB]);
+    expect(existsSync(readsFile), 'the bash prefilter wrote no reads file — every later assertion would be vacuous').toBe(true);
+
+    await bufferThenFlush(cwd, 'cc-off-1', { significant: false, env });
+    expect(existsSync(readsFile), 'the off switch did not switch anything off: the insignificant flush left the reads file').toBe(false);
+
+    const schema = join(cwd, 'alpha-schema.sql');
+    await bufferThenFlush(cwd, 'cc-off-2', { significant: true, schemaFile: schema, env });
+    const row = rowFor(project, schema);
+    expect(row, 'no observation flushed for the significant episode').toBeTruthy();
+    expect(JSON.parse(row.files_read), 'the off switch did not restore the old behavior: the reads survived the insignificant flush').toEqual([]);
+  }, 60000);
+
+  // The reorder put `planEpisodeFlush` ABOVE the collection, and its multi-session branch
+  // builds fresh sub-objects that copied whatever `filesRead` the buffer held at that
+  // moment — always `[]`. One line writes the collected paths back into every sub. Without
+  // this case that line is invisible: deleting it leaves the whole suite (309 files / 5231
+  // tests) green while every concurrent same-project session silently loses its reads, and
+  // it fails in BOTH flag arms, because the reorder is not gated on the flag. Found by the
+  // pre-tag review, which mutated the line and watched nothing go red.
+  it('two concurrent sessions in one project: BOTH observations carry the reads', async () => {
+    const NAME = 'hs-readseat-multi';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const readsFile = join(RUNTIME_DIR, `reads-${project}.txt`);
+    const readA = join(cwd, 'alpha-config.mjs');
+    const readB = join(cwd, 'beta-config.mjs');
+
+    await seedReads(cwd, 'cc-multi-1', [readA, readB]);
+    expect(existsSync(readsFile), 'the bash prefilter wrote no reads file — the case would assert nothing').toBe(true);
+
+    // Two DIFFERENT session ids buffered into the one per-project episode file, so
+    // planEpisodeFlush takes its multi-session branch on the flush below.
+    const schemaA = join(cwd, 'alpha-schema.sql');
+    const schemaB = join(cwd, 'beta-schema.sql');
+    for (const [session, file] of [['cc-multi-1', schemaA], ['cc-multi-2', schemaB]]) {
+      const post = await hookEvent('post-tool-use', {
+        cwd,
+        stdin: JSON.stringify({
+          session_id: session, tool_name: 'Write',
+          tool_input: { file_path: file, content: 'CREATE TABLE widgets (id INTEGER);\n' },
+          tool_response: `File created successfully at: ${file}`,
+        }),
+      });
+      expect(post.code, `post-tool-use exited ${post.code}\n${post.stderr}`).toBe(0);
+    }
+    const stop = await hookEvent('stop', {
+      cwd, stdin: JSON.stringify({ session_id: 'cc-multi-1', transcript_path: join(ROOT, 'no-such-transcript.jsonl') }),
+    });
+    expect(stop.code, `stop exited ${stop.code}\n${stop.stderr}`).toBe(0);
+
+    // Both sub-episodes saved, and BOTH carry the reads — the multi-session branch
+    // inherits the collected set by value, so a missing write-back empties both.
+    for (const schema of [schemaA, schemaB]) {
+      const row = rowFor(project, schema);
+      expect(row, `no observation flushed for ${schema}`).toBeTruthy();
+      expect(JSON.parse(row.files_read),
+        `${schema.split('/').pop()}'s sub-episode lost the collected reads — planEpisodeFlush now runs before the collect, so every sub needs the write-back`)
+        .toEqual([readA, readB]);
+    }
+  }, 60000);
+
+  it('default (v3.83.0): the reads survive and land on the next significant flush', async () => {
+    const NAME = 'hs-readseat-on';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const readsFile = join(RUNTIME_DIR, `reads-${project}.txt`);
+    const readA = join(cwd, 'alpha-config.mjs');
+    const readB = join(cwd, 'beta-config.mjs');
+    const env = {};
+
+    await seedReads(cwd, 'cc-on-1', [readA, readB]);
+    expect(existsSync(readsFile)).toBe(true);
+
+    await bufferThenFlush(cwd, 'cc-on-1', { significant: false, env });
+    expect(existsSync(readsFile), 'the insignificant flush still consumed the reads file').toBe(true);
+    expect(readFileSync(readsFile, 'utf8').split('\n').filter(Boolean)).toEqual([readA, readB]);
+
+    const schema = join(cwd, 'alpha-schema.sql');
+    await bufferThenFlush(cwd, 'cc-on-2', { significant: true, schemaFile: schema, env });
+    const row = rowFor(project, schema);
+    expect(row, 'no observation flushed for the significant episode').toBeTruthy();
+    expect(JSON.parse(row.files_read), 'the carried reads did not reach the saved observation').toEqual([readA, readB]);
+    // …and the significant flush DID consume: the carry is a deferral, not a leak.
+    expect(existsSync(readsFile), 'the significant flush left the reads file in place — it would accumulate forever').toBe(false);
+  }, 60000);
 });
 
 // ─── hook.mjs: the background workers (spawnBackground / detached) ──────────────────
@@ -826,7 +1183,15 @@ describe('hook feature sweep: hook.mjs background workers', () => {
       '};',
       '',
     ].join('\n'));
-    const OFFLINE = { SWEEP_FETCH_LOG: fetchLog, NODE_OPTIONS: `--require "${offlineFetch}"` };
+    // The blanked proxy vars are part of the network boundary, not hygiene: when a
+    // proxy is configured hook-update takes the CONNECT tunnel, which does NOT go
+    // through globalThis.fetch — so on a proxy-bound developer machine this stub
+    // would be silently bypassed and the arms below would hit api.github.com.
+    const OFFLINE = {
+      SWEEP_FETCH_LOG: fetchLog,
+      NODE_OPTIONS: `--require "${offlineFetch}"`,
+      HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '',
+    };
 
     // This event is spawned in production as `spawnBackground('update-check')`, i.e. with
     // CLAUDE_MEM_HOOK_RUNNING=1. That used to kill it: `update-check` was missing from
@@ -1009,7 +1374,10 @@ describe('hook feature sweep: standalone hook scripts', () => {
     );
   });
 
-  itHook('scripts/pre-agent-inject.js', async () => {
+  // Registered surface is the PREFILTER (audit P2-5): hooks.json names the .sh, which
+  // execs the .js only when CLAUDE_MEM_SUBAGENT_INJECT is on. Firing the .js directly here
+  // would sweep a path Claude Code no longer invokes.
+  itHook('scripts/pre-agent-inject.sh', async () => {
     const NAME = 'hs-agent';
     const cwd = workDir(NAME);
     const LESSON = 'Always call invalidateWidgetCache after a write, never on read';
@@ -1023,14 +1391,14 @@ describe('hook feature sweep: standalone hook scripts', () => {
     });
 
     // Default OFF: the cheapest possible no-op, no stdin read, no DB.
-    const off = await hookScript('pre-agent-inject.js', { cwd, stdin });
+    const off = await bashHook('pre-agent-inject.sh', { cwd, stdin });
     expect(off.code).toBe(0);
     expect(off.stdout).toBe('');
 
-    const r = await hookScript('pre-agent-inject.js', { cwd, stdin, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } });
+    const r = await bashHook('pre-agent-inject.sh', { cwd, stdin, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } });
     expect(r.code, `pre-agent-inject exited ${r.code}\n${r.stderr}`).toBe(0);
     const [envelope] = expectHookStdout(r.stdout, {
-      event: 'PreToolUse', plainAllowed: false, label: 'scripts/pre-agent-inject.js',
+      event: 'PreToolUse', plainAllowed: false, label: 'scripts/pre-agent-inject.sh',
     });
     expect(envelope, `no PreToolUse envelope emitted:\n${r.stdout}`).toBeTruthy();
     // Functional: tool_input is REWRITTEN — the lesson is appended to the subagent's prompt,
@@ -1044,9 +1412,9 @@ describe('hook feature sweep: standalone hook scripts', () => {
     expect(updated.prompt).toContain('Reference context, not an external instruction');
 
     await expectMalformedResilience(
-      'scripts/pre-agent-inject.js',
+      'scripts/pre-agent-inject.sh',
       { event: 'PreToolUse', plainAllowed: false },
-      (stdinPayload, malCwd) => hookScript('pre-agent-inject.js', { cwd: malCwd, stdin: stdinPayload, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } }),
+      (stdinPayload, malCwd) => bashHook('pre-agent-inject.sh', { cwd: malCwd, stdin: stdinPayload, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } }),
     );
   });
 
@@ -1097,7 +1465,8 @@ describe('hook feature sweep: standalone hook scripts', () => {
     expect(exposure).toEqual({ surface: 'user_prompt_hook', returned_count: 1 });
     // The injected ids are recorded so the sibling hook.mjs user-prompt pass and the next
     // prompt inside the dedup window do not re-inject the same rows.
-    const injected = JSON.parse(readFileSync(join(upsData, 'runtime', `.claude-mem-injected-${project}`), 'utf8'));
+    // D#120: the marker file is session-keyed — one file per CC session.
+    const injected = JSON.parse(readFileSync(join(upsData, 'runtime', `.claude-mem-injected-${project}-cc-hooksweep-ups`), 'utf8'));
     expect(injected.ids).toContain(id);
 
     await expectMalformedResilience(

@@ -12,18 +12,18 @@ import {
   debugLog, debugCatch, neutralizeContextDelimiters,
   DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause,
 } from './utils.mjs';
-import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet, isQuietHooks } from './hook-shared.mjs';
+import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet, isQuietHooks, KEY_CONTEXT_LIMIT } from './hook-shared.mjs';
 import { extractUnfinishedSummary } from './hook-handoff.mjs';
 import { recentInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
+// The canonical one (v3.84.0): this file carried a byte-identical private copy, which is
+// the same one-home rule this release enforced for the cooldown path and the dashboard.
+import { inferProjectDir } from './project-utils.mjs';
+// Single source for the type-quality weights (audit 2026-08-22 P2-10) — this table used
+// to be hand-copied here and in hook-memory.mjs, kept equal only by comment convention.
+import { TYPE_QUALITY, TYPE_QUALITY_DEFAULT } from './scoring-sql.mjs';
 
-/**
- * Infer the project directory from environment variables or cwd.
- * @returns {string} Absolute path to the project directory
- */
-function inferProjectDir() {
-  return process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-}
-
+import { DAY_MS } from './lib/time-constants.mjs';
 /**
  * Compute adaptive recall time windows based on project activity velocity.
  * High activity -> shorter windows (recent data more relevant).
@@ -42,7 +42,7 @@ function mdCell(s) {
 }
 
 export function computeAdaptiveWindows(db, project) {
-  const sevenDaysAgo = Date.now() - 7 * 86400000;
+  const sevenDaysAgo = Date.now() - 7 * DAY_MS;
   const row = db.prepare(`
     SELECT COUNT(*) as c FROM observations
     WHERE project = ? AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
@@ -51,13 +51,13 @@ export function computeAdaptiveWindows(db, project) {
 
   if (velocity > 10) {
     // High velocity: tighter windows, focus on very recent
-    return { tier1: 12 * 3600000, tier2: 3 * 86400000, tier3: 14 * 86400000, sessWindow: 3 * 86400000 };
+    return { tier1: 12 * 3600000, tier2: 3 * DAY_MS, tier3: 14 * DAY_MS, sessWindow: 3 * DAY_MS };
   } else if (velocity >= 3) {
     // Medium velocity: default windows
-    return { tier1: 24 * 3600000, tier2: 7 * 86400000, tier3: 30 * 86400000, sessWindow: 7 * 86400000 };
+    return { tier1: 24 * 3600000, tier2: 7 * DAY_MS, tier3: 30 * DAY_MS, sessWindow: 7 * DAY_MS };
   } else {
     // Low velocity: wider windows, older data still relevant
-    return { tier1: 48 * 3600000, tier2: 14 * 86400000, tier3: 60 * 86400000, sessWindow: 14 * 86400000 };
+    return { tier1: 48 * 3600000, tier2: 14 * DAY_MS, tier3: 60 * DAY_MS, sessWindow: 14 * DAY_MS };
   }
 }
 
@@ -83,12 +83,7 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   const obsPool = db.prepare(`
     SELECT id, type, title, narrative, importance, created_at_epoch, files_modified, lesson_learned
     FROM observations
-    WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-      -- superseded invisibility: auto-dedup (hook.mjs) sets superseded_at but leaves
-      -- compressed_into=0, so the compressed filter alone lets the hidden near-duplicate
-      -- resurface in the most-visible surface (injected every SessionStart). Sibling
-      -- keyObs already filters this; obsPool + fallbackObs must match.
-      AND superseded_at IS NULL
+    WHERE project = ? AND ${liveObsFilterSql('')}
       AND ${notLowSignalTitleClause('')}
       AND (
         (created_at_epoch > ? AND importance >= 1)
@@ -111,18 +106,12 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   const selectedSess = [];
   let totalTokens = 0;
 
-  // Type quality multipliers — aligned with scoring-sql.mjs TYPE_QUALITY_CASE (R2).
-  // Weights calibrated from empirical avg access_count per type:
-  //   decision 6.05, discovery 3.32, bugfix 2.24, feature 2.04, change 0.93, refactor 0.54.
-  // Pre-R2 had bugfix=0.35 (inverted vs reality — bugfixes are 2.4× more used than changes).
-  const TYPE_QUALITY = { decision: 1.5, discovery: 1.3, bugfix: 1.1, feature: 1.0, refactor: 0.6, change: 0.5 };
-
   // Score each candidate: value = recency * type_quality * importance, cost = tokens
   // Recency uses exponential half-life (consistent with server.mjs BM25 scoring)
   const scoredObs = obsPool.map(o => {
     const halfLifeMs = DECAY_HALF_LIFE_BY_TYPE[o.type] || DEFAULT_DECAY_HALF_LIFE_MS;
     const recency = 1.0 + Math.exp(-0.693 * (now_ms - o.created_at_epoch) / halfLifeMs);
-    const typeQuality = TYPE_QUALITY[o.type] || 1.0;
+    const typeQuality = TYPE_QUALITY[o.type] || TYPE_QUALITY_DEFAULT;
     const impBoost = 0.5 + 0.5 * (o.importance || 1);
     const lessonBoost = o.lesson_learned ? 1.3 : 1.0;
     const value = recency * typeQuality * impBoost * lessonBoost;
@@ -293,9 +282,15 @@ export function cleanupClaudeMdLegacyBlock() {
  * @param {string|null} [currentCcSessionId=null] Claude Code session id — when provided,
  *   the "Working State (from /clear)" block is filtered to handoffs owned by this
  *   session, preventing parallel-session bleed (see docs/bug.txt).
+ * @param {object|null} [collector=null] Optional out-param: when given, its
+ *   `keyContextIds` property is set to the obs ids ACTUALLY rendered into the
+ *   File Lessons / Key Context sections ([] under quiet/adopted or when the
+ *   sections are empty). handleUserPrompt persists this as its exclude-set
+ *   (D#123: the exclude-set must mirror real injections, not the keyObs query).
  * @returns {string} Joined markdown lines (without <claude-mem-context> wrappers)
  */
-export function buildSessionContextLines(db, project, now = new Date(), currentCcSessionId = null) {
+export function buildSessionContextLines(db, project, now = new Date(), currentCcSessionId = null, collector = null) {
+  if (collector) collector.keyContextIds = [];
   // 1. Token-budgeted observation selection
   const selected = selectWithTokenBudget(db, project, 2000);
   const observations = selected.observations;
@@ -308,8 +303,7 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     fallbackObs = db.prepare(`
       SELECT id, type, title, project, created_at
       FROM observations
-      WHERE COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
+      WHERE ${liveObsFilterSql('')}
         AND ${notLowSignalTitleClause('')}
         AND (
           (created_at_epoch > ? AND importance >= 1)
@@ -335,10 +329,9 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
   //    and Key Context (informational). Pushed into summaryLines.
   const keyObs = db.prepare(`
     SELECT o.id, o.type, o.title, o.lesson_learned, o.files_modified FROM observations o
-    WHERE o.project = ? AND COALESCE(o.compressed_into, 0) = 0
-      AND o.superseded_at IS NULL
+    WHERE o.project = ? AND ${liveObsFilterSql('o')}
       AND COALESCE(o.importance, 1) >= 2
-    ORDER BY o.created_at_epoch DESC LIMIT 10
+    ORDER BY o.created_at_epoch DESC LIMIT ${KEY_CONTEXT_LIMIT}
   `).all(project);
 
   if (keyObs.length > 0) {
@@ -357,30 +350,35 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
           const files = JSON.parse(o.files_modified);
           const fname = basename(Array.isArray(files) && files.length > 0 ? files[0] : '');
           if (fname) {
-            fileLessons.push(`- ${fname}: ${truncate(o.lesson_learned, 100)} (#${o.id})`);
+            fileLessons.push({ id: o.id, line: `- ${fname}: ${truncate(o.lesson_learned, 100)} (#${o.id})` });
             continue;
           }
         } catch { /* fall through to keyContext */ }
       }
       const lesson = hasLesson ? ` — ${truncate(o.lesson_learned, 60)}` : '';
-      keyContext.push(`- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}`);
+      keyContext.push({ id: o.id, line: `- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}` });
     }
 
     // Phase A (QUIET_HOOKS) + Phase D (adopted sentinel): drop descriptive
     // File Lessons / Key Context sections when the user has opted into low-noise
     // hooks OR adopted invited-memory (MEMORY.md sentinel carries the triggers
     // at higher system-prompt authority). The Recent table still fires so #IDs
-    // remain reachable via mem_get.
+    // remain reachable via mem_get. The collector sees only rows that survive
+    // BOTH the quiet gate and the per-section slice — rendered rows, nothing else.
     const quiet = effectiveQuiet();
     if (fileLessons.length > 0 && !quiet) {
+      const shown = fileLessons.slice(0, 5);
       summaryLines.push('### File Lessons');
-      summaryLines.push(...fileLessons.slice(0, 5));
+      summaryLines.push(...shown.map((e) => e.line));
       summaryLines.push('');
+      if (collector) collector.keyContextIds.push(...shown.map((e) => e.id));
     }
     if (keyContext.length > 0 && !quiet) {
+      const shown = keyContext.slice(0, 5);
       summaryLines.push('### Key Context');
-      summaryLines.push(...keyContext.slice(0, 5));
+      summaryLines.push(...shown.map((e) => e.line));
       summaryLines.push('');
+      if (collector) collector.keyContextIds.push(...shown.map((e) => e.id));
     }
   } else if (!latestSummary && !effectiveQuiet()) {
     // Fallback: no summary AND no key observations — show recent activity.

@@ -5,6 +5,9 @@
 import { basename, dirname, resolve, sep } from 'path';
 import { execSync } from 'child_process';
 import { buildLowSignalRegex } from './lib/low-signal-patterns.mjs';
+// Local binding for internal use: the `export … from './secret-scrub.mjs'` re-export below
+// is a pass-through and creates no binding in this module's scope.
+import { scrubSecrets as _scrubSecrets } from './secret-scrub.mjs';
 
 // ─── Re-exports from extracted modules ──────────────────────────────────────
 // Backward compatibility: all consumers import from utils.mjs
@@ -16,11 +19,14 @@ export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';
 export { stripPrivate } from './lib/private-strip.mjs';
 export { truncate, typeIcon, fmtDate, fmtTime, isoWeekKey, formatErrorRecallHints, neutralizeContextDelimiters } from './format-utils.mjs';
 export { computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity } from './hash-utils.mjs';
-export { detectBashSignificance, extractErrorKeywords, extractFilePaths, stripTestSuffix } from './bash-utils.mjs';
+export { detectBashSignificance, extractErrorKeywords, planErrorRecall, extractFilePaths, stripTestSuffix } from './bash-utils.mjs';
 
 // Internal imports for functions that remain in this module
 import { truncate } from './format-utils.mjs';
 import { stripTestSuffix } from './bash-utils.mjs';
+// Static, and deliberately the dependency-free resolver (node:os + node:path only) —
+// debugCatch's sampler must not pull in the DB layer. See its comment below.
+import { resolveDataDir } from './lib/resolve-data-dir.mjs';
 
 // ─── Sentinel Values ────────────────────────────────────────────────────────
 
@@ -44,20 +50,15 @@ export function isPathConfined(candidate, allowedBase) {
   return resolved === base || resolved.startsWith(base + sep);
 }
 
-/**
- * Basename that treats BOTH '/' and '\' as separators on every host OS.
- * `path.basename` follows the HOST's rules, so on POSIX it returns a Windows
- * path unchanged. Hook payloads carry the CLIENT's paths and
- * observation_files.filename stores either separator (lib/file-edge-match.mjs),
- * so DB search keys derived from them must be host-independent.
- * Not for filesystem access — '\' is a legal POSIX filename character.
- * @param {string} p Path in any separator style
- * @returns {string} Last segment, trailing separators ignored; '' if none
- */
-export function basenameAnySep(p) {
-  const s = String(p ?? '').replace(/[/\\]+$/, '');
-  return s.slice(Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\')) + 1);
-}
+// `basenameAnySep` lived here until 2026-08-22. Its sole production consumer was
+// `recallForFile` (hook-memory.mjs), which had no callers of its own and was
+// deleted the same round; keeping the export would have added a dead name to the
+// knip baseline. The behaviour it encoded is NOT gone — it moved into
+// lib/file-edge-match.mjs (module-private, so that ~30ms cold-start path stays
+// free of this module's child_process import), which is where the split actually
+// had to happen: `path.basename` follows the HOST's rules, so on POSIX it returns
+// a Windows path unchanged, while observation_files.filename stores either
+// separator. tests/win-path-basename.test.mjs asserts it through fileMatchParams.
 
 // ─── Token Estimation ─────────────────────────────────────────────────────
 
@@ -202,34 +203,51 @@ export function isRelatedToEpisode(episode, newFiles) {
  * @param {boolean} [opts.isError] If provided, overrides inline error regex detection
  * @returns {string} Concise description of the action
  */
+// SEC-3 (2026-08-29 audit): scrub BEFORE truncating, inside the function that truncates.
+//
+// The caller wraps this whole result in scrubSecrets(), which is one step too late: every
+// field below is already cut to 40-60 characters by then, so a secret straddling the cut
+// has lost the tail its value-length-gated pattern needs and the head survives verbatim.
+// The prompt path fixed this ordering (hook.mjs) and this path kept the old one.
+//
+// The scrub input is windowed rather than whole: `resp` is an uncapped tool response (a
+// Bash stdout can be megabytes) and this runs on every PostToolUse. 4096 is two orders of
+// magnitude above the longest cut here, so a secret that begins before the cut is still
+// seen whole by the patterns, at bounded cost.
+const DESC_SCRUB_WINDOW = 4096;
+function scrubTruncate(str, max) {
+  if (typeof str !== 'string' || str === '') return truncate(str, max);
+  return truncate(_scrubSecrets(str.slice(0, DESC_SCRUB_WINDOW)), max);
+}
+
 export function makeEntryDesc(toolName, input, resp, opts) {
   switch (toolName) {
     case 'Edit':
-      return `${basename(input.file_path || '')}: "${truncate(input.old_string || '', 40)}" → "${truncate(input.new_string || '', 40)}"`;
+      return `${basename(input.file_path || '')}: "${scrubTruncate(input.old_string || '', 40)}" → "${scrubTruncate(input.new_string || '', 40)}"`;
     case 'Write':
       return `Created ${basename(input.file_path || '')} (${(input.content || '').length} chars)`;
     case 'NotebookEdit':
-      return `Notebook cell: ${truncate(input.new_source || '', 60)}`;
+      return `Notebook cell: ${scrubTruncate(input.new_source || '', 60)}`;
     case 'Bash': {
-      const cmd = truncate(input.command || '', 50);
+      const cmd = scrubTruncate(input.command || '', 50);
       // Use caller-provided bashSig.isError (word-boundary aware) when available;
       // fall back to inline regex only for standalone callers (tests, etc.)
       const isErr = opts?.isError ?? (/\berror\b|\bfail(ed|ure)?\b|\bexception\b|\bpanic\b/i.test(resp) && resp.length > 30);
-      const snippet = truncate(resp, 60);
+      const snippet = scrubTruncate(resp, 60);
       return isErr ? `${cmd} → ERROR: ${snippet}` : `${cmd} → ${snippet}`;
     }
     case 'Grep':
-      return `Search "${truncate(input.pattern || '', 20)}" → ${truncate(resp, 60)}`;
+      return `Search "${scrubTruncate(input.pattern || '', 20)}" → ${scrubTruncate(resp, 60)}`;
     case 'LSP':
       return `${input.operation || ''} ${basename(input.filePath || '')}`;
     case 'Task': case 'Agent':
-      return truncate(input.description || '', 60);
+      return scrubTruncate(input.description || '', 60);
     case 'WebSearch':
-      return `Web: ${truncate(input.query || '', 50)}`;
+      return `Web: ${scrubTruncate(input.query || '', 50)}`;
     case 'WebFetch':
-      return `Fetch: ${truncate(input.url || '', 50)}`;
+      return `Fetch: ${scrubTruncate(input.url || '', 50)}`;
     default:
-      return `${toolName}: ${truncate(resp, 50)}`;
+      return `${toolName}: ${scrubTruncate(resp, 50)}`;
   }
 }
 
@@ -266,14 +284,19 @@ export function debugCatch(e, context) {
   // Sampled-to-disk surface for post-mortem. Lazy-loaded so fs-less paths
   // don't pay the module cost; wrapped in try so sampler faults never crash
   // the caller (debugCatch is the error-handler-of-last-resort path).
+  //
+  // The data dir comes from lib/resolve-data-dir.mjs (imports: node:os, node:path) and
+  // NOT from schema.mjs's DB_DIR. This is the last-resort error path, so it must not
+  // inherit the DB layer's import graph: with schema.mjs unresolvable, the sampler wrote
+  // NOTHING — the trail meant to explain a broken install disappeared with it (verified
+  // by blocking the specifier; tests/debug-catch-sampler-deps.test.mjs). Resolving at
+  // call time also honours a data dir redirected after module load, which DB_DIR (a
+  // load-time constant) does not.
   if (process.env.CLAUDE_MEM_CATCH_SAMPLE) {
     (async () => {
       try {
-        const [{ maybeSampleError }, { DB_DIR }] = await Promise.all([
-          import('./lib/err-sampler.mjs'),
-          import('./schema.mjs'),
-        ]);
-        maybeSampleError(e, context, DB_DIR);
+        const { maybeSampleError } = await import('./lib/err-sampler.mjs');
+        maybeSampleError(e, context, resolveDataDir(process.env.CLAUDE_MEM_DIR));
       } catch { /* sampler dynamic-import fault must not propagate */ }
     })();
   }

@@ -10,7 +10,13 @@ import { join, dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const SKIP_DIRS = new Set(['node_modules', '.git', 'coverage', 'dist', 'tmp']);
+// `tasks/` belongs here for the same reason `tmp/` does (D#168): it is gitignored local
+// workspace — specs, plans, review reports, mutation backups — not shipped source, and a
+// scanner that walks it turns red because of what a session happened to leave behind. The
+// two sibling walkers (obs-types-invariant.test.mjs, time-constants.test.mjs) already skip
+// it; this one was the odd one out, and a pre-tag reviewer's `cp` backups under
+// tasks/bak-3810/ are what surfaced it.
+const SKIP_DIRS = new Set(['node_modules', '.git', 'coverage', 'dist', 'tmp', 'tasks']);
 
 /** Collect every .mjs file in the repo, excluding vendored/generated trees. */
 function collectMjs(dir, out = []) {
@@ -97,9 +103,11 @@ function findCycles(graph) {
 // standard remedy for a cycle, not a defect — the module is not on the importer's
 // load path. Listed explicitly so a NEW lazy cycle still fails this suite.
 const KNOWN_LAZY_CYCLES = [
-  // utils.debugCatch() lazy-loads schema.mjs for DB_DIR only under
-  // CLAUDE_MEM_CATCH_SAMPLE; schema.mjs statically imports utils.mjs.
-  'utils.mjs -> schema.mjs -> utils.mjs',
+  // Was: 'utils.mjs -> schema.mjs -> utils.mjs' — debugCatch()'s sampler lazy-loaded
+  // schema.mjs for DB_DIR while schema.mjs statically imports utils.mjs. The sampler now
+  // takes lib/resolve-data-dir.mjs (node:os + node:path only), so the cycle is gone
+  // rather than tolerated. Keep this list EMPTY if you can: an entry here means a real
+  // cycle that only an await-import keeps off the load path.
 ];
 
 const fmt = (cycles) => cycles.map(c => c.map(f => relative(ROOT, f)).join(' -> ')).sort();

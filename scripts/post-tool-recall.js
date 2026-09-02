@@ -17,6 +17,11 @@ import { existsSync, readFileSync } from 'fs';
 import { basename, join } from 'path';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
+// D#154: every envelope on this stdout goes through the one writer. This script has a
+// single emit today, so the change buys nothing on its own — it buys that a SECOND
+// emit added later merges instead of producing two JSON documents, which the host
+// parses as neither (lib/hook-stdout.mjs). Import-free module over no runtime deps.
+import { queueHookContext, flushHookStdout } from '../lib/hook-stdout.mjs';
 
 const SALIENCE_BIND = process.env.CLAUDE_MEM_SALIENCE === 'bind';
 
@@ -69,10 +74,8 @@ async function main() {
   for (const d of dropped.slice(0, 3)) {
     lines.push(`[mem] ⚠ your edit to ${basename(filePath)} dropped \`${d.token}\` flagged by #${d.obsId} — if intentional say so, else re-check before moving on.`);
   }
-  process.stdout.write(JSON.stringify({
-    suppressOutput: true,
-    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: lines.join('\n') },
-  }));
+  queueHookContext('PostToolUse', lines.join('\n'));
+  flushHookStdout();
 }
 
 // No forced process.exit(0): main() consumes stdin to EOF (or early-returns without

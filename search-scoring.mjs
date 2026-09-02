@@ -9,7 +9,9 @@ import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from 
 import { BASE_STOP_WORDS } from './stop-words.mjs';
 import { porterStem } from './tfidf.mjs';
 import { CLI_INVOKE } from './cli-path.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── MCP Server Instructions Builder ───────────────────────────────────────
 // Phase A (v2.31.3+): when quiet=true, drops WHEN-TO-USE proactive-trigger and
 // Decision-rules sections; keeps the irreducible CLI/MCP tool list. Intended
@@ -225,8 +227,7 @@ export function expandQueryByConcepts(db, ftsQuery, project) {
     rows = db.prepare(`
       SELECT o.concepts FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
-      WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+      WHERE observations_fts MATCH ? AND ${liveObsFilterSql('o')}
         AND (? IS NULL OR o.project = ?)
       ORDER BY ${OBS_BM25}
       LIMIT 20
@@ -302,7 +303,7 @@ export function runIdleCleanup(db) {
 
   db.transaction(() => {
     for (const { types, days } of staleThresholds) {
-      const cutoff = Date.now() - days * 86400000;
+      const cutoff = Date.now() - days * DAY_MS;
 
       const marked = db.prepare(`
         UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}

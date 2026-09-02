@@ -11,6 +11,9 @@ import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 // format-utils.mjs is import-free — pulling three defang helpers keeps this script
 // inside its "lightweight standalone" budget (no heavy transitive deps).
 import { neutralizeContextDelimiters, neutralizeSkillDelimiters, neutralizeSkillBridgeDelimiters } from '../format-utils.mjs';
+// D#154: single envelope writer. Also import-free (no runtime deps), so it stays
+// inside this script's "lightweight standalone" budget.
+import { queueHookContext, flushHookStdout } from '../lib/hook-stdout.mjs';
 
 // CLAUDE_MEM_DIR mirrors pre-tool-recall.js — one env var sandboxes everything.
 const DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
@@ -104,17 +107,14 @@ try {
     let additionalContext;
     if (content.length > 16000) {
       const summary = defang(content.slice(0, 800));
-      additionalContext = `<skill-bridge name="${safeName}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Read("${portablePath}") to load full content.`;
+      // D#122 ③: the path interpolates OUTSIDE the wrapper — defang it too (a
+      // locally-created managed dir can carry delimiter chars in its name).
+      additionalContext = `<skill-bridge name="${safeName}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Read("${defang(portablePath)}") to load full content.`;
     } else {
       additionalContext = `<skill-bridge name="${safeName}" source="managed">\n${defang(content)}\n</skill-bridge>\n\nThis skill was loaded from the managed registry. Follow the instructions above.`;
     }
-    process.stdout.write(JSON.stringify({
-      suppressOutput: true,
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        additionalContext,
-      },
-    }));
+    queueHookContext('PreToolUse', additionalContext);
+    flushHookStdout();
   } catch (e) {
     // Silent failure — never block Skill tool, but record for self-observation.
     recordHookError('skill-bridge:query', e, RUNTIME_DIR, { skillName });

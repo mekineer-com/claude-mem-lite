@@ -218,4 +218,104 @@ describe('citation-stats CLI', () => {
     expect(parsed.funnel.window.injected).toBe(9);
     expect(parsed.funnel.window.cited).toBe(6);
   });
+
+  // v45 per-face split. The section must (a) show each face's own rate and
+  // (b) say out loud that the faces overlap — a reader who sums them and
+  // compares to the funnel total would otherwise conclude the numbers are broken.
+  const seedSurface = (surface, inj, cited, session = 'fs1') =>
+    testDb.prepare(
+      `INSERT INTO citation_surface_log (project, session_id, surface, resolved_at, injected_n, cited_n)
+       VALUES (?,?,?,?,?,?)`
+    ).run('p1', session, surface, Date.now(), inj, cited);
+
+  it('renders the per-injection-face section with each face rate', async () => {
+    seedSurface('pretool', 20, 2);
+    seedSurface('error_recall', 5, 4);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/injection face/i);
+    expect(output).toMatch(/PreToolUse recall.*inj\s+20\s+cited\s+2\s+10\.0%/);
+    expect(output).toMatch(/error-recall.*inj\s+5\s+cited\s+4\s+80\.0%/);
+  });
+
+  it('states that faces overlap so the rows are not a partition', async () => {
+    seedSurface('pretool', 3, 1);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/not a partition/i);
+  });
+
+  // The label table and the enum are two lists again the moment a face is added to one
+  // of them. The render falls back to the raw key, so a missed label is silent — it just
+  // prints `task_imperative` in a column of prose names. This pins the readable label.
+  it('renders a readable label for every metered face, task_imperative included', async () => {
+    seedSurface('task_imperative', 12, 3);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/task-imperative.*inj\s+12\s+cited\s+3\s+25\.0%/);
+    expect(output).not.toMatch(/task_imperative/);   // the raw key must not reach the user
+  });
+
+  it('labels keyctx as promotion-only (it can never demote)', async () => {
+    seedSurface('keyctx', 10, 1);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/Key Context.*promotion-only/s);
+  });
+
+  // The sibling of the case above, and the reason the note is derived from
+  // DECAY_DENOMINATOR_SURFACES rather than special-cased: an annotated keyctx
+  // beside a BARE non-decay face reads as "that one does feed decay", which is
+  // false. Until v3.77.0 that argument lived only in a code comment — collapsing
+  // the note to '' left every CLI suite green.
+  //
+  // `task_imperative` moved sides here (it entered the denominator once its rate was
+  // read) and is now the pinned NEGATIVE, which is the stronger half of this case: a
+  // derivation that inverts fails on it, and so does one that hardcodes the old face
+  // list. `subagent` is still metered-only, so the positive is pinned too.
+  it('labels every non-decay face as metered-only, and no decay face', async () => {
+    seedSurface('subagent', 5, 2);
+    seedSurface('task_imperative', 12, 3);
+    seedSurface('pretool', 20, 8);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/subagent \(dispatch\).*metered only: outside the decay denominator/);
+    // Positive first: a bare `not.toMatch` on this face is satisfied just as well by the
+    // row not being rendered at all (v3.79.0's "my assertion was satisfied by another
+    // cause"). A sibling case does pin the row, but keeping the non-vacuity in the SAME
+    // case is what makes this one self-contained.
+    expect(output).toMatch(/task-imperative.*inj\s+12\s+cited\s+3/);
+    expect(output).not.toMatch(/task-imperative.*metered only/);
+    expect(output).not.toMatch(/PreToolUse recall.*metered only/);
+  });
+
+  it('--json includes the surface_funnel breakdown', async () => {
+    seedSurface('ups', 8, 3);
+    const output = await captureStdoutOnly(() => run(['citation-stats', '--json']));
+    const parsed = JSON.parse(output);
+    expect(parsed.surface_funnel.surfaces).toHaveLength(1);
+    expect(parsed.surface_funnel.surfaces[0]).toMatchObject({ surface: 'ups', injected: 8, cited: 3 });
+    expect(parsed.surface_funnel.surfaces[0].rate).toBeCloseTo(0.375, 5);
+  });
+
+  // b4: the two zero-row states must READ differently. Pre-b4 both printed the
+  // same line, so a table that was never created (#10650) was indistinguishable
+  // from a fresh install — for as long as the surface stayed unmetered.
+  it('an empty window reads as "no rows yet", never as a failure', async () => {
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/no rows in this window yet/i);
+    expect(output).not.toMatch(/UNAVAILABLE/);
+  });
+
+  it('an unreadable table reads as UNAVAILABLE, not as an empty window', async () => {
+    testDb.prepare('DROP TABLE citation_surface_log').run();
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/UNAVAILABLE/);
+    expect(output).toMatch(/citation_surface_log/);       // names the actual failure
+    expect(output).toMatch(/fts-check/);                  // and the repair
+    expect(output).not.toMatch(/no rows in this window yet/i);
+  });
+
+  it('--json carries `unavailable` so a scripted reader is not misled either', async () => {
+    testDb.prepare('DROP TABLE citation_surface_log').run();
+    const output = await captureStdoutOnly(() => run(['citation-stats', '--json']));
+    const parsed = JSON.parse(output);
+    expect(parsed.surface_funnel.surfaces).toEqual([]);
+    expect(parsed.surface_funnel.unavailable).toBeTruthy();
+  });
 });

@@ -5,13 +5,13 @@
 // for install health checks). With --benchmark or --metrics it is routed to
 // mem-cli which delegates to this handler.
 
-import { inferProject } from '../utils.mjs';
+import { resolveCliProject as cliProject } from '../lib/cli-project.mjs';
 import { out } from './common.mjs';
 
 export async function cmdDoctor(db, args) {
   if (args.includes('--benchmark')) {
     const { runBenchmark } = await import('../lib/doctor-benchmark.mjs');
-    const project = inferProject();
+    const project = cliProject(db);
     // Sample recent user prompts so the CLI report has non-null injection_rate
     // and hook latency. Without this, runBenchmark's prompts default of [] makes
     // every metric 0/null — a dead command from the user's perspective. Tests

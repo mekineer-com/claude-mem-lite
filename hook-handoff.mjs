@@ -13,6 +13,7 @@ import {
 // immutable in ESM and cannot be mocked after the fact.
 import * as gitStateModule from './lib/git-state.mjs';
 import * as taskReaderModule from './lib/task-reader.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
 /**
  * Build and save a handoff snapshot to session_handoffs table.
@@ -76,8 +77,7 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   if (subjectPrompts.length === 0) {
     const fallback = db.prepare(`
       SELECT title FROM observations
-      WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
+      WHERE project = ? AND ${liveObsFilterSql('')}
         AND COALESCE(importance, 1) >= 3
         AND ${notLowSignalTitleClause('')}
       ORDER BY created_at_epoch DESC LIMIT 1
@@ -185,8 +185,7 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   const decisions = db.prepare(`
     SELECT title FROM observations
     WHERE memory_session_id = ? AND COALESCE(importance, 1) >= 2
-      AND COALESCE(compressed_into, 0) = 0
-      AND superseded_at IS NULL ${obsWindowClause}
+      AND ${liveObsFilterSql('')} ${obsWindowClause}
     ORDER BY created_at_epoch DESC LIMIT 10
   `).all(sessionId, ...obsWindowParams).filter(d => d.title && !LOW_SIGNAL_TITLE.test(d.title)).slice(0, 5);
 

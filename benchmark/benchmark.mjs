@@ -10,7 +10,8 @@ import { searchObservationsHybrid } from '../search-engine.mjs';
 import { computePerSourceWindow } from '../lib/search-core.mjs';
 import { deepSearch } from '../deep-search.mjs';
 import { computeVector, rebuildVocabulary, _resetVocabCache, VOCAB_DIM, MIN_COSINE_SIMILARITY, RRF_K } from '../tfidf.mjs';
-import { OBS_BM25, TYPE_QUALITY_CASE } from '../scoring-sql.mjs';
+import { OBS_BM25, TYPE_QUALITY_CASE, noisePenaltyClause, citeFactorClause } from '../scoring-sql.mjs';
+import { recencyDecaySql, liveObsFilterSql } from '../lib/inject-search-core.mjs';
 import { createTestDb } from '../tests/test-helpers.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -109,7 +110,7 @@ export function seedVectors(db, { dim } = {}) {
 
   const obs = db.prepare(`
     SELECT id, title, narrative, concepts FROM observations
-    WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
+    WHERE ${liveObsFilterSql('')}
   `).all();
   const ins = db.prepare(
     'INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)'
@@ -201,6 +202,12 @@ export function searchProductionHybrid(db, query, { limit = 10, project = null, 
 //   'no_lesson'     — drop the (1+0.3*lesson) boost. The fixture has 0
 //                     lesson_learned rows, so this multiplier is a constant 1.0×
 //                     there and reports 0 by construction (untestable here).
+//   'no_noise'      — drop noisePenaltyClause. Like lesson, the fixture carries
+//                     zero injection/access counters, so it reads 0 by
+//                     construction — included so `hybrid` models the FULL_SCORE
+//                     chain (D#121: cite+noise joined FULL_SCORE in v3.63 M-3 and
+//                     the matrix/ci-gate floor silently covered a subset).
+//   'no_cite'       — drop citeFactorClause. Same fixture caveat as no_noise.
 //
 // Per-term ablation modes were added to answer "do these multipliers earn their
 // keep?" — the previous matrix only compared full-hybrid vs bm25_only, leaving
@@ -209,7 +216,11 @@ export function searchProductionHybrid(db, query, { limit = 10, project = null, 
 // each multiplier's parameters are appended in MULT_PARAMS order.
 
 const MULT_EXPR = {
-  decay:      '(1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))',
+  // decay composes the real clamped shape (D#123): same MAX(created, last_accessed)
+  // timestamp and per-type half-life as search-engine FULL_SCORE — the previous
+  // hand-copy was unclamped, created-only, constant-half-life while the mode doc
+  // above claims FULL_SCORE fidelity.
+  decay:      recencyDecaySql({ tsExpr: 'MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))' }),
   // type imports the real TYPE_QUALITY_CASE (no hardcoded copy — #8770); lesson
   // mirrors search-engine.mjs FULL_SCORE's inline boost (no exported constant —
   // keep in sync). Both added so `hybrid` mirrors the full production chain.
@@ -217,7 +228,11 @@ const MULT_EXPR = {
   project:    '(CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)',
   importance: '(0.5 + 0.5 * COALESCE(o.importance, 1))',
   access:     '(1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))',
-  lesson:     '(1.0 + 0.3 * (o.lesson_learned IS NOT NULL))',
+  lesson:     "(1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))",
+  // noise/cite import the real clauses (no hardcoded copies) — D#121: FULL_SCORE
+  // gained both in v3.63 M-3; without them here the matrix scored a stale chain.
+  noise:      noisePenaltyClause('o'),
+  cite:       citeFactorClause('o'),
 };
 const MULT_PARAMS = {
   decay:      (now)         => [now],
@@ -226,19 +241,23 @@ const MULT_PARAMS = {
   importance: ()            => [],
   access:     ()            => [],
   lesson:     ()            => [],
+  noise:      ()            => [],
+  cite:       ()            => [],
 };
 // NOTE: decay must precede project in every term list so the bound params
 // (decay → [now], project → [project, project]) stay aligned with the `?`
 // placeholders. type/importance/access/lesson contribute no params.
 const MODE_TERMS = {
-  hybrid:        ['decay', 'type', 'project', 'importance', 'access', 'lesson'],
+  hybrid:        ['decay', 'type', 'project', 'importance', 'access', 'lesson', 'noise', 'cite'],
   bm25_only:     [],
-  no_decay:      ['type', 'project', 'importance', 'access', 'lesson'],
-  no_type:       ['decay', 'project', 'importance', 'access', 'lesson'],
-  no_project:    ['decay', 'type', 'importance', 'access', 'lesson'],
-  no_importance: ['decay', 'type', 'project', 'access', 'lesson'],
-  no_access:     ['decay', 'type', 'project', 'importance', 'lesson'],
-  no_lesson:     ['decay', 'type', 'project', 'importance', 'access'],
+  no_decay:      ['type', 'project', 'importance', 'access', 'lesson', 'noise', 'cite'],
+  no_type:       ['decay', 'project', 'importance', 'access', 'lesson', 'noise', 'cite'],
+  no_project:    ['decay', 'type', 'importance', 'access', 'lesson', 'noise', 'cite'],
+  no_importance: ['decay', 'type', 'project', 'access', 'lesson', 'noise', 'cite'],
+  no_access:     ['decay', 'type', 'project', 'importance', 'lesson', 'noise', 'cite'],
+  no_lesson:     ['decay', 'type', 'project', 'importance', 'access', 'noise', 'cite'],
+  no_noise:      ['decay', 'type', 'project', 'importance', 'access', 'lesson', 'cite'],
+  no_cite:       ['decay', 'type', 'project', 'importance', 'access', 'lesson', 'noise'],
 };
 
 function searchObservations(db, query, options = {}) {
@@ -510,7 +529,7 @@ function round(v) {
 // doesn't beat recency-only is broken.
 
 const BASELINE_MODES = ['hybrid', 'bm25_only', 'recency', 'random'];
-const ABLATION_MODES = ['no_decay', 'no_type', 'no_project', 'no_importance', 'no_access', 'no_lesson'];
+const ABLATION_MODES = ['no_decay', 'no_type', 'no_project', 'no_importance', 'no_access', 'no_lesson', 'no_noise', 'no_cite'];
 
 /**
  * Deterministically partition a query fixture into train + eval splits so the

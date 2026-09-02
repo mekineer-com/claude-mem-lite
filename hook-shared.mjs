@@ -1,7 +1,7 @@
 // claude-mem-lite: Shared infrastructure for hook.mjs and hook-llm.mjs
 // Constants, session management, DB access, LLM calls, process utilities
 
-import { execFileSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync, chmodSync } from 'fs';
@@ -10,7 +10,7 @@ import { ensureDbWithWalRecovery, DB_DIR } from './schema.mjs';
 // Pure-`node:`/local module (it imports only binding-probe + native-binding-hint, and
 // neither imports this file) — no cycle.
 import { recordHookError } from './lib/hook-telemetry.mjs';
-import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku } from './haiku-client.mjs';
+import { execClaudeCliSync, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 // Phase D: invited-memory sentinel detection. memdir.mjs/claudemd.mjs only pull in
 // fs/path/os/crypto; adopt-content.mjs is pure strings. No circular deps —
 // neither imports hook-shared.
@@ -18,6 +18,7 @@ import { memdirPath as _memdirPath, isAdopted as _isAdoptedMemdir } from './memd
 import { isAdopted as _isAdoptedClaudeMd } from './claudemd.mjs';
 import { PLUGIN_SLUG as _PLUGIN_SLUG } from './adopt-content.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 export const RUNTIME_DIR = join(DB_DIR, 'runtime');
@@ -29,9 +30,25 @@ export const EPISODE_TIME_GAP_MS = 5 * 60 * 1000;       // 5 min
 export const SESSION_EXPIRY_MS = 12 * 60 * 60 * 1000;    // 12h
 export const STALE_SESSION_MS = 24 * 60 * 60 * 1000;     // 24h
 export const STALE_LOCK_MS = 30000;                       // 30s
+
+// The background-maintenance mutex, defined HERE next to the sweeper policy it has to
+// escape. cleanStaleLockFiles() below unlinks any `*.lock` older than STALE_LOCK_MS
+// WITHOUT checking whether the holder is alive — right for the episode lock's millisecond
+// critical section, fatal for a maintenance pass that runs for seconds to minutes. The
+// name therefore ends in `.proclock`, and `tests/auto-maintain-proc-lock.test.mjs` asserts
+// that against THIS constant rather than a re-typed copy: the first version of that test
+// built its own path from a literal, so renaming the lock left it green with the hazard
+// back. proc-lock's own staleness policy (age OR provably-dead pid) is the correct one.
+export const AUTO_MAINTAIN_LOCK = 'auto-maintain.proclock';
 export const DEDUP_WINDOW_MS = 5 * 60 * 1000;            // 5 min (title dedup)
-export const RELATED_OBS_WINDOW_MS = 7 * 86400000;       // 7 days
+export const RELATED_OBS_WINDOW_MS = 7 * DAY_MS;       // 7 days
 export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
+// Candidate rows the SessionStart Key Context surface considers (hook-context.mjs
+// keyObs; each of the two sections then renders at most 5). The user-prompt
+// exclude-set does NOT mirror this query — it reads the ids actually rendered
+// from the keyctx marker (D#123 review C-1: query-mirroring suppressed
+// <memory-context> injection on quiet/adopted projects where nothing renders).
+export const KEY_CONTEXT_LIMIT = 10;
 
 // Phase A (v2.31.3+): MEM_QUIET_HOOKS=1 drops descriptive hook/MCP-instruction
 // bodies (File Lessons / Key Context headers, MCP WHEN-TO-USE & decision rules,
@@ -101,18 +118,154 @@ export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE
   const readsCutoff = now - readsAgeMs;
   let count = 0;
   for (const f of entries) {
-    // `.claim-` = handleStop's lock-contended fallback claim file (ep-<project>.json.claim-<pid>-<ts>),
-    // which leaks if the process dies between rename and unlink; sweep it on the same 1h cutoff.
-    const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-') || f.includes('.claim-');
+    // Crash residue: this runtime dir writes four families of temp name, each the middle
+    // of a rename-or-unlink pair that leaks if the process dies between the two steps.
+    // The predicate covered only `.claim-`, whose comment states the reason it exists —
+    // and the other three are that same window (audit FLOW-3):
+    //   .claim-   handleStop's lock-contended fallback   (hook.mjs)
+    //   .collect- the reads-file rename a flush performs (hook.mjs)
+    //   .trim-    the reads-file truncation              (hook.mjs)
+    //   .tmp-     every atomic write                     (hook-episode.mjs, atomicWrite)
+    // Neither of the old clauses could reach them: `reads-<p>.txt.collect-<ts>` does not
+    // end in `.txt`, and `ep-<p>.json.tmp-<pid>` does not start with `ep-flush-`.
+    //
+    // Anchored to the END of the name, and the reason is not the one first written here.
+    // The original note claimed it protected `reads-x.tmp-y.txt` from the short clock; it
+    // does not — that name ends in `.txt`, so `isReads` picks the 24h cutoff either way,
+    // and dropping the anchor killed no test (caught by a pre-tag reviewer). What the
+    // anchor actually protects is the LIVE episode buffer of a project whose sanitized
+    // name contains the token: `ep-x.tmp-y.json` matches an unanchored pattern, and would
+    // then be swept as residue one hour into a session that is still using it.
+    const isCrashResidue = /\.(claim|collect|trim|tmp)-[^.]*$/.test(f);
+    const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-');
     const isReads = f.startsWith('reads-') && f.endsWith('.txt');
-    if (!isEpisode && !isReads) continue;
+    if (!isCrashResidue && !isEpisode && !isReads) continue;
     const full = join(runtimeDir, f);
     try {
+      // Residue takes the short cutoff and a live tracker takes the 24h one, with no
+      // tie-break needed: residue always APPENDS its suffix, so it never ends in `.txt`
+      // and `isReads` is already false for it. (A `&& !isCrashResidue` tie-break was
+      // written here first and no mutation could kill it — it was guarding a state the
+      // two predicates cannot both be in.)
       if (statSync(full).mtimeMs < (isReads ? readsCutoff : cutoff)) {
         unlinkSync(full);
         count++;
       }
     } catch { /* concurrent unlink / permission — ignore */ }
+  }
+  return count;
+}
+
+// ─── Per-project marker GC (P2-15) ───────────────────────────────────────────
+// RUNTIME_DIR had three sweeps and a hole. Per-SESSION files age out at 24h
+// (hook.mjs) and orphaned episode/read trackers at 1h/24h (above), but the
+// per-PROJECT markers — one file per project, written once, never revisited —
+// had no reclamation path at all. A live install on 2026-08-16 held 253 files,
+// 152 of them past 30 days, including entire families for test sandboxes
+// deleted months earlier (session-tmp--sdscc-e2e-*, cite-recall-scratchpad--
+// fixture-*) and a .skill-reco-cooldown-* family that nothing had ever swept.
+//
+// Deliberately a NAMED list rather than a wildcard: these markers share a shape
+// but not a meaning. The GC-able ones are caches — delete them and the next
+// session re-derives the state (or, for a cooldown, merely allows a suggestion
+// sooner). The preserved ones are records of a side effect already performed;
+// removing them re-arms it (.auto-adopt-* re-attempts a write into the user's
+// project CLAUDE.md, the migration sentinels re-run their one-time work), which
+// is a bad trade for the 13-45 bytes each occupies.
+export const STALE_PROJECT_MARKER_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Regenerated on demand; safe to lose at any time.
+export const GC_PROJECT_MARKER_PREFIXES = Object.freeze([
+  'session-',                 // project → memory-session-id pointer
+  'cite-recall-',             // last session's cite-recall snapshot (nudge input)
+  '.skill-cooldown-',         // suggestion throttle timestamp
+  '.skill-reco-cooldown-',    // recommendation throttle timestamp
+]);
+
+// Records of a completed side effect — never age out. `ep-`/`ep-flush-`/
+// `pending-`/`reads-` are absent from BOTH lists on purpose: the first holds
+// unflushed observations (data, not cache) and the rest already belong to
+// sweepOrphanEpisodeFiles on tighter cutoffs.
+export const GC_PRESERVED_MARKER_PREFIXES = Object.freeze([
+  '.auto-adopt-',
+  '.deferred-block-migrated-',
+  '.legacy-claude-md-cleaned-',
+  // v3.66.1: these two shipped in the GC list for one release and had to come
+  // out. Both are version-keyed one-shot migration sentinels written by
+  // scripts/setup.sh, and their gate is `! -f <marker>` — deleting one re-runs
+  // its migration. `.mcp-dedup-v2.78` gates a block that removes
+  // mcpServers.mem / mcpServers["mem-lite"] from the user's ~/.claude.json with
+  // a raw writeFileSync (no tmp+rename, no backup), which the repo's own test
+  // documents as intentionally one-shot: "If a user later runs `claude mcp add
+  // mem ...` themselves, the gate intentionally lets it stand." A 30-day sweep
+  // turned that into a recurring purge of a config file we do not own.
+  // The mtime never refreshes (the gate skips the block once the file exists),
+  // so every install older than 30 days would have lost it on the first
+  // SessionStart after upgrading.
+  //
+  // Why it was missed: the search for writers used `grep --include=*.mjs
+  // --include=*.js`, and the writer is a SHELL script. `sentinelPrefixesFromShell`
+  // below now derives this class from scripts/*.sh instead of from memory.
+  '.mcp-dedup-',
+  '.residue-warned-',
+]);
+
+/**
+ * Marker-name prefixes that scripts/*.sh treats as one-shot sentinels, derived
+ * from the shell source rather than restated here. `tests/runtime-marker-gc`
+ * asserts none of them is GC-able: a shell-written sentinel is invisible to a
+ * JS-only grep, which is exactly how `.mcp-dedup-` reached the GC list.
+ *
+ * @param {string} shellSource concatenated contents of scripts/*.sh
+ * @returns {string[]} prefixes like `.mcp-dedup-`
+ */
+export function sentinelPrefixesFromShell(shellSource) {
+  const out = new Set();
+  // Matches `"$DATA_DIR/runtime/.mcp-dedup-v2.78"` and friends: a dotfile under
+  // runtime/ whose name carries a version-ish suffix.
+  for (const m of String(shellSource || '').matchAll(/runtime\/(\.[a-z0-9-]*?-)v?[0-9][0-9.]*/gi)) {
+    out.add(m[1]);
+  }
+  return [...out];
+}
+
+/**
+ * Sweep per-project runtime markers older than `ageMs`. fs-only, best-effort,
+ * never throws. Returns the number of files removed.
+ *
+ * The two prefix lists are injectable ONLY so the precedence rule below can be
+ * exercised: with the shipped lists they are disjoint, which makes the
+ * preserved check redundant today and load-bearing the moment a future family
+ * nests inside a GC-able one. Production callers pass neither.
+ *
+ * @param {string} runtimeDir
+ * @param {{ageMs?: number, now?: number, gcPrefixes?: string[], preservedPrefixes?: string[]}} [opts]
+ * @returns {number}
+ */
+export function sweepStaleProjectMarkers(runtimeDir, {
+  ageMs = STALE_PROJECT_MARKER_AGE_MS,
+  now = Date.now(),
+  gcPrefixes = GC_PROJECT_MARKER_PREFIXES,
+  preservedPrefixes = GC_PRESERVED_MARKER_PREFIXES,
+  env = process.env,
+} = {}) {
+  // Kill switch (naming mirrors SKIP_COMPRESS / SKIP_OPTIMIZE / SKIP_SAVE_ENRICH):
+  // this is the only sweep that deletes files a user might want to inspect, so a
+  // released default that reclaims state needs a documented way back out.
+  if (env.CLAUDE_MEM_SKIP_MARKER_GC === '1') return 0;
+  let entries;
+  try { entries = readdirSync(runtimeDir); } catch { return 0; }
+  const cutoff = now - ageMs;
+  let count = 0;
+  for (const f of entries) {
+    // Preserved wins on any overlap, so a future prefix added to both lists
+    // fails safe (kept) instead of deleting a side-effect record.
+    if (preservedPrefixes.some((p) => f.startsWith(p))) continue;
+    if (!gcPrefixes.some((p) => f.startsWith(p))) continue;
+    const full = join(runtimeDir, f);
+    try {
+      if (statSync(full).mtimeMs < cutoff) { unlinkSync(full); count++; }
+    } catch { /* concurrent unlink / permission / directory — ignore */ }
   }
   return count;
 }
@@ -189,7 +342,7 @@ export function openDb() {
 // response string (callers run parseJsonFromLLM themselves) or null.
 // maxTokens is sized for session-summary / episode JSON (larger than the
 // registry/optimize callers' budgets).
-export async function callLLM(prompt, timeoutMs = 15000) {
+export async function callLLM(prompt, timeoutMs = BG_LLM_TIMEOUT_MS) {
   if (detectLLMMode() !== 'cli') {
     const result = await callHaiku(prompt, { timeout: timeoutMs, maxTokens: 2000 });
     return result?.text ?? null;
@@ -197,14 +350,10 @@ export async function callLLM(prompt, timeoutMs = 15000) {
 
   const { cli: modelName } = resolveModelShared();
   try {
-    const result = execFileSync(getClaudePathShared(), ['-p', '--model', modelName], {
-      input: _flattenForCLI(prompt),
-      timeout: timeoutMs,
-      encoding: 'utf8',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/tmp', // Prevent ghost sessions in user's /resume list
-    });
+    // Shared runner with haiku-client.mjs#callModelCLI (rationale there): no
+    // transcript persistence, no claudemd hook fan-out, and the one-shot
+    // retry-without-flag that keeps this leg alive on an older Claude Code CLI.
+    const result = execClaudeCliSync(modelName, { input: _flattenForCLI(prompt), timeout: timeoutMs });
     return result.trim();
   } catch (e) {
     const out = _extractResponseFromError(e);

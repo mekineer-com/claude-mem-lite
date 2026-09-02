@@ -4,7 +4,7 @@ import { resolve, join } from 'path';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
-import { createRegistryTestDb } from './test-helpers.mjs';
+import { createRegistryTestDb, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import { ensureRegistryDb } from '../registry.mjs';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-skill-bridge.js');
@@ -32,7 +32,7 @@ function runScript(inputStr, env = {}) {
     child.on('error', reject);
     child.stdin.write(inputStr);
     child.stdin.end();
-    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, 5000);
+    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 

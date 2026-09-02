@@ -2,6 +2,3017 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.85.0 — the bound we closed in v3.82.0 was alive on four more surfaces
+
+D#172 established that **a SQL `LIMIT` upstream of a JS-side relevance filter is a
+reachability bound, not a ranking bound** — whatever the SQL orders by, a row outside the
+window cannot be picked however well it scores on the criterion that actually decides.
+The 2026-08-29 audit found the same shape in four more places (ALGO-2~5) and filed them as
+P3. All four are closed here. The pattern is this project's first recurring disease —
+*the copy you fixed was not the only copy* — and this is its fifth counted round.
+
+**ALGO-3 · `hook-memory.mjs`, the `fyi` injection face.** The candidate pool was taken with
+`ORDER BY <raw bm25> LIMIT 10` (and `LIMIT 5` cross-project — a second copy the audit did
+not name), but the injected row is chosen by a JS composite. Multiplying out the factor
+tables, that composite spans **281×** (best 1.5 decision × 1.5 lesson × 1.0 importance ×
+1.0 noise × 3.0 cite = 6.75; worst 0.5 × 1.0 × 0.6 × 0.2 × 0.4 = 0.024) — the audit
+estimated ">10×". Pools raised to 30 / 15.
+
+Priced on the live corpus, not on the fixture, and reproducible:
+**`node benchmark/rerank-pool-replay.mjs`**. The default replays the **whole
+`user_prompts` table** — every prompt, no sampling predicate — through both the shipped
+module and a twin carrying the old 10/5 pools. On this machine (n = **11279**):
+
+| | over all 11279 | over the 4901 that retrieve anything |
+|---|---|---|
+| different injected set | **15.9%** | 36.5% |
+| different top-1 | **6.6%** | 15.2% |
+
+2476 rows newly reachable against 1230 displaced, and 219 prompts that previously injected
+nothing now inject something (6597 → 6378 empty). The gain exceeds the displacement because
+freed-but-empty slots get filled, not because the cap moved; the injected set is still
+`MAX_MEMORY_INJECTIONS = 3`.
+
+**Why the whole corpus and not a sample.** The first draft of this entry quoted 11.9% / 4.0%
+off a newest-1200 sample filtered to `LENGTH(prompt_text) BETWEEN 20 AND 2000`. The pre-tag
+review could not reproduce it and re-measured under nine sampling configurations, every one
+of them higher. Running the same harness on the reviewer's sample settles it: the harness
+agrees to within one row (14.8% / 7.1% / 284 / 126 vs their 14.7% / 7.0% / 282 / 126), and
+**the sample predicate was the entire disagreement** — 1200-row samples of this one table
+span 11.9%–20.2% depending on which predicate you pick. A headline that moves by 70% with
+the sampling choice is not a measurement of the change; the whole-corpus run has no such
+free parameter, which is why it is the number quoted and why `--sample N` prints a warning.
+
+**The replay cannot pollute the corpus, and proves it rather than promising it.**
+`searchRelevantMemories` bumps `injection_count` on every row it returns — the exact column
+`noisePenaltyClause` reads — so replaying it against a writable handle would both corrupt
+that signal permanently and let arm A's writes change arm B's scores. The DB is opened
+`readonly`, and the harness executes the bump against its own handle at startup and
+**refuses to run if it succeeds**. Confirmed independently by the review: `sum(injection_count)`
+unchanged at 5048 across the whole exercise, with only 14 rows carrying a same-day
+`last_injected_at`, in human-scale clusters.
+
+**How loose the cross-project arm still is, measured rather than asserted**
+(`--cross-arm`, whole corpus, n = 11104). Driving the *shipped* cross-project predicate
+including its OR fallback — the branch it takes on 6730 of its 8487 firings — the leg fires
+on **76.4%** of prompts, and of those firings **83.9% match more than 5 rows**. So the old
+`LIMIT 5` was truncating in the large majority of cases, not occasionally. But **71.5% still
+match more than 15**, and 56.9% match more than 50; largest single match 242. On match count
+alone, 5 → 15 does not close this arm.
+
+That sounds worse than it is, and the difference was checked rather than argued. Relaxing the
+cross pool further — `--baseline-same 30 --baseline-cross 50`, whole corpus — changes the
+injected set on **4.0%** of prompts and the top-1 on **1.7%**, and fills 52 more previously
+empty injections. So the OR penalty (0.4×), the cross penalty (0.7×) and the adaptive
+threshold do drop nearly every row the LIMIT cuts, and match-count truncation overstates the
+harm by roughly an order of magnitude — but not to zero. **15 is a judgement call, not a
+finding**: 50 buys a measured 4.0% / 1.7% for ~3.3× the cross-arm `narrative` reads per
+prompt, and that trade was declined for a face `denoise-ab` cannot see, not proven worthless.
+The command above is in the repo precisely so the next person can disagree with numbers.
+
+The first version of that measurement reported the cross leg as firing on **5 of 1200**
+prompts and never truncating. It modelled only the AND pass, and the leg takes the OR
+fallback on the large majority of real prompts — it measured a branch production rarely
+uses. That is why the OR fallback is modelled inside the shipped `--cross-arm` mode rather
+than left to whoever re-derives the number next.
+
+**Stated plainly, because widening is not closing:** with a 281× spread and bm25 decaying
+slowly across a window, **no finite pool size proves sufficiency**. 30/15 makes the bound
+loose. The bound is *removable* — every composite factor already has a SQL clause, and the
+two that do not (cross-project, OR) are per-query constants that cannot affect within-query
+order, so ordering by the composite would make `LIMIT` a true ranking bound. That was
+deliberately **not** done: `lib/inject-search-core.mjs:23-25` records this surface's
+"BM25-sort + JS scoring" split as an intentional per-surface asymmetry (#8786), and
+`benchmark/denoise-ab.mjs` is structurally blind to this face (its suites drive the
+search-engine, not this function). Widening is monotone and provable; re-ranking needs a
+ruler that does not exist yet.
+
+**ALGO-2 · `scripts/user-prompt-search.js`, the identifier bypass.** The bypass exists so a
+named-identifier hit survives the set floors — and it selected from `ftsRows`, the same
+LIMIT-3 window it was meant to rescue rows *into*. It could therefore only restore rows the
+sort had already ranked top-3; the low-document-frequency identifier row its own docblock
+argues for was unreachable. Now the query over-fetches (bypass-only; with the bypass off it
+is the old query verbatim) and the bypass may pull at most 2 rows from beyond the window.
+Implemented as **strictly additive** rather than as the audit's flat "LIMIT 2": a cap of 2
+over the merged set could have evicted a third head row that ships today.
+
+**ALGO-4 · `scripts/pre-tool-recall.js`, cross-hook dedup.** The dedup that drops rows UPS
+already injected ran *downstream* of the SQL `LIMIT`, so a deduped row left its slot **empty
+instead of yielding it to the next candidate** — "dedup" implemented as "shrink". On a Read
+(`obsLimit` 1) one dedup hit silenced the entire face. The seen-set is now read before the
+queries and its size raises each `LIMIT` (capped at 5), so the dedup re-ranks.
+
+**ALGO-5 · prompt-fallback.** `searchByUserPrompts` filters through `cjkPrecisionOk` after
+the SQL `LIMIT`, and `PROMPT_FALLBACK_LIMIT` ships at 1 — dropping one row dropped the whole
+face. Fetches a pool, filters, then takes `limit`.
+
+Building that fixture turned up something worth writing down: **`user_prompts_fts` is
+declared with no `tokenize=` clause, and FTS5's default tokenizer indexes a contiguous CJK
+run as ONE token** — `'分页接口'` is a single term, not 分/页/接/口 (verified against
+`fts5vocab` on SQLite 3.53.1). `observations_fts` is CJK-searchable only because its write
+path folds space-separated CJK bigrams into the **`text`** column — `buildFtsTextField`
+(hook-llm.mjs) joins `cjkBigrams(title + narrative)` into the `text` blob, and `derivedText`
+(lib/observation-write.mjs) and lib/save-enrich.mjs do the same on their paths. This table
+holds raw `prompt_text` and has no such segmentation. So a CJK query reaches this corpus only through
+the OR fallback, on prompts that happen to carry the bigram as an isolated run — which is
+the branch the new test exercises, and the reason ALGO-5's blast radius is narrow.
+
+**Evidence.** Every one of the four is pinned by a fixture **verified to go RED against the
+pre-fix code**, checked by reverting each fix in turn: ALGO-2 (bypass reading `ftsRows`) →
+empty stdout; ALGO-3 (pool back to 10) → the face returns nothing at all; ALGO-4 (`obsLimit`
+back to a flat 2) → no id emitted; ALGO-5 (`LIMIT` back to `limit`) → empty stdout. Two of
+the fixtures needed a correction that is itself the lesson: **an all-one-topic corpus makes
+FTS5's IDF degenerate and `bm25()` returns 0.000 for every row**, so the first drafts were
+ranking on rowid tie-breaks and asserting on insertion order. The ALGO-2 draft also failed
+for the wrong reason first — "why" in the prompt triggers `detectIntent`'s type filter, a
+*different* reachability bound that dropped the target row in SQL before the pool question
+was reached. Each case ships with a negative control on the same corpus (the set floors must
+still bind; the fillers must still lose; the dedup must still dedup).
+
+`benchmark/denoise-ab.mjs`: Δ **exactly 0.000** on all 12 metrics, all behavioural probes
+pass. Read that as the signature of *a lever this ruler cannot see* — all four faces are
+outside the suites' query→document path — i.e. evidence of no collateral regression on the
+search engine, and **not** validation of the four changes. Full suite 315 files / **5335**
+tests (+13), `eslint .` 0, knip 46 unused exports / 0 unused files (name set unchanged).
+
+**What the pre-tag review changed.** Two independent reviewers; both found real defects, and
+the first draft of this entry shipped none of the following.
+
+- **The CJK write-path sentence above named the wrong columns.** It said the bigrams go into
+  `search_aliases`/`concepts`; they go into **`text`**. Confirmed three ways before accepting
+  it: `buildFtsTextField` folds `bigramText` into the `text` blob, `derivedText` and
+  save-enrich do the same on their paths, and on a live CJK row the bigram run is in `text`
+  (626 chars) while `search_aliases` is NULL and `concepts` empty. The failure is #10918's own
+  lesson — *when a "because X" is executable, run it before writing it* — applied to half a
+  claim: the tokenizer half was verified with `fts5vocab`, the write-path half was written
+  from memory, and the wrong half was then copied into three files. The row that proves it is
+  that very memory.
+- **Three of the four fixes had no binding test.** Mutating `RERANK_POOL_CROSS_PROJECT`,
+  `eventsLimit`'s slack, and the trailing `.slice(0, limit)` each left the **entire** suite
+  green. The `.slice` is the one that mattered, and the reason is sharper than "untested":
+  `cjkPrecisionOk` returns `true` unconditionally for any query without two adjacent CJK
+  characters, so on every English or code prompt the filter is the identity function and that
+  `.slice` is the *only* thing holding this face at `PROMPT_FALLBACK_LIMIT = 1`. Deleting it
+  injects `min(1 × 5, 25)` = **5 rows instead of 1 on every non-CJK prompt-fallback firing** —
+  a 5× budget blowout on the main path, not an edge case. (The first draft of this entry said
+  "up to 25 rows"; 25 is the cap of the pool formula, reachable only under the env override.)
+  All three now have fixtures verified
+  RED against their mutation. The lesson is narrower than "add tests":
+  each of the three unbound changes was the *second arm* of a fix whose first arm was tested —
+  cross-project beside same-project, events beside observations, the cap beside the pool.
+- **The five live-corpus numbers came from a scratch script that was never committed, and
+  the reviewer could not reproduce one of them.** The harness turned out to be right — run
+  on the reviewer's own sample it returns 14.8% / 7.1% / 284 / 126 / 736→705 against their
+  14.7% / 7.0% / 282 / 126 / 736→706 — and the entire gap was the sample predicate: the draft
+  filtered `LENGTH(prompt_text) BETWEEN 20 AND 2000`, the reviewer did not, and 1200-row
+  samples of this one table span **11.9%–20.2%** depending on which predicate you pick. Two
+  fixes, because "my harness was fine" does not answer the objection: the headline is now the
+  **whole corpus** (no sampling decision exists to argue about), and the ruler ships as
+  `benchmark/rerank-pool-replay.mjs`, the way `imperative-pool-replay.mjs` shipped for D#172.
+  A number nobody else can re-derive is not evidence.
+
+**Two findings are recorded rather than fixed**, both outside this round's authorised scope.
+
+- **D#188** — `scripts/pre-tool-recall.js`'s cross-hook dedup tests
+  `crossHookSeen.has(String(r.id))` against rows that mix `src: 'obs'` and `src: 'evt'`, and
+  events share the numeric id space with observations, so an event is dropped because an
+  *observation* with the same id was injected. The comment three lines above states that
+  id-space collision as the reason the `src` tag exists; the predicate below ignores the tag.
+- **D#189 — a FIFTH instance of this release's own defect class, and it is not fixed here.**
+  `selectWithTokenBudget` (hook-context.mjs:72-178), the SessionStart Key Context face, takes
+  `obsPool` with `ORDER BY created_at_epoch DESC LIMIT 50` and `sessPool` with the same
+  ordering `LIMIT 10`, then chooses what to inject by `valueDensity`. It is a purer form of
+  the defect than ALGO-3: there the SQL key (raw bm25) is at least a factor of the composite,
+  whereas here `recency` is squashed into `(1, 2]` by `1 + exp(…)` while
+  `typeQuality × impBoost × lessonBoost / √cost` spans far more — the column the SQL sorts by
+  barely participates in the ranking that decides. Measured on the live DB with the shipped
+  `computeAdaptiveWindows` and the pools' own predicates: `obsPool` is truncated in **3 of 8**
+  projects (109 / 73 / 61 eligible against a LIMIT of 50) and `sessPool` in **5 of 8**
+  (75 / 73 / 47 / 41 / 25 against a LIMIT of 10). It is left open deliberately: SessionStart
+  injects on every start, so changing it is a user-visible default-behaviour change on a
+  released artifact, and it surfaced *after* this release's review round — folding it in would
+  ship one unreviewed change on the back of four reviewed ones. Saying "we closed the class"
+  while a quantified fifth instance stays open would be the same overclaim this project keeps
+  paying for, so: four surfaces closed, one known and open, numbers above.
+
+**CI (`.github/workflows/publish.yml`, both authorised explicitly).**
+
+- **SEC-4** — top-level `permissions` tightened from `contents: write` to `read`. It covered
+  only `validate`, which checks out and runs npm; the `publish` job declares its own
+  `contents: write` + `id-token: write`, so release upload and provenance are untouched.
+- **ENG-2** — `validate` now runs `node benchmark/ci-gate.mjs`. `ci.yml` has a standalone
+  benchmark job, but it gates the *branch*: a tag pushed right after the branch push starts
+  a Release run that does not wait for it. Observed 2026-09-01 — CI started 13:55:59,
+  Release 13:56:09 — so a retrieval regression could ride out with the release.
+
+## v3.84.1 — the update banner nagged forever on the one install shape we never had
+
+First outside contribution ([#17](https://github.com/sdsrss/claude-mem-lite/pull/17), Peter Bakker):
+a **pure-plugin** install — no `claude-mem-lite install`, only the marketplace plugin — showed
+`📦 claude-mem-lite: v3.84.0 available (current: v0.0.0) — plugin mode only checks for updates;
+reinstall/update the plugin to apply it` at every SessionStart on a fully current plugin cache.
+The hint was the insult on top: there was nothing to reinstall.
+
+`getCurrentVersion()` read `~/.claude-mem-lite/package.json`, and on that install shape the
+file does not exist: the data dir holds the DB and runtime state, never source. This repo
+states that invariant in two places already — `syncDataDirFromCache`'s `no-existing-code-install`
+guard and doctor's "plugin-only install never deploys into ~/.claude-mem-lite" branch — but the
+version read predated both. The `'0.0.0'` catch-all then made `compareVersions` report an update
+forever, and the banner is rendered from that persisted state.
+
+Fixed by falling back to `CLAUDE_PLUGIN_ROOT/package.json` — the running plugin cache. Two
+narrowings on top of the contributed patch:
+
+- **The code dir is asked first, the cache second.** `getCurrentVersion()` is also how
+  `repair()`'s signed-release rollback guard (`isRepairDowngrade`) learns which tree is about
+  to be overwritten, and `hook-launcher.mjs`'s `attemptHeal` spawns `repair` with no env
+  override — so `CLAUDE_PLUGIN_ROOT` is set in that child too. On a hybrid install (managed
+  code dir *plus* plugin cache) the two trees legitimately carry different versions; that drift
+  is why `syncDataDirFromCache` exists. Cache-first would have judged one tree by the other's.
+- **A `package.json` with no `version` field falls through** instead of returning `undefined`.
+  Not because comparing would throw: `compareVersions` parses `String(undefined)` to `[NaN]` and
+  reads every component as `pa[i] || 0`, so `undefined` degrades to exactly `0.0.0` — the bug
+  this release closes, wearing a different hat and rendering `(current: vundefined)`.
+
+The tradeoff the first form got right and this one does not: on a **hybrid** install whose code
+dir lags the cache, reading the code dir first shows one banner that cache-first would have
+suppressed. It is bounded — `trySyncDataDirFromCache()` runs at every SessionStart and pulls the
+code dir up to the cache — and a correct rollback guard is worth more than a transient banner,
+but it is a real cost and not a free win.
+
+Three tests added beside the contributed one, each verified to fail against the code without
+its guard: code-dir-wins-when-both-exist (the contributed case leaves only one readable
+`package.json`, so it passes under either order and cannot pin it), the version-less
+`package.json` fall-through, and the reported symptom end-to-end — a current pure-plugin
+install must report no update and emit no banner. 68 passed in `tests/hook-update.test.mjs`.
+
+Known, not fixed here: `tests/cli-path-invocation.test.mjs`'s injection-budget test measures
+four strings that each embed the absolute `CLI_PATH`, so what it gates on is partly the length
+of the checkout path. The first to trip is the detail doc — 26 occurrences, 6293/8000 — which
+goes red once `CLI_PATH` reaches 104 chars; the instructions (7 occurrences, 2866/3500) hold to
+129. On this machine `CLI_PATH` is 38, which is why the contributor saw a failure there and a
+re-run here could not reproduce it. Filed as a deferred item.
+
+## v3.84.0 — the audit's own P1, and a second promotion path the ledger never knew about
+
+Thirteen batches against the 2026-08-29 engineering audit (`docs/reviews/PROJECT_AUDIT.md`).
+Every P0/P1/P2 is closed; eight P3 items with it. Of the twelve findings re-tested before
+any code moved, twelve held and none was rejected — but four were **larger than filed**,
+and one new P1 came out of running the suite rather than out of the report.
+
+**Upgrade note — one default behaviour change, with an off switch.**
+
+**Discussing a memory no longer promotes it.** At Stop, an `access_count` used to be
+credited for every `#NN` appearing in the session's assistant text, with no check that
+anything had ever put that memory in front of the model. Downstream that is a promotion:
+`access_count > 3` raises importance a tier. In a repository whose subject matter IS the
+memory store, a session writing release notes or an audit report names dozens of ids in
+prose and promoted every one of them. Now a citation counts when the memory was injected
+this session — through any of the seven faces, including the SessionStart Key Context block
+and lessons handed to a dispatched agent — or when **you** typed its `#NN` yourself.
+
+Measured on the live transcript corpus (77 session transcripts, 72 carrying an injection):
+**269 of 863 (id, session) pairs the Stop scan cited were mentions nothing had put in front
+of the model — 31.2%**. Of the 254 pairs the old code would actually have *credited* (the id
+still existing as a row in that project), **69 — 27.2%**. Both are given because the second
+is the population the change acts on, and it is the smaller number. Revert with
+`CLAUDE_MEM_CITATION_RELEVANCE_GATE=off`; pinning `claude-mem-lite@3.83.0` also reverts it.
+
+This was filed as D#179 against the citation-decay loop, which at least had an injected
+gate. The audit found the *second* path — this one, with no gate at all — so "discussing a
+memory" was promoting it twice over while the ledger recorded only the gated half. D#179
+itself stays open and now says so: an injected id that is merely mentioned rather than
+applied still promotes through decay.
+
+**The report's own P1 was a test whose green depended on the host.** The startup dashboard
+took its `project` from the environment but its filesystem root from `process.cwd()`. Those
+diverge whenever a hook is not spawned at the project root, and the dashboard then renders
+one directory's git state and task list under another directory's project name. Production
+never showed it — Claude Code spawns hooks at the project root — but the test face did: on
+a clean tree HEAD was one test red, and the CI green of 2026-08-25 was a parallel worker
+happening to leave a scratch file in the repository first. Fixed by same-sourcing rather
+than by a fallback chain, so identity and filesystem root cannot drift apart again.
+
+**And a second one, found by running the suite rather than by reading the code.** A full run
+reddened an unrelated case on a 5-second MCP-startup timeout. A cold `node server.mjs`
+initialize round trip measures 240-640ms on this machine, so that cap had an order of
+magnitude of headroom — and it still lost, on 24 cores with 311 test files in flight, to CPU
+starvation of the spawn. Thirteen suites
+had independently copy-pasted the same literal. They now share one budget under vitest's own
+`testTimeout`, which is what actually owns hang protection; the inner timer exists only to
+name which round trip stalled.
+
+**Security and reliability.** `stripPrivate` — the first step of every `scrubSecrets` call,
+on the synchronous prompt path — was quadratic on opener-dense input: 891ms at the 256KB
+stdin cap, against 0.6ms for a megabyte of plain text, and `import-jsonl` feeds it user
+files with no cap at all. Rewritten as a linear tag scan: **891ms → 1.8ms**, with a
+differential oracle against the original regex over 13 adversarial arrangements and 500
+seeded random tag soups, so "same output" is asserted rather than assumed. The unsampled
+hook-error log now scrubs its fields like its twin sampler already did — Node quotes
+offending input back inside JSON.parse errors, and one hook hands it raw stdin. Episode
+descriptions scrub *before* truncating, so a secret straddling the cut can no longer leave
+its head behind. The cite-back hints' filenames are defanged, closing the last cell in the
+ten-surface injection matrix that reached the model raw.
+
+**Concurrency, and a memory row that could vanish early.** Two Claude Code windows booting
+either side of the 24-hour maintenance boundary both saw "due" and both spawned a worker.
+That broke an invariant `decayAndMarkIdle` documents in its own docblock: it marks before it
+decays precisely so an importance-2 row cannot be decayed and hidden as pending-purge in one
+pass. Across two processes the ordering is gone — one worker decays, the other hides the
+row, 37 days from a hard delete. The family now takes a cross-process lock, deliberately not
+named `*.lock` because the 30-second sweeper strips those without checking whether the holder
+is alive. Separately, both episode upgrade paths now check the pre-saved row is still live:
+the in-place UPDATE reported success while writing a whole enrichment onto a tombstone, and
+the delete hard-removed rows a keeper may have absorbed.
+
+**Performance.** `lib/ups-query.mjs` calls itself the one query-cap definition for the
+UserPromptSubmit event. That event has three legs, not two, and the third was uncapped. On a
+250KB CJK prompt — path B's stdin cap is 256KB — building the query cost **two orders of
+magnitude more uncapped than capped** (measured between 114ms and 356ms depending on whether
+the text is prose or random glyphs, against 4-10ms capped), synchronously, before the model
+sees the turn. `denoise-ab` reported NEUTRAL with Δ=0.000 on all twelve metrics, and that verdict
+was worth nothing here — its longest fixture query is 72 characters against a 2000-character
+cap, so the suites cannot reach the lever. The evidence is the live prompt corpus instead:
+around a third of prompts do build a different query under the cap, and running both through
+the shipped retriever returns the same rows for every one of them. Said precisely, because
+"the same rows" flatters it: on the prompts where the cap changes the query, **neither arm
+returns any row at all**. A 2900-term AND-joined FTS5 query matches nothing, and so does the
+50-term one it is capped to. That is a sound safety argument for the cap and it is the true
+one; the face fires on roughly 1% of prompts overall and never once on a prompt the cap
+changed.
+
+**Fixed guards, one home each.** The test-directory containment guard was wired into the
+Node exit of the PostToolUse channel; the channel has two, and the bash Read fast path
+appended straight into the developer's live runtime directory. The pre-recall cooldown path
+had three copies of its naming rule — a writer and two readers, two of them carrying comments
+saying the copies must agree — and only one pair was pinned by a test. The crash-residue
+sweep reached one of four temp-name families. Frozen benchmark corpora, one of which holds
+real commands and their real stderr, were protected by a single `.gitignore` line while the
+flags that write them take an arbitrary path.
+
+**Instrumentation you can now discount.** `citation-live-replay` prints a pollution
+sensitivity table by default, not behind a flag: excluding document-shaped sessions moves
+`pretool` 37.5% → 31.6% and `task_imperative` 36.8% → 30.8%. Reported, not filtered — which
+mentions were real uses is not decidable from the text, so dropping those sessions would
+trade a known bias for an unknown one.
+
+**Docs.** Both READMEs described an auto-adopt that stopped existing in v3.13: it writes a
+managed block into your project's own `CLAUDE.md` — a file that normally goes into git —
+plus a `.claude/` detail file, and it re-syncs on every SessionStart, not the first. The
+audit named two sites; sweeping for copies of the claim found eight.
+
+**Two independent pre-tag reviewers changed this release before it was tagged**, which is the
+whole reason that step exists. Both found, separately, that the first cut of the relevance gate
+built its population from the five injection faces that leave a hook attachment and silently
+dropped the other two — inverting a contract written verbatim in the omitted extractor's own
+docblock, and doing it invisibly on this machine, because the Key Context marker is empty on an
+*adopted* project. The loss would have landed on non-adopted ones: the default for a new install,
+and the configuration where that block is the most prominent surface there is. One reviewer also
+found two tests in `hook-context.mjs`'s suite that were red from any checkout other than the
+maintainer's — the release's own headline defect class, reproduced here in a clean clone and
+fixed. The rest of their findings corrected four numbers in these notes, including one that named
+a population 3.4× larger than the sentence claimed and one non-vacuity clause that the data
+refutes; those corrections are already folded in above.
+
+Suite: 309 files / 5233 tests with one red on a clean tree → **315 files / 5318 tests green**.
+eslint 0, shellcheck 0, knip 46 unused exports / 0 unused files, unchanged. Every batch was
+mutation-verified — the fix reverted, the new tests confirmed red, and only the ones that
+should be. One of those mutations survived and that was the finding: the branch it guarded
+was unreachable, so it was deleted rather than papered over with a test that could not fail.
+
+## v3.83.0 — the flush that ate the reads, and the class I was about to demote for citing best
+
+**Upgrade note — two default behaviour changes, both with an off switch, both measured on
+real data before they were flipped.**
+
+1. **An episode flush that saves nothing no longer discards the file paths it swept up.**
+   `reads-<project>.txt` used to be renamed, read and unlinked on EVERY flush, while an
+   observation is only written when the episode is significant. So an insignificant flush
+   destroyed every Read since the last one, and the next saved observation carried
+   `files_read: []`. Measured over 1122 real transcripts: **42.2% of the Read paths a flush
+   consumed died that way** (687 of 1627), and 72.7% of significant flushes carried no reads
+   at all. What changes for you: more of those paths reach a flush that saves — ×1.68 —
+   and a read can now attach to a flush later than the one that swept it up. How much of
+   that survives the DB's own dedup is NOT established; see below. Revert with
+   `CLAUDE_MEM_READS_CARRY=0`.
+2. **The `subagent` injection face now feeds citation-decay.** A lesson injected into a
+   dispatched agent's prompt enters the decay denominator, and the citation that agent
+   makes **in its own transcript** counts as the numerator. Until now the face was metered
+   but could neither promote nor demote. What changes for you: importance on lessons that
+   reach subagents starts moving — including one measured row that a miss would evict, see
+   the cost paragraph. Revert with `CLAUDE_MEM_SUBAGENT_DECAY=0`.
+
+Pinning `claude-mem-lite@3.82.0` reverts both without flags.
+
+**The reads defect is an ORDERING, and that is also the fix.** `explainSignificance` reads
+only `entries` and `files` — never `filesRead` — so the verdict was always available before
+the file was touched; the code simply asked in the wrong order. `flushEpisodeWithDb` now
+decides first and collects second. Two things had to move with it: `planEpisodeFlush` runs
+before the collection now, and its multi-session branch builds fresh objects that had
+copied the OLD `filesRead`, so the collected paths are written back to every sub-episode;
+and not collecting means the file grows across an insignificant streak, so
+`READS_CARRY_MAX_LINES = 20000` trims it — an unbounded-growth backstop, not a relevance
+bound. The trim counts LINES: the bash prefilter appends one line per Read with no dedup,
+so the growth mode is repeated lines, and the first draft compared the DISTINCT set (median
+1, p95 6, max 21 carried paths on this corpus) against the cap — a valve that could not
+fire on the thing it was installed for.
+
+**The filed premise was wrong by more than a factor of two.** D#178 was written saying
+92–96% of flushes are insignificant. The live `episode_significance` meter says **40.7%**
+(n=938 across three active days). The new ruler, `benchmark/episode-flush-replay.mjs`,
+computes 37.1% independently and the two are cross-checked against each other on every run:
+the replay models the same quantity the meter measures directly, and a gap over 15
+percentage points exits 1 (measured 3.6pp). That check is the reason the corrected number
+is trustworthy rather than a second guess — it also names its own known under-count
+(`<session>/subagents/*.jsonl` sits one level below the walk, so tool calls inside a
+dispatched agent are missing from the input) and says plainly that on a machine which never
+set `CLAUDE_MEM_METRICS=1` it has no teeth at all. The replay has no fixture: it drives the
+SHIPPED batcher (`isRelatedToEpisode`, `EPISODE_BUFFER_SIZE`, `EPISODE_TIME_GAP_MS`,
+`planEpisodeFlush`, `explainSignificance`, `buildImmediateObservation`, both write-side
+noise gates) over every real tool call in `~/.claude/projects/**.jsonl`.
+
+**What this release does NOT claim.** The flush-level number (42.2% of consumed reads) is
+solid. The observation-level benefit is not: past the two write-side noise gates, 10 → 17
+of 47 landed rows would carry a read, and that is an upper bound because the DB's own dedup
+tiers are not modelled. The live DB currently shows 0 of 73 non-empty `files_read` over five
+active days — dominated by manual saves — and this release does not establish that the fix
+moves that number much. It fixes a mechanism that was provably destroying data; the
+downstream size is still uncertain and is left uncertain here rather than rounded up.
+
+**Admitting `subagent` to decay is four wiring points, not one.** A face is "in the
+denominator" only if all of them agree: the entry gate (`injected.size > 0 || …` had to
+learn about `sub.injected`, or a session whose ONLY injection was a dispatched prompt never
+reaches the loop at all), the denominator set, the numerator set, and the position where the
+copies are built. **Both sets are copies, and the pre-tag review is why.** The first draft
+merged the subagent cites into `citedMain` in place; `citedMain` has four consumers, and the
+review measured two leaks that caused — `recordCitationSurfaces` scored a `pretool` row the
+main thread never cited as a pretool HIT (`pretool.cited_n` 0 → 1), and
+`resolveEdgeAttribution`, whose sidechain gate reads `!mainInjected.has(id) && !cited.has(id)`,
+flipped a file edge from MISS to HIT (`miss_streak` 1 → 0). The first would have made
+`citation_surface_log` and `benchmark/citation-live-replay.mjs` permanently different rulers,
+which is the v3.81.0 cross-agent defect mirrored. Both are now pinned by a case that asserts
+the funnel does NOT count the cite while decay DOES — either half alone passes under a broken
+implementation. `collectSubagentSurface` also moved from the tail of the citation block to
+its head, with no additional parent-transcript parse: `lib/transcript-scan.mjs` memoizes ONE
+file, and the constraint was never "run last", it was "do not run BETWEEN two parent scans".
+
+**Measured cost of the admission**, from one walk of 1122 transcripts: the face cites at
+25.5% (14/55), above `fyi` 11.1% and `error_recall` 6.6% which were already in the
+denominator. 33 marginal (session, id) pairs join, 21.2% of them cited; behind the uncited
+ones sit 21 distinct observations, five of which are at `uncited_streak = 2` and take a
+demotion on their next miss.
+
+**Four of those five are 3→2 down-ranks. The fifth is an EVICTION, and the first draft of
+this entry said there were none.** The part that generalises is that the marginal population
+is not all `importance = 3`. When this was measured (2026-08-25 18:00Z) #10716 sat at
+`importance = 2` with `uncited_streak = 2` — one miss from `IMPORTANCE_FLOOR = 1`, which is
+below the `COALESCE(importance, 1) >= 2` gate of `rankImperativeCandidates`, the pool of the
+very face being admitted. That is the 2→1 eviction v3.82.0's own note says
+`IMPERATIVE_POOL_BACKSTOP` does not cover; raising the pool bound fixed 3→2, not this. The
+four down-ranks are #8597, #8847 (`cited_count` 56), #8948 and #10246.
+
+**A re-check today will not find that row in that state, and the reason is a property of the
+shipped system worth more than the finding it undermines.** #10716 is now `importance = 3`,
+`uncited_streak = 0`, `demoted_at` cleared, `last_cited_session_id` set to the session this
+release was written in. Nothing applied it. It was promoted because **21 occurrences of
+`#10716` appear in that session's own assistant text** — this entry, and the two reviews of
+it, discussing the row. `extractCitationsFromTranscript` scans assistant text for `#NN` and
+`applyCitationDecay` promotes on a hit, so **writing ABOUT a memory is indistinguishable
+from applying it**. The same thing happened to #10857, which is why the marginal-cited share
+reads 21.2% here and 18.2% in a pass taken 37 minutes earlier. Filed as D#179; it is not
+fixable inside a release that is already changing decay behaviour, and it means the two
+DB-state figures in this paragraph are the only ones in this entry that cannot be
+re-derived. Every other figure can, and was.
+
+Cross-crediting — a main-face id the main thread never cited but a subagent did — is 3
+pairs; the denominator that gives 0.25% is **distinct (session, id) across the five decay
+faces inside subagent-bearing sessions** (1181), and 0.11% is the same caliber corpus-wide
+(2738). Naming the caliber matters here more than the ratio: the per-face sums for the same
+populations are 1245 and 2894, and quoting one against the other is the error this paragraph
+used to end by warning about.
+
+**D#153 is closed by refutation, and nothing shipped for it.** `CLAUDE_MEM_SCOPE_FILTER`
+rests on the claim that environment-scoped lessons are the low-relevance class on
+file-triggered recall. `benchmark/citation-live-replay.mjs --by-scope` re-buckets each face's
+(session, id) pairs by `observations.scope`, and on `pretool` — the exact face that filter
+gates — `environment` cites at **47.5% (67/141)**, the highest bucket, against `project`
+44.3% (293/661), `file` 40.0% (2/5), `(gone)` 37.1% (185/498), `module` 36.5% (31/85) and
+`(null)` 34.9% (45/129); face overall 41.0% (623/1519), and those six buckets sum to exactly
+that 1519. The confidence intervals for environment and project overlap, so "environment
+leads" is NOT established — what is refuted is that it is the class to suppress. The planned
+redesign (multiplicative demotion instead of a WHERE-clause exclusion) would have fixed the
+failure mode that was measured — 173 recall groups going empty — while still down-ranking
+the best-citing bucket on that face, so it was not built. The flag stays as an off switch
+with the reason not to flip it written at its definition.
+
+Caliber note so the number is re-derivable: 498 of that face's 1519 pairs are ids whose row
+has since left the table, reported as `(gone)` rather than dropped — a scope table whose
+buckets do not sum to the face's pair count is comparing rates over a population that is not
+the face. Those gone ids are an old cohort (max id 8880 against a live corpus reaching
+10850), and in the id bands they come from the surviving population is ~81% `(null)`-scope
+and ~2.5% `environment`, so the missing bucket cannot plausibly be environment-heavy.
+`environment` and `project` pairs sit in the same id bands, so the head-to-head the
+refutation rests on is not era-confounded; the `(null)` bucket and the face-overall
+comparator are, being dominated by legacy rows.
+
+**One corroboration was withdrawn.** The first draft said #10720 was a second independent
+measurement putting environment's waste rate on par with project's. It is not: #10720 is a
+scope LABEL distribution (364 labelled DB rows — project 184 / environment 114 / module 50 /
+file 16), and what it establishes is the filter's blast radius, that environment is 31.3% of
+labels rather than the near-no-op it looked like at 8 rows. There is no hand-labelled
+waste-rate-by-scope measurement in the store; the refutation rests on the by-scope replay
+alone, which is sufficient on its own.
+
+**The prerequisite D#153 carried was itself the wrong shape.** It said to add a scope-mixed
+suite to `benchmark/denoise-ab.mjs` first. denoise-ab does not execute
+`scripts/pre-tool-recall.js` at all — its own SCOPE docblock says so — so any suite added
+there reports NEUTRAL Δ=0 by construction, which is the "A/B NEUTRAL ≠ safe" trap this repo
+has now hit on three separate faces. The ruler had to be real injections bucketed by the
+attribute the lever keys on.
+
+Every figure above was measured on 2026-08-25 against a 1122-transcript corpus and a live DB
+that both grow daily; they are a frozen snapshot, not a moving number. Corpus-derived figures
+drift upward with a fresh walk. **DB-state figures (`importance`, `uncited_streak`,
+`demoted_at`) drift in BOTH directions and are perturbed by the act of writing about them —
+see D#179 above.** Tests 5216 → 5233 (+17, 309 files). knip
+unchanged at 46 unused exports / 0 unused files, with the round's new benchmark entry point
+registered in `knip.json` rather than left reported. Two independent pre-tag reviews ran and
+between them found one blocker (the eviction above), the `citedMain` leak, a delivery
+multiple inflated 2.9% by summing occurrences where production takes a union, a trim valve
+that could not fire, and a load-bearing line no test could see — deleting the write-back loop
+left all 5231 tests green. Each of those now has a case, and each case was mutation-verified.
+
+## v3.82.0 — a LIMIT that was never a ranking bound, and the ruler I said did not exist
+
+**Upgrade note — one default behaviour change, and it reaches you only if you opted in.**
+The candidate pool behind the task-imperative pick got much wider: `rankImperativeCandidates`
+took `LIMIT 50`, and now takes `LIMIT 5000`. That changes WHICH lesson two injection faces
+pick — `task_imperative` (the imperative one-liner after the `<memory-context>` block) and the
+dispatch-time subagent injection, which share the same selector.
+
+**Both faces are behind flags that are OFF by default** (`CLAUDE_MEM_TASK_IMPERATIVE`,
+`CLAUDE_MEM_SUBAGENT_INJECT` — verified against `hook.mjs:1927`, `scripts/pre-agent-inject.js`
+and the README env table, not from memory). If neither is set, nothing about your install
+changes. If one is: the pick can differ, and when it does it is a strictly better-scoring
+pick under this face's own objective — see the argument below. Reverting precisely means
+pinning `claude-mem-lite@3.81.0`; there is no per-face switch for the pool bound and this
+release does not add one.
+
+**The bound was never doing the job its position implied.** The pool selects
+`importance >= 2 ORDER BY importance DESC, created_at DESC, id DESC LIMIT n` **in SQL**, and
+the identifier-overlap relevance filter runs afterwards **in JS**. So `n` was never a ranking
+bound; it was a hard REACHABILITY bound. At `n = 50` the face could only ever pick from the
+50 newest high-importance rows, and in five projects on this machine the `importance = 3`
+population alone exceeds that (projects--mem 327, code-graph-mcp 121, ubuntu-sec 56, daagu 53,
+agentsmd 51) — so every `importance = 2` lesson in those projects was unreachable no matter
+how exactly it matched the prompt.
+
+**Count that population with the pool's own filter.** Those five figures are measured through
+`liveObsFilterSql` plus the pool's own gates, i.e. rows the query can actually return. The
+first draft of this entry published the RAW `importance = 3` counts (365 / 131 / 62 / 69 / 51),
+which include superseded and compressed rows and overstate one project by a third — and, worse,
+those wrong figures replaced correct ones already sitting in `lib/citation-tracker.mjs`. The
+pre-tag review caught both halves. `node benchmark/imperative-pool-replay.mjs --population` is
+now the way to ask.
+
+That is a bigger fact than the one D#172 was filed on. D#172 recorded a narrower symptom: a
+citation-decay demotion `3 -> 2` **evicted** a row from this pool rather than down-ranking it,
+a feedback loop the four FTS-selected denominator faces do not have. Both are the same cause,
+and raising the bound out of relevance range closes both. The constant is now named
+`IMPERATIVE_POOL_BACKSTOP` and documented at its definition as an OOM/latency backstop that is
+explicitly **not** a relevance gate, so the next reader does not have to re-derive why it is
+large.
+
+**Measured, and then argued — and this time the harness ships.**
+`benchmark/imperative-pool-replay.mjs` replays real user prompts against their OWN project's
+live corpus. Over the 373 prompts that resolve to a project with a corpus (1019 scanned), 85
+produced a candidate at all: the 50-row bound destroyed **7 of 85** picks outright and changed
+the top-1 in **3 of 78**. That n is small and the per-project split is
+smaller still, so the load-bearing argument is deliberately not that one: the wider pool is a
+**superset** of the narrower one, so its top-1 score is monotone non-decreasing, and
+`Array.prototype.sort` being stable keeps the incumbent on a tie — a different pick therefore
+always means a strictly higher `importance x overlap`. Widening cannot lower this face's own objective — and the harness stops treating that as an
+assertion. It tries to FALSIFY it on every prompt (narrow pick missing from the wide pool, wide
+top-1 scoring lower, pick changed without a strict gain) and exits non-zero on a counterexample;
+it currently finds **0** of each, and it cross-checks its own pool query against the shipped
+`rankImperativeCandidates` before reporting anything.
+
+Cost, from the same run against the **383** eligible rows in projects--mem:
+**0.45 -> 1.51 ms/prompt**, on a UserPromptSubmit path budgeted in seconds. A synthetic 8000-row
+pool measures 8.3 ms/prompt, so 5000 is doing real work at the top of its range and should not be
+raised casually; it is ~13x the largest eligible population here.
+
+**One tiebreaker was added to make that argument true rather than merely observed.** The pool's
+`ORDER BY importance DESC, created_at_epoch DESC` is not a total order, and SQLite may sort a
+small LIMIT with a bounded top-N sorter and a large one with a full sort — so "the narrow pool is
+a prefix of the wide pool" held on this corpus rather than by construction. Appending `id DESC`
+closes that. Zero rows are tied on both keys live, so it changes nothing here.
+
+**And one thing the closure does NOT cover.** A `3 -> 2` demotion is a down-rank again; a
+`2 -> 1` demotion is still an eviction, because the pool gate is `>= 2` and the importance floor
+is 1. Widening is also what first makes `importance = 2` rows reachable by this face, so it
+creates the injections that can walk one down there. Measured exposure: of the picks the widening
+newly surfaces, one is `importance = 2` — `score = importance x overlap` keeps `importance = 3`
+rows ahead nearly always. Small, known, and stated rather than rounded off to "the loop is
+closed".
+
+**`benchmark/denoise-ab.mjs` cannot see this face and reports NEUTRAL regardless** — its
+suites are query→document FTS, and this face is prompt→lesson identifier overlap. Same
+structural blindness the error-recall face has. It was run anyway and its behavioural probes
+are green (multiscript 8/8, cross-source 11/11, deferred 10/10, events 9/9); that is evidence
+about the retrieval path, not about this change.
+
+**New: `benchmark/citation-live-replay.mjs`** — every injection FACE's cite-rate re-derived
+from real transcripts through the **shipped** extractors (`extractInjectedBySurface`,
+`extractCitationsFromTranscript`, `collectSubagentSurface`). Baseline over 1115 transcripts /
+87 injection-bearing sessions / 9 projects: pretool 39.5% (562/1424) · subagent 24.5% (12/49) ·
+task_imperative 45.7% (16/35) · fyi 11.3% (32/284) · ups 8.1% (20/246) · error_recall 6.2%
+(44/709). Those are quoted from a FROZEN corpus so they are reproducible; a fresh walk reads a
+little higher on every face within the same day, which is corpus growth and precisely why a
+cross-time subtraction is banned above.
+
+Three properties it has because of specific past failures: the denominator is **(session, id)
+pairs** and the `subagent` numerator is **receiver-attributed** (an id handed to agent A and
+mentioned by agent B is not a hit — the caliber that inflated this face until v3.81.0);
+`--split` cuts ONE walk into a before/after pair so nothing between the arms is corpus growth,
+because a +38 delta measured as two runs at two times was +22 in a same-corpus pass; and
+`keyctx` is **declared unreachable** rather than silently omitted, with an assertion that
+fails the run if a face is added to `SURFACE_MATCHERS` that this replay can neither score nor
+declare. A frozen `--dump` carries a format stamp and `--corpus` refuses a shape it does not
+recognise instead of half-scoring it.
+
+**A correction to my own last report.** I said the tooling was missing exactly this slot, and that I
+had rewritten one-off scripts for the third time. `benchmark/cite-recall.mjs` has walked real
+transcripts all along. The real gap was narrower and more specific: it routes ids into buckets
+with its own hand-copied markers — a twin of `SURFACE_MATCHERS` — its buckets are hook EVENT
+names rather than `citation_surface_log.surface` labels, and its cited-side attribution is a
+per-session union. It keeps its `--vs-baseline` job; new per-face questions go to the new
+script. A tool can look like it does not cover a surface when what it actually does is
+re-implement the rules that define the surface.
+
+**Also:** `wilson95` had been hand-copied into two benchmarks; a third copy was not written.
+It now lives once in `benchmark/wilson.mjs` and both existing callers import it, and both were
+re-run to confirm unchanged output.
+
+**What the new tests do and do not bind.** The three cases added to
+`tests/adoption-imperative-rank.test.mjs` are killed by mutating the bound back to 50, 100 and
+200, and SURVIVE at 250 — by design: they bind "this bound is no longer a small relevance gate",
+not the literal 5000. Nothing binds it as FINITE; deleting the `LIMIT` outright would pass.
+Across both suites the round was mutation-tested at **27 points against the post-review code**:
+26 killed, and the one survivor is the intentional 250 above. `tests/citation-live-replay.test.mjs`
+carries 26 cases.
+
+**Both pre-tag review lenses landed before the tag, and between them they changed this
+release.** The test lens returned no blocker and four should-fix items, every one of them in
+code written this round; the correctness lens returned no blocker, four should-fix items, and
+twenty-four explicit clean findings including an independent 449-prompt replication of the
+headline effect (13.8% / 7.2% against the 8.2% / 3.8% published here — different sample, same
+direction, larger on theirs). What they caught, and what it changed:
+
+- **Four guards that could be deleted with the suite still green.** `--split` was never
+  exercised as a partition, because the fixture was stamped entirely on one side of the split
+  date and `expect(after).toHaveLength(0)` is satisfied by a literal `[]`; both self-checks
+  could be unwired from `main()` with all 17 cases passing; `assertFaceCoverage` did not enforce
+  that its two lists are disjoint while the case titled "names every real face in exactly one of
+  the two lists" asserted only that the face list was non-empty; and `wilson95` had no coverage
+  at all — a mutation making it always return `[0, 0]` survived. All four now fail their
+  mutations. The self-checks were also collapsed into a single wiring point so there is one
+  thing to bind rather than two.
+- **`assertRulerCanSayNo` summed across faces, so it could not see the defect it names.** Rows
+  of `[{pretool, 10, 10}, {error_recall, 10, 0}]` — one face always-true, one face blind,
+  simultaneously — reduce to 20/10 and the guard stayed silent. It is now per-face as well as
+  global, asymmetrically: 100% over 20+ pairs hard-fails, 0% is flagged rather than thrown
+  because a narrow `--project`/`--since` slice can legitimately be zero.
+- **The population figures were counted without the pool's own live filter** — see above. This
+  is the one that replaced right numbers with wrong ones.
+- **"438 eligible rows" and "~11x"** came from the same loose predicate: 383 and 13x.
+- **"A demotion is a down-rank again" was unqualified and false at `2 -> 1`** — corrected above.
+- **CLAUDE.md gave one gitignore justification for two files**, only one of which carries real
+  transcript text. The citation corpus holds no transcript text at all; it is excluded for
+  session UUIDs and absolute paths.
+- **No harness in the tree could reproduce any published number.** That is why
+  `benchmark/imperative-pool-replay.mjs` exists.
+- Smaller: the empty-scope error message always blamed `CLAUDE_MEM_TRANSCRIPT_ROOT`, which is
+  irrelevant under `--corpus`; `--split`'s session-START boundary and `--project`'s unanchored
+  substring match are now documented at the flags.
+
+Two of my own mutation results from the first pass were worthless and are recorded because the
+shapes recur: one fixture could not DISCRIMINATE the two subagent calibers (the receiving agent
+also cited the very lesson it was handed, so receiver-attribution and a session union produced
+the same number), and one "mutation" was a no-op — it appended an unused const instead of
+changing the constant, and reported SURVIVED while testing nothing. The re-run harness now
+aborts on an edit that does not change the file.
+
+**Still open.** The other half of D#172 — admitting `subagent` to the citation-decay
+denominator — is not in this release; it needs the receiver-attributed cites merged into
+`citedMain` asymmetrically. And v3.79.0's error-recall rerank still has no live-corpus verdict:
+at the release split the after-arm held 35 pairs with a CI of [0.5, 14.5]%, fully overlapping
+the before-arm. `benchmark/citation-live-replay.mjs` reports a `sidechain_files` count for
+`subagent` but deliberately computes no rate from it: the per-dispatch caliber its docblock
+quotes needs a (dispatch, id) pair count that `collectSubagentSurface` does not return, and
+dividing by files instead reads 8.6% against a documented 14.6%.
+
+## v3.81.0 — the parked flag and the young meter, and a ruler that credited the wrong agent
+
+**Upgrade note — one default behaviour change, and it reaches you only if you opted in.**
+The `task-imperative` injection face now feeds the citation-decay denominator: a lesson
+delivered as the imperative one-liner after the `<memory-context>` block can now lose
+importance if it goes uncited, where before it could not. It could already GAIN importance
+by being cited; only the downward half was missing.
+
+**If `CLAUDE_MEM_TASK_IMPERATIVE` is unset — the default — this changes nothing for you.**
+The face never injects, so it contributes no rows to the denominator and the blast radius is
+exactly zero. The affected population is people who turned an experimental flag on. If that
+is you: there is no per-face switch and this release does not add one;
+`MEM_DISABLE_CITATION_DECAY=1` turns the whole decay loop off (blunt — it also stops
+promotion on every face), and pinning `claude-mem-lite@3.80.0` reverts precisely.
+
+Measured blast radius on this machine, which does run the flag on — same-corpus one-pass A/B
+over 1114 transcripts: **+22 (session,id) rows = +0.90% of the denominator, across 17
+sessions**, 9 of the 22 cited (40.9%).
+
+A first draft of this note claimed "zero demotions, none had accumulated the three-session
+uncited streak a demotion requires". **The pre-tag review showed that was measured on the
+wrong unit and it has been restated.** `uncited_streak` is per-OBSERVATION and is driven by
+all five faces at once, so the question is not whether a row went uncited in three *marginal*
+sessions — it is whether a marginal uncited resolution lands on a row the other four faces
+already walked to 2. It does: 13 of the 22 marginal pairs are uncited, and of the 16 distinct
+observations behind them **five sit at `uncited_streak = 2` today**, four of which this flip
+newly resolves as uncited. One of those, `#8847`, is `importance=3` with `cited_count=56`.
+The CLI in this repo labels that state `Active decay queue (uncited_streak >= 2, next miss →
+demote)`, so the original claim contradicted the product's own framing of the same rows.
+
+What softens it, and is also measured: a 3→2 demotion is **not** permanent. It still clears
+the candidate pool's `>= 2` gate (it only loses the `LIMIT 50` race against the imp=3
+population), and a citation from *any* face restores importance on the next resolution.
+
+Nothing else in this release changes behaviour: the other two items are a metering correction
+and a docblock, neither of which moves what gets injected or demoted.
+
+### The rate was read, and the exclusion's own exit criterion failed (D#164, P2-5)
+
+`task_imperative` was metered in v3.76 and deliberately held out of the decay denominator on
+a written condition — *"if the imperative framing under-performs, the penalty lands on the
+LESSONS it carried rather than on the framing"* — with the instruction to read the rate
+first. The rate was read on 2026-08-25 and the condition is not met. Over the live corpus:
+
+| face | sessions | injected | cited | rate |
+|---|---|---|---|---|
+| pretool | 76 | 1362 | 521 | 38.3% |
+| **task_imperative** | 27 | **34** | **15** | **44.1%** |
+| fyi | 63 | 274 | 30 | 10.9% |
+| ups | 68 | 237 | 20 | 8.4% |
+| error_recall | 73 | 678 | 42 | 6.2% |
+
+Two things about that table are worth more than the flip itself.
+
+**`citation_surface_log` would not have supported this.** It held n=8 over 2.1 days, which
+reads as "not enough data, keep waiting" — the state P2-5 called out as systemic debt. But
+the FLAG had been parked for weeks while the METER had only run since v3.76, so the small
+number was a property of the instrument, not of the behaviour. Re-deriving the rate by
+walking live transcripts with the *shipped* extractors turned n=8 into n=34. When a face's
+row count looks too small to decide on, check whether the meter is younger than the thing it
+measures before concluding there is nothing to read.
+
+**The delta was nearly mis-attributed by subtraction.** Post-flip the denominator measured
+2462 against a pre-flip 2424 — +38, contradicting the predicted +23. The change was not the
+cause: the corpus grew while the round ran (1113 → 1114 transcripts; the four-face baseline
+itself moved 2424 → 2440). A same-corpus A/B computing both unions **in one walk** gave +22
+(+0.90%), matching the prediction. This is the knip-baseline rule from `CLAUDE.md`
+generalising past knip: never attribute a delta by subtracting two counts taken at different
+times.
+
+**What ships with a known residual risk** — see the upgrade note above for the corrected
+demotion figures. All 22 marginal rows are `importance=3`, because
+`rankImperativeCandidates` orders by `importance DESC` and takes 50, and in the five largest
+projects here the imp=3 population alone exceeds that limit (`projects--mem` 327,
+`projects--code-graph-mcp` 121). So a demotion 3→2 **evicts** a lesson from this face's
+candidate pool rather than merely down-ranking it — a feedback loop the four original
+denominator faces do not have, because they select on FTS relevance instead. Measured
+demotion volume is 0 over 12 days: the loop is slow, not absent, and its long-run
+accumulation is **not** measured. If imperative picks start thinning out, that is the first
+place to look, and the cap belongs in `rankImperativeCandidates` (raise the LIMIT above the
+imp=3 population, or exempt this face's picks from demotion) rather than back in the
+exclusion set.
+
+`DECAY_EXCLUDED_SURFACES` is now empty. That turns its companion guard — *"every face is in
+the denominator OR in the exclusion list"* — **true by construction**, since the denominator
+is literally the attachment list minus the exclusion set. A test that cannot fail is worse
+than no test, so it was replaced with one that pins the DECISION: the denominator must equal
+the full attachment face list, and re-excluding a face has to be a deliberate edit to that
+line. In the CLI suite `task_imperative` moved from the pinned positive to the pinned
+negative, which is the stronger half — a derivation that inverts fails on it, and so does one
+that hardcodes the old face list.
+
+### The subagent face credited citations to agents that never received them (D#164)
+
+`subagent` is the only injection face where the injection and the citation can land in
+different contexts: every other face injects into the main thread and looks for the cite in
+that same thread. `collectSubagentSurface` built two independent unions over the session's
+`subagents/*.jsonl` — every injected id into one set, every cited id into another — and then
+intersected them. So "agent A was handed it, agent B mentioned it" counted as adoption.
+
+Fixed by pairing per file: an id is credited only when the agent that *received* it cited it.
+On the live corpus that moves the face from 13/48 to **12/48**, and `cited` is now a subset of
+`injected` by construction (verified end-to-end: 30 sessions, 0 violations).
+
+Three calibers now exist for this face and they answer different questions, so the docblock
+names all three rather than picking one silently: union 27.1% (what shipped), receiver-attributed
+id-level **25.0%** (the house ruler — every other face also counts an obs once per session),
+per-dispatch 14.6% (48 ids fan out over 82 dispatches). 25.0% sits above `fyi` and
+`error_recall`, both already in the denominator, so "it performs badly" was never available
+as a reason to keep it out.
+
+It stays out anyway, and the reason is not the rate. Admitting it needs its receiver-attributed
+cites merged alongside `citedMain` asymmetrically (measured cost: 3 of 1064 main-face ids,
+0.28%, would flip demote→promote on a cite the main thread never made); its numerator only
+became trustworthy in this release; and letting one release separate the two faces means the
+eviction loop they share — they call the same `selectImperativeLesson` — is observed acting on
+one face before it acts on two. Tracked as D#172.
+
+### D#171 closed as won't-fix, on measurement rather than judgement (D#171)
+
+v3.80.0 recorded that `explainSignificance`'s rule 4 and `isReviewPattern` are both dormant
+because `readCount` counts `Read || Grep` and both are filtered out before they reach
+`episode.entries`. The obvious repair — re-point rule 4 at `episode.filesRead`, which
+hook.mjs populates before the rule runs — was deferred as an L3 default-behaviour change.
+It was measured before being scheduled, and it does not work.
+
+Unlike the `grepDecisive` case, the denominator here is real: `Read` fires **1861 times**
+across the 1114-transcript history (9.1% of all tool calls, and the transcripts hold records
+spanning 2026-08-13..08-25, so that is a live rate rather than a lifetime counter). But
+`filesRead` is a per-FLUSH slice, not a per-episode total — `flushEpisodeWithDb` renames and
+consumes `reads-<project>.txt` on every flush.
+
+**Compare the two rates on the same window.** The first draft of this section divided a
+12-day Read rate by a 3-day flush rate and got ~0.8 Reads per episode — two windows, one
+ratio, the same shape of error v3.80.0 recorded as *reading a lifetime counter as an active
+rate*. On the same three active days (08-22 / 08-24 / 08-25; 08-23 has no metric file):
+**596 Reads against 607 episode flushes = 0.98 Reads per episode.** The conclusion survives;
+the figure did not.
+
+At ~1 Read per episode a threshold of 8 is out of reach, and the 90-day sample agrees:
+`observations.files_read` is non-empty on 34 of 1872 rows (1.8%), p50 1 / p95 5 / max 8,
+exactly one row reaching 8 — and that column is a *superset* of `episode.filesRead`
+(`hook-llm.mjs` merges searched files in), so the real field is smaller still. Two caveats,
+both from the review: the sample covers only SIGNIFICANT episodes (`saveEpisodeImmediate` is
+gated on `isSignificant`), i.e. ~8% of flushes, and that is structurally the wrong population
+— rule 4 exists to *make* an episode significant. And 90 days starts after the break below.
+
+**The rule was not always unreachable, and "structurally" was the wrong word.** Non-empty
+`files_read` by month, with the count reaching 8:
+
+| month | non-empty / total | ≥8 | max |
+|---|---|---|---|
+| 2026-02 | 35 / 78 (44.9%) | 3 | 11 |
+| 2026-03 | 603 / 1004 (60.1%) | **49** | 53 |
+| 2026-04 | 314 / 621 (50.6%) | **28** | 33 |
+| 2026-05 | 8 / 129 (6.2%) | 0 | 3 |
+| 2026-06 | 5 / 754 (0.7%) | 0 | 3 |
+| 2026-07 | 8 / 919 (0.9%) | 1 | 8 |
+| 2026-08 | 20 / 193 (10.4%) | 0 | 5 |
+
+81 rows lifetime reach the threshold, 49 of them in March alone. For three consecutive months
+this field fed rule 4 at a real rate; it collapsed in **2026-05** and the cause is not
+identified. That break is the most useful fact in this section, and it argues *for* the
+conclusion rather than against it: the reachable input is the episode **boundary**, not the
+threshold and not the field — and the boundary demonstrably moved once already.
+
+So D#171 closes as won't-fix-as-specified: the repair it named does not work at the current
+cadence, and re-pointing the rule would move the dormancy to a field nobody suspects.
+Reopening means finding what changed in May 2026, which is a far larger change than the rule,
+with no evidence its output was worth it (111 lifetime observations, dormant 133 days, nobody
+noticed). Recorded in the `explainSignificance` docblock so the next reader does not
+re-derive the cheap repair, and the May break is tracked separately so it does not close with
+D#171.
+
+### Pre-tag review
+
+Two independent lenses, both delivered before the tag. Neither found a BLOCKER, and neither
+found a defect in the code — **every finding was in the numbers and the claims built on
+them**, which is where the brief predicted the problem would be and where it was worse than
+predicted in two places.
+
+*Correctness lens* reproduced the figures against the live DB and all 1114 transcripts.
+Three SHOULD-FIX, all now applied: the "zero demotions" claim was measured on the wrong unit
+(above); the docblock and the CHANGELOG disagreed with each other on the same measurement
+(23 / +0.95% / 39.1% versus 22 / +0.90%) — and the surviving `39.1%` was a rate over the
+stale denominator the CHANGELOG itself spends a paragraph disowning, corrected to 40.9%; and
+the D#171 ratio compared two different windows. It also confirmed the parts that held: no
+consumer of `DECAY_DENOMINATOR_SURFACES` assumed four members, there is no demote-by-
+construction path for the admitted face, `sub.cited` has no consumer wanting the old broader
+meaning, and the A/B method and arithmetic are both right.
+
+One of its premises did not survive checking, and the correction is recorded because it cuts
+the other way: it read the 1861 Reads as a lifetime counter spanning 2026-02, on the grounds
+that the observations table goes back that far. The transcripts do not — their records span
+2026-08-13..08-25, so the per-day Read rate was sound. The window error was in the
+comparison, not the numerator.
+
+*Test-effectiveness lens* ran 18 mutations, each backed up with `cp` and each restore
+verified. Both new subagent cases are binding, and it found a mutation the brief did not
+name: a **global** intersection (union both sets across files, intersect once at the end)
+preserves `cited ⊆ injected`, so the invariant case lets it through while re-introducing
+cross-agent credit in full — `credits a cite only to the agent that RECEIVED the lesson` is
+the sole guard against it. It confirmed the replaced imperative guard is strictly stronger
+than the three assertions it retired, killing one mutation class (a denominator hardcoded to
+the correct faces in the wrong order) that none of the old three caught. Its three SHOULD-FIX
+were prose the flip made false: an inverted comment in `mem-cli.mjs` whose twin in the test
+file this diff *had* updated, a stale cross-reference in the funnel suite, and the test count
+in `CLAUDE.md` left at 5182.
+
+Two of its NITs were applied — the CLI case now carries a positive assertion so its negative
+cannot pass by row-disappearance, and the load-bearing `toEqual` now says in a comment why it
+must not be weakened. Three were not, and are recorded rather than dropped: D#175 files the
+one unpinned premise under D#171's closure, with the reason it was not rushed in before a tag.
+
+The review also flushed out an unrelated one-token hole by tripping over it. `tasks/` is
+gitignored local workspace, and both sibling repo-walkers (`obs-types-invariant`,
+`time-constants`) skip it — but `import-graph`'s `SKIP_DIRS` did not, so a reviewer's `cp`
+backups under `tasks/bak-3810/` turned the suite red. Same shape as D#168, one directory over.
+`tasks` added to that set; the odd one out is now aligned with its two siblings.
+
+## v3.80.0 — two counters that were never the same ruler, and a blocker that was not there
+
+**Upgrade note.** Nothing user-facing changes. One behaviour delta, on a surface that is
+off by default: the subagent-injection hook (`CLAUDE_MEM_SUBAGENT_INJECT=on`) now emits
+`suppressOutput: true`, so its payload stops appearing in transcript mode. The payload is
+the dispatched prompt echoed back — a machine mutation, not a message. Verified
+display-only against the 2.1.241 host bundle: the field is documented "Hide stdout from
+transcript (default: false)" and is read at exactly one place, the transcript-render
+branch; the `updatedInput` mutation is taken from the parsed envelope regardless.
+
+This release is internal hardening. Its interest is in what it did **not** build.
+
+### One writer for the hook envelope (D#154)
+
+Claude Code parses a command hook's stdout as ONE JSON document — no line splitting. Two
+envelopes, or an envelope after prose, degrade to plain text: `SessionStart` and
+`UserPromptSubmit` then inject the raw JSON as literal text, and every other event drops
+it in silence. `lib/hook-stdout.mjs` was built for this in v3.70.0 and only `hook.mjs`
+adopted it. The four standalone hook scripts still hand-wrote their own envelopes —
+`pre-tool-recall.js` at three separate emit sites, which stay one document today only
+because each branch happens to `process.exit()` before reaching the next.
+
+All four now queue through the writer. `pre-tool-recall.js`, `pre-skill-bridge.js` and
+`post-tool-recall.js` take a static import; `pre-agent-inject.js` takes a dynamic one on
+its enabled path, leaving its import-free default-off fast path untouched.
+
+**The deferred item's stated blocker was wrong on both halves.** It recorded that two of
+the four scripts keep an import-free default-off fast path and therefore cannot use a
+shared module, so the round would first have to decide "shared module or inlinable
+codegen". In fact `pre-tool-recall.js` carries fifteen static imports of repo modules
+(twelve from `lib/`) and has no fast path at all — it is default-ON — and
+`pre-agent-inject.js`, the one that really does have one,
+already resolves the conflict three lines above its write site with `await import()` for
+`schema.mjs` / `utils.mjs` / `hook-memory.mjs`. There was no design decision to make.
+
+New channel: `queueHookUpdatedInput`. The 2.1.241 `PreToolUse` schema carries
+`updatedInput` and `additionalContext` in the same `hookSpecificOutput`, so a mutation
+hook that later also wants to say something must merge rather than write twice. First
+writer wins; a second is dropped loudly, because merging two whole tool inputs is not
+defined and silently discarding the first is this repo's most-repeated defect shape.
+
+### The guard that was worth adding was not the obvious one
+
+The obvious guard is behavioural: spawn each hook script, assert its stdout is one
+document. That was built first — and then **mutation-checked against the existing suite
+rather than assumed to be new**. `tests/feature-sweep-hooks.test.mjs::expectHookStdout`
+already covers all six registered entry points: appending a second envelope in
+`pre-tool-recall.js` (tried in two different branches) and queueing one behind
+`hook.mjs`'s prose user-prompt writer each turned that suite red on its own. The
+behavioural leg was deleted as a slower copy with no additional kill-power.
+
+What nothing caught is the invariant D#154 is actually about — *route through the
+writer*, not merely *emit one document*. Reverting `post-tool-recall.js` to its
+hand-written single envelope left **39 of 39** pre-existing tests green. So the guard
+that shipped is structural: no manifest-registered entry point may CONSTRUCT an envelope;
+only `lib/hook-stdout.mjs` assembles one. Plus a coverage cross-check that every entry in
+`hooks/hooks.json` appears in the behavioural sweep — both lists were hand-maintained, so
+a newly registered hook was previously born unguarded. The registered set is derived from
+the manifest, following the `.sh` prefilter hop that `pre-agent-inject.js` is reachable
+only through.
+
+### One caliber for `#NN`, and an honest zero
+
+Four id calibers were live at once. `benchmark/cite-recall.mjs` scanned citations with
+`{2,6}` while its **own** injected denominator used `{1,7}`; `efficacy-observational.mjs`
+had a third, `adoption-replay.mjs` a fourth, production a fifth. A denominator wider than
+its numerator counts ids as injected-never-cited that the numerator structurally cannot
+see, biasing measured cite-rate down — and nothing errors when it happens.
+
+`lib/citation-tracker.mjs` now owns `OBS_ID_DIGITS` / `citationIdRe()`; the five
+production regexes and the three benchmarks derive from it. The sweep guard added
+alongside found a **sixth** copy that hand enumeration had missed —
+`lib/cite-back-hint.mjs`, whose ids are unioned into the same cited set
+`applyCitationDecay` reads, which is the one place the caliber most had to match.
+
+**One owner does not mean one shape, and the first version of this got that wrong.** The
+bare caliber is a NUMERATOR caliber: on the cited side a spurious `#1` costs nothing,
+because it only counts once it intersects an injected set that was anchored — every
+injected-side extractor in `citation-tracker.mjs` matches a row shape. Two of the three
+benchmarks apply the caliber to *injected* text, where nothing anchors it.
+
+Pointing `adoption-replay.mjs` at `citationIdRe()` therefore did **not** measure as a
+no-op. On a real transcript it pulled `#1` and `#2` — quoted from a subagent prompt
+discussing fixture rows, "with `#1` superseded by `#2` …" — straight into `injectedIds`,
+the denominator whose inflation this section's own rationale says to avoid. That file now
+takes a second, deliberately narrower export, `unanchoredInjectedIdRe()`, whose docblock
+says why it is narrower and that the real fix is to anchor the extraction rather than
+tune digits.
+
+**Measured impact on the other two: exactly zero.** A same-tree A/B — swap only `ID_RE`,
+run `cite-recall.mjs --json` twice over the same window — produced byte-identical output
+apart from the `Date.now()` window timestamps, and `efficacy-observational.mjs` likewise.
+Over the live corpus (3692 rows, ids 1..10834 at time of measurement) the only ids outside
+`{2,6}` are four 1-digit rows, all with `injection_count = 0`, so they never entered a
+denominator; there are no 7-digit ids. The mechanism is real, its live magnitude on the
+numerator side is nil. This corrects an earlier claim in this project's own notes that the
+drift "systematically underestimates cite-rate" — stated without measuring.
+
+The sweep guard's first version walked only `benchmark/` and `lib/`, which is how it
+reported a closed class while a **seventh** copy sat in `scripts/p0-forward-probe.mjs` —
+`{3,6}`, narrower than every other copy at both ends, scanning transcripts for injected
+and cited ids exactly like the benchmarks do. A guard whose directory list is what hides
+the violation is not a guard. It now walks the repo root and `scripts/` as well, covers
+`.js` alongside `.mjs`, and pins three specific files so narrowing it back goes red.
+
+### The decay defect that was not one
+
+The round was going to fix a measured cohort: 85 rows with `injection_count >= 5` and
+`cited_count = 0`, carrying 877 injections — 18.3% of every injection the database has
+recorded — of which 17 rows had `uncited_streak = 0`, `demoted_at IS NULL` and
+`decay_seen_count = 0`, i.e. the decay mechanism had never resolved them despite 5 to 61
+injections each. Nothing in the codebase noticed.
+
+Four checks, each meant to confirm it, and the fourth killed it:
+
+- **Not an era effect.** The resolved cohort spans 0–124 days since last injection, the
+  unresolved one 28–123 — the same range, fully overlapping.
+- **Not a per-project gap.** Decay resolves rows in the same projects those rows live in
+  (`projects--bz`: 5 resolved, 3 unresolved).
+- **The two counters do not measure the same population.** `injection_count` is bumped by
+  exactly two UPS write paths; `decay_seen_count` comes from Stop-time transcript
+  extraction across every decay-denominator face. **1253 of 1949 decay-resolved rows have
+  `injection_count = 0` — 64.3%.** So `injection_count >= 5 AND uncited_streak = 0` is not
+  a decay-coverage predicate at all. It is two rulers of different caliber, subtracted —
+  the same defect shape as the benchmark regexes fixed one section above.
+- **There is no live waste to recover.** 877 is a lifetime sum. Scoped by
+  `last_injected_at`, the whole 85-row cohort had **1** row injected in the last 7 days
+  and 12 in the last 30; the 17-row "blind" set had **none in the last 7 days** and one in
+  the last 30 — its most recent injection was 28 days ago. These rows stopped consuming
+  the context budget long ago.
+
+All live-DB figures in this section are a point-in-time reading taken on 2026-08-24; the
+database grows during a session, so re-measuring gives ±1 row (a pre-tag review re-ran
+them the next day and got 1252 where this says 1253, because `MAX(id)` had moved).
+
+So nothing was built. The note this project already carried said "many noisy rows" ≠
+"noise is diluting retrieval — first look at their `injection_count`". The correct
+generalisation is **recency**, not magnitude, and this round made the original mistake
+one level up by treating a lifetime counter as a live rate.
+
+### Knip counting: fix the method, not the discrepancy (D#161)
+
+The same commit measures ~15 fewer unused exports from a detached `git worktree` than
+from the primary working tree, with the same binary. Reproduced, never explained, and one
+round was already misled into reading `+14 added` where the true delta was `-1 / +0`.
+Closed by pinning the method instead: `CLAUDE.md`'s baseline now fixes the command and
+the tree context as part of the number, mandates same-tree NAME-SET A/B for attributing a
+round's delta, and marks every count in that paragraph stale-by-default. The
+worktree/working-tree gap is documented as reproduced-but-unexplained and explicitly not
+worth chasing.
+
+This round, measured under that contract: 46 unused exports, 0 unused files, same-tree
+A/B name set **+0 / −0**.
+
+### What the pre-tag review changed
+
+Two independent read-only reviewers (correctness lens, test-effectiveness lens; 28 and 7
+source mutations respectively) ran before the tag. Both of the author's central claims
+were put up for refutation and **both survived**: the behavioural half of the stdout guard
+really is redundant against `feature-sweep-hooks.test.mjs` (mutating all six registered
+entry points to emit two envelopes turns that suite red on each), and reverting
+`post-tool-recall.js` really does leave 5107 of 5108 pre-existing tests green.
+
+Four things they found that the author had wrong, all fixed above and each re-verified by
+killing the reviewer's own mutant:
+
+1. **The headline guard had an unguarded door.** `ENVELOPE_LITERAL` matched
+   `hookSpecificOutput:` in object-literal position only — while the repo's canonical way
+   to assemble an envelope is *assignment*, `envelope.hookSpecificOutput = {...}`, which
+   the neighbouring assertion pins by name. A hand-written envelope in assignment form
+   passed both the structural sweep and the shape sweep. Widened to `[:=]`; the writer is
+   exempt by path, never by syntax.
+2. **The caliber unification was not the no-op the notes claimed** — see the section
+   above.
+3. **A new assertion was satisfied by the wrong cause.** "is cleared by the flush" flushed
+   twice with nothing queued in between, so it could never reach `queuedInput`: deleting
+   the reset left the file 19/19 green while the mutant silently re-applied a stale
+   whole-tool-input replacement on a later envelope. Both reviewers found this
+   independently. It now re-queues a context line between the flushes.
+4. **A comment asserted something false.** `pre-tool-recall.js` claimed routing through
+   the queue makes a second write "impossible by construction". It does not — each site
+   flushes immediately, so queue→flush→queue→flush emits two documents; the three sites
+   are still mutually exclusive by `process.exit()`. Corrected in the source and in the
+   test header. This project's own recorded lesson is that an unverified assertion written
+   as a comment gets obeyed by every caller that believes it, so it is worth naming rather
+   than quietly editing.
+
+Delivery note, because it is now a pattern: one reviewer returned an empty idle
+notification and nothing else — the fifth such failure here. Its 19KB report was on disk
+because the dispatch mandated writing the file **and** returning the text. The mandate is
+the only reason the review exists.
+
+### Also
+
+- 307 test files / 5182 tests (from 305 / 4984). `tests/sandbox/phaseA-plugin.mjs` 43/43
+  against a real plugin-cache install, which is what the D#154 deferral asked for.
+- A correction this round made against itself, worth the line because it nearly cost a
+  round of duplicate work: while looking for remaining work, the 2026-08-22 audit report
+  was read as listing five fixed items as still open, and two of them (a weekly CI job
+  for the real-install sandbox, and a triplicated `fast-summary` whose truncation
+  constants had drifted) were about to be re-done. Both were already fixed —
+  `.github/workflows/sandbox-install.yml` exists, and `lib/fast-summary.mjs` owns a
+  single `FAST_SUMMARY_LIMITS` table consumed at all three sites. The report is not
+  stale; its `✅` marker sits inconsistently in the table's ID cell while the actual
+  resolution lives in a blockquote directly beneath the row, and only the rows had been
+  scanned. Checked properly, exactly three of its eighteen items carry no resolution
+  block: **P1-4** (UserPromptSubmit still spawns two node processes per prompt, with a
+  marker-file protocol that exists only because of that split), **P2-5** (parked
+  experiment flags — `TASK_IMPERATIVE` and `PRETOOL_NUDGE` still have no verdict after
+  8-9 weeks), **P2-14** (`Grep` absent from the bash pre-filter, paying a full Node
+  handoff per call). Verified against the code, not the document.
+
+## v3.79.0 — the query knew the command's name and not the failure's, and never saw it fail
+
+**Upgrade note.** Two default-on changes, both to the error-recall face (the memories
+injected after a failed Bash command), and **one new hook event registration**:
+`PostToolUseFailure`. Installing rewrites your `settings.json` hook block; third-party
+hooks are preserved (verified: 7 in, 7 out, none lost). What changes for you:
+
+- The face now fires on commands that **actually failed**. It never did before — Claude
+  Code delivers failed tool calls to a hook event this plugin had not registered, so the
+  only "failures" it ever saw were commands that exited `0` while printing error-ish
+  text. Off switch: `CLAUDE_MEM_ERROR_RECALL_ON_FAILURE=off`.
+- What it retrieves changes: the query now carries the failure's *name*, and memories
+  that merely share the failed command's vocabulary are ranked below memories that
+  mention the failure. Off switch for the ranking half:
+  `CLAUDE_MEM_ERROR_RECALL_RERANK=off`. The term half has no switch, because it has no
+  defensible off position (see below).
+
+Nothing else moves. Two of the three deferred items this release set out to close were
+**refuted by measurement instead** — that story is the rest of these notes.
+
+### The failure had a name and the query did not carry it
+
+D#167 was filed against the wrong culprit. Its premise — "command words dominate BM25" —
+came from five hand-picked replays. Measured properly it is half right, and the half it
+misses is bigger.
+
+The sample is 52 real failing commands with their real stderr, extracted from 1110
+transcripts and filtered through the surface's actual trigger (`detectBashSignificance`
+→ `isHardError`), then replayed against the live database across 15 projects. Two
+readings:
+
+- **28 of the 52 name their failure** — `ModuleNotFoundError`, `ENOENT`,
+  `JSONDecodeError`, `OperationalError`. In **25 of those 28 (89.3%) the name never
+  reached the query.** The six-term budget went to the Python banner
+  (`traceback, most, recent` — a constant string that says nothing about what broke) and
+  to path fragments split out of the command (`mnt, data_ssd, dev`).
+- **39.2% of injected rows (764/1947) matched no error term at all**, and for
+  **42.3% of firing cases that was true of the TOP-1 row** — the row whose
+  `lesson_learned` is inlined verbatim into the model's context.
+
+`ERROR_NAMER_RE` fixes the first: the token that names a failure is prepended to the term
+list. It is a positive pattern for the signal, deliberately not a stop-list for the noise
+— a list of boilerplate grows once per runtime forever, which is the enumeration the
+D#136 docblock warns against. When nothing matches, extraction is byte-identical to
+before. The name now reaches the query in **96.4%** of the shapes that have one.
+
+### The two defects are independent, and the first fix does not touch the second
+
+Naming the failure did **not** reduce command-vocabulary injection. It nudged it up,
+39.2% → 40.2%: better terms are more specific, so they match fewer rows, so the flat OR
+has *more* room to fill its three slots with whatever shares the command's words.
+
+So the ranking half ships too. The retrieval runs an error-first query — at least one
+term from the failure required, every term still scoring, because dropping command words
+outright was measured in D#136 and regressed two of five replays — and then **fills any
+remaining slots from the unchanged flat-OR result**:
+
+| | cmd-only rows | cmd-only at TOP-1 | rows injected |
+|---|---|---|---|
+| v3.78.0 | 764/1947 39.2% | 302/714 42.3% | 1947 |
+| + names only | 780/1941 40.2% | 301/715 42.1% | 1941 |
+| **+ error-first rerank** | **434/1941 22.4%** | **154/715 21.5%** | **1941** |
+
+On the face's own calibration suite the same change reads precision **23.1% → 34.6%**
+with hit-rate **85.7% → 100%** and the injected row count unchanged at 26. Fixture and
+live DB agree on direction here — worth stating, because in v3.78.0 they did not, and
+that disagreement is why the floor from that release is still off.
+
+### What was rejected, and why the shape matters
+
+The simpler form — make the error term **mandatory** and stop — was measured on the same
+sample: −22.4% rows and **154 of 715 cases (21.5%) injecting nothing at all**, with the
+loss concentrated in small projects. That is v3.78.0's magnitude floor wearing a
+different hat, and it is not what ships. The rerank **reorders and never removes**: a row
+that only matches the command falls to slot 2 or 3 instead of being deleted, and when a
+project has no error-matching row anywhere the output is byte-identical to the flat OR.
+The residual 21.5% is essentially that set — verified rather than assumed: of the cases
+the mandatory form silences, **0** had a base set containing an error-matching row.
+
+D#136 had already considered and rejected this shape, on the grounds that "the primary
+query always fills its LIMIT 3 so the fallback never runs". True of the five cases it
+replayed. False at 715, where the primary leaves hundreds of slots for the fallback.
+
+### Two errors of mine, both caught by measurement rather than by reading
+
+- **The first ruler was an always-true predicate, and it "refuted" the defect.** Row
+  membership was tested with `SELECT 1 FROM observations_fts WHERE rowid = ? AND
+  observations_fts MATCH ?`. On SQLite 3.53.1 that form **silently drops the rowid
+  constraint** and returns a row whenever the term matches *anywhere in the table*. It
+  reported 0.0% command-only rows — which is what an always-true membership test always
+  reports — and the number was only exposed as false because it contradicted a second
+  measurement in the same run. Proven by probing a rowid known to be outside the term's
+  match set and getting a hit back.
+- **`ERROR_NAMER_MAX` shipped at 2 on an argument, not a measurement.** The argument was
+  chained Python tracebacks. The sweep says 1 is better on both metrics (22.4%/21.5% vs
+  22.8%/22.0%) and 3 is worse: 96.4% of shapes have their failure named by the *first*
+  match, so later slots buy a duplicate while still evicting a scanned term — and the
+  evicted tail is often the most specific token there is.
+
+That last cost is real and is recorded rather than smoothed over: on a vitest-assertion
+shape, prepending `assertionerror` evicts `scope-label.test.mjs`, trading a high-IDF
+filename for a low-IDF class name. The golden case in `tests/error-recall-gate.test.mjs`
+now states the trade in place. The follow-up it argues for — evict the *least*
+discriminative term rather than the last one — is **D#169**, not implemented.
+
+### The surface had never once seen a failed command
+
+D#151 said "widen `HARD_ERROR_RE`, a lot of real failures do not trigger this surface".
+Measured, it was aimed one layer too low — the same way D#167's premise was. Over 1110
+transcripts and 12904 Bash results, every anchor D#151 named (`panicked`, segfault, tsc,
+gcc, make, go-test, cargo-test, docker, kubectl) gains **zero**; the one that gains
+anything, `git fatal:`, adds 6 cases and 9 false positives. And 89.1% of missed failures
+never reach that regex at all — `looksLikeError` upstream already said no.
+
+The reason is that **`PostToolUse` does not fire for a tool call the host marks as
+failed.** Claude Code routes those to a separate `PostToolUseFailure` event, which this
+plugin had never registered. So the only "failures" error-recall ever saw were commands
+that exited **0** while printing error-ish text — the classic shape being
+`cmd 2>&1 | tail`, where the pipe launders a failure into a success. A genuinely failing
+build recalled nothing, ever. Verified twice over: the 2.1.241 bundle lists the event
+with the failure text in an `error` field (there is no `tool_response`) and an
+`additionalContext` output channel; and two genuinely failing Bash calls, one carrying a
+full stack frame, left zero trace in the episode buffer and the `events` table while the
+successful calls either side were recorded.
+
+**The event is now registered** (`hooks/hooks.json` and `install.mjs` both — they are two
+separate hook sets, and `tests/audit-silent-20260814.test.mjs` diffs them; a one-sided
+registration was mutation-tested and does red). Three things bound the change:
+
+- **Bash only.** This surface queries on a command plus its output; no other tool has
+  that shape.
+- **A refusal gate** (`lib/tool-refusal.mjs`). Of 798 host-flagged Bash failures on the
+  maintainer's machine, **558 (68.9%) are the agent's own tool chain refusing** — sandbox
+  denials, policy hooks, declined permission prompts. Injecting three memories because a
+  permission prompt was declined is noise by construction. Every sentinel is anchored on
+  something no ordinary program prints (a bracketed tag, a section marker, a syscall
+  name), never a bare word: `docker`, `psql` and `npm` all print "permission denied" in
+  their own voice, and a gate that swallowed those would fail *silently*, because silence
+  is also what this path did before it existed. The user's own interrupt is excluded via
+  the host's `is_interrupt` flag rather than by pattern-matching text.
+- **It does not feed the episode buffer.** That is scope, not oversight: episode entries
+  flow into LLM summarisation and the bugfix save-nudge, whose behaviour under a sudden
+  influx of failures is unmeasured.
+
+**A correction to this section's own arithmetic, from the first hour of live use.** The
+replay reports firing *shapes* — 53 → 186 across 15 projects — and that is a COVERAGE
+measure. It was written here in a way that reads as a volume prediction, which it is not.
+Window-matched production counters over the first 56 minutes after install say the new
+event adds **+20% fires and +20% injected rows** (25 → 5 fires, 75 → 15 rows), not 3.5×.
+Distinct shapes replayed across every project is not the same question as firings in one
+session, and quoting one to answer the other is the exact error the rest of these notes
+are about. n=5, so treat +20% as a first reading rather than a settled rate — the
+`error_recall_failure` counter exists to refine it.
+
+Precision on the newly-visible population is not worse than on the old one — replayed
+across 15 projects, 22.4% of injected rows and 17.9% of top rows match no error term,
+against 22.5%/21.4% for the population the surface already had. Its volume is metered
+separately (`error_recall_failure`) so the addition can be read on its own, while the
+citation funnel deliberately keeps one `error_recall` surface: these are the same
+injections to the model, and splitting the cite-rate denominator would leave both halves
+too small to read. Off switch: `CLAUDE_MEM_ERROR_RECALL_ON_FAILURE=off`.
+
+Nine mutations were run against the new guards; all nine killed — but only after the
+first round, where **the Bash-scoping case survived**. It was asserting a necessary
+condition instead of the one it named: the Edit payload it sent carried no `command`, so
+a downstream guard rejected it and deleting the tool_name check changed nothing. The
+payload now carries a `command`, which is the whole difference between a test that
+mentions a guard and one that binds it.
+
+### What two independent pre-tag reviews found, and what it cost
+
+Both lenses were dispatched before the tag and both delivered. No BLOCKER in the shipped
+behaviour; one BLOCKER in the *tests*, and one real production defect. Everything below
+was fixed before tagging, and every mutation the reviewers reported as SURVIVED was
+re-run against the fix and killed (12/12).
+
+**The production defect.** The refusal gate was anchored on `§8 SAFETY`, the one section
+marker that happened to appear first in the corpus. The family is wider — `§7
+Ship-baseline`, `§11 MEMORY.md`, `§10-V Specificity`. The `§7` shape alone was **13 of 135
+firing cases (9.6%)**, and it does not merely waste a slot: the refusal's own boilerplate
+becomes the query, so a `git push` blocked by a red-CI rule injected three memories about
+statusline adoption — this release's headline defect arriving through the door this
+release opened. Now anchored on the section *citation*; firing shapes 135 → 122, exactly
+the 13.
+
+**The test BLOCKER.** Both cases that named the refusal filter were vacuous. They sent
+`§8 SAFETY (immutable): denied …`, on which `planErrorRecall` returns null — so the
+surface injects nothing whatever the gate does, and disabling *only* the refusal branch
+passed every test in the release. Same class the author had already caught once this
+round, reproduced twice more. The cases now use refusal text that would match the seeded
+row, plus a negative control asserting the same text *without* the marker does inject —
+so "silent" can no longer be satisfied by matching nothing.
+
+**A defect the docblock's own claim hid.** The rerank's `(errWords) AND (allTerms)`
+repeats every error term, and FTS5's `bm25()` sums over phrase instances — so a primary
+row's `|bm25_raw|` is systematically larger than its flat-OR score (1.334 → 1.779 on a
+one-row index). The calibration table for the still-off relevance floor was derived
+pre-rerank: filler p75 moves 10.99 → 20.27, and the 10.5 constant no longer sits in any
+gap. Documented at the constant rather than silently left for whoever switches it on.
+
+Also fixed: the fallback could inject the top row **twice** (the id de-dup was unbound and
+its mutant produced ids 1,1,2); the rerank compared against the raw `limit` rather than
+the sanitized one, so `limit: 0` turned it into the filter this release rejects; two
+irreconcilable refusal ratios shipped in different files (**558 of 810, 68.9%** is the
+reproducible one, and the benchmark now buckets by the gate's own reason instead of
+lumping refusals with empties); `handlePostToolFailure` recorded nothing on its
+silent-exit paths, which is the only window a host payload-shape change would show in.
+
+And the guards the reviews showed were decorative are now binding: `ERROR_NAMER_MAX`
+(the value this release corrected on data could be set straight back), three of the four
+alternatives in `ERROR_NAMER_RE`, the stop-word interaction its own docblock calls
+load-bearing, the `tmp/**` exclusion that D#168 was actually about, and the sentinel
+anchoring meta-test — which was a whitelist keyed to the list it checked, and fell to a
+one-line loose pattern. Writing that guard behaviourally immediately caught a second
+thing: `**/.git/**` had been silently dropped from Vitest's defaults by our own
+`exclude`.
+
+### A third premise, also refuted — built, measured, reverted
+
+D#169 came out of this release's own evidence, which is the strongest kind of premise
+there is, and it was still wrong. The term cap truncates by position, and a real shape
+showed that costing a filename: `npx vitest run tests/scope-label.test.mjs` failing with
+an `AssertionError` keeps `fail, tests` and drops `scope-label.test.mjs`. Keeping
+identifier-shaped tokens (`[._-]`) first should fix it. Same 58 real shapes × 15 projects
+either way:
+
+| | cmd-only rows | cmd-only at TOP-1 |
+|---|---|---|
+| positional cap (kept) | 493/2184 **22.6%** | 171/801 **21.3%** |
+| identifier-first cap | 749/2093 35.8% | 259/775 33.4% |
+
+Thirteen points worse on both. `[._-]` conflates *discriminative* with *unique to this
+invocation*: it promotes the run's own paths and filenames, whose IDF is so high they
+match nothing, and evicts `enoent` and `syscall` — low-IDF, but present in the memories
+that explain the failure. The row then survives on command vocabulary alone, which is
+this release's headline defect rebuilt from the other side. (A variant sparing command
+words measured byte-identical; command words sit at low indices, so a positional
+tiebreak already keeps them.) Reverted, with the numbers and the mechanism recorded in
+the cap's docblock rather than in a commit message nobody will find.
+
+### Scratch files in `tmp/` could fail the whole suite
+
+D#168, reported by a reviewer whose own mutation harness — parked in `tmp/`, this repo's
+gitignored scratch dir and a §5 safe-path — produced two failures in suites unrelated to
+anything it was reviewing. Two repo-walking invariant scanners skipped `.tmp` but not
+`tmp`, and Vitest's default discovery collected `tmp/**/*.test.mjs` and ran it.
+
+Fixed in all three places, and pinned by a probe rather than by asserting the skip list
+contains the entry — that assertion passes even if the walker ignores the list. Each
+scanner now writes a file into `tmp/` that *would* be reported if scanned, asserts it
+really is an offender, then asserts it was not seen. Verified by reverting: the same
+planted files produce 5 failures and one collected test file; with the fix, none.
+Vitest's `exclude` **replaces** the defaults rather than extending them, so they are
+restated in full — omitting them would have collected thousands of vendored tests.
+
+Six mutations were run against the new guards (rerank disabled, rerank turned into a
+filter, command words dropped from the error-first expression, namer disabled, namer
+pattern partially reverted, reported query decoupled from the one that ran); all six
+killed. The fixture needed a new decoy row to see any of it: before that row existed,
+the reranked and flat orders coincided and the whole feature measured as a no-op — the
+same "fixture cannot see the lever" failure recorded in v3.78.0.
+
+## v3.78.0 — a ruler built to justify a lever, and what it measured instead
+
+**Upgrade note.** No default behaviour changes. The error-recall face (memories injected
+after a failed Bash command) gains a relevance floor that is **off by default**, and
+schema moves to v46 with one nullable column (`observations.decay_seen_at_first_cite`)
+written by the citation-decay loop and read by nothing yet. The floor is opt-in via
+`CLAUDE_MEM_ERROR_RECALL_BM25_MIN=10.5`; why it is not the default is the substance of
+this release.
+
+### The measurement that started this
+
+Per-face citation funnel, whole of `citation_surface_log` as of 2026-08-24 — 135 rows
+(its PK is `(project, session_id, surface)`) across 42 distinct sessions, `resolved_at`
+spanning 2026-08-16..24. Header and body come from one query, because
+`recordCitationSurfaces` **overwrites** `injected_n`/`cited_n` and bumps `resolved_at`
+on every resolution: a snapshot taken at another moment cannot be reconstructed, and
+mixing two of them is how the first draft of this table ended up self-inconsistent.
+
+| face | rows | injected | cited | cite-rate |
+|---|---|---|---|---|
+| pretool | 40 | 432 | 151 | 35.0% |
+| error_recall | 37 | 345 | 20 | **5.8%** |
+| fyi | 33 | 141 | 18 | 12.8% |
+| ups | 17 | 33 | 9 | 27.3% |
+| task_imperative | 7 | 7 | 3 | 42.9% |
+| subagent | 1 | 1 | 1 | n=1 |
+
+`error_recall` is the **second-largest injector** and the worst-performing one. Reading
+the ratio rather than the level (per #10798: an A/B-shaped metric needs its control read
+at the same time) it sits at 0.17 of pretool here and held at 0.13–0.17 across the
+v3.74.0 gate change — so this is a property of the face, not of one week's sessions.
+
+**D#150 is answered**: the v3.74.0 gate fixed "the surface could not extract terms" and
+did not move the cite-rate. **D#151 stays open and stays correct** — verified again,
+`SqliteError: unable to open database file`, `eslint` errors and `go test FAIL` all have
+`isHardError=false` and never reach this face at all. The face is simultaneously too
+narrow and too imprecise; D#151's own reason for waiting (widening the trigger while
+changing precision mixes two variables) is why only precision was examined here.
+
+### A ruler for a face no existing harness can see
+
+`denoise-ab.mjs` is structurally blind to error-recall: its suites are query→document,
+and this face's input is a failed command plus its stderr. Any lever here reads
+NEUTRAL Δ=0 there no matter what it does. So `benchmark/error-recall-suite.mjs` — 9
+cases over a 620-row fixture, scoring the statement the hook actually runs (the
+selection was extracted to `lib/error-recall-core.mjs` precisely so the benchmark
+cannot measure a lookalike).
+
+Two rules it enforces on itself, both learned here:
+
+- **Every case must clear the real trigger gate.** `assertReachable` refuses to score a
+  shape whose `detectBashSignificance().isHardError` is false — #10731's lesson made
+  mechanical. It fired immediately: `Segmentation fault (core dumped)` was written into
+  the case list from memory and rejected on the spot. `core dumped` is in
+  `HARD_ERROR_RE`'s alternation, but the surrounding conditions still decline the shape,
+  exactly as the 24-shape battery in #10737 recorded.
+- **The corpus must have real IDF.** On a small all-one-topic fixture every row scores
+  exactly 0.00 (df = N kills the IDF term) and any floor removes everything; 600 filler
+  rows with disjoint vocabulary put the fixture past `FLOOR_REF_CORPUS`.
+
+Ground truth is structural, and the negative classes are kept apart per #8858: `filler`
+rows are TRUE off-topic false positives, `negative` rows are topical-but-unrequested —
+the shape #10730 measured, where a missing-module failure returned v3.66.0 release
+records because `npm`/`run`/`build` dominate BM25.
+
+### What the ruler said: build it, calibrate it, and leave it off
+
+The distribution suggested a floor. Over 7 well-served cases, `filler` p75 was 10.13 and
+`relevant` min was 10.93, so 10.5 sat in a clean gap — the same shape of choice that put
+the UPS face's OR floor at 30 in its own 22→41 gap. A per-row floor there was worth
++3.3pp precision (20 → 18 injected rows, both removed rows off-topic, hit-rate flat).
+
+Three measurements then took that apart.
+
+**The probe was measuring post-gate rows.** `probeScores()` inherited the shipped default
+instead of passing `floor: 0`, so the distribution used to choose the floor had already
+been filtered by it — `filler` reported n=4/min 10.69 instead of n=19/min 8.33. The
+calibration table was, for a while, not reproducible from the shipped tool. Found in
+review; the probe now passes `floor: 0` and self-checks that it can see below the
+calibrated value.
+
+**On a live database the per-row form was five times larger than the fixture suggested.**
+Across 8 projects × 10 real hard-error shapes on the maintainer's own DB: injected rows
+**221 → 112 (−49%)**, and **25 of 80 firing cases (31%) went to injecting nothing at
+all**. The loss is entirely in small projects (under ~500 observations: −47..−87%; above
+~800: −0..−3%). `corpusFloorScale` cannot correct this and is documented as deliberately
+project-blind — it normalises over the whole observations table, which is right for
+FTS5's IDF. But what collapses on a small project is not IDF, it is how good the best
+available memory is. That is v3.61.0's failure mode relocated from install scope to
+project scope.
+
+**The obvious repair looked free, and the fixture was lying again.** Making the gate
+set-level — read the top row, drop the whole set on failure, which is what UPS actually
+does and what "every other face has a floor" should have said — is the form now
+implemented. On the ruler it is a no-op at 10.5 (26 injected rows at every floor from 0
+to 20; it bites only at 25, costing hit-rate 85.7% → 42.9%). On the live DB, same
+threshold, 8 projects × 9 shapes, 69 firing cases:
+
+| | injected rows | vs off | cases silenced |
+|---|---|---|---|
+| floor off | 201 | — | — |
+| set-level 10.5 | 126 | **−37%** | **27 / 69 (39%)** |
+| per-row 10.5 | 97 | −52% | 26 / 69 (38%) |
+
+So it is not inert: it trims fewer rows in the cases it spares and silences just as
+many. The fixture cannot see this because its hard negatives are **constructed to score
+high** — every fixture case, including the two no-good-match ones, has a top row above
+10.5, while real small projects frequently have nothing above it. A second reviewer
+caught this, and it is the same defect as the per-row measurement one level up: a
+fixture number standing in for a live one.
+
+And the gap itself was an artifact. The fixture originally contained only cases the
+corpus could answer. Adding two **no-good-match** cases — real failures nothing in the
+corpus explains, which is the common case in production — moves `filler` p75 to 10.99,
+**above** `relevant` min of 10.93. There is no gap.
+
+So: the per-row form buys 2 rows on a fixture at a live cost nothing has shown to be
+noise (`citation_surface_log` stores counts, not ids, so the |bm25| of the 15 cited rows
+is unrecoverable), and the set-level form costs a third of the face for a benefit
+measured nowhere. Neither earns a default. The defect this face actually has is that
+command words dominate BM25 — semantic, and out of reach of any magnitude gate (filed as
+D#167). The floor ships built, calibrated, documented and **off**, which is the same
+call D#153 got when its data came back.
+
+One property worth stating because the comment used to overstate it: the gate reads the
+**rank-top** row's undecayed |bm25| — rank being `bm25 × recency-decay` — not the best
+|bm25| in the set. With a 14-day half-life a fresh weaker row can outrank an older
+stronger one and veto the whole set, which is why the set-level form silences marginally
+*more* cases than the per-row one. This matches what UPS does with `ftsRows[0]`, so the
+shape is consistent across faces; it is documented rather than "fixed" because changing
+it would make this face diverge from the one it was modelled on.
+
+The suite grew a second population as a result: cases are scored as **servable** (judged
+on hit-rate) or **unservable** (judged on whether the surface stayed quiet), because
+averaging them hides both effects.
+
+### Two defects I introduced, both caught by machinery rather than by reading
+
+**Placeholder order is decided by position in the SQL text, not by meaning.** Moving the
+decayed score from `ORDER BY` into a SELECT list renumbered every placeholder: `MATCH`
+received the project name and FTS5 answered `no such column: main`. Fixed by shape —
+the statement binds **named** parameters, and `recencyDecaySql` grew an optional
+`nowParam` (defaulting to the positional `?`, with a test asserting the six existing
+positional callers generate byte-identical SQL).
+
+**My own guard for the floor's ordering was vacuous.** It passed even when `LIMIT` was
+moved inside the subquery. Distinguishing the two orderings needs rows where rank order
+(decayed score) and gate order (undecayed |bm25|) disagree, and the shared fixture had
+none — the decay multiplier tops out at 2×, so a fresh row only outranks an old one
+while its |bm25| stays above half the old row's. That test is gone with the per-row
+form, but the lesson produced the tie-break pair now in the fixture: without it,
+collapsing the 14-day half-life to 1 millisecond — deleting recency ranking outright —
+left the entire suite green.
+
+### D#159 — making "stop injecting a memory nobody cites" a decidable question
+
+`observations.decay_seen_at_first_cite` (schema v46) records `decay_seen_count` as it
+stood when a memory was first cited. The lifetime counters cannot answer the question
+the gate needs. Measured 2026-08-22, a candidate gate of `decay_seen >= 20 AND
+cited_count = 0` matched 631 rows, while 331 of the 510 rows that *had* been cited also
+carried lifetime `decay_seen >= 20` — whether they crossed 20 before or after their
+first citation is unrecoverable from cumulative counters, so the gate's false-kill rate
+was not computable. (Both halves drift with use; re-read 2026-08-24 the same DB gives
+631 / 334 of 518. Every count in this paragraph is a snapshot, and the two must be read
+from the same one — the 518 quoted further down is the 08-24 figure.)
+
+The value includes the citing resolution, so it reads as "cited on the Nth time the loop
+saw it". NULL is deliberately not 0 — but note the boundary, because the analysis in
+4–6 weeks depends on it: **NULL means never cited *or* first cited before v46.** The
+stamp only fires when `cited_count` is 0 pre-update, so every row already cited when the
+migration ran (518 on the maintainer's DB) stays NULL permanently. The D#159 cohort is
+rows whose first citation happens after the upgrade, and the never-cited query needs
+`AND cited_count = 0` — a test pins that the naive form miscounts a legacy row.
+
+Instrumentation only. **No gate is added**, and there will not be enough data to design
+one for another 4–6 weeks.
+
+### Not in this release
+
+**SCOPE_FILTER redesign (D#153) was cut.** It is default-off, so reshaping it from a
+query-time exclusion into a render-time demotion changes nothing observable until
+someone flips the default — and the data already refused that flip (173 of 1112 recall
+groups would go empty; environment-scoped rows waste at 19.6% against project-scoped
+rows' 20.4%). Its deferred entry stands, including its own precondition: `denoise-ab`
+has no scope-annotated fixture, so any SCOPE change measures NEUTRAL Δ=0 there today.
+
+## v3.77.0 — the face nobody could see, and the guard nobody could break
+
+**Upgrade note.** One new metering face (`subagent`) writes rows to
+`citation_surface_log` and adds a line to `claude-mem-lite citation-stats`. It does
+**not** feed the citation-decay denominator, so no lesson's importance moves because of
+it. Everything else here is tests and naming.
+
+### D#162 — the live-row filter on the highest-cite-rate face had no guard
+
+`scripts/pre-tool-recall.js` injects into the PreToolUse recall face, the
+**highest-volume** injection face in the repo and the best-performing one at real volume
+(35.0%, 414 injections over the last 7 days; `task_imperative` reads 42.9% and `ups` 28.1%,
+on 7 and 32 injections respectively). Its query excludes retracted (`superseded_at`) and
+compacted (`compressed_into`) observations via `liveObsFilterSql`. Deleting that clause left
+the entire suite green — 4881 tests, zero failures.
+
+The suite *looked* covered: two cases in `tests/pre-tool-recall.test.mjs` assert exactly
+that exclusion, against a **hand-copy** of the SELECT written in the test file. The copy
+cannot drift-detect the original. The deleted `recallForFile` twin (v3.76.2) carried the
+filter too, but no test ever seeded a superseded row through it either.
+
+Four cases now drive the real script as a subprocess. Each seeds a live row and an
+excluded row **on the same file**, with the excluded row NEWER so it sorts first and would
+render inside the Edit path's 2-row limit — so the case cannot pass by the query returning
+nothing (the failure mode recorded in `feedback_necessary_not_sufficient_assertions`).
+Verified by mutation: removing `liveObsFilterSql` kills three, disabling the 60-day
+`created_at_epoch` lookback kills the fourth, and neither kills the other's cases.
+
+### D#152 — the `subagent` injection face is now metered
+
+`scripts/pre-agent-inject.js` appends a memory block to a dispatched subagent's task
+prompt via PreToolUse `updatedInput`. Claude Code writes that turn to
+`<session>/subagents/agent-<name>-<hash>.jsonl` — **not** the parent transcript — so every
+attachment-based extractor read zero and the face had no row in `citation_surface_log` at
+all. Its contribution to every denominator was zero by construction, not by measurement.
+
+Two search shapes silently find nothing here, which is why this sat blocked: the files are
+not at the transcript directory's top level, and grepping the parent transcript for
+`isSidechain` returns 0 records — the flag lives inside the subagent files.
+
+The extractor (`extractInjectedFromSubagentPrompt`) had existed since v3.47 with zero
+production callers. What was missing was the file discovery, now `findSubagentTranscripts`
+(derived from the parent path, no directory scan) and `collectSubagentSurface`.
+
+Two things are load-bearing in the wiring:
+
+- **It is a separate `recordCitationSurfaces` call.** That function scores every face in
+  one call against one `cited` set, and a lesson handed to a subagent is cited in the
+  *subagent's* text. Scoring it against `citedMain` reports 0% by construction; unioning
+  its cites into `citedMain` credits the main-thread faces for citations the main thread
+  never made.
+- **It runs last.** `lib/transcript-scan.mjs` memoizes one file, so reading sidechain
+  files evicts the parent transcript. Placed earlier, the block costs **one** extra parse of
+  the parent — the memo re-caches on the first re-read, so it is one, not one per later
+  scanner — and breaks the one-parse-per-Stop property the surrounding code documents.
+  Verified by instrumenting the parse: 1 parent parse at the shipped position, 2 when
+  relocated earlier. ~25ms on the largest real transcript here (5.4MB).
+
+`subagent` joins `keyctx` in the new `NON_ATTACHMENT_SURFACES` list: faces that leave no
+attachment, so the derived `DECAY_DENOMINATOR_SURFACES` can never include them and their
+absence would otherwise be silent. Metered first — D#152's own instruction. A retro-read
+over this project's real transcripts (28 sessions, 21 with subagents, 74 sidechain files)
+finds 28 injections and 7 of them cited.
+
+**Read the unit before reading that rate.** Both sets are unioned across all of a session's
+sidechain files, so it measures "fraction of injected ids that appear anywhere in any
+sidechain of the session", not per-dispatch adoption: an id handed to agent A and cited by
+agent B counts as a hit. One of the 7 above is exactly that shape. The number is therefore
+biased **high** against per-dispatch adoption, which is the caveat that matters when D#164
+decides whether this face joins the decay denominator. Per-dispatch attribution would need
+per-file accounting, deliberately not built yet.
+
+The `citation-stats` face table now annotates every non-decay face rather than only
+`keyctx`; an annotated `keyctx` beside a bare `task_imperative` read as "that one does feed
+decay", which is false.
+
+### D#163 — a helper named for more than it covers
+
+`matchFileEdges` (`tests/test-helpers.mjs`) is now `fileEdgeMatchOnly`. Its docstring
+claimed it ran "the SHIPPED predicate — the one `scripts/pre-tool-recall.js` injects on";
+it runs the shipped **match arm** plus a hand-copied importance gate, and nothing else from
+that query. Four suites read as though the missing clauses were guarded there. They were
+not guarded anywhere until D#162 above — which is how the two items are the same finding at
+two altitudes.
+
+### one of this round's own tests was non-binding, and the mutation pass caught it
+
+The text-floor case for the new face asserted "no row recorded" while referencing a
+hard-coded `#1` that was never seeded. `recordCitationSurfaces` drops ids that resolve to
+no live row, so the case passed on an empty DB regardless of the gate — replacing the gate
+with `if (true)` left it green. It seeds a real observation now, and the mutation kills it.
+
+### what the pre-tag review changed
+
+Two independent lenses ran before the tag; **both delivered**, and both found real things.
+Neither found a BLOCKER, and all three load-bearing wiring claims above were independently
+mutation-verified — including the one that turned out to be structurally enforced rather
+than merely intended: at the shipped position `citedMain` is out of scope, so the block
+*cannot* score against it.
+
+Four numbers in the first draft of this entry were wrong and are corrected above: the
+pretool cite-rate (40.0% was carried over from an older memory entry, not measured — it is
+35.0%), "best cite-rate in the repo" (false as written; `task_imperative` reads higher at
+n=7), the re-parse cost (42ms was a *cold* single read; warm is ~25ms, which is what
+`lib/transcript-scan.mjs`'s own header already said — the draft contradicted a comment five
+files away), and the re-parse *mechanism* (one extra parse, not one per later scanner).
+
+Four guards that were missing or non-binding are now closed, three of them the round's own
+thesis one clause further out:
+
+- `scripts/pre-tool-recall.js`'s `AND o.importance >= 2` — the line **directly above** the
+  one D#162 was opened to guard — could be relaxed to `>= 0` with 237 related tests green.
+  The only case that looked like it covered this binds `fileEdgeMatchOnly`'s hand-copied
+  gate, not the shipped query; it is retitled to say so, and a real case now guards the
+  shipped clause.
+- the new CLI note and label had no assertion at all, while their *sibling* (`keyctx`) did.
+- `CLAUDE_MEM_NO_CITATION_TRACK` correctly gates the new face, but nothing bound it. The
+  other two gates on that block each had a case; this one now does too.
+- the `.jsonl` guard in `findSubagentTranscripts` was covered by a negative assertion with
+  no decoy — it passed because `readdirSync` threw and returned the same `[]`.
+
+## v3.76.2 — the correct implementation was in the copy that does not ship
+
+**Upgrade note.** Bugfixes and tests only. One shipped-path defect (Windows-shaped file
+paths recalled nothing), one dead in-process twin deleted, and two description strings that
+had been telling the model and the user something v3.76.1 stopped doing. No behaviour a
+v3.76.1 user opted into changes.
+
+### the defect: a Windows-shaped file path recalled nothing
+
+`fileMatchParams` (`lib/file-edge-match.mjs`) derived the basename with node:path
+`basename`, which follows the **host's** rules. On a POSIX host,
+`basename('C:\proj\src\x.mjs')` returns the whole string, so three of the four match arms
+degrade to garbage and the row is never found:
+
+```
+"C:\proj\src\hook-memory.mjs" -> ["C:\proj\src\hook-memory.mjs",   <- arm 1, full path
+                                    "C:\proj\src\hook-memory.mjs",   <- arm 2, "basename"
+                                    "%/C:\proj\src\hook-memory.mjs",  <- arm 3
+                                    "%\\C:\proj\src\hook-memory.mjs"] <- arm 4
+```
+
+That predicate is shared, byte-identically and on purpose, by `scripts/pre-tool-recall.js`
+(the injection trigger) and `lib/edge-attribution.mjs` (Stop-side hit/miss resolution), so
+one fix covers both and their parity is preserved by construction. The split now accepts
+either separator regardless of host OS.
+
+### why it survived: the tests asserted the twin that does not ship
+
+`hook-memory.mjs` also carried `recallForFile`, an in-process file-recall implementation
+with **zero production callers** — superseded by the standalone `pre-tool-recall.js` hook,
+which owns the cooldown, scope filter, edge-decay filter and event leg it never had. Five
+test files referenced it and four imported it, which made it look alive, and it cost real
+money twice:
+
+- it was the only code splitting basenames on either separator, so six Windows-path cases
+  went green against it while the shipped predicate carried the gap;
+- its bare `%<basename>` LIKE lacked the path-boundary arms that `file-edge-match` added
+  for the `bash-utils.mjs`-vs-`utils.mjs` collision.
+
+`recallForFile` is deleted, along with `utils.mjs`'s `basenameAnySep` (its only consumer).
+The suites now go through one shared `matchFileEdges` helper that calls the shipped
+predicate, so there is no second derivation left to drift. A path-boundary collision case
+was added, since the twin never had one.
+
+### two descriptions that stopped being true one patch version ago
+
+v3.76.0 wrote `demote_pinned=importance→1` into the MCP tool schema and the CLI help.
+v3.76.1 changed the behaviour to a dual floor (no lesson → 1, lesson-bearing → 2) and
+updated neither, so the **released** LLM-visible schema stated the wrong rule for a whole
+patch version. Nothing failed, because no test read those strings. Both are corrected, and
+both are now asserted against `PINNED_INJ_THRESHOLD` and against the floor semantics —
+reverting either string turns the suite red.
+
+### the pre-tag review, and what it found
+
+Two independent reviewers read this diff **before** the tag — the first time in six releases
+that both landed in time to change what shipped. Neither found a blocker; both found real
+work, and all of it is in this release rather than the next one.
+
+**The same defect was still shipping on three other faces.** The fix above landed in
+`lib/file-edge-match.mjs`. Host-native `basename` was still deriving the lookup key in:
+
+- `scripts/pre-tool-recall.js` — the **events** leg, ~120 lines below the fix, in the same
+  function. So a Windows-shaped payload would have recalled lessons but still no events.
+- `scripts/user-prompt-search.js` — the UserPromptSubmit file-reference leg, using
+  `file.split('/').pop()`, which is weaker still: it misses `\` even *on* a Windows host.
+- `lib/recall-core.mjs` — which is `mem_recall` (MCP) **and** the CLI `recall` command.
+
+The latter two also carried the second defect, the bare `%<basename>` suffix LIKE with no
+path boundary. Demonstrated on the real function before fixing:
+
+```
+recallByFile(db, "utils.mjs")  ->  [ 'Fix in bash-utils.mjs' ]     <- false positive
+recallByFile(db, "C:\proj\src\hook-memory.mjs")
+                               ->  filename = "C:\proj\src\hook-memory.mjs", 0 rows
+```
+
+All three now go through the shared predicate. Shipping a release *named* "the correct
+implementation was in the copy that does not ship" while leaving three more copies of the
+wrong one would have been the joke writing itself.
+
+A **sweep guard** now enforces the class rather than the instances: every shipped file that
+joins `observation_files` to answer "what do we know about this file?" must match through
+`fileMatchClause` and derive its key with `basenameAnySep`. Reverting any one of the three
+fixes turns it red (3/3 mutation-verified). Per-face tests never catch this, because each
+face only tests itself. The guard strips comments before scanning — its own first run went
+red on the explanatory comment quoting the banned shape.
+
+**A test added by this very release passed on copy stating the exact opposite rule.** The
+`demote_pinned copy matches the shipped behaviour` suite asserted `/to 1/`, `/to 2/` and
+`/lesson/i` as three independent existence checks. Rewriting both descriptions to
+"to 1 when it HAS a lesson_learned, to 2 when it has none" left all 22 tests green. Three
+necessary conditions were reading as one sufficient condition — in the suite written to
+prevent exactly this failure recurring, and inverting a clause while editing is the most
+likely way the copy actually goes wrong. Each floor is now bound to its condition in one
+regex per arm, and both inversion mutants die.
+
+**`demotePinned` had no cross-project fixture.** Neutering `projectFilter` while preserving
+SQL arity kept **279 tests** green across all three maintain suites, because every fixture
+lived in project `'p'`. For an op that writes `importance` across the whole table, "it only
+touched my project" is the property that most needs one. Added; the mutant now dies.
+
+Also from the review: a vacuous emptiness assertion (`returns empty for files with no
+history` asserted against an *empty* database, so `OR 1=1` bolted onto the match clause left
+it green while killing six siblings) now seeds a decoy first; the `CLAUDE.md` knip paragraph
+had attributed the parent commit's 46-name count to this commit, which measures 45; a stale
+`importance→1` comment three lines above the corrected CLI help; and a test name in
+`maintain-core.test.mjs` that stated the whole rule while covering one arm.
+
+Independently re-derived by the reviewers and worth recording: 14/14 and 15/15 mutations
+killed with **empty NOT-BINDING columns** on the pre-review diff, the "5/5" floor-suite claim
+reproduced from scratch, zero match regressions across 9 probes × 15 stored filename shapes,
+0 of 6406 `observation_files` rows containing a backslash, and the ~450ms subprocess saving
+measured at 3 × 138ms rather than estimated.
+
+One environment note for anyone re-running the suite: **do not export `CLAUDE_MEM_DIR`.** The
+suite self-sandboxes, and an ambient value makes `tests/resolve-data-dir.test.mjs` fail for a
+reason that has nothing to do with the code.
+
+### tests
+
+- `demotePinned` gains five in-process cases at the `maintain-core` layer, where the floor
+  is written. Every other case in that file reaches the op through a face, so a floor
+  regression could previously only be read off a terminal importance after `cleanup`,
+  `decay` and `boost` had also run — three ops of interference between the change and the
+  assertion. All five were mutation-verified: flat floor, dropped `'none'` arm, moved
+  threshold, dropped `cited_count` guard, dropped WHERE bound — 5/5 killed.
+- Three pure in-process assertions moved out of the subprocess-paying `beforeEach` they had
+  been sitting in (a real `cli.mjs stats` spawn plus a seed write, ~450ms, to test pure
+  functions).
+- 300 files / 4881 tests (from 4860).
+
+### a claim in the v3.76.0 notes, narrowed
+
+Those notes led with "148 rows demoted by citation decay, never cited, and back at
+importance>=3 — 148/148 boost-eligible". True, and in the headline slot it invites "this
+fix repairs 148 rows". It does not. `boostAccessed` triggers on `access_count`,
+`demotePinned` on `injection_count >= 8`, and the overlap is thin. Re-measured on the same
+database: 178 rows now match that shape and 152 are boost-eligible, but only **7** are
+reachable by `demotePinned` — 94 sit at `injection_count = 0` and 77 between 1 and 7. The
+op closes the loop for the heavily-injected tail; the larger access-driven population it
+does not touch is a separate and still-open question. The test file's header now says so.
+
+## v3.76.1 — the second review landed 13 minutes after the tag, and it was right
+
+**Upgrade note.** Upgrade from v3.76.0. One user-visible defect, introduced by v3.76.0's own
+pre-tag fix and shipped 90 minutes later, plus three test holes that let two real mutants
+pass 4857 tests. No behaviour a v3.76.0 user opted into changes.
+
+### the defect: `maintain scan` promised work that `maintain execute` would never do
+
+v3.76.0 gave `demotePinned` two floors (no lesson → 1, lesson → 2). The **forecast** in
+`maintenanceStats` was not moved with it: it still counted `importance > 1`. So a
+lesson-bearing row already sitting at its floor of 2 was reported as pinned **forever**,
+while every execute reported `Demoted 0`. Reproduced end to end before fixing:
+
+```
+--- scan BEFORE ---  Pinned-but-uncited (…): 1 — cleared by the default maintain set…
+--- execute ---      [mem] Demoted 0 pinned-but-uncited observations…
+--- scan AFTER ---   Pinned-but-uncited (…): 1        ← unchanged, and unchangeable
+```
+
+Worse than a wrong number, because v3.76.0 also rewrote that line to *promise* the rows
+would be cleared. The predicate now has one home (`PINNED_PREDICATE_SQL`) that the op and
+its forecast both consume, so they cannot disagree again, and a test pairs the two counts
+across a real scan → execute → scan cycle rather than asserting either alone — asserting
+either alone is exactly what let this ship. This is the same scan-forecast-vs-execute drift
+class the `decayAndMarkIdle` comment a few lines above it exists to prevent.
+
+The scan label also stops saying `imp>1`, which was never true of a lesson row.
+
+### three test holes, two of them hiding live mutants
+
+- **The opt-out was pinned on one face out of three — and not the one that matters.**
+  `CLAUDE_MEM_SKIP_DEMOTE_PINNED` was asserted only through the CLI. Deleting the check
+  from `hook.mjs` — the **only** face that runs unattended, and therefore the one a user
+  setting the variable actually needs — passed all 4857 tests, as did deleting it from the
+  MCP face. The case was even named "on every face" while running one. Both faces are now
+  asserted end to end, and both mutants die.
+- **`tests/lint-gate-coverage.test.mjs` asserted a necessary condition and called it
+  binding.** `isPathIgnored()` answers "is this file skipped", not "does any rule apply".
+  Review built a config that un-ignores `scripts/` while scoping the strict rules to
+  `**/*.mjs`, under which the case stayed green and the five production hook scripts had
+  silently lost `eqeqeq` / `no-var` / `prefer-const` / `no-unreachable` — the v3.75.1 stray
+  `export` sails through that config. A second case now resolves the config per file with
+  `calculateConfigForFile()` and asserts the rules are in force.
+- **The shellcheck half matched a commented-out line.** `l.includes('run: shellcheck')` is
+  satisfied by `# run: shellcheck …`, so replacing the step with `run: echo skipping` and
+  commenting the original kept it green. Anchored to a line that actually runs.
+
+**Also:** `CLAUDE.md` said 4853 tests where the real count was 4857 — the pre-tag review
+added four cases after the Quick Reference was synced. Now 4860 and re-synced.
+
+### about the review itself
+
+Both v3.76.0 reviews were dispatched before the tag. The correctness lens delivered in
+time and reshaped the release. The test-quality lens delivered **13 minutes after** it —
+the fifth time in this project a review has arrived post-tag — and found the defect above.
+The cost was one patch release rather than one rollback, which is the argument for waiting;
+the honest reading is that the v3.76.0 notes claimed a test-quality lens was missing, and
+it was merely late.
+
+One of its findings did **not** reproduce and is recorded as refuted: it reported the suite
+red at `ca7be0d` in this checkout (`session-start-stdout-envelope`, attributed to the
+working copy's adopted state). That file passes 5/5 here at HEAD, and the pre-commit hook
+ran the full suite green at commit time — so the commit message's "300 files / 4857 tests"
+was accurate as written.
+
+Suite **300 files / 4860 tests**, eslint clean, shellcheck clean over four scripts, knip
+back at 31 unused exports (the new predicate constant is module-private — nothing outside
+consumes it, and exporting by habit is how that baseline drifts).
+
+## v3.76.0 — the automatic maintenance path promoted and never demoted
+
+**Upgrade note — a default changes, and it will move rows in your database.**
+`demote_pinned` joins the default maintenance op set. Observations auto-injected **8+
+times and never cited** get their importance floored: **rows with no lesson to 1, rows
+carrying a lesson to 2**. Nothing is deleted, and nothing is hidden. The automatic pass
+caps at **500 rows per 24h run**, the CLI/MCP faces at 1000 per run, so a large backlog
+drains over days rather than in one sweep.
+
+The two floors matter because `importance >= 2` is a hard `WHERE` on the injection faces
+that actually earn citations — PreToolUse recall, SessionStart Key Context, cross-project —
+while `injection_count`, the signal that triggers this op, is incremented only on the two
+UserPromptSubmit faces, the weakest by measured cite-rate. A single floor of 1 would
+convict a row on its weakest surface and evict it from its strongest. **On the maintainer's
+own database, 16 of the 17 rows this op moves carry lessons** (13 of them at importance 3),
+so "clears pinned noise" would have been the wrong description of what it actually does.
+Lesson rows lose the top tier and its ranking weight, and stay eligible everywhere.
+
+**Recovery, stated precisely.** A citation lifts importance by **+1 per cited session**,
+through the Stop-time decay resolution — not "straight back". The row has to be injected
+in that session for the citation to resolve, which a lesson row at 2 still is on every
+face. `boostAccessed` also lifts +1 per 24h maintain run, but only for rows with
+`access_count > 3`; a row below that has no automatic path back and recovers by citation
+alone.
+
+**No action required.** To keep the old behaviour, set `CLAUDE_MEM_SKIP_DEMOTE_PINNED=1`
+(any non-empty value except `0`/`false`/`no`/`off`). It removes the op from the DEFAULT
+set only, so an explicit `maintain execute --ops demote_pinned` or
+`mem_maintain operations:["demote_pinned"]` still runs. Pinning v3.75.1 also works.
+
+### the defect: the op that clears pinned noise was wired to every face except the ones that run
+
+`demotePinned` exists, is tested, and its docstring names the exact blind spot it repairs:
+the regular `decay` op deliberately protects `injection_count > 0` — a row Claude was shown
+eight times is treated as contextually proven — so a heavily-injected, never-cited row is
+the one thing decay can never reach. That is what `demote_pinned` is for.
+
+It ran on no path by default. It was absent from the CLI default op set
+(`cleanup,decay,boost`), absent from the MCP default set (the same three), and `hook.mjs`
+did not import it at all — so on the only path that runs unattended, it did not exist. Its
+opponent `boostAccessed` (`access_count > 3` → `importance + 1`) was in all three. The
+automatic path promoted and never demoted.
+
+Measured on the maintainer's live database before the fix: **148 rows** sat demoted by
+citation decay, never cited, and back at `importance >= 3` — and **148 of those 148** were
+`boostAccessed`-eligible, so the mechanism is exact rather than inferred. A further **17
+rows** were sitting demote-eligible at that moment, carrying 265 recorded injections
+between them.
+
+A second drift rode along: the two faces that *did* wire the op ran it in **opposite
+orders**, and the order is load-bearing. `mem-cli` demoted then boosted — which hands the
+row straight back, 1 → 2, the demotion silently undone inside a single maintain run.
+`server.mjs` boosted then demoted, landing at 1. The default set and its order now live in
+one place (`DEFAULT_MAINTAIN_OPS` in `lib/maintain-core.mjs`) and all three faces consume
+it; `demote_pinned` is ordered after `boost` everywhere.
+
+The auto-maintain call sits inside the global 24h gate on purpose. Unlike
+`markAutoCompressible` — whose per-project argument is what made the v3.75.0 regression
+possible — this op runs on the whole-DB `mctx` (`projectFilter: ''`), so one run covers
+every project at once. The comment says so, because "fix it into a per-project gate" is the
+plausible wrong move here.
+
+Pinned by `tests/maintain-default-ops.test.mjs`, which drives all three faces for real: the
+CLI through `cli.mjs maintain execute`, MCP through a `tools/call` over stdio, and the hook
+through `hook.mjs auto-maintain` in a subprocess. The fixture row seeds at **importance 2**,
+not 3, and that is the whole design: at 3 `boostAccessed` cannot fire (it requires
+`importance < 3`), the ordering mutation stays green, and the case would only prove "demote
+ran at all". At 2 the three outcomes separate — correct order ends at 1, reversed order at
+2, opt-out at 3. Eight mutations verified, each landing on its predicted value: dropping
+`demote_pinned` from the default set reddens all three faces; swapping the CLI's block order
+reddens with `expected 2 to be 1`; deleting the hook's call reddens with `expected 3 to be
+1`; making the opt-out a no-op reddens with `expected 1 to be 3`; collapsing the two floors
+to a literal 1 reddens the lesson case; reverting only the `WHERE` bound while keeping the
+`CASE` in `SET` reddens the phantom-demotion case; restoring `=== '1'` reddens the env-value
+case; and dropping `injection_count = 0` from the noise pass reddens the auto-hide case.
+
+### what pre-tag review changed
+
+Two independent fresh-context reviews were dispatched against this candidate **before** the
+tag — the first release in a while where that happened in the right order rather than 40 to
+90 minutes after it. **One of the two delivered nothing** (an idle signal, no report, no
+scratch artifact — the fourth time this delivery channel has failed here), so the
+test-quality lens is missing from this release and its questions are unanswered: what these
+tests do NOT kill, and whether the diff eroded any pre-existing guard. The correctness pass
+did deliver, and it confirmed the four verifiable claims (execution order on all three faces, the whole-DB
+`mctx` argument for keeping the global gate, the 500/1000 caps, and that no cited row or
+sub-1 importance is reachable) and **refuted the framing of the change itself**. Four
+things landed because of it:
+
+- **The lesson floor above.** It was a flat `importance = 1` until review measured the
+  affected population and found it was 16/17 lessons. `demotePinned` was the only
+  automatic pass in `lib/maintain-core.mjs` without the "never auto-GC a lesson" clause its
+  six siblings all carry.
+- **`markAutoCompressible`'s noise pass gained `injection_count = 0`,** matching the aged
+  pass that has had it since v2.56.0. Review reproduced the full chain: demote a row to 1
+  on one run, and the next run marks it `COMPRESSED_AUTO` — hidden from every read path,
+  therefore never injected, therefore never cited, therefore with no way back. The
+  population was zero and stayed zero only because of an undocumented interlock between two
+  hand-listed title sets in two files. Now it is a clause, and a test.
+- **The demote call moved below the fuzzy-dedup block in `hook.mjs`.** Dedup keeps the
+  higher-importance member of a near-duplicate pair, and it re-`SELECT`s importance — so
+  demoting first inverted dedup's own rule using a value rewritten 40 lines earlier in the
+  same pass, tombstoning the pinned row and keeping the copy without the injection history.
+- **`CLAUDE_MEM_SKIP_DEMOTE_PINNED` stopped comparing `=== '1'`,** which silently ignored
+  `=true` / `=yes`. That is the exact failure mode the comment three lines above it cites
+  `CLAUDE_MEM_RECOMMEND_MODE=live` for, committed underneath its own warning.
+
+Two claims in the first draft of these notes were false and are corrected above: that a
+citation "promotes the row straight back", and that the change "clears pinned noise".
+
+### also fixed: eslint never looked at scripts/
+
+`eslint.config.mjs` listed `scripts/**` in `ignores`, so **17 files / 4470 lines** were
+outside the gate — five of them (`post-tool-use`, `pre-agent-inject`, `pre-tool-recall`,
+`pre-skill-bridge`, `user-prompt-search`) fire on every hook event in production. This is
+where the v3.75.1 stray-`export` bug lived. Un-ignoring the directory reported five errors,
+three of them real:
+
+- **A lone-surrogate corruption reaching SQLite.** `scripts/index-managed.mjs:222` stripped
+  header emoji with `/[#*`🚀📋⚡🔍]/g` — no `u` flag, so the class held the *surrogate
+  units* of the three astral emoji and the shared lead `\uD83D` was stripped out of every
+  other U+1F3xx–1F5xx emoji. `"## 📊 Metrics"` became `"\uDCCA Metrics"`, an unpaired
+  UTF-16 code unit, which then flowed through `extractFeatures` into `resources` and
+  `resources_fts`. With `u` the class matches whole code points: the four listed emoji are
+  stripped, the rest survive intact.
+- **An `eqeqeq` report that must not be taken at face value.** `scripts/launch.mjs:46` used
+  `e?.status != null` — the deliberate both-nullish idiom. Rewriting it as `!== undefined`,
+  which is what the rule suggests, would be a behaviour change: `execSync` reports a
+  signal kill with `status: null`, and the result would read `npm exited null`. Coalescing
+  first (`e?.status ?? null`) keeps the original semantics exactly, `0` included.
+- `scripts/extract-repos.mjs:37` — `let` that is never reassigned.
+
+`tests/lint-gate-coverage.test.mjs` pins the gate open through eslint's own
+`isPathIgnored()` rather than a substring match on the config, so a config-format change
+cannot make it pass vacuously. Its second half guards the sibling gate with the identical
+failure mode: `ci.yml` enumerates the shellcheck targets by hand, and
+`scripts/pre-agent-inject.sh` already spent a release outside that list. Both assertions
+were mutation-verified.
+
+### corrections to the v3.75.1 notes below
+
+- **knip does not skip `scripts/`.** The v3.75.1 note says "eslint and knip both skip
+  `scripts/`". Only the eslint half is true. `knip.json` lists `scripts/**/*.{mjs,js}` in
+  both `project` and `entry` — it scans the directory, and the stray `export` escaped
+  because **an entry point's exports are exempt from the unused-export report by
+  definition**, not because the file was unseen. The evidence is in the report itself: zero
+  of the 31 unused exports carry a `scripts/` path. The distinction matters because the two
+  causes have different fixes, and the sentence as written points at the wrong one.
+
+Suite **300 files / 4857 tests** (from 298 / 4844), eslint clean with `scripts/` now inside
+the gate, shellcheck clean over four scripts, knip unchanged at 0 unused files / 31 unused
+exports — both new exports have real consumers, so the round adds no dead surface. Denoise
+A/B at baseline (precision P@10 0.811, vocab-mismatch R@10 0.341, cjk_mixed P@10 0.940) with
+all four behavioural probe groups green — though that suite is structurally blind to this
+release's main change: its fixtures seed `importance` directly and never run maintenance, so
+"unchanged" here means no collateral damage to retrieval, not that the lever was evaluated.
+
+**What was deliberately NOT built.** The investigation started from a different hypothesis —
+that heavily-injected, never-cited rows need a hard gate that stops injecting them — and the
+data refuted it. A candidate gate of `decay_seen >= 20 AND cited_count = 0` matches 631 rows,
+while 331 of the 510 rows that have *ever* been cited also carry a lifetime `decay_seen >= 20`.
+Whether those rows had already been cited when they crossed the threshold is unknowable:
+`citation_log` stores per-session aggregates (`injected_n` / `cited_n`), never a
+per-observation citation timestamp. That unknown is exactly what such a gate's safety rests
+on, so no gate ships. Deciding it needs a new column recording `decay_seen_count` at first
+citation, and several weeks of data.
+
+## v3.75.1 — what independent review found in v3.75.0, including a regression and three false claims
+
+**Upgrade note.** Upgrade from v3.75.0. Three independent reviews of that release landed
+*after* the tag went out; between them they found one behaviour regression, one half-wired
+fix, and three statements in the v3.75.0 notes below that are not true as written. Those
+statements are corrected in place rather than rewritten, so the record of what was claimed
+survives.
+
+### the regression: auto-compress marking reached only one project per 24h
+
+v3.75.0 moved `markAutoCompressible` off SessionStart onto the auto-maintain worker and
+said *"this moves **when** the marking runs, not **what** it marks."* **That sentence was
+wrong.** The scope did survive each invocation — but the worker sits behind
+`last-auto-maintain.json`, a *single* gate file in the one global runtime directory. There
+is no per-project key. Whichever project's SessionStart won the 24h gate was the only
+project whose rows got marked; with N projects in daily rotation, N−1 never got the
+**7-day accelerated noise pass** at all.
+
+Reproduced before fixing, on two projects through the real worker argv: project A ended
+with 3 rows at `COMPRESSED_AUTO`, project B with **zero**. Being precise about the blast
+radius, because the first framing of this overstated it — B's rows are not orphaned
+forever; the whole-DB decay still reaches them at 30 days. What was lost is the 7-to-30-day
+window and the compressible disposition inside it.
+
+The marking now runs on its **own per-project gate**, before the global one, so every
+project gets it daily while the expensive pass (VACUUM snapshot, purge, decay, dedup)
+stays global and still runs once a day in total. Both existing tests stayed green through
+the regression because each drives exactly one project; the new suite drives two, and a
+source guard now fails if the marking call drifts back inside the global gate.
+
+### the half-wired fix: the query cap covered one of the event's two hooks
+
+UserPromptSubmit fires **two** commands — `scripts/user-prompt-search.js` (the FYI block)
+and `hook.mjs user-prompt` (the `<memory-context>` block). v3.75.0 capped the first and
+titled the item "UserPromptSubmit query building". The second still called
+`sanitizeFtsQuery` on the raw prompt every turn, and it is the worse half: its stdin
+ceiling is 256KB against path A's 64KB, with no truncation in between. Measured at that
+ceiling: **186ms → 2ms**. A normal prompt stays byte-identical either way.
+
+The caps now live in `lib/ups-query.mjs` and both faces import them, so this cannot be
+present on one hook and missing on the other again — the same one-home-per-rule treatment
+the five twins got in v3.75.0.
+
+### also fixed
+
+- **A stray `export` keyword.** In `scripts/user-prompt-search.js` it landed before a
+  comment block instead of its declaration, so it silently attached to the constant seven
+  lines below: `IDENTIFIER_BYPASS` stopped being exported and `UPS_QUERY_CAPS` started.
+  Inert (nothing imports either), and invisible to every gate in the repo — **eslint and
+  knip both skip `scripts/`**, which is why the v3.75.0 "byte-identical export name set"
+  claim was true and yet could not see this file.
+- **A ninth uncollapsed transcript scan.** `countDeliberatePersistence` did its own
+  read + per-line parse two lines away from two scanners that had just been migrated,
+  charging a full re-parse against the pass whose entire purpose was to stop doing that.
+  It now shares the memo like its eight siblings.
+- **`picomatch` was an undeclared dependency** of `tests/coverage-scope.test.mjs`,
+  resolving only through npm's flat hoist of a vitest transitive. Now a devDependency.
+  (knip had been reporting it under `Unlisted dependencies`; the v3.75.0 note read only
+  the `Unused exports` line.)
+- **`scripts/pre-agent-inject.sh` was outside the shellcheck gate** and not executable
+  (`100644`, unlike its `100755` sibling). Both fixed; it is clean under shellcheck.
+
+### corrections to the v3.75.0 notes below
+
+- **The MCP-import revert instruction does not work.** `quality_tier` is only ever written
+  upward — no shipped path lowers it — so re-importing re-grants `installed` rather than
+  restoring `community`. The actual revert is `registry remove` followed by
+  `registry import --source <preinstalled|user|github>`, or pinning v3.74.1.
+- **CLI `get` gained `prompt_number`, not `created_at`.** `created_at` has been printed in
+  the `P#NN <date>` header since before v3.75.0; the field loop skips it deliberately.
+- **The auto-compress item claimed an invariant it did not hold** — see the regression
+  above.
+
+Suite **298 files / 4844 tests**, eslint clean, shellcheck clean over four scripts, knip
+0 unused files / 31 unused exports / **0 unlisted dependencies**.
+
+## v3.75.0 — the audit batch: five hand-copied twins collapsed, four hot paths bounded, and a README that no longer disagrees with itself
+
+**Upgrade note.** Three defaults move, all of them toward what the other face already did.
+`mem_registry import` now grants `quality_tier='installed'` like its CLI twin always has,
+so a resource imported over MCP ranks and gates the same way as one imported from the
+shell — if you relied on MCP imports staying at `community`, ~~re-import is the revert~~
+**[corrected in v3.75.1: re-importing re-grants `installed`; `quality_tier` is never
+written downward. Use `registry remove` then `registry import --source <…>`]**.
+`CLAUDE_MEM_RECOMMEND_MODE=live` no longer pretends: Phase 2 was never built, so the value
+now resolves to `shadow`, warns once per process on stderr, and `doctor` reports it as an
+inert flag rather than letting the log claim `mode='live'`. And `get` on the CLI now prints
+`prompt_number` ~~and `created_at`~~ **[corrected in v3.75.1: only `prompt_number` is new;
+`created_at` was already in the `P#NN <date>` header]** for prompt rows, which the MCP face
+has printed all along;
+existing labels (`Text:`, `Files:`) are unchanged, so the visible delta is additive.
+Nothing here needs a migration; pin v3.74.1 to keep the old behaviour.
+
+### what the npm page was telling users
+
+The headline retrieval metrics disagreed with themselves in **four** places (the audit
+named three; `README.zh-CN.md` still carried the entire retired lexical row). Rather than
+copy `baseline.json`, they were re-measured — three runs of `benchmark.mjs
+--production-hybrid` agree in every digit: R@10 **0.8998** / P@10 **0.8497** / nDCG
+**0.9712** / MRR **0.9611** / p95 **~1.79ms**. All four sites now read those numbers and
+name the command that reproduces them. Published precision is the measured 0.8497, not
+`baseline.json`'s 0.8597: ci-gate passes within its 5% tolerance, and re-capturing the
+baseline would lower the CI floor rather than fix a document.
+
+The env-flag surface had rotted to **9 documented out of 70** the shipped code reads — the
+whole `SKIP_*` family, the `UPS_*` tuning set and the citation loop were undiscoverable.
+README now covers 70/70, grouped by what each flag controls, with experimental arms and
+test-only names called out. `tests/readme-env-flags.test.mjs` keeps it from rotting again:
+it reads `package.json#files`, so a flag only `benchmark/` touches is not treated as a user
+knob, and it fails in both directions — undocumented flag, and documented name no shipped
+file references.
+
+### five twins, collapsed onto one body each
+
+Each of these was two hand-copies of one rule, and in three cases the copies had already
+drifted. The pattern this project pays for most is a guard wired into one face and missing
+on the other, so the fix is one home per rule, not one more patched instance.
+
+- **registry import/remove/reindex** — the last CLI/MCP pair where both sides wrote their
+  own SQL. Drift was real and reproduced before it was fixed: a parity pin driving a
+  spawned `cli.mjs` and a real `server.mjs` over stdio failed on exactly one column,
+  `quality_tier: cli="installed" mcp="community"`. Now `lib/registry-core.mjs`. The pin
+  compares every non-identity column, so a column added later is compared by default.
+- **auto-dedup `superseded_by` stamping** — the exact channel grew `AND superseded_at IS
+  NULL` in v3.63; the fuzzy channel never got it. This is the **seventh** time this one
+  invariant has drifted between hand-copies, so both channels now stamp through
+  `stampDedupSuperseded` in `lib/maintain-core.mjs`, and a fifth case asserts `hook.mjs`
+  still routes through the helper — re-inlining an UPDATE fails.
+- **type-quality weights** — a SQL `CASE` plus two JS objects, kept equal by comments. The
+  values did agree; the next re-weighting is what three copies are waiting for, and two of
+  them sit on injection paths where a wrong weight is silent. `TYPE_QUALITY_CASE` is now
+  generated from the one table, and the test evaluates generated and pre-generator SQL side
+  by side in SQLite across all six types plus unknown/empty/NULL. Ranking is metric-coupled,
+  so the benchmark was re-run: identical in every digit to the run before the change.
+- **`get`'s prompt and event sources** — the third and fourth sources to join `get-core`.
+  The prompt source had drifted the way the session source did before it.
+- **`hook.mjs`'s two triplicated blocks** — the 13-column fast-summary INSERT (three
+  retypings) and the episode-flush fallback, which carried three comments claiming parity
+  with `flushEpisodeGroup` while diverging from it twice: it ignored
+  `CLAUDE_MEM_SKIP_EPISODE_LLM`, and a failed flush-file write threw out of the loop into a
+  `finally` that deleted the claim file, abandoning the subs not yet written. Fast-summary
+  truncation limits are deliberately **not** unified — the Stop path stores roughly twice
+  what the SessionStart paths do, every one of those strings is re-injected later, and
+  changing how much text the product injects is a decision, not a refactor's to make. A
+  test pins the difference so unifying stays something someone chooses.
+
+### four hot paths, measured before and after
+
+- **Stop transcript parsing.** `handleStop` asked the same `.jsonl` eight different
+  questions, each doing its own read + split + per-line parse. On a real 5.7MB transcript:
+  **165.8ms → 30.0ms**, peak RSS **118MB → 80MB**. `lib/transcript-scan.mjs` memoizes one
+  parse behind a path+size+mtime key — a memo, not a rewrite; every scanner keeps its
+  per-entry logic byte for byte. mtime is in the key because an in-place rewrite landing on
+  the same byte count would otherwise be served stale (dropping it stayed green until a test
+  covered that case). Above a 24MB cap nothing is retained — parsed entries cost ~3.45× the
+  file in heap — so a very large transcript behaves exactly as before rather than risking an
+  OOM-killed hook.
+- **UserPromptSubmit query building.** The only upstream guard capped what is *read*, not
+  what is *computed*: 0.8ms for a normal prompt, 6.2ms for a 64KB ASCII one, **31.8ms for a
+  64KB CJK one** (`extractCjkKeywords` is O(len × dict) over an unsegmented run) — all of it
+  before the model sees the turn. With caps (2000 chars, 64 terms) on that surface only:
+  **0.2ms / 1.4ms**. An explicit `claude-mem-lite search` stays uncapped and searches exactly
+  what was typed. `denoise-ab` VERDICT NEUTRAL, every delta 0.000, all probes green — and
+  that neutrality is structural (no fixture comes near 2000 characters), so the load-bearing
+  evidence is that a normal query is byte-identical capped and uncapped.
+- **Agent dispatch.** `CLAUDE_MEM_SUBAGENT_INJECT` is default-off yet started a Node
+  interpreter on every dispatch. Both registries now point at `scripts/pre-agent-inject.sh`,
+  which execs the launcher only when the flag is on: **22.6ms → 2.4ms**.
+- **SessionStart.** Two full-table conditional UPDATEs marking auto-compressible rows ran on
+  every boot, outside the 24h gate that already guarded decay, purge and backup a few lines
+  away. Nothing about starting a session makes a 30-day-old row newly compressible; the
+  marking moved onto the maintain worker, project scope forwarded through argv so it does not
+  quietly widen to the whole DB. **[corrected in v3.75.1: the scope survived, but the global
+  24h gate collapsed the marking to ONE project per day. Fixed with a per-project gate — see
+  the v3.75.1 entry above.]**
+
+### coverage, containment, and a sandbox that runs on its own
+
+- **Coverage scope.** The gate measured 22 hand-picked root modules; `lib/`'s ~70 shipped
+  modules — every shared core extracted since v3.4x — were outside `include` entirely. Now
+  **92 files: statements 82.94% / branches 77.17% / functions 87.27% / lines 86.55%**. The
+  re-scoping *raised* the number, so the audit's premise that including `lib/**` would force
+  a threshold downgrade was wrong: 75/75/65 is unchanged and now guards 4× the files.
+- **Test containment.** Clearing `CLAUDE_MEM_DIR` stops a relocated dev DB from being read,
+  but not a test that never sets it — that one takes the default, i.e. the live database, as
+  v3.73.0 did when it wrote a `rateLimited` marker there. `resolveDataDir` now redirects the
+  live dir to a per-run sandbox whenever `CLAUDE_MEM_TEST_GUARD` is armed. It redirects
+  rather than throws: throwing took 181 of 289 test files down at collection, because
+  `schema.mjs` resolves at import time and "imported the module" is not the failure.
+- **Sandbox CI.** `tests/sandbox` (103 checks over both install paths) ran only when someone
+  remembered. Now weekly + `workflow_dispatch`, one job per phase (the README records phase A
+  chaining into B crashing B), opening or commenting on a single issue on failure. Not
+  nightly: the phases drive real `npm install`s over the network.
+
+### where new code goes
+
+The audit called the god-module split "half finished". Re-reading it, that is not what
+happened: v2.41's `cli/` split did stop, but a different direction took hold and has produced
+**72 modules under `lib/`**. So the fix is a stated convention rather than a split project —
+shared by two or more faces goes to `lib/` (registered in **both** `source-files.mjs` and
+`package.json#files`; a missed registration has shipped a broken tarball three times), owned
+by one face stays put, and line count is not the trigger.
+
+Suite **293 files / 4816 tests** green, eslint clean, knip unchanged at 0 unused files / 31
+unused exports with a byte-identical name set — the five new exports each have a real
+consumer. Every new guard in this batch was mutation-checked against the assertion it
+protects, with each mutated file verified byte-identical after restore.
+
+## v3.74.1 — v3.74.0 silenced Go panics; the filter is now a superset of the trigger
+
+**Upgrade note.** Upgrade from v3.74.0. That release closed a real defect but with an
+over-broad instrument, and independent pre-tag review caught it after the tag went out:
+a failure that trips the error-recall trigger but whose output does not match the
+extractor's prose regex was answered with silence, and that class is larger than it
+looked. `panic: assignment to entry in nil map` got no recall while `panic: runtime
+error: index out of range` did — purely because the second message contains the substring
+`error`. Whether you got recall depended on the wording of your panic. Verified
+end-to-end against a real store: a row the pre-v3.74.0 query did retrieve was not
+retrieved under v3.74.0.
+
+The fix keeps v3.74.0's goal and drops its instrument. The extractor's line filter is now
+`ERROR_LINE_RE || HARD_ERROR_RE` — the selection filter is a superset of the trigger, so
+whatever convinced `isHardError` this was a failure is by definition also something terms
+are read from. The class is closed by construction instead of by listing failure shapes.
+v3.74.0's own headline case improves too: `npm run build` dying on ENOENT now queries
+`['npm','run','build','code','enoent','syscall']` rather than being silenced, i.e. it
+searches the failure instead of either the command's topic (pre-3.74.0) or nothing
+(3.74.0). The residual gate still fires when extraction genuinely yields nothing — empty
+output, or a line that is only stop words.
+
+Two comment claims from v3.74.0 were also falsified by review and corrected. `ERROR_LINE_RE`
+has no word boundary: it matches substrings, and it matches six alternatives, not just
+`error` — the old comment asserted the opposite twice over. And `errWords.length === 0`
+reads as "no error term that is not ALSO a command word", because term collection dedups
+across both classes command-first; `docker compose up -d` and `docker stack deploy` decide
+differently on byte-identical output. That asymmetry predates this work and is now
+documented rather than silently changed.
+
+Tests +5, each pinning a behaviour a reviewer mutated without anything dying: the line
+filter's non-`error` alternatives (`command not found` flips the gate), the 3-line scan
+budget (line 1 holding only stop words flips it), the merged term ORDER (golden list —
+order is what the 6-term cap truncates), and cross-class dedup. The end-to-end case now
+seeds two COMPETING rows — one matching the command's words, one matching the failure —
+and asserts the failure-topic row is recalled; the v3.74.0 version asserted absence and
+so could have passed on an empty store. Suite 4750/4750; `denoise-ab` unchanged to four
+decimals with all behavioral probes green.
+
+**On this face's citation rate.** The measured 4–6% for `error_recall` (against pre-tool
+recall's 38–42%) predates both releases. The population it measures has changed twice
+now, so a rate movement across these boundaries is not on its own evidence of quality.
+
+## v3.74.0 — the error-recall surface was searching the command, not the error
+
+**Upgrade note.** Superseded by v3.74.1 — upgrade past this version. It introduced a
+regression that silences Go panics whose message lacks the substring `error`; see above.
+
+### two pattern lists that were never the same list
+
+This surface fires on `detectBashSignificance`'s `isHardError`, then extracted keywords
+using a second, unrelated regex. `HARD_ERROR_RE` accepts `ERR!`, `enoent`, `panic`,
+`traceback`. The extractor's line filter took `error|fail|exception|cannot|not found|
+undefined|null` as substrings. Nothing kept the two in sync, and npm sits exactly in the
+gap: `npm ERR! code ENOENT / npm ERR! enoent ENOENT: no such file or directory` clears
+the trigger, then yields **zero** lines to extract from — no `error`, no `fail`, no `not
+found` (npm says "no such file"). The keyword set fell back to command words alone,
+literally `['npm','run','build']`, and the FTS query went looking for observations about
+npm and building.
+
+Measured on the live library: `npm run build` failing on a missing module returned two
+release records ahead of the one row that explained it. A Python traceback's head lines
+degrade identically to `['python','train.py']`.
+
+- **`planErrorRecall()`** in `bash-utils.mjs` is the decision seam — pure, so it is
+  testable without spawning a hook, the same split `formatErrorRecallHints` already uses.
+  This release answered "no extractable error term" with silence rather than a
+  command-topic match. **That instrument was too broad** — see v3.74.1, which keeps the
+  goal and replaces the mechanism.
+- **Command words stay in the query.** Demoting them to a fallback was implemented,
+  measured, and rejected: replaying five real failures, error-terms-only fixed the
+  missing-module case but regressed two others — dropping `database` lost the plugin-mode
+  data-dir row for a failed DB open, dropping `vitest` lost the test-failure row. Command
+  words carry domain anchoring, not just BM25 noise. The demote-to-fallback variant
+  measured byte-identical to error-terms-only, because the primary query always filled
+  its `LIMIT 3` and the fallback never ran. This finding still holds in v3.74.1.
+
+Four mutants were killed by the tests shipped here, including one restoring the ungated
+behaviour, which also reddens an end-to-end case driving the real PostToolUse entry point
+— something the pure-function tests cannot see. That wiring test earned its place
+immediately: the first cut of this change imported `planErrorRecall` from `utils.mjs`
+without re-exporting it there, which broke `hook.mjs` load entirely and turned 119 tests
+red. What those tests did NOT pin is what review later found — see v3.74.1.
+
+### doctor no longer exits 1 over a process it cannot do anything about
+
+`doctor`'s stale-process check rendered with `warn()` (⚠) and then incremented the
+issue counter — the only check in the pipeline doing both; the other eight `issues++`
+sites all follow `fail()`. `buildDoctorSummary`'s own JSDoc states the contract it was
+breaking: issues are ✗-level (action required), warnings are ⚠-level (informational).
+The visible result was a run where every line on screen was ✓ or ⚠ and the summary still
+said `1 issue(s) found.`, exit 1.
+
+An old process is exactly the finding a doctor run cannot act on: auto-update bumps
+`installed_plugins.json` but cannot kill an MCP process a live session already spawned,
+so a correct, healthy install reports it for as long as that session stays open. **If you
+script against `doctor`'s exit code, note that a stale process alone no longer makes it
+non-zero.** Everything `fail()`-level still does. This is the same site that failed the
+v3.70.0 release `validate` job on vitest's own worker processes; the narrowing done then
+removed the false positive but left the accounting, so a *true* positive still went red.
+
+Two tests were already asserting the fixed behaviour and failing against it — one of
+them named "ignores a stale NON-ACTIVE cache version instead of going red forever". They
+had been written off as host-sensitive. They were not: they were correct guards on a real
+defect, and they pass now without being modified.
+
+### a test that depended on what sits above $TMPDIR
+
+`binding-error-diagnosis` needs `npm install` to fail so it can assert npm's diagnosis
+reaches inherited stderr, and it arranged that by running in an empty temp dir. But npm
+searches PARENT directories for a package.json, and `$TMPDIR` is commonly nested under
+one — so npm found an unrelated manifest, installed its dependencies, and exited 0. The
+case now writes an unparseable package.json itself, failing locally and immediately on
+`EJSONPARSE`: same assertions, still no network, and 5131ms → 362ms because it is no
+longer really installing somebody else's dependency tree.
+
+## v3.73.0 — the column nothing filled, and the update that never phoned home
+
+**Upgrade note.** No action needed, and no default changed. Two things start happening
+that were not happening before: manual saves and the daily re-enrich pass now classify
+`observations.scope`, and the keyed LLM providers plus the auto-update version check work
+behind an HTTP proxy. Both were designed to be no-ops where they already worked.
+
+One cost worth stating plainly: until your scope backlog drains, the daily maintenance
+pass makes up to twice as many Haiku calls — the classification pass is budgeted
+separately from the re-enrich slice rather than carved out of it, for reasons in the code
+at the call site. Each of the extra calls is enum-only (60 max tokens against 500). Drain
+it in one go with `optimize --run --task re-enrich --scope scopes --max 100` if you would
+rather not pay it daily. To revert, pin `npm i claude-mem-lite@3.72.1`.
+
+### a read lever whose column only one of three writers filled
+
+v44 added `observations.scope` (`file` / `module` / `project` / `environment`) and the
+`CLAUDE_MEM_SCOPE_FILTER` lever that skips environment-scoped rows on file-triggered
+recall. Three code paths create observations. Exactly one of them — the episode
+summarizer — ever set the column.
+
+The live reading that made this concrete: of the rows written across two days, the
+summarizer's `change` rows were 48/50 classified and every `bugfix` / `decision` /
+`discovery` / `refactor` / `feature` row was **0/41**. Those are the lesson-bearing rows
+pre-tool recall actually injects, so the lever was inert on precisely the population it
+exists to filter.
+
+- **Save-time enrichment** (`lib/save-enrich.mjs`) now classifies scope on the Haiku call
+  it was already making — no extra round trip — filling only when the column is empty,
+  re-checked inside the existing `BEGIN IMMEDIATE` transaction.
+- **The re-enrich passes** (narrow / wide / aliases) carry scope on their existing calls,
+  written through `COALESCE` so an omitted or off-enum value can never blank a label.
+- **A dedicated backfill scope**, `optimize --scope scopes`. It is not redundant with the
+  three above: narrow and wide both require a MISSING lesson and aliases requires MISSING
+  aliases, but 1955 of the 2041 unclassified rows had **both**, so the existing passes
+  could reach about 3% of the backlog. This one writes a single column, never stamps
+  `optimized_at`, and is guarded by `AND scope IS NULL` against a save-enrich worker
+  landing mid-classification.
+
+The scopes pass is budgeted **separately** rather than carved out of the re-enrich slice
+the way `aliases` is. Its candidate pool is a near-superset of every other scope's, so an
+adaptive half-share would not occasionally borrow from lesson enrichment — it would halve
+that cadence permanently. It is also an enum-only call (60 max tokens against 500), so one
+full item slot mis-prices it by an order of magnitude.
+
+The six prompts that classify scope now share one legend instead of hand-copied wording —
+five render sites, because the episode summarizer's two templates append one common schema
+tail. A column whose `environment` means something different per writer makes the read
+lever incoherent.
+
+### the network paths that were proxy-blind, and nothing could see it
+
+Node's global `fetch` ignores `HTTP(S)_PROXY`. A CONNECT tunnel already existed for that
+reason — but as two private functions inside `haiku-client.mjs`, reachable only from the
+OpenRouter call site. Everything else kept calling bare `fetch`:
+
+- `hook-update.mjs`'s **version check** and its **release manifest / signature asset**
+  download. Behind a proxy both fail instantly, and because `checkForUpdate` is silent on
+  network failure by design, the plugin then reports itself permanently up to date. (The
+  release *tarball* was never affected — it goes through `curl`, which honours the proxy
+  environment natively. An earlier draft of this entry claimed otherwise.)
+- Both **`ANTHROPIC_API_KEY`** paths. The OpenRouter site had been tunnelled since the
+  outage that prompted it; the Anthropic ones never were, so the better-supported provider
+  was the broken one. Found in pre-tag review, together with the fact that the new doctor
+  check would have reported it green — it probed the hop that code was assumed to use.
+
+The tunnel is now `lib/proxy-fetch.mjs`, with the redirect following the swap requires: the
+release asset always 302s from github.com to the CDN, which native fetch had been doing for
+free. Redirects drop `Authorization` on a cross-host hop and never replay the body, and the
+github.com host lock now runs BEFORE transport selection — having a proxy configured must
+not route around a supply-chain guard.
+
+`doctor` also had no LLM-provider check at all. It reported 21 green checks on a machine
+where a configured API key had never once been usable and every background call was paying
+the CLI fallback — 13.5s against 1.4s. It now reports the provider and whether it is
+reachable over the hop the product actually uses. Transport only, no key sent: a rejected
+key answers HTTP 401 and says so, while unreachability is the silent class.
+
+Three test suites that mock `fetch` needed their proxy env neutralized. Two of them are
+subprocess harnesses whose preflight probes still passed — they verify the stub is
+installed, not which branch runs.
+
+### three things the pre-tag review caught, all in the new code
+
+The reviewer went idle without filing a report, but left three probes on disk. Every one
+of them reproduced:
+
+- **The proxy password was printed.** `HTTP(S)_PROXY` legitimately carries `user:pass@`,
+  and the new doctor line echoed the URL verbatim — onto the terminal and into
+  `doctor --json`, which is the text people paste into bug reports. The URL is redacted to
+  scheme, host and port now, which is all the line needed to be diagnosable.
+- **The reachability check had a false green of its own.** It was a plain TCP connect to
+  the proxy port, so anything listening there read as healthy: a SOCKS-only listener, a
+  proxy that forbids CONNECT, or whatever took the port after the proxy died. A check
+  written to end silent provider failure would have certified a dead provider. It now
+  opens a real CONNECT to the provider host and requires a 200.
+- **`timeout` bounded each phase instead of the whole call.** A proxy that accepted the
+  CONNECT and then went silent rejected at 2008ms on a 1000ms budget. Recomputing the
+  per-phase timers from a deadline did not fix it — a TLS socket wrapping an
+  already-connected socket never finishes its handshake, so `ClientRequest.setTimeout`
+  arms against events that never arrive. The bound is now an explicit timer rather than a
+  claim about when Node arms its own.
+
+## v3.72.1 — the guards the mutation harness said were not there
+
+**Upgrade note.** No action needed. Almost all of this is test-only. The one behaviour
+change: `stats` run from a SUBDIRECTORY now tiers rows against the same project `recent`
+resolves, instead of against the empty cwd-derived name. To revert, pin
+`npm i claude-mem-lite@3.72.0`.
+
+### five spots the new suites did not actually guard
+
+v3.72.0's pre-tag review ran a 51-mutation harness but never delivered a report. The harness
+was still on disk afterwards, so it was re-run against the shipped code: 42 mutations
+applied, 28 killed, **5 survived**. None was a behaviour defect — the shipped code is
+correct — but five things it does were pinned by nothing:
+
+- **Swapping the entry-script and imported-helper filters** in `checkHookScriptDrift` left
+  the whole suite green. Both branches name their files and both raise an issue, so doctor
+  would have told the reader the wrong consequence and no test noticed. This is the same
+  face-swap blindness v3.68.1 fixed on the citation funnel: when every case omits ONE file,
+  a classification swap is invisible. One entry AND one helper are now omitted together, so
+  the pairing is observable.
+- **Forcing `dirSymlink` to false** left it green: nothing asserted the shape wording, so
+  doctor could describe a dev install as a copy install, or a dangling `scripts/` symlink as
+  a plain absent directory. Both are asserted now, with a dangling-link fixture.
+- **The plugin-only skip branch had no fixture at all** — forcing `skipScripts=false` was
+  invisible, and that is the branch that stops doctor prescribing a repair to a correct
+  install. It now builds a real plugin-only shape: a data-only install dir plus a plugin
+  cache version dir carrying `scripts/launch.mjs`.
+- **Making the memo return its first cached value regardless of key** was invisible, because
+  each test resolved one directory after a reset. Two directories are now resolved in one
+  process.
+- **Requiring `.git` to be a DIRECTORY** was invisible. A linked worktree and a submodule
+  both put a `.git` FILE at their root, so the fallback would have quietly stopped working
+  for every worktree user. Pinned with a `gitdir:` fixture.
+
+All five mutations now fail their own new test.
+
+### stats and recent disagreed about "current project"
+
+`computeStatsFeed` filters by `project` but tiers by `inferProject()`, and v3.72.0 gave CLI
+read commands a DB-aware project without threading it through here. Tier classification is
+relative to the project you are standing in, so from a subdirectory the distribution
+collapsed — measured on a fixture, `{active:3, working:1}` became `{active:4}`. The feed now
+takes an optional `currentProject` that steers the tier context only; an explicit
+`--project` still wins over it, and the default stays `inferProject()` because the MCP twin
+has no CLI-layer resolver.
+
+---
+
+## v3.72.0 — three checks that were looking at the wrong thing
+
+**Upgrade note.** No action needed, but one default changes: a `claude-mem-lite` READ
+command (`search` / `recent` / `context` / `browse` / `defer list` / `defer drop` /
+`activity` / `doctor --benchmark`) run from a SUBDIRECTORY of a repo now falls back to the
+enclosing work-tree root's project when the subdirectory's own name holds no rows at all.
+Previously it silently read an empty project. Commands that CREATE rows — `save`,
+`defer add`, `restore`, `import-jsonl`, `activity save` — are unchanged and still name the
+directory you stand in, so a new subproject's first rows are never absorbed into the
+enclosing repo. Pass `--project` to target either explicitly. To revert, pin
+`npm i claude-mem-lite@3.71.0`.
+
+### doctor was grading the wrong manifest
+
+`checkDevDrift` classifies whatever the caller hands it, and `install.mjs` hands it
+`SOURCE_FILES` — which holds zero `scripts/` entries. Hook scripts install from the
+separate `HOOK_SCRIPT_FILES` manifest into `~/.claude-mem-lite/scripts/`, and every
+settings.json hook command names one of those absolute paths. So the failure
+`source-files.mjs` documents — a tarball published without `scripts/` — left every hook
+dead while doctor printed an all-clear. That is the fatal-in-every-shape case the v3.69.0
+severity split was written to grade, and it was the unmonitored one.
+
+The new `checkHookScriptDrift` does NOT reuse the SOURCE_FILES severity. #10686's rule is
+to grade by which path RESOLVES the file, and the two manifests answer differently: a dev
+install symlinks the whole `scripts/` DIRECTORY, so per-file `lstat` sees plain files and
+"plain among symlinks = drift" does not exist there at all — porting it would flag every
+healthy dev install with eight phantom drifts. A file missing there is missing from the
+repo. In a copy install an entry script is named by a command line and
+`user-prompt-search.js` resolves `./prompt-search-utils.mjs` against the install dir. Both
+classes are fatal in both shapes, so the entry/helper split drives the message and never a
+demotion. The entry-point set is re-derived in test from the `command` strings in
+`hooks/hooks.json` rather than kept by hand.
+
+### the CLI and the session's hooks could name different projects
+
+`inferProject()` names the directory the process stands in. Inside a hook that is always
+the session root, because Claude Code sets `CLAUDE_PROJECT_DIR`; in a bare terminal it does
+not, so `cd src/auth && claude-mem-lite recent` asked for `src--auth` and answered "No
+recent observations" about a project full of them.
+
+Anchoring on the git work-tree root was tried and reverted before v3.69.0 shipped, because
+it breaks the mirror case: Claude Code started in `mono/packages/api` sets
+`CLAUDE_PROJECT_DIR` to the PACKAGE dir, so hooks write `packages--api` while a git anchor
+sends the CLI to `mono--monorepo`. No path-derived rule separates the two — the difference
+is which name the hooks actually chose, and only the DB knows that. `lib/cli-project.mjs`
+computes both candidates and prefers whichever already holds rows, cwd winning ties; the
+probe reads `observations` and `deferred_work` so `defer add` at the root and
+`defer list` from a subdirectory cannot disagree one table over. A failing probe degrades
+to the old answer rather than taking the command down.
+
+`project-utils.mjs` stays DB-free and byte-identical on the hook hot path; the naming rule
+was extracted so the CLI candidate uses it instead of a copy, and the cwd candidate still
+routes through `inferProject()` so "what does this process call its project" keeps one
+definition.
+
+### the Key Context marker outlived its own garbage collector
+
+The marker is session-scoped — `injected-ids.mjs` documents "session-lifetime validity (no
+time window)" — but it is swept at 24h mtime on the policy borrowed from the cooldown and
+injected-ids markers, whose semantics genuinely are time-windowed. A session running past a
+day had its own exclude-set deleted underneath it and began re-injecting rows the Key
+Context block was still showing. Keying the sweep on session liveness does not fix it:
+`hook.mjs` marks any session older than `STALE_SESSION_MS` abandoned by
+`started_at_epoch`, so the long session reads as dead there too. Still being read is the
+signal that separates them, so the reader now refreshes the stamp (gated at one hour, since
+it runs on every prompt) and the age sweep means "a day with no prompt in this session".
+
+`handlePreCompact` also skipped the recorder entirely when the re-rendered body was empty,
+while `handleSessionStart` writes the marker even when empty. The early return left the
+previous render's ids standing as an exclude-set for content compaction was about to
+remove — suppression of rows no longer shown, which is D#123 review C-1 on the twin leg.
+
+---
+
+## v3.71.0 — the update notice is for you, not for the assistant
+
+**Upgrade note.** No action needed. The "a new version is available" line returns to
+being shown to *you*; v3.70.0 had quietly turned it into something only the assistant
+could read. To revert, pin `npm i claude-mem-lite@3.70.2`.
+
+v3.70.0 merged SessionStart's three stdout writers into one envelope, which was
+necessary — Claude Code parses hook stdout as a single JSON document, so three writes
+meant none of them parsed. But it folded the update banner into
+`hookSpecificOutput.additionalContext` under `suppressOutput: true`. Content preserved,
+audience lost: `📦 claude-mem-lite: v3.71.0 available` was being delivered to the model
+as context instead of to the user as a notice. That release listed it as a known
+consequence and deferred the fix rather than guess at a channel; this is the fix.
+
+Claude Code renders a command hook's top-level `systemMessage` as its own
+`hook_system_message` conversation message, independently of `additionalContext` —
+from the 2.1.234 bundle:
+
+```js
+if (G.systemMessage) { … yield { message: yc({ type: "hook_system_message", … }) } }
+```
+
+and its embedded docs say `systemMessage` — "Display a message to the user (all
+hooks)". Both fields may ride the same envelope, so one document now carries context
+for the model and a notice for the user. Verified by reading the implementation, not by
+observing a live session — the same limit the v3.70.0 note stated.
+
+### Also in this release
+
+| Change | Detail |
+|---|---|
+| **A dropped hook contribution now says so.** `queueHookContext` discards a contribution whose `hookEventName` disagrees with what the process already queued, because one envelope carries exactly one event name and the host rejects a mismatch outright. That discard was silent. | Unreachable today — all three call sites are event-consistent — but `flushEpisode`'s `hookEventName` **defaults** to `'PostToolUse'`, so a caller that forgets the argument would both mis-tag its receipt and have it vanish. Work disappearing without a trace is this codebase's most-repeated defect class; it now writes a line naming both events to stderr, which the host never parses as the envelope. |
+| **The sandbox install harness is in the repo.** `tests/sandbox/` — 103 checks across both documented install paths (`/plugin install`, and `npm i -g` + `claude-mem-lite install`), each covering install → use → auto-update → self-heal → uninstall. | It found five defects in v3.70.0 that 4500 unit tests could not, because each lived in the difference between install *shapes* rather than inside a function. Deliberately **not** in `vitest run`: it drives real `npm pack` / `npm i -g` and a real MCP server over stdio, so it needs network and minutes. `tests/sandbox/README.md` records the conventions that make it honest — inherit the ambient env, never nest the sandbox under `$HOME`, give each fake root its own dependency tree, and pair every "it goes red" check with a control proving the thing is genuinely broken. |
+
+273 test files / 4633 tests green, eslint clean, shellcheck clean, knip 31 unused
+exports (the harness adds no manifest churn: `tests/` is outside knip's project globs,
+outside `package.json` `files`, and not collected by vitest). Sandbox 103/103.
+
+## v3.70.2 — the ABI-mismatch check printed the path and dropped the diagnosis
+
+Node's message for a stale native binding is five lines, and the filename is line 0:
+
+```
+[0] The module '/…/better_sqlite3.node'
+[1] was compiled against a different Node.js version using
+[2] NODE_MODULE_VERSION 127. This version of Node.js requires      ← the diagnosis
+[3] NODE_MODULE_VERSION 137. Please try re-compiling or re-installing
+[4] the module (for instance, using `npm rebuild` or `npm install`).
+```
+
+Four surfaces rendered that with `.split('\n')[0]`, so for the one fault family this whole subsystem exists to detect, each of them showed a bare path and dropped the ABI numbers. `lib/binding-probe.mjs` even asserted in a comment that this string is "the highest-value line `doctor` prints" — for a stale binding it carried no diagnosis at all.
+
+Not a regression: the same truncation is in v3.70.0 and in every build before it. It became conspicuous in the case v3.70.1 had just corrected, where the rendered line put a path from an *ancestor* tree immediately next to "this install owns no node_modules" — two halves naming different trees, which reads as a contradiction even though neither half is false.
+
+Flattening replaces truncating, at a single home (`flattenBindingError`), so the path and the numbers both survive on one line that is still safe for a JSON envelope, a JSONL record and a hook receipt. Fixed on all four surfaces, not just the one that was reported:
+
+| Surface | Was |
+|---|---|
+| `doctor`'s per-root binding failure | a bare path |
+| the **persisted** breakage marker | a bare path — and `doctor` reads it back hours later as `a fire failed ~Nh ago (<reason>)` |
+| `setup.sh`'s probe diagnostic (`binding-probe-cli`) | a bare path |
+| the same file's lock-contention message | a bare path |
+
+`bareProbe` keeps its own inlined copy on purpose: it is the fallback for a tree where `lib/` failed to import, so the shared helper is unreachable there — importing it would have turned the fallback into a `TypeError`.
+
+Verified against this machine's genuinely ABI-127 `~/node_modules/better-sqlite3` rather than a fixture: `doctor` now prints `NODE_MODULE_VERSION 127 … requires NODE_MODULE_VERSION 137` alongside the path and the correct `npm install --omit=dev` repair. 273 test files / 4626 tests green, eslint clean, shellcheck clean, knip 31, sandbox 103/103. All three flattening sites are mutation-verified against the exact `.split('\n')[0]` they replaced.
+
+## v3.70.1 — v3.70.0's fix for a false green over-corrected into a false red
+
+One line of v3.70.0. Fixing the false-green case (a certified code home dropped from the probe set instead of reported) was done by pre-judging any such root **broken** without probing it. That is wrong in the other direction: Node resolves a specifier up the directory tree, so a code home nested under a parent that owns a working `better-sqlite3` loads perfectly well. On the shipped build the ground-truth probe returned `{ok: true}` while `doctor` printed
+
+```
+✗ better-sqlite3 unusable in managed install (~/.claude-mem-lite):
+    node_modules/better-sqlite3 is absent — every hook and the MCP server that
+    load this install throw ERR_MODULE_NOT_FOUND
+```
+
+— exit 1, about an install whose hooks were fine. Same class of defect v3.70.0 exists to remove, one step further out, and introduced by that release.
+
+Whether a root *owns* its dependency tree was never the question; whether it can **load** is, and only the probe answers that, because only the probe walks Node's real resolution chain. So every certified root is now probed. The repair still differs by case: a root that owns no tree gets `npm install --omit=dev` (a `npm rebuild` of a package that is not installed exits 0 and heals nothing), a present-but-unloadable tree gets the rebuild.
+
+The failure message also stopped asserting what it could not know. It claimed "none resolvable from a parent directory" while printing, in the same line, a probe error naming the parent tree it had just loaded from. It now reports the probe's own error plus the one fact that is certain: this install owns no tree, so there is nothing here to rebuild.
+
+Trigger was narrow — it needed a managed code home with no `node_modules` of its own *and* a usable `better-sqlite3` in an ancestor directory — but on this maintainer's machine `~/node_modules/better-sqlite3` exists, which is how a reviewer's aside about ancestor resolution turned into a reproduction.
+
+272 test files / 4616 tests green, eslint clean, shellcheck clean, knip 31 unused exports, sandbox 103/103. Both directions are mutation-verified: restoring the pre-judgment reddens the ancestor case, and dropping certified roots again reddens six.
+
+## v3.70.0 — a sandbox install of the recommended method failed its own health check, and the hook envelope was never being parsed
+
+A sandbox played a real user through both documented install paths end to end — `/plugin install`, `npm i -g` + `claude-mem-lite install`, then use, auto-update, self-heal and uninstall for each (103 checks). Five defects, each reproduced before it was fixed and each fix mutation-verified. Two of them change what users see by default, so this is a minor bump.
+
+**Upgrade note.** No action needed. `doctor` and `status` will report differently — in most cases they stop reporting problems that were never there. To revert, pin the prior build: `npm i claude-mem-lite@3.69.1`. There is no env flag for either change: both are corrections to a health check and a wire format, not tunable policy.
+
+### Claude Code parses hook stdout as ONE JSON document — this repo assumed otherwise
+
+The parser, read out of the Claude Code 2.1.233 bundle, is four lines:
+
+```js
+function Hxi(e){ let t=e.trim();
+  if(!t.startsWith("{")) return {plainText:e};   // whole stdout = prose
+  try{ let r=XZf(t); ... }                        // JSON.parse(WHOLE stdout) + schema
+  catch(r){ return {plainText:e} } }              // throw ⇒ whole stdout = prose
+```
+
+There is no line splitting in it. `hook.mjs` had assumed the opposite in two comments ("Claude Code's line-based JSON parser", "two separate JSON lines each parse independently") and shipped surfaces that wrote more than one thing to stdout, which makes `JSON.parse` throw and drops everything to the plain-text branch.
+
+| Surface | What was actually happening |
+|---|---|
+| **SessionStart** | Three writers on one stdout: the dashboard envelope, the raw `<claude-mem-context>` block, and the update banner. The envelope was never parsed, so `suppressOutput: true` was ignored and the literal string `{"suppressOutput":true,"hookSpecificOutput":{…}}` — escaped newlines and all — was injected into every session as text. Visible in any transcript as `SessionStart:startup hook success: {…}`, where the same product's PreToolUse and PostToolUse hooks (one envelope, nothing else) render as `hook additional context:` with the content extracted. |
+| **PostToolUse** | A hard-error Bash call reaches `triggerErrorRecall` and then flushes a full episode buffer in one `handlePostToolUse`, writing two envelopes. Plain text is not rendered at all for PostToolUse, so **both receipts were dropped in silence** — the error-recall hint and the episode receipt, exactly when a command had just failed. |
+
+Both now queue through `lib/hook-stdout.mjs` and the dispatcher writes one envelope at exit. `tests/feature-sweep-hooks.test.mjs::expectHookStdout` encoded the same wrong model, so it graded two-envelope output as compliant; it now caps stdout at one JSON document and rejects prose beside it.
+
+### `doctor` answered about one install when the machine can run three
+
+A machine can hold three code homes at once — the plugin cache, `~/.claude-mem-lite`, and the npm-global package — each with its own `node_modules` and its own native binding that can go stale alone. `bindingHostDir()` probed whichever directory `install.mjs` itself sits in. That is the right question for `install.mjs`'s own imports and the wrong one for a health check, and it failed in both directions.
+
+| What changed | Detail |
+|---|---|
+| **A healthy plugin-only install no longer reports three problems.** `server.mjs`, `hook.mjs` and the `SOURCE_FILES` manifest only exist in the `install.mjs`-managed layout; `/plugin install` provisions the data dir and serves code from the plugin cache. Checks are now graded against the shape actually in use. | The README's recommended method, freshly installed and fully working, printed `✗ server.mjs: missing`, `✗ hook.mjs: missing`, `⚠ Managed files: 121 missing`, `3 issue(s) found` and exited 1 — and the remedy it named, `node ~/.claude-mem-lite/install.mjs repair`, is a path that install shape never creates. `status` likewise printed `✗ MCP server: not registered` and `✗ Hooks: not configured` for the plugin manifest doing its job. |
+| **A stale binding is now found in whichever install owns it.** `doctor` enumerates every wired runtime root and probes each, naming the broken one and giving that root's own repair command; `rebuild-binding` repairs every broken tree instead of only its own. | With `~/.claude-mem-lite`'s binding stale — the tree the settings.json hooks and the registered MCP server actually load — the server FATAL'd on startup (`wrong ELF class`) and every hook degraded to a silent exit 0, while `doctor` printed `✓ better-sqlite3: verified` and exited 0, and `rebuild-binding` rebuilt the *other*, healthy tree and reported success. That is the v3.60 field failure (memory dead for four days) with the entire diagnose→repair chain green. |
+| **`doctor` stopped prescribing a command that does something else.** The missing-managed-files remedy said `claude-mem-lite update`; that is the observation editor (`update <id>`), and running it prints a usage error. The self-updater is `self-update`. | |
+| **`claude-mem-lite install` no longer leaves the package it ran from uncompiled.** npm ≥ 12 blocks lifecycle scripts, so `npm i -g claude-mem-lite` always lands an uncompiled `better-sqlite3` in the global package; `install` rebuilt only `~/.claude-mem-lite`. | The documented two-command setup finished with every line green, and the very next `claude-mem-lite doctor` reported `2 issue(s) found` and exited 1. It self-healed on the following CLI call, so the state was transient — but the first thing a new user is told to run said the install had failed. Non-fatal: this tree is not what hooks or the MCP server load. |
+
+### What the pre-tag review changed, before the tag
+
+Two independent reviewers read the release diff — one for correctness, one for test effectiveness. Both earned their keep, and two of their findings were regressions introduced by this very refactor.
+
+| Finding | What shipped instead |
+|---|---|
+| **The new code turned a real failure from red to green.** `detectInstallShape` dropped any root with no `node_modules/better-sqlite3` — including a managed code home whose deps were deleted or whose `npm install` died after the file copy. Its hooks and MCP server still load from it and throw `ERR_MODULE_NOT_FOUND` on every fire, and that error is not in `NATIVE_BINDING_PATTERNS`, so nothing recorded it either. Pre-v3.70 probed `bindingHostDir()` → `INSTALL_DIR`, failed, exited 1. | A root this module has certified as a code home is now reported with `depsMissing`, graded broken, and given an `npm install` repair (not a `npm rebuild` of nothing). |
+| **Probing every cache version made the fix red where it used to be right.** Claude Code never prunes old version dirs and each keeps its own real `node_modules`; this machine holds three. After a Node major upgrade the never-started versions stay stale forever → `doctor` permanently red about trees nothing loads, and `rebuild-binding` — which clears the breakage marker only when *every* target succeeds — could never clear it, which is the documented "launcher re-spawns npm every 6h forever" state. | Only the **active** version is a runtime root: the one `CLAUDE_PLUGIN_ROOT` names, else the newest. Stale versions are still listed, never probed. |
+| **A 161-line change to the diagnose→repair chain had zero regression coverage.** Reverting `install.mjs` to its pre-fix state left the entire suite green — `tests/install-shape.test.mjs` covered the extracted helper, but the bug was always `install.mjs` asking the wrong helper. This is precisely how v3.60 shipped green and stayed broken for four days. | `tests/doctor-install-shape-e2e.test.mjs` drives `doctor` / `status` / `rebuild-binding` as subprocesses against real install shapes. The same revert now fails 11 of its 13 cases. |
+| **Three guards could not fail.** `tests/e2e.test.mjs`'s SessionStart co-fire case still asserted the disproven line-based contract and passed against the pre-fix code; the dashboard and update-banner legs of the new envelope test were satisfied by the context block alone. | All three now assert content, and each was mutation-verified against the exact deletion that used to slip through. |
+| **`rebuild-binding` iterating every code home made an existing unit test mutate `~/.claude`.** `tests/native-binding-selfheal.test.mjs` ran with the real `HOME`, so a freshly-installed plugin cache version (deps present, binding uncompiled) would have it run a real `npm rebuild … --dangerously-allow-all-scripts` inside `~/.claude`. | That test now gets an isolated `HOME`, which is what its own name promised. |
+| Smaller: the SIGTERM salvage path exited without flushing a queued receipt; `semverDesc` collapsed to "equal" on a prerelease dir because `Number('0-rc1')` is `NaN`; a comment recorded a root cause the reviewer could not reproduce (raw-SQL inserts *do* populate FTS via `AFTER INSERT` triggers) and now says so. | |
+
+### And one more false-red, found by CI on the first tag attempt
+
+The first `v3.70.0` tag failed `validate`: the new subprocess tests are the first thing in this repo to assert `doctor`'s exit code, and on the runner it was 1 with `1 issue(s) found` while every individual check was green but one — `⚠ Old processes running`, listing **vitest's own worker processes**.
+
+The stale-process check's legacy clause was `/claude-mem.*worker/`, intended for the pre-v2.20 chroma worker. It matches any command line where `claude-mem` precedes `worker` anywhere, and GitHub Actions checks the repo out to `/home/runner/work/claude-mem-lite/claude-mem-lite/`, so `…/node_modules/vitest/dist/workers/forks.js` matched. Invisible on the dev machine purely because that checkout is not named after the package.
+
+The judgment is now `isStaleMemProcess(line, currentVersion)` — cwd-independent and unit-tested against the exact CI command line — and the legacy clause anchors on the old dot-prefixed data dir (`~/.claude-mem/…worker`), which a repo checkout path cannot contain. Fixing it also removed the last thing that made `doctor` exit non-zero on a healthy install, which is the whole point of the release.
+
+Three unrelated `ups-*` tests also timed out at 20 s on the 2-core runner; the new subprocess file was starving the other workers, so its 13 spawns are consolidated to 7 and the one npm-invoking case carries its own 120 s budget.
+
+### Notes
+
+- **The update-available banner is now delivered to the assistant rather than printed raw.** It used to reach the transcript only because the whole stdout was being rendered as text — the same bug this release fixes. It now rides `additionalContext` with `suppressOutput: true`. The documented `systemMessage` field looks like the right channel for a human-facing notice, but the command-hook render path for it could not be confirmed in the bundle, so moving the banner there is deferred rather than shipped on a guess.
+- The plugin **update** window is fine and was measured, not assumed: a new cache version dir arrives without `node_modules`, and the next SessionStart's `setup.sh` provisioned and compiled it in 1013 ms with memory searchable across the version swap (15/15 checks). That measurement used a warm npm cache; cold-cache and offline behaviour is untested.
+- The harness that found all of this is a sandbox driver (fake `$HOME`, fake `claude` binary, real `npm pack` / `npm i -g`, real stdio MCP JSON-RPC). It is not in the repo; the regressions it caught are pinned by `tests/install-shape.test.mjs`, `tests/doctor-install-shape-e2e.test.mjs`, `tests/session-start-stdout-envelope.test.mjs` and `tests/hook-stdout-single-envelope.test.mjs`.
+- 272 test files / 4614 tests green, eslint clean, shellcheck clean, knip 31 unused exports (unchanged from baseline).
+
+## v3.69.1 — a GitHub 503 ate v3.69.0's Release; identical code, re-cut so auto-update can verify it
+
+No code change from v3.69.0. Its `Release` run published to npm and signed the manifest, then `softprops/action-gh-release` hit `503 No server is currently available` three times and aborted — a GitHub API outage, nothing in this repo. That left npm holding 3.69.0 with no GitHub Release behind it.
+
+That combination cannot be patched in place. `hook-update.mjs` ships an embedded Ed25519 public key, so it is in signed-release mode: a Release without `release-manifest.json` + `.sig` returns `missing-signature` and **refuses to install**. Creating the Release by hand would therefore have been worse than leaving it absent — `releases/latest` would advertise a version every client declines. Only CI holds the signing key, and re-running its `publish` job is impossible because `npm publish` is not idempotent and 3.69.0 is already on the registry.
+
+So v3.69.1 re-cuts the same tree under a version npm has not seen, which lets CI regenerate and attach the signed manifest. Everything in the v3.69.0 entry below applies unchanged. npm's orphaned 3.69.0 is harmless: auto-update resolves through `releases/latest`, and a direct `npm i claude-mem-lite@3.69.0` gets identical code.
+
+## v3.69.0 — three rounds of first-day-user simulation, and the worst finding was that asking "what did we do before?" removed the answer
+
+An end-to-end round played the product as a new user would: cold install, first saves, prompt-time recall, edit-time recall, a `/clear`, a backup, a maintenance pass. Thirteen defects, each reproduced before it was fixed and each fix mutation-verified (break it, confirm red, revert). Two behaviours users feel change here, so this is a minor bump, not a patch.
+
+**Upgrade note.** Two injection behaviours change by default. Neither needs action. To revert them, pin the prior build: `npm i claude-mem-lite@3.68.1`. Note that `CLAUDE_MEM_UPS_FLOOR_REF_CORPUS=1` is NOT a way back — it disables the corpus ramp entirely, giving the full calibrated floors at every corpus size (pre-v3.61 behaviour), which is *stricter* than either v3.68.1 or this release below 584 rows. No env value reproduces the v3.68.1 ramp. The first `claude-mem-lite doctor` after upgrading also reads differently — see the doctor row.
+
+| What changed | Detail |
+|---|---|
+| **A recall prompt no longer discards what you asked about.** `detectIntent` set `useRecent` on any prompt carrying "之前 / previously / 记得", and the hook then answered with `searchRecent`, ignoring the query text. Recency is now a fallback for a contentless recall prompt, not a short-circuit. | Measured on a 600-row corpus with two prompts one word apart: `分页接口又报 500 了，边界问题怎么处理` put the right row at rank 1; adding `之前` surfaced neither it nor anything related, and spent the budget on five unrelated recency rows. The most explicit memory request a user can make was the one answered without reading it. A contentless `之前我们在做什么` still gets recent rows. |
+| **`update` no longer destroys an observation's body.** `text` is a derived search blob rebuilt from title + narrative + lesson; two ingest paths (`import-jsonl`, and any caller taking `OBS_DEFAULTS`) leave `narrative` empty with the body in `text`, so the rebuild derived from a base with no body in it. The rebuild now promotes an orphaned body into `narrative` first, and `import-jsonl` writes `narrative` so new rows hold the invariant. | `claude-mem-lite update 1 --importance 3` — a field unrelated to content — replaced an imported transcript payload with nothing but the row's own title. Unrecoverable: `update` takes no snapshot, only `delete` does, and the row also stopped matching searches for its own contents. Zero rows on this machine's 3623-row database were exposed; the risk is any user who ran the documented cold-start backfill. |
+| **A first-week corpus is reachable from the prompt surface.** The v3.61.0 ramp scaled the score floors by `ln(N+1)/ln(N_REF+1)`; FTS5's IDF is `log((N-df+0.5)/(df+0.5))`, which is exactly 0 at N=2 and far below `ln(N+1)` across the whole first-week window. Floors now scale by the corpus's max attainable IDF. | Re-measured through the production write path (a raw INSERT skips CJK bigram expansion, which is how the first ramp table was misread), CJK prose prompt carrying no identifier for the bypass to rescue: at N=2..4 the top hit scored below the OR floor and nothing was injected. The two ramps agree within 8% at N≥30 and 2% at N≥200, so the change is confined to the window it fixes. Accepted trade: on a ≤4-row corpus the floors are near zero, so the best lexical match is injected even when weak — the measured alternative is silence, and a 4-row corpus has no room to bury signal. |
+| **`doctor` had the severity of a missing managed file inverted.** Node resolves ESM specifiers against a module's realpath, so in a symlink install every entry point resolves into the repo and an absent `~/.claude-mem-lite/lib/x.mjs` is unreachable, not broken. In a copy install (npm / plugin) the same absence throws on every hook fire. Missing files are now split into entry points and import-only modules and graded by install shape. (Scope: doctor classifies the `SOURCE_FILES` manifest, which carries no `scripts/` entries — checking the separate hook-script manifest is still missing and is tracked as deferred.) | The dev case warned, counted an issue and prescribed `install --dev` — verified on the maintainer's machine, where six modules were reported missing while every hook importing them worked. The copy case, where the same fact is fatal, printed nothing at all: `checkDevDrift` returns `devMode=false` when no symlinks exist, and both the warning and the all-clear were gated on `devMode`. |
+| **`mem_save` honours `obs_type`.** `mem_search` / `mem_recall` / `mem_recent` all name the field `obs_type`; `mem_save` accepted only `type`, and the schemas are non-strict. | `mem_save({content, obs_type: "bugfix"})` — the shape a caller reaches for right after a search — dropped the unknown key and saved a `discovery` row, reporting success. `type` feeds the ranking multiplier and the row becomes invisible to every `--type bugfix` filter, so the memory was stored and unfindable by the query that should find it. An invalid value now errors instead of coercing. |
+| **A retracted observation says so before its body.** Every list surface filters superseded rows, so the only way to reach one is to name its id — exactly what a stale citation does. Both detail faces render `lesson_learned` near the top and `superseded_at` a dozen lines below. | A reader who stops early took the withdrawn advice and never reached the marker. `get` / `mem_get` now lead with `⚠ RETRACTED — superseded by #N`, from one shared helper so the two faces cannot drift. |
+| **`import-jsonl` reports the rows it wrote.** Unpaired `tool_use` events write observations but were counted only as orphans, so the summary said `+0 observations` after writing them. | The newest transcript is usually still open, which makes truncation the common shape for a cold-start backfill — the report read as "nothing imported". Now `+1 observations (1 from unpaired tool_use)`. |
+| **Two dead entries left the CLI flag allowlist.** `suggestUnknownFlags` warns on every flag outside `KNOWN_CLI_FLAGS`, so a bogus entry suppresses the only signal a user gets. | `out` was catalogued from a benchmark script; `claude-mem-lite export --out backup.json` printed the export to stdout, wrote no file and said nothing. `has` had no reader and no help entry. A derived guard now re-reads the CLI sources and fails on an allowlisted flag that appears in none of them; it accepts a bare string literal as evidence, so it catches these two and any future entry whose name is not ordinary vocabulary. |
+| **`restore --dry-run` reports a preview, not an outcome.** | It said `10 restored` for a run that wrote nothing, and the count could exceed reality: the preview applies the durable exact-dup guard but not the Jaccard near-duplicate collapse that only exists on the writing path. Measured 10 previewed, 9 restored. The number is now labelled an upper bound rather than being made exact — simulating Jaccard would be a second copy of the dedup rule. |
+| **SessionStart stops injecting an empty context block.** A brand-new install emitted `<claude-mem-context></claude-mem-context>` with nothing in it — wasted context that also asserts a memory surface and shows it empty. Non-empty output is byte-identical. |
+| **`activity promote` is documented.** It was in the usage error but not in `help`, and it is the only path that makes an event searchable. |
+
+Verification: 267 test files / 4547 tests (from 257 / 4510), eslint and shellcheck clean, knip 31 unused exports with a name set identical to the pre-round measurement, denoise A/B NEUTRAL at Δ=0.000 across all three suites with all four behavioural probe groups green. Eleven new test files; every fix was mutation-verified. Two independent fresh-context reviews ran against the release commit BEFORE the tag and changed it: one regression was reverted (git-work-tree project anchoring — it fixed a CLI run below the session root but split the namespace for a session rooted below the repo root, the more common monorepo shape), one new defect was fixed (the body-promotion repair would have written derived FTS bigrams into `narrative` for rows whose empty narrative is legitimate), the upgrade note above was corrected, and the ingest half of the `update` fix — which had no test at all, so reverting it left the whole suite green — was pinned.
+
+## v3.68.1 — the test-effectiveness review arrived after the tag, and its best finding was that v3.68.0's headline test could not see a mislabelled face
+
+v3.68.0 waited for its correctness review and shipped the four defects it found. The second review — test effectiveness — arrived after the tag. Everything it found was a missing guard rather than a broken behaviour, so nothing here changes what v3.68.0 does; it changes what the suite can catch. One runtime flag is added, because the alternative was another race.
+
+| What changed | Detail |
+|---|---|
+| **The per-face funnel's end-to-end test could not detect a mislabelled face** — the one thing a per-face funnel exists to get right. Faces now carry distinct injected counts (2/3/1/4) and two different faces are cited. | Every face was seeded with exactly one observation and only one was cited, so the three uncited rows were interchangeable. The reviewer proved it by swapping `ups` and `fyi` at the recorder call site: the end-to-end file stayed 3/3 green and the unit file 32/32 green. A swapped attribution would have shipped silently under the release whose headline is that attribution. The same mutation is now red. |
+| **`CLAUDE_MEM_SKIP_SUMMARY`** — the session-summary background worker becomes suppressible, like every other one. | It was the only ungated `spawnBackground`; `auto-compress`, `llm-optimize` and `auto-maintain` all have a flag. Ungated, it made Stop untestable without residue: the detached child outlives the process an end-to-end test waits on and recreates the sandbox tree behind the test's cleanup. The reviewer timed one recreate at **432ms** and watched a 300ms grace lose, then observed the real suite leak two directories. Any grace period is a race; gating the spawn is the barrier. Three consecutive runs now leave zero residue, and the cleanup asserts the sandbox is gone rather than swallowing a failed delete. |
+| **The semaphore's staleness escape hatch is tested.** New `_setLocalHeldAt` test hook. | v3.68.0 added local hold bookkeeping as a timestamp specifically so a caller that never releases cannot deadlock the process — and shipped that half untested. Replacing the age check with a bare boolean, deleting the self-heal outright, left the suite 16/16 green. The reviewer measured the blast radius directly: removing the test resets made the file take **181 seconds** instead of 1.9, which is the 120s stale threshold materialising. Two cases now pin both halves, and the boolean mutation is red. |
+| **`callHaikuJSONAsync`'s inherited budgets are pinned.** | v3.68.0's fix had two halves — resolve the model tier, and inherit `callHaiku`'s 10s/500 rather than `callModelJSONAsync`'s 15s/1000. Only the first was tested: reverting the defaults left the file 119/119 green. |
+| **A static guard replaces the hand-maintained leg list.** | v3.68.0's three-leg enumeration was written by hand, and a hand-written list is what failed in the first place — the deferred note named two legs and the wrong file for one, and `rerank.mjs` was found only because a human re-enumerated. The guard now walks `server.mjs`'s real transitive imports and fails if any module binds a blocking dispatcher, with a checked exemption for the one module whose sync call runs in a detached child. Reverting `rerank.mjs` makes it red. |
+
+Also corrected: the end-to-end suite's isolation comment claimed `CLAUDE_MEM_DIR` pointed at the sandbox when the env strip merely deleted it, leaving isolation to rest on `os.homedir()` honouring `HOME` — POSIX-only, so on Windows the suite would have written to the real `~/.claude-mem-lite`. It is now set explicitly. Reads take a `busy_timeout`, and three test files shed a dead `callLLMWithModel` mock entry that no longer corresponds to any import.
+
+**Process note, second occurrence.** v3.61.0 shipped without waiting and took a same-day v3.61.1. v3.68.0 waited for one review and shipped its four findings; the other arrived afterwards and found five more. Two reviewers were run in parallel precisely because the lenses are not interchangeable, and that held again: the correctness lens found a defect (a silently downgraded model tier) that no test could have shown was wrong, and the test lens found that the release's headline guard was blind to the release's headline failure mode. The cost of waiting for both is minutes; this is the second release where the second lens rewrote the outcome.
+
+## v3.68.0 — the MCP server stops freezing on a provider outage, and the funnel stops proving itself by reading its own source
+
+Two failures this release closes have the same shape: something was *asserted* to work rather than *observed* to work. One was asserted by a code comment (the MCP hot path is non-blocking), one by a test that matched `hook.mjs`'s source text instead of running it.
+
+| What changed | Detail |
+|---|---|
+| **Three LLM legs reachable from an MCP request handler moved off the blocking `execFileSync` path.** `hook-optimize.mjs` (5 call sites), `registry-enricher.mjs`, `rerank.mjs` — now on `callModelJSONAsync` and two new async twins, `callLLMWithModelAsync` and `callHaikuJSONAsync`. | `server.mjs` is one long-lived process with one event loop. `execFileSync` holds it for the child's entire lifetime, so a keyed-provider outage — which degrades to the `claude` CLI by design — stalled **every** concurrent MCP request behind one call, for up to the 45s `BG_LLM_TIMEOUT_MS`. deep-search moved to the async dispatcher in D#40; these three never did. The affected tools are `mem_optimize`, `mem_registry` (`enrich` / `import_url`) and `mem_search` with `deep` + `rerank`. |
+| **The deferred item named two of the three legs, and named the wrong file for one of them.** | D#138 pointed at `server.mjs` for a set of `callModelJSON` calls that actually live in `hook-optimize.mjs`; `server.mjs` only reaches them through `optimizeRun`. Re-enumerating the parallel paths before editing — rather than trusting the note — turned up a third leg it never mentioned, `rerank.mjs`'s `defaultRerankLLM`, sitting on the `mem_search` path. Fixing only the two named legs would have left the freeze reachable. A deferred item's `files` field is a hypothesis. |
+| **The per-face funnel now has an end-to-end test that spawns a real `hook.mjs stop`.** `tests/citation-surface-funnel-e2e.test.mjs`. | v3.67.0 shipped the recorder with 14 unit cases and asserted the `hook.mjs` wiring by pattern-matching `hook.mjs`'s **source text**. Source matching cannot see a chain that breaks anywhere between the call site and the table — which is not hypothetical, because that is precisely how v3.67.0's own migration bug stayed invisible. Mutation-checked both ways: breaking the recorder call site turns 2 of 3 cases red; removing the table's `CREATE` turns all 3 red. Every source-text assertion stays green under both. |
+| **`computeSurfaceFunnel` distinguishes "the query failed" from "the window is empty".** New `unavailable` field, set only on failure; `citation-stats` prints `UNAVAILABLE` plus the repair command instead of the empty-window line, and `--json` carries it. | v3.67.0 softened the CLI *sentence* so it no longer asserted a benign cause. That was half a fix: the reader still returned the same value in both states, so no caller — human or scripted — could tell them apart. A missing table now reads as a failure. |
+| **`redirectSupersededIds`' copy-on-bail contract is pinned.** | Its JSDoc promises callers own their input sets, and v3.67.0 made both bail-outs return `new Set(src)` — but reverting either to `return src` left all 71 surface-funnel and decay cases green, because neither live caller mutates the result. Three cases now hold the alias contract itself; each was mutation-verified against the bail-out it covers. |
+| **`CLAUDE_MEM_TASK_IMPERATIVE` is marked experimental and the default-flip plan is withdrawn** (D#137). | The flip was gated on a live cite-recall canary that can never reach n. Replaying `selectImperativeLesson` over the last 400 real prompts, the gate opened 76 times = **19.0%** — CJK prompts 57/352 = **16.2%**, ASCII 19/48 = **39.6%**. `rankImperativeCandidates` requires identifier overlap between prompt and lesson, and a Chinese prompt carries few symbol anchors; at 88% Chinese prompts the emitter fires about once every six. That is the gate's design ceiling, not a defect, so waiting longer buys nothing. Reviving it needs a CJK-viable anchor proven in A/B without a precision loss — separate work, not a canary. (D#56's 53.8% figure is not usable; #10425 corrected it as a small-n artifact.) |
+
+**Non-MCP callers are unaffected in behaviour, deliberately.** The async twins mirror their sync counterparts line for line — same provider priority, same headless-flag compat retry and remaining-budget arithmetic, same partial-stdout JSON salvage on timeout — and only the CLI transport differs. Short-lived hook workers and the CLI go through the same async path now; `await` semantics are identical, they simply no longer block a loop that had nothing else to do.
+
+**Four defects in that claim, all found by the pre-tag review, all fixed before the tag.** They are listed because each one is a way "behaviourally identical twin" can be false while reading as true:
+
+| Found | Why it mattered |
+|---|---|
+| **`callHaikuJSONAsync` pinned the literal `'haiku'`.** Now `resolveModel().cli`. | Despite the name, `callHaikuJSON` resolves the tier on **all three** legs — `callHaikuAPI`, `callOpenRouterAPI`, `callHaikuCLI` all call `resolveModel()`. Pinning silently downgraded `mem_registry enrich` from Sonnet to Haiku for every user who set `CLAUDE_MEM_MODEL=sonnet`, a documented knob. A test now asserts the async twin passes the resolved tier, with the sync twin as a parity witness. |
+| **De-blocking made a same-process semaphore race the normal case.** `acquireLLMSlot` now keeps local bookkeeping of whether this process holds its slot. | The slot file is named per **process**, and the `EEXIST` branch unlinked it on the reasoning "we are inside acquire, so we cannot be holding one — it must be stale." That was true only because `execFileSync` made two overlapping acquires impossible inside one process. With two concurrent `mem_optimize` handlers the second would delete the first's **live** slot: the cross-process count stops seeing it, so more than `LLM_SEM_MAX` CLI children run at once, and the first holder's release then unlinks the second's file. The record is a timestamp rather than a boolean, with the same age escape hatch the reaper applies to other processes — a boolean has no self-heal, so one caller that never released would have deadlocked every later LLM call in the server for the life of the process, which is worse than the race being fixed. |
+| **`callModelCLIAsync` returned a non-zero-exit child's stdout as the model's answer.** Now gated the way `callModelCLI` is. | `execFileSync` *throws* on a non-zero exit, so the sync leg only ever salvaged such output when `parseJsonFromLLM` accepted it. The async leg ignored the exit code, and rerank is the first caller to consume the raw `{text}`: `extractRanked`'s last resort matches any bracketed number list in prose, so a `[1]` inside an auth-failure banner became a ranking and silently reordered search results. |
+| **The documented "one deliberate divergence" did not exist.** | The JSDoc claimed a keyed provider returning empty text degrades to the CLI on the async leg but not the sync one. Every provider function returns `text ? { text } : null`, so `{text: ''}` is unreachable and the two are identical — while the real divergence, the model tier above, went undocumented. Comments asserting a difference that cannot occur are worse than silence. |
+
+One MEDIUM-severity item was left for a later release: `getCurrentBranch()` in `utils.mjs` still runs a synchronous `git rev-parse` reachable from `mem_save`. It is bounded at 2s and cached for 60s, against the 45s LLM legs this release moved.
+
+**Knip baseline is 32, measured against 33 on the v3.67.0 tag** — a net *decrease* of one, with zero additions (name-set diff between a clean-HEAD worktree and this tree). The v3.67.0 CLAUDE.md line recorded 31 while that tag actually measures 33; the note now says to prefer a fresh count over the written one.
+
+## v3.67.0 — memory injection stops being one number and becomes four
+
+Every release so far has been able to say whether memory injection is working *in aggregate* — `citation_log` gives one cite-rate per project per session. None of them could say **which of the four injection faces** earned that number, because `hook.mjs` unioned pre-tool-recall, the UserPromptSubmit `<memory-context>` block, PostToolUse error-recall and the prompt-search FYI block into a single set before anything was recorded. Any precision lever aimed at "memory injection" was therefore aimed at an average. That is what gated D#44 and the remaining legs of D#78/D#129.
+
+Schema v45 adds `citation_surface_log`: the same invocation→cite funnel, keyed `(project, memory_session_id, surface)`. `citation-stats` grows a per-face section.
+
+| What changed | Detail |
+|---|---|
+| **The four faces are extracted in one pass and recorded separately.** `extractInjectedBySurface()` is now the primitive; `extractAllInjected()` is its union via `unionSurfaces()`. | Two problems collapse into one table. The faces used to be four independent transcript walks (four full parses per Stop) *and* a second, hand-maintained union list — the exact shape that let UserPromptSubmit go unmetered for a whole minor version. A face added to `SURFACE_MATCHERS` now widens the denominator automatically, and a test asserts the union equals the breakdown. |
+| **Key Context rides along as a reported face without entering the decay denominator.** | v3.66.1 established why: the block re-renders the same fixed top-10 unconditionally, so an uncited render is evidence of nothing, and `keyObs` gates on `importance >= 2` — one demotion evicted a row permanently. It is a separate telemetry table, so recording it here cannot repeat that. The v3.66.1 source guard was retargeted to the new call site rather than dropped, and widened to cover both entry points. |
+| **Rows are a per-face VIEW, not a partition — and the CLI says not to reconcile them against the funnel.** | Faces overlap, so they sum *above* the funnel; but the Stop handler also unions cite-back signals into the aggregate denominator after taking the breakdown, and those belong to no face and skip the `mainOnly` filter, so the funnel can exceed the surface sum too. The two numbers are not comparable in either direction, which is worth saying plainly — a reader who diffs them and finds a mismatch would otherwise reasonably conclude the instrument is broken. |
+| **The row key is the Claude Code session id, not the memory session id.** | This table overwrites rather than accumulates, and the memory session id lives in one file per *project* — so two concurrent Claude Code sessions in one project share it, and the second Stop would erase the first's counts outright instead of adding to them. `citation_log` survives the shared key only because it accumulates deltas. This is the same hazard D#60 fixed for `applyCitationDecay`, one table over; the pre-tag review caught that the new code had not inherited the lesson. |
+| **The semaphore's budgets are derived from the hold they have to cover.** `LLM_SEM_TIMEOUT` and the new `LLM_SEM_STALE_MS` now come from `BG_LLM_TIMEOUT_MS` — 60s and 120s. | Both were literals sized for the ~15–20s LLM calls of the time. v3.66.0 raised the background budget to 45s and neither followed. The wait budget was then *shorter than the hold*: with both slots busy the third worker gave up at 30s while a holder was legitimately working, and its caller fell through to degraded storage — the observation is saved but never enriched, with nothing logged. Separately, a 60s age cutoff left a 45s holder 15s of margin, so a slow shutdown or a loaded machine could let a peer delete a **live** holder's slot file; that drops it out of `active`, and the peer then sees room that does not exist. The reaper was also reordered to check pid liveness before age — but the review's own mutation testing showed that reorder is **behaviourally inert** while both paths share one threshold (the old order reaps a live holder past `T`; so does the new one). It stays because it states the intent and stops being inert the moment the thresholds diverge; the fix that actually closes the window is the constant. |
+
+**A migration bug this release found in itself.** The version bump to 45 and the `CREATE TABLE` landed in two separate edits. A dev-mode hook fired in the window, saw `44 != 45`, ran a `CORE_SCHEMA` that did not yet contain the table, and stamped 45. Every later open then took the fast path — version matches, sentinel columns present — and never ran `CORE_SCHEMA` again, so the table could not appear on that database *ever*. The symptom was invisible: the reader wraps its query in `debugCatch`, so "no such table" rendered as `(no per-face rows in window)`, which is exactly what "no data yet" looks like. The fix is that `LATEST_MIGRATION_COLUMNS` now carries an entry for the new **table**, not just for new columns (`pragma_table_info` on a missing table returns zero rows rather than throwing, so naming any of its columns is a presence check). v38 and v39 added tables without sentinels and carry the same latent hole; it is now documented where it would be read.
+
+**First reading, and it is lopsided.** Computed retroactively over 1069 transcripts across all projects with the same extractors the live path uses. These are a snapshot — the corpus is live, so a re-run minutes later moves the counts by single digits (an independent re-run during review got 617 / 157 / 358 / 186); the ranking and the spread do not move:
+
+| face | injected | unique obs | cite-rate |
+|---|---|---|---|
+| pre-tool-recall | 608 | 326 | **42.4%** |
+| FYI (prompt-search) | 186 | 99 | 11.8% |
+| UserPromptSubmit | 154 | 69 | 5.8% |
+| error-recall | 358 | 211 | **4.2%** |
+
+1306 injected / 304 cited = 23.3% overall, which independently corroborates `citation_log`'s aggregate 21.9%. The faces differ by an order of magnitude, and the biggest waste is error-recall — 2.3× UserPromptSubmit's volume at a lower rate. Against the pre-G8 baseline (220 unique / 765 occurrences / 10.9%) the v3.51.0 hard gate halved occurrences and left unique roughly flat while cite-rate **fell**: it cut volume without buying precision. The windows and scope are not strictly comparable, so treat the direction as trustworthy and the magnitude as not quotable.
+
+No injection behaviour changes in this release. `citation_surface_log` starts empty and accumulates from the first Stop after upgrade; the table above is a retroactive measurement, not a read of the new instrument.
+
+Two independent pre-tag reviews landed **before** the tag for the second release running, and again they changed the release.
+
+The correctness pass found the session-key defect above (reproduced, not theorised), the false "sum above" invariant, an inert reorder credited with a fix the constant made, a `redirectSupersededIds` doc claiming a copy on two paths that returned the caller's own Set, an untested `<memory-context>` gate, and a `COUNT(*)` printed as "over N sessions" that counts project-sessions. It also independently re-verified the extractor refactor as behaviour-identical: **0 differences across 12,828 set comparisons** over all 1069 real transcripts, old code vs new, both `mainOnly` settings, every face plus the union.
+
+The test-quality pass ran 25 mutations against the new tests; 20 landed RED at the right assertion, and **five guards survived mutations they claimed to prevent**. The worst was self-inflicted: retargeting the v3.66.1 Key Context guard to accept either extractor name made it match on `src.match()` — first occurrence only — so a clean call of either name above a dirty one silently shadowed it. That guard now checks every call site. Also hardened: a "parses once" test that counted textual occurrences (wrapping the single call in a per-face loop restored all four file reads and left it green — it now counts real `readFileSync` calls, in its own file because ESM namespaces cannot be spied), a keyctx guard that only caught one literal spelling (an *additive* `keyCtxIds.forEach(...)` walked past it), a block-scope assertion that went vacuous when its `indexOf` anchor was renamed to `-1`, and the semaphore budget — pinned as a constant but not as behaviour, so re-hardcoding `30000` in the acquire deadline reinstated the bug with every assertion green. All five mutations are now RED.
+
+4483/4483 tests (255 files, +45), eslint clean, knip 31 exports with zero new entries (verified by a HEAD-worktree name-set diff, not by the count alone). Denoise A/B unchanged at baseline — precision P@10 0.811, cjk_mixed P@10 0.940, vocab-mismatch R@10 0.341 — with all behavioural probes green (8 scripts, cross-source 11/11, deferred 10/10, events 9/9).
+
+## v3.66.2 — the one live defect the last release shipped with, closed
+
+v3.66.1's own changelog named it and deferred it: `--no-session-persistence` was an unguarded dependency on a recent Claude Code CLI. `package.json` declares `node>=20` and no Claude Code floor. On an older binary the spawn dies in argument parsing, `callModelCLI`'s catch swallows it, and the call returns `null` — no retry, no telemetry, nothing in `stats`. That is not one degraded feature: the `claude -p` leg is what the keyed providers *degrade to*, so for such a user save-enrichment, session summaries, episode titles, cluster-merge and registry enrichment all stop at once, silently, and the fallback path v3.66.0 exists to protect is the one that dies.
+
+| What changed | Detail |
+|---|---|
+| **An older CLI now self-corrects instead of failing silently.** When the failed spawn's output names the flag in a parse rejection, the call is retried once without it and the result is returned normally. | The negative is cached **only after the retry actually succeeded**, not on the failure — caching on failure would let one transient exit that merely mentions the flag push a healthy CLI back onto the interactive-session tax for the rest of the process. An ordinary failure — 529 overload, expired credit, "Not logged in" — is not retried; nor is a **timeout**, on either leg: a child that was killed rejected nothing, and retrying it would double a latency-bound budget (`lesson-bridge` runs this leg at 2500ms on PreToolUse, where the CLI is measured at 8–13s and therefore times out routinely). |
+| **The detector is anchored on the flag's own name.** A diagnostic only counts as a rejection if it names `no-session-persistence` *and* reads as a parse error or a usage banner. | An unanchored "unknown-ish word near option-ish word" regex matches Claude Code's own config diagnostics — `Skill X has invalid effort 'y'. Valid options: …`, `Input validation error: Invalid arguments for tool` — which are emitted for a malformed agent or skill file, i.e. a *persistent* condition. The first transient 529 on such a machine would have dropped the flag permanently and logged a `WARN` blaming it. |
+| **Three sync spawn sites now compose one runner; the async leg shares its flag state and its detector.** `callModelCLI`, `callHaikuCLI` and `hook-shared`'s `callLLM` share `execClaudeCliSync`. | This is the drift class the v3.66.0 review already caught once: the headless flags were pinned in argv at three sites and only *asserted* at two, so a site could lose the env half and stay green. `hook-shared`'s test now fails if that leg re-inlines its own spawn. The async leg keeps its own retry tail because its budgeting and its exit-code handling genuinely differ — that difference is now asserted rather than assumed. |
+
+Cost on a current CLI: none — the flag is sent, accepted, and no retry path runs. Cost on an old one: one extra fail-fast spawn per process (hooks are short-lived; the long-lived MCP server pays it once per run, because the cache now keys on the retry's **exit code** rather than on it having produced text — an empty answer is a designed outcome here, and keying on text left that process re-probing forever).
+
+**This is the first release in three where the independent review landed before the tag rather than forty minutes after it, and it changed the release.** It found the timeout retry, the unanchored detector, a usage-banner-on-stdout path that returned the banner as the model's answer, and a concurrency window where a sibling call could steal another's retry — plus six decision points that shipped with no assertion at all. All are fixed above. 14 of 15 mutations against the final code turn the suite red; the one that does not is documented in place as behaviourally unobservable (the sync leg cannot interleave, because `execFileSync` blocks the event loop) rather than papered over with a test that would pass either way.
+
+Also here: `quiet-hooks.test.mjs` spawned `server.mjs` on a 3000ms budget. That budget guards against a hang — it is not what those three cases measure, and all three assert on stderr content — but a cold `node server.mjs` costs ~0.3s idle and the pre-commit hook runs the whole suite, so under vitest's worker fan-out the spawn was being killed and `stderr` came back empty. Three failures, all exactly 3000ms long. Now 20s, matching the sibling helper in `wal-recovery.test.mjs`; no assertion is weakened.
+
+4438/4438 tests (252 files, +33), eslint + shellcheck clean, knip at the 32-export baseline.
+
+## v3.66.1 — the review landed after the tag, and it was right three times
+
+**Upgrade from 3.66.0 immediately.** The independent pre-tag review of v3.66.0 arrived ~40 minutes after that tag was pushed (the same delay that forced v3.61.1). It found three HIGH defects in v3.66.0's own new code, all confirmed. If you are on 3.66.0, this release is not optional.
+
+| What 3.66.0 did wrong | Fix |
+|---|---|
+| **It deleted a one-shot migration sentinel and let the migration re-run.** The 30-day marker sweep listed `.mcp-dedup-`, which is not a cache: `scripts/setup.sh` writes `.mcp-dedup-v2.78` to gate a block that removes `mcpServers.mem` and `mcpServers["mem-lite"]` from **your `~/.claude.json`** with a raw `writeFileSync` — no temp-and-rename, no backup. That block is deliberately one-shot; the repo's own test says "if a user later runs `claude mcp add mem …` themselves, the gate intentionally lets it stand." Sweeping the marker turned that into a purge every 30 days. The marker's mtime never refreshes, so **any install older than 30 days would have lost it on the first SessionStart after upgrading** — immediate, not eventual. `.residue-warned-` is the same shape and had the same problem. | Both are now in the preserved list. More usefully, the guard is structural: `sentinelPrefixesFromShell()` derives this class **from `scripts/*.sh`**, and a test asserts none of them is GC-able. The original miss was a `grep --include=*.mjs --include=*.js` for a writer that lives in a shell script; a list-based fix would have repeated it. |
+| **It made the highest-importance rows score worse over time.** The new Key Context metering bumped `injection_count`, which is not a neutral counter: `noisePenaltyClause` reads it as a noise signal and multiplies a row's score by **0.5** once `injection_count >= 4` and by **0.2** at `>= 8`, whenever `access_count` trails it — and nothing bumps `access_count` for a rendered row. `scoring-sql.mjs` states the invariant the change broke: bumped **only** on UserPromptSubmit / hook-memory auto-inject. That bump is query-conditioned (a row counted because it *matched*); an unconditional SessionStart render measures nothing but elapsed sessions, so Key Context rows were being deprioritised in `mem_search`, UPS ranking and `injectionRelevanceSql` on a clock. | The bump is gone. D#124's actual requirement — decay reachability — never needed it: decay reads `decay_seen_count` / `uncited_streak` / `cited_count`, never `injection_count`. |
+| **It made the Key Context block eat its own contents.** Those ids went into citation decay's *denominator*, and `keyObs` gates on `importance >= 2`. Three uncited sessions demote a row by one, so the common importance-2 row crossed the gate on its **first** demotion and left Key Context permanently — each departure promoting the next row into the same grinder. Projects that cite at all (rate ≥2%) are exactly the ones not covered by the adoption suppression. | Key Context is now **promotion-only**: its ids are no longer part of `extractAllInjected`, and the Stop handler adds them to the decay set only where they were actually cited. A cited row still gets credited; an ignored one is untouched. An unconditional render is not evidence of irrelevance. |
+
+Test hardening from the same review (three assertions that passed while holding nothing):
+
+- The `BG_LLM_TIMEOUT_MS` scan was satisfied by the **import line** — deleting `timeout: BG_LLM_TIMEOUT_MS` from `registry-enricher.mjs`, or from all five `hook-optimize.mjs` sites, left the suite green while each call silently fell back to its dispatcher default. Now counted per file, both call shapes.
+- The Stop handler's `sessionId` was unpinned; dropping it makes the reader look for `.claude-mem-keyctx-<project>` while the writer wrote `…-<session>`, so the whole face returns empty forever. Now asserted.
+- `runExport`'s filter had a shape pin but no behavioural one: inverting the ternary — default export leaking **retracted** rows — passed all 4398 tests. Now driven through the real handler, both branches.
+
+Known and deliberately not fixed here (tracked): `--no-session-persistence` is an unguarded dependency on a recent Claude Code CLI. On an older binary the spawn exits non-zero, the error is swallowed, and every CLI-leg LLM call fails silently with no telemetry. `package.json` declares no Claude Code floor. A probe-and-cache or retry-without-flag belongs in the next release, not in a hotfix that is already touching three subsystems.
+
+4405/4405 tests (252 files), eslint + shellcheck clean, knip at the 32-export baseline. Every fix above is mutation-verified: reverting it turns the suite red.
+
+## v3.66.0 — the headless calls stop paying an interactive tax, the enrichment stops timing out, and the last uncounted injection surface joins the ledger
+
+**Upgrading from 3.65.0 — what changes for you.** Four behaviors you may notice. Each has an escape hatch; none requires action.
+
+| Change | If it bothers you |
+|---|---|
+| Every background `claude -p` call now runs with `--no-session-persistence` and `DISABLE_CLAUDEMD_HOOKS=1`. Before, each headless spawn paid the full interactive-session tax: a dev machine had accumulated **1,004 transcripts** under `~/.claude/projects/-tmp/`, and every spawn ran the installed hook fan-out (one plugin's SessionStart telemetry alone logged 682 rows in 3 days, drowning that project's own signal). Output is unchanged; only the session bookkeeping is skipped. | Nothing to do. Do **not** substitute `--bare` or `CLAUDE_CODE_SIMPLE=1` — both hard-require `ANTHROPIC_API_KEY` and fail "Not logged in" on OAuth-subscription machines (OAuth and keychain are never read); `--no-session-persistence` is the tested OAuth-safe path, and the source comments say so. |
+| Background LLM work (save-enrich, the daily optimize passes, registry enrichment, episode/summary workers) now gets a **45s** budget instead of 15–20s. The old number was calibrated for the API leg and handed unchanged to the `claude -p` fallback, which pays a full Claude Code boot before inference — measured 8.1s / 9.2s / 11.7s / 13.4s on an idle machine, i.e. up to 89% of a 15s allowance. Under any load `execFileSync` killed the fallback mid-flight and the outage surfaced as `reason:'llm-null'` (6/57 of instrumented `enrich_save` runs), which is why recent manual saves stopped getting `search_aliases`. | The budget applies **only** to background callers. Latency-bound paths keep their tight numbers on purpose: the lesson bridge's 2.5s fail-open on the PreToolUse hook, and deep-search rerank on the MCP request path — a 45s block there would be worse than failing fast. Both directions are pinned by tests. |
+| Rows rendered into the SessionStart / PreCompact **Key Context** block now bump `injection_count` and are read back by a fifth citation extractor face. They were shown-but-uncounted: up to 10 rows per session that could accrue no denominator, so they could neither promote nor demote through citation decay. Consequence to expect: a Key Context row you never cite will now age like every other injected row. | Pin the prior version (rollback recipe in README → *Trust model per install path*). The extractor is marker-derived and session-gated — another window's marker is never read. |
+| Per-project runtime markers older than **30 days** are swept at SessionStart. These had no reclamation path at all: a live install held 253 files under `~/.claude-mem-lite/runtime`, 152 of them past 30 days, including whole families belonging to test sandboxes deleted months earlier. The sweep is a **named family list**, not a wildcard — `session-`, `cite-recall-`, `.skill-cooldown-`, `.skill-reco-cooldown-`, `.mcp-dedup-`, `.residue-warned-`. | `CLAUDE_MEM_SKIP_MARKER_GC=1` disables it. Markers that record a completed side effect are never swept at any age (`.auto-adopt-`, `.deferred-block-migrated-`, `.legacy-claude-md-cleaned-`) — deleting those re-arms the effect, and auto-adopt's re-attempt writes into your project's CLAUDE.md. |
+
+Fixes:
+
+- **fix(llm):** headless calls stop paying the interactive-session tax — `--no-session-persistence` + `DISABLE_CLAUDEMD_HOOKS=1` at all four `claude` spawn sites (`callModelCLI` / `callModelCLIAsync` / `callHaikuCLI` in haiku-client, `callLLM` in hook-shared). Both halves are now pinned at every site: argv **and** env. Two sites had argv-only assertions and could have silently lost the env half — caught by mutation before ship, not after.
+- **fix(enrich):** new `BG_LLM_TIMEOUT_MS` (45s) in haiku-client, applied at the background call sites only. Deliberately not a floor inside the three CLI helpers, which latency-bound callers also reach.
+- **feat(metering):** `lib/keyctx-marker.mjs` records one Key Context render — marker write *and* `injection_count` bump, both fed by the same actually-rendered id list. `handleSessionStart` and `handlePreCompact` call it; the SessionStart/PreCompact twin can no longer drift apart on one half.
+- **feat(gc):** `sweepStaleProjectMarkers` (hook-shared), 30d mtime gate, named families, preserved-list precedence.
+
+Structural:
+
+- **refactor(export):** MCP `runExport` composes `liveObsFilterSql()` — the last read surface still hand-writing the live-row pair while its CLI twin already composed the core. `server.mjs` joins the D#123 consumer ledger (mutation-verified: reverting to the hand-written pair reds).
+- **refactor(time):** `lib/time-constants.mjs` single-sources `DAY_MS` across 25 runtime files (4 local definitions + ~60 bare `86400000` literals). Tests and benchmarks keep their literals — a fixture stating `-60 * 86400000` is stating raw data. The companion half of that audit item (annotating 135 empty `catch` blocks) was **not** taken: 135 rubber-stamp comments is not a codebase improvement, and the same guarantee belongs in a lint rule for new code.
+
+Data gate closed (no code): the Phase-A telemetry finally had a month of data. The **G17 backfill gate opens** — `enrich_save` 51/57 = 89.5% enriched against a 70% threshold, single failure mode, zero transaction or worker errors; the backlog it unblocks is 2,382 alias-empty and 510 obligated-lessonless live rows. The **G14 soft injection budget is archived unbuilt**: the dilution it targeted decayed out from under it (max `injected_n` 105 → 23 over 14 days; 3 of 144 sessions exceed 20, so a budget at 25–30 would fire about once per 144 sessions), and `citation_log` is keyed `(project, memory_session_id)` with aggregate counts only — it cannot attribute which rows were cited, so no amount of further data calibrates a per-row threshold. Re-measuring the *premise* rather than the threshold is what retired it.
+
+Review: **this release shipped without an independent pre-tag review** — three fresh-context reviewer agents were dispatched and none returned a report within ~50 minutes despite repeated prompting, so their four focus areas (the file-deleting GC's blast radius, the 45s budget's reachability from deadline-bound hooks, the decay consequence of newly counting Key Context rows, and the DAY_MS substitution) were re-verified by the author instead. Author verification is not equivalent to independent review and is recorded as such. What that self-check did produce: two of the four `claude` spawn sites had argv-only assertions and could have silently lost `DISABLE_CLAUDEMD_HOOKS` (now pinned; 8 mutations across 4 sites × 2 halves all red), and two GC prefixes documented as live markers turned out to have no writer or reader left in the tree (comment corrected). Decay blast radius bounded by inspection: demotion needs 3 consecutive uncited sessions AND a project cite-rate ≥2%, `IMPORTANCE_FLOOR` is 1 so no row is buried, one citation promotes it back, and a demoted row leaves Key Context and stops being injected.
+
+4398/4398 tests (252 files), eslint + shellcheck clean, knip at the 32-export baseline, main CI green at the baseline commit.
+
+## v3.65.0 — the consolidation's second cut: every read surface composes the shared SQL core, and the prompt-time exclude-set stops suppressing what was never shown
+
+**Upgrading from 3.64.0 — what changes for you.** Two behaviors you may notice. Each has an escape hatch; neither requires action.
+
+| Change | If it bothers you |
+|---|---|
+| Prompt-time `<memory-context>` injection no longer excludes rows by a DB query. The old exclude-set silently removed the 5 newest importance≥2 rows on every prompt — even on adopted/quiet projects where the SessionStart Key Context those rows were "deduped against" is never rendered at all (on a dense project this blanked the same-project injection leg outright: 3 → 0 lines in the review's reproduction). Exclusion now mirrors reality: SessionStart/PreCompact record the ids they ACTUALLY rendered into a per-session `.claude-mem-keyctx-*` runtime marker (empty under quiet), and the prompt hook excludes exactly those — no marker, or another session's marker → nothing excluded. Net effect: adopted/quiet projects see MORE relevant memory at prompt time; non-quiet projects get exact dedup (up to 10 rendered rows) instead of approximate recency-based dedup (5 rows). | Pin the prior version (rollback recipe in README → *Trust model per install path*). The marker rides the existing 24h session-start GC. |
+| `benchmark.mjs --matrix` ablation numbers are not comparable across this version: the `hybrid` arm's decay multiplier now composes the real FULL_SCORE shape (clamped, `MAX(created, last_accessed)`, per-type half-life) instead of an unclamped created-only 14-day copy, and the `lesson` arm now matches FULL_SCORE's empty/`'none'` guard. Fixture matrix `hybrid` R@10 0.9015 → 0.8998 — the old copy was measuring a chain production doesn't run. The default (non-matrix) benchmark and the denoise A/B suites run the real engine and are unaffected (Δ=0.000 bit-identical); `ci-gate` passes on the new numbers. | Dev-tooling only; re-baseline any private snapshots against v3.65.0. |
+
+Structural (D#123 — the second cut of the audit's P2-11):
+
+- **refactor(core):** the remaining ~26 hand-inlined live-row filter pairs across 13 read-surface files (hook-context / hook-handoff / hook-optimize / mem-cli / search-scoring / tfidf / deep-search / recall-core / recent-core / timeline-core / stats-core / search-core / maintain-core) + benchmark's `seedVectors` now compose `liveObsFilterSql()`; the sessions/events decay arms in `lib/search-core.mjs` compose `recencyDecaySql()`. The `EXP(-0.693` decay shape now has exactly one home repo-wide (source-scan pinned). The ledger test grew from 5 to 19 enforced files, strips `//` comments before scanning (a comment naming both literals near a legitimate single could otherwise false-positive later), and deliberate compressed-only singles are documented as non-members (maintain UPDATE guards, stats noise-gauge counts, export tombstone toggles, session-own history).
+- **fix(export):** CLI `export --include-compressed` branch restructured to compose the core — byte-identical WHERE in both flag states (verified against the pre-image by SQL capture).
+
+Review: two fresh-context passes (adversarial SQL-equivalence / test-quality + blast-radius) attacked the diff before tagging. The SQL reviewer verified all 32 converted statements byte-equivalent (fake-prepare capture against a `git archive` pre-image + real-DB CLI end-to-end diff) — and refuted the first cut's exclude-set "alignment" outright (C-1 above), which was redesigned to the marker mechanism pre-tag. The test reviewer mutation-tested the new pins (5-tombstone case couldn't catch a lone filter revert; over-exclusion direction had zero coverage) — the rewritten suite kills all three mutation classes (query-revert / marker-ignored / session-gate-dropped), verified by running each mutant. 4349/4349 tests, eslint/shellcheck clean, knip at the 32-export baseline, denoise A/B bit-identical, benchmark ci-gate green.
+
+Known measurement gap (deferred): rows rendered in SessionStart Key Context still have no citation extractor and no `injection_count` bump — shown-but-uncounted for the decay/telemetry loop (was 5 rows' worth before, now up to 10). Tracked as deferred work; the direction (wire Key Context as a fifth extractor face) is noted there.
+
+## v3.64.0 — the drift class gets a home: one shared SQL core for the injection surfaces, five CLI/MCP twins consolidated, and the two-window dedup bug
+
+**Upgrading from 3.63.0 — what changes for you.** Five behaviors you may notice. Each has an escape hatch; none requires action.
+
+| Change | If it bothers you |
+|---|---|
+| Two Claude Code windows on the same project no longer clobber each other's injection-dedup state: the marker file is now **per session** (`.claude-mem-injected-<project>-<session>`), so each window keeps its own dedup window and its own `MAX_SESSION_INJECTIONS` cap. Before, alternating windows reset each other's count (the cap was unreachable) and re-injected the same rows. Stale markers are swept at session start (24h). | Nothing to do — single-window behavior is unchanged. |
+| Session-summary detail (`get S#N`, both CLI and MCP) now renders the **full** field set — `remaining_items`, `notes`, `files_read/edited` were searchable via FTS but never shown (a retrieval dead end); the CLI also gains the `Memory session id` / `Prompt number` lines the MCP face already had, and field order follows the shared list (`Completed` renders fifth, was second on the CLI). | Pin the prior version (rollback recipe in README → *Trust model per install path*). |
+| `registry list` is aligned across faces: the CLI gains the NULL-safe adoption ordering the MCP face had (`adopt:0` instead of `adopt:null`, no NULL rows sorting apart) and the 80-char summary cap (was 50); both faces keep newline-flattened, surrogate-safe truncation. | Same rollback recipe. |
+| `restore` no longer drops purge-**queued** rows (`compressed_into = -2`): they have no summary keeper, so rejecting them silently lost their only copy — they now restore live and re-enter normal decay. Keeper-absorbed and auto-retired tombstones stay rejected, and the rejection message now says which kind it meant. | Nothing to do — previously-rejected backups can simply be restored again. |
+| Concept/PRF **expansion** results now respect the noise penalty (an entrenched-noise row demoted 0.2× on every direct surface could re-enter through expansion at full magnitude). The cite factor deliberately stays out of expansion scoring — it can amplify 3×, exactly what the expansion path must not do to loose matches. Denoise A/B: NEUTRAL, Δ=0.000 bit-identical. | `CLAUDE_MEM_UPS_TOP_MIN=0`-style per-surface knobs are unchanged; pin the prior version if ordering matters to you. |
+
+Structural (the audit's P2-11/P2-12 — turning three audits' worth of "the fix reached surface A but not its twin" from memory into code):
+
+- **refactor(core):** `lib/inject-search-core.mjs` — single shared home for the live-row filter pair (the superseded invariant's 7-time reopening vector), the `MAX(0,…)`-clamped recency decay (M-1's missing clamp), and the injection relevance chain incl. cite/noise (M-3's missing factors). Five consumers compose it (UPS, pre-tool-recall, hook-memory, error-recall, search-engine); a source-scan ledger test fails the suite if any of them hand-rolls the pair again — any alias, either order.
+- **refactor(twins):** get/update/delete/browse/registry consolidated into lib/ cores (`get-core`, `browse-core`, `previewDeleteRows`, `applyObsUpdate`, `collectRegistryStats`/`listResourcesRanked`/`formatRegistryListLine`) per the fts-check thin-adapter template — the hand-copied blocks behind the audited 16-vs-24-column incident shape. Faces keep their validation front-ends and rendering conventions.
+- **fix(banding):** the cross-source lone-hit `-1.05` invariant vs cite-widened scores is adjudicated and pinned by three real-SQL probes (cite widening is exactly 3.0×-capped, a decisively strongest lone event survives max cite state, noise shrink can only improve the lone hit's band); benchmark `--matrix`/ablation now model the full FULL_SCORE chain incl. `no_noise`/`no_cite` arms.
+- **fix(bridge):** `pre-skill-bridge` defangs the `Read()` path outside the wrapper; PRF's row gate reads the pre-expansion primary count.
+- **docs(security):** `SECURITY.md` — private vulnerability reporting channel + scope notes (release signing, defang surfaces, secret scrubbing, data-dir confinement).
+
+Review: three fresh-context passes (adversarial / testing / maintainability) attacked the behavior-preservation claim before tagging — SQL parameter order, twin data parity, and every D#120 marker face verified clean; the one caught regression (a hand-rolled slice replacing `truncate()` dropped newline flattening and surrogate safety on the registry list) and three mutation-verified test holes were fixed pre-tag. 4330/4330 tests, eslint/shellcheck clean, knip at the 32-export baseline, denoise A/B bit-identical.
+
 ## v3.63.0 — the 2026-08-14 audit's P0+P1 batch: a write-side tombstone bug, two unclamped clocks, and the guards that never reached the explicit surfaces
 
 **Upgrading from 3.62.0 — what changes for you.** Four behaviors you may notice. Each has an escape hatch; none requires action.

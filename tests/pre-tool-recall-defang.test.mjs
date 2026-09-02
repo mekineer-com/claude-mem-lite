@@ -14,7 +14,7 @@ import { mkdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import { insertSession, insertObs } from './test-helpers.mjs';
+import { insertSession, insertObs, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-tool-recall.js');
 
@@ -31,7 +31,7 @@ function runScript(input, env = {}) {
     child.on('error', rej);
     child.stdin.write(JSON.stringify(input));
     child.stdin.end();
-    setTimeout(() => { child.kill(); rej(new Error('timeout')); }, 5000);
+    setTimeout(() => { child.kill(); rej(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 

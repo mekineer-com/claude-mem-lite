@@ -16,7 +16,7 @@ import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import { insertSession, insertObs } from './test-helpers.mjs';
+import { insertSession, insertObs, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import { memTimelineSchema, memMaintainSchema, memOptimizeSchema } from '../tool-schemas.mjs';
 import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
 
@@ -58,7 +58,7 @@ function rpc(proc, id, method, params) {
     setTimeout(() => {
       proc.stdout.off('data', onData);
       reject(new Error(`timeout waiting for id=${id} method=${method}`));
-    }, 5000);
+    }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 
@@ -619,11 +619,13 @@ describe('T2 CLI fixes', () => {
   it('optimize --scope rejects unknown scope values', async () => {
     const output = await captureStdout(() => run(['optimize', '--scope', 'bogus']));
     expect(output).toMatch(/Invalid --scope/);
-    expect(output).toMatch(/narrow, wide/);
+    // Every accepted value must be named in the error — a scope missing from this
+    // list is a scope users can't discover from the failure they actually hit.
+    expect(output).toMatch(/narrow, wide, aliases, scopes/);
   });
 
-  it('optimize --scope accepts narrow and wide', async () => {
-    for (const scope of ['narrow', 'wide']) {
+  it('optimize --scope accepts narrow, wide, aliases and scopes', async () => {
+    for (const scope of ['narrow', 'wide', 'aliases', 'scopes']) {
       const output = await captureStdout(() => run(['optimize', '--scope', scope]));
       expect(output).toMatch(/Optimization Preview/);
     }
@@ -761,9 +763,11 @@ function initHomeDb(home) {
   return { db, dbPath };
 }
 
+// `event` may be a string or [event, ...argv] — `auto-maintain` takes the project scope
+// as argv[3] since the compress-marking passes moved off SessionStart (P2-11).
 function runHookCmd(event, { home, stdin = '', cwd = home }) {
   try {
-    const stdout = execFileSync(process.execPath, [HOOK_PATH, event], {
+    const stdout = execFileSync(process.execPath, [HOOK_PATH, ...(Array.isArray(event) ? event : [event])], {
       input: stdin,
       timeout: 10000,
       encoding: 'utf8',
@@ -1550,6 +1554,10 @@ describe('v2.56.0 #4: injection_count protects from auto-maintain decay/mark-idl
     db.close();
 
     runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: JSON.stringify({ session_id: 'cc-inj-uuid' }) });
+    // P2-11: the compress-marking passes moved off the SessionStart transaction onto the
+    // 24h auto-maintain cadence, so the marking that used to happen inside the call above
+    // is now driven explicitly — the same shape MED-4 already established here.
+    runHookCmd(['auto-maintain', 'audit--t4'], { home: tmpHome, cwd: projDir });
 
     const db2 = new Database(dbPath, { readonly: true });
     try {

@@ -4,7 +4,7 @@
 
 `claude-mem-lite` 是 **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**（Anthropic 官方 CLI 编程代理）的 **持久化记忆系统**（也称 **长期记忆 / 跨会话上下文 / Claude Code 记忆插件**）。它以 **[MCP](https://modelcontextprotocol.io/) 服务器** + Claude Code 钩子（hooks）的形式运行，在编码会话中自动捕获观察记录、决策、bug 修复，并通过 FTS5 全文检索 + TF-IDF 向量的混合检索召回历史上下文。
 
-与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本估算下降约 600 倍 —— 见下方成本模型，属架构估算而非实测基准）；FTS5 + TF-IDF 混合检索在 30 个查询的基准上达到 **Recall@10 = 0.88 / Precision@10 = 0.96**。
+与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本估算下降约 600 倍 —— 见下方成本模型，属架构估算而非实测基准）；FTS5 + TF-IDF 混合检索在 30 个查询的基准上达到 **Recall@10 = 0.90 / Precision@10 = 0.85**（复现命令见[搜索质量](#搜索质量)一节）。
 
 无需外部服务。单一 SQLite 数据库。开销极低。
 
@@ -152,7 +152,9 @@ node install.mjs install
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
 2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 20 个工具（9 个核心通过 `tools/list` 暴露 + 11 个隐藏但可调；完整表见 Usage 段）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
 
-> **首次 SessionStart 自动 adopt（v2.82.1+）。** 插件会自动向该项目 memdir 写入**邀请式 memory 哨兵**（一条提升 Claude 主动调用 `mem_recall` / `mem_save` 的 system-authority 指针），**任何安装路径都生效**（npm、npx、`/plugin`、手动），**无需再手动跑 `/adopt`**。项目级关闭：`claude-mem-lite adopt --disable`（重新启用用 `--enable`）。全局关闭：`export MEM_NO_AUTO_ADOPT=1`。手动 `/adopt` 仍保留用于编辑后重写或 `--all` 批量场景。
+> **自动 adopt 会写进你的项目，且每次 SessionStart 都跑（v3.13+）。** 插件向**项目自己的 `<cwd>/CLAUDE.md`**（通常是会进 git 的文件）写入一个 slug 限定的**托管块**，外加 `<cwd>/.claude/plugin_claude_mem_lite.md` 详情文件。该块是一条提升 Claude 主动调用 `mem_recall` / `mem_save` 的 system-authority 指针；块以外的内容逐字保留，也能与其它插件的块共存于同一文件。这是**每次** SessionStart 都做的幂等同步，不只是第一次——块被删掉会重新写回，出货模板变了会刷新。**任何安装路径都生效**（npm、npx、`/plugin`、手动），**无需再手动跑 `/adopt`**。
+>
+> 关闭方式：项目级 `claude-mem-lite adopt --disable`（重新启用用 `--enable`）；全局 `export MEM_NO_AUTO_ADOPT=1`；只冻结模板刷新用 `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`。`claude-mem-lite unadopt` 可移除托管块与详情文件。手动 `/adopt` 仍保留用于编辑后重写或 `--all` 批量场景。
 3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库、运行时和托管资源文件
 5. **自动迁移** -- 自动检测 `~/.claude-mem/`（原版 claude-mem）或 `~/claude-mem-lite/`（v0.5 前的非隐藏目录），将数据库和运行时文件迁移到 `~/.claude-mem-lite/`，原目录保持不变
@@ -297,7 +299,9 @@ Slash 命令 `/adopt` 和 `/unadopt` 是上述 CLI 的包装。
 - Hash 守护：你手动改了 sentinel 段 → 下一次 adopt 报 `UserEditedError`，
   除非显式 `--force`。
 - 预算门：MEMORY.md 已 >180 行时拒绝新增（避开 Claude Code 200 行截断）。
-- **任何安装路径首次 SessionStart 自动 adopt（v2.82.1+）。** 项目级关闭：
+- **任何安装路径每次 SessionStart 都自动 adopt（v2.82.1+；v3.13 起写入目标由
+  memdir 改为 `<cwd>/CLAUDE.md`）。** 同步是幂等的——托管块被删会写回，出货模板
+  变化会刷新（用 `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1` 冻结）。项目级关闭：
   `claude-mem-lite adopt --disable`（写 `<memdir>/.mem-no-auto-adopt` 哨兵，
   存活于 marker 删除 / 插件重装）。全局关闭：`export MEM_NO_AUTO_ADOPT=1`。
   v2.82.1 前因 `CLAUDE_PLUGIN_ROOT` gate 与 `install.mjs` 写出的 hook 命令
@@ -572,17 +576,25 @@ claude-mem-lite/
 
 ## 搜索质量
 
-基于 200 条观察和 30 个查询（标准 + 困难负样本类别）的基准测试结果：
+基于 200 条观察和 30 个查询（标准 + 困难负样本类别）的基准测试结果，测量的是
+**production-hybrid** 检索路径（FTS5 BM25 + TF-IDF 向量 + RRF）——也就是 `mem_search` /
+`recall` 实际走的那条路径：
 
-| 指标 | 得分 |
+| 指标 | 得分（production-hybrid） |
 |------|------|
-| Recall@10 | 0.88 |
-| Precision@10 | 0.96 |
-| nDCG@10 | 0.95 |
-| MRR@10 | 0.95 |
-| P95 搜索延迟 | 0.15ms |
+| Recall@10 | 0.90 |
+| Precision@10 | 0.85 |
+| nDCG@10 | 0.97 |
+| MRR@10 | 0.96 |
+| P95 搜索延迟 | ~1.8ms |
 
-基准测试作为 CI 门控运行（`npm run benchmark:gate`），防止搜索质量回退。
+> **数据来源。** 复现命令：`node benchmark/benchmark.mjs --production-hybrid`（确定性输出——
+> 固定语料、固定查询集、无采样）。CI 参考快照是 `benchmark/baseline.json`，
+> `npm run benchmark:gate` 在偏离超过 5% 时让构建失败。本 README 中所有检索指标都以此为唯一来源。
+
+> **关于测量路径。** 本表早期版本报告的是 *lexical* 纯 FTS 路径（Precision@10 0.96、
+> P95 0.15ms）。混合向量臂用 precision@10 换取更高的 recall / nDCG / MRR——它会召回超出字面
+> 匹配的语义相关候选；门控现在测量混合路径，所以这些数字反映的是 `mem_search` 的真实行为。
 
 ## 开发
 
@@ -606,8 +618,8 @@ npm run benchmark:gate    # CI 门控：指标回退超过 5% 容差时失败
 | `OPENROUTER_MODEL` | 覆盖**所有**后台调用的 OpenRouter 模型 slug（如 `openai/gpt-4o-mini`、`qwen/qwen-2.5-72b-instruct`）。未设时按 `CLAUDE_MEM_MODEL` 分层映射到 `anthropic/claude-haiku-4.5`（haiku）或 `anthropic/claude-sonnet-4.5`（sonnet）。 | _(分层默认)_ |
 | `CLAUDE_MEM_DEBUG` | 启用调试日志（设为 `1` 启用）。 | _(禁用)_ |
 | `MEM_QUIET_HOOKS` | 低噪声 hook。设为 `1` 时，SessionStart 注入去掉 `File Lessons` / `Key Context` 两节，`[mem] Related memories` 去掉 lesson 后缀，MCP server instructions 去掉 `WHEN TO USE` / `Decision rules` 两段。ID 与 `Recent` 表仍保留，`mem_get(ids=[…])` 可继续展开细节。适用于启用了 invited-memory adopt 流程或偏好最小化自动注入的用户。**v2.82.0 起此 env 不再阻挡 auto-adopt——如需关闭 auto-adopt 用 `MEM_NO_AUTO_ADOPT=1`。** | _(禁用)_ |
-| `MEM_NO_AUTO_ADOPT` | auto-adopt 全局关闭开关（v2.82.0+）。设为 `1` 阻止首次 SessionStart 在**所有**项目自动写入邀请式 memory 哨兵。项目级关闭走 `claude-mem-lite adopt --disable`（写 `<memdir>/.mem-no-auto-adopt` 哨兵，存活于 marker 删除）。 | _(禁用)_ |
-| `MEM_NO_ADOPT_HINT` | 静音当前项目未 adopt 时 SessionStart 追加的那一行 "Invited-memory 未启用…" 提示。v2.82.1 起任何安装路径首次 SessionStart 都自动 adopt，所以该提示一般只在你显式 opt out（`MEM_NO_AUTO_ADOPT=1` 或 `claude-mem-lite adopt --disable`）的项目才会出现。 | _(禁用)_ |
+| `MEM_NO_AUTO_ADOPT` | auto-adopt 全局关闭开关（v2.82.0+）。设为 `1` 阻止每次 SessionStart 在**所有**项目自动写入 `CLAUDE.md` 托管块。项目级关闭走 `claude-mem-lite adopt --disable`（写 `<memdir>/.mem-no-auto-adopt` 哨兵，存活于 marker 删除）。 | _(禁用)_ |
+| `MEM_NO_ADOPT_HINT` | 静音当前项目未 adopt 时 SessionStart 追加的那一行 "Invited-memory 未启用…" 提示。v2.82.1 起任何安装路径每次 SessionStart 都自动 adopt，所以该提示一般只在你显式 opt out（`MEM_NO_AUTO_ADOPT=1` 或 `claude-mem-lite adopt --disable`）的项目才会出现。 | _(禁用)_ |
 
 ## 许可证
 

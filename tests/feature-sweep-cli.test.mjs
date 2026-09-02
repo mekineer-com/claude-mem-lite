@@ -433,7 +433,7 @@ describe('CLI feature sweep: data commands', () => {
     expect(withDb(db => db.prepare("SELECT COUNT(*) c FROM observations WHERE project='sweep-restore'").get().c)).toBe(0);
 
     const dry = ok(['restore', dump, '--dry-run']);
-    expect(dry.stdout).toMatch(/Restore \(dry-run\): 1 restored/);
+    expect(dry.stdout).toMatch(/Restore \(dry-run\): 1 would be restored/);
     expect(withDb(db => db.prepare("SELECT COUNT(*) c FROM observations WHERE project='sweep-restore'").get().c)).toBe(0);
 
     const real = ok(['restore', dump]);

@@ -13,14 +13,17 @@ import {
   computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity, clampImportance, cjkBigrams,
   notLowSignalTitleClause, scrubSecrets,
 } from './utils.mjs';
-import { callModelJSON } from './haiku-client.mjs';
+import { callModelJSONAsync, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, cosineSimilarity, vecTextForRow } from './tfidf.mjs';
 import { MERGE_JACCARD_LOW, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { DB_DIR } from './schema.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
+import { normalizeScope, SCOPE_PROMPT_LEGEND } from './lib/observation-write.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 
 // ─── Budget ─────────────────────────────────────────────────────────────────
@@ -90,10 +93,38 @@ export function rebuildVector(db, obsId, textPartsOrRow) {
  *
  * @param {object} db better-sqlite3 database handle
  * @param {number} limit max candidates to return
- * @param {{ scope?: 'narrow' | 'wide', project?: string }} [opts] Optional project filter (e.g. inferProject()-resolved name) narrows candidates to a single project — opt-in to preserve prior cross-project default.
+ * @param {{ scope?: 'narrow' | 'wide' | 'aliases' | 'scopes', project?: string }} [opts] Optional project filter (e.g. inferProject()-resolved name) narrows candidates to a single project — opt-in to preserve prior cross-project default.
  */
 export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', project } = {}) {
   const projectClause = project ? 'AND project = ?' : '';
+  if (scope === 'scopes') {
+    // D#135 P3 scope backfill: substantive rows with observations.scope still
+    // NULL, REGARDLESS of lesson or aliases. narrow/wide need lesson IS NULL and
+    // aliases needs search_aliases IS NULL, so a legacy lesson-bearing row with
+    // aliases is reachable by NONE of them — that shape was 1955 of the 2041
+    // scope-less rows on 2026-08-19, i.e. the pool is ~97% invisible to the
+    // existing passes. Idempotent via scope becoming non-null; deliberately NOT
+    // gated on optimized_at (the alias branch's precedent — an optimized row can
+    // still be unclassified) and it never SETS optimized_at, so the wide pass
+    // keeps its own candidates.
+    // Lesson-bearing first: CLAUDE_MEM_SCOPE_FILTER gates pre-tool recall, which
+    // injects lesson-bearing rows — classifying those first is what makes the
+    // lever usable before the backlog is fully drained.
+    const stmt = db.prepare(`
+      SELECT id, title, narrative, type, lesson_learned, importance, project
+      FROM observations
+      WHERE ${liveObsFilterSql('')}
+        AND scope IS NULL
+        AND LENGTH(COALESCE(narrative, '')) > 100
+        AND ${notLowSignalTitleClause('')}
+        ${projectClause}
+      ORDER BY
+        CASE WHEN lesson_learned IS NOT NULL AND lesson_learned != '' THEN 0 ELSE 1 END,
+        created_at_epoch DESC
+      LIMIT ?
+    `);
+    return project ? stmt.all(project, limit) : stmt.all(limit);
+  }
   if (scope === 'aliases') {
     // P1 alias backfill: substantive rows missing search_aliases, REGARDLESS of
     // lesson. Targets lesson-bearing manual saves (mem_save writes no aliases →
@@ -104,8 +135,7 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
     const stmt = db.prepare(`
       SELECT id, title, narrative, type, subtitle, concepts, facts, text, search_aliases, importance, project
       FROM observations
-      WHERE COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
+      WHERE ${liveObsFilterSql('')}
         AND (search_aliases IS NULL OR search_aliases = '')
         AND LENGTH(COALESCE(narrative, '')) > 100
         AND ${notLowSignalTitleClause('')}
@@ -119,8 +149,7 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
     const stmt = db.prepare(`
       SELECT id, title, narrative, type, subtitle, concepts, facts, search_aliases, importance, project
       FROM observations
-      WHERE COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
+      WHERE ${liveObsFilterSql('')}
         AND optimized_at IS NULL
         AND type IN ('bugfix','refactor','feature','decision')
         AND (lesson_learned IS NULL OR lesson_learned = '')
@@ -150,6 +179,29 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
   return project ? stmt.all(project, limit) : stmt.all(limit);
 }
 
+/**
+ * Row count for a re-enrich pool, without materialising it. Only the 'scopes'
+ * pool is served: it is the one large enough for the difference to matter
+ * (2041 rows at introduction, against ~22 alias candidates), and keeping the
+ * predicate here rather than duplicating it would drift — so this shares the
+ * finder's WHERE by construction, via a SELECT COUNT over the same clauses.
+ * @returns {number}
+ */
+export function countReenrichCandidates(db, scope = 'scopes', project) {
+  if (scope !== 'scopes') return findReenrichCandidates(db, 5000, { scope, project }).length;
+  const projectClause = project ? 'AND project = ?' : '';
+  const stmt = db.prepare(`
+    SELECT COUNT(*) c
+    FROM observations
+    WHERE ${liveObsFilterSql('')}
+      AND scope IS NULL
+      AND LENGTH(COALESCE(narrative, '')) > 100
+      AND ${notLowSignalTitleClause('')}
+      ${projectClause}
+  `);
+  return (project ? stmt.get(project) : stmt.get()).c;
+}
+
 export async function executeReenrich(db, limit = 10, { scope = 'narrow', project } = {}) {
   const candidates = findReenrichCandidates(db, limit, { scope, project });
   if (candidates.length === 0) return { processed: 0, skipped: 0 };
@@ -162,6 +214,34 @@ export async function executeReenrich(db, limit = 10, { scope = 'narrow', projec
     if (!gotSlot) { skipped++; continue; }
 
     try {
+      if (scope === 'scopes') {
+        // Classification-only pass (D#135 P3). One cheap Haiku call per row, and
+        // the UPDATE touches exactly ONE column — this pool is full of curated
+        // lesson-bearing rows, so borrowing the general re-enrich (which rewrites
+        // title/narrative/lesson and stamps optimized_at) would risk permanent
+        // content loss to buy a single enum value.
+        const scopePrompt = `Classify where this coding memory APPLIES. Return ONLY valid JSON, no markdown fences.
+
+Title: ${truncate(cand.title || '(untitled)', 200)}
+Narrative: ${truncate(cand.narrative || '(no narrative)', 500)}
+Lesson: ${truncate(cand.lesson_learned || '(none)', 300)}
+
+JSON: {"scope":"file|module|project|environment"}
+scope: ${SCOPE_PROMPT_LEGEND}`;
+        const parsed = await callModelJSONAsync(scopePrompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 60 });
+        const scopeValue = normalizeScope(parsed && parsed.scope);
+        if (!scopeValue) { skipped++; continue; }
+        // `AND scope IS NULL` is the fill-only-empty guard: a save-enrich worker or
+        // an episode upgrade can land between candidate selection and this write,
+        // and a classifier round-trip is long enough for that to be real.
+        const res = db.prepare('UPDATE observations SET scope = ? WHERE id = ? AND scope IS NULL')
+          .run(scopeValue, cand.id);
+        if (res.changes === 0) { skipped++; continue; }
+        // No rebuildVector: scope is a filter column, absent from the FTS text
+        // field and from vecTextForRow — a rebuild here would be a no-op write.
+        processed++;
+        continue;
+      }
       if (scope === 'aliases') {
         // Alias-only backfill: generate search_aliases and APPEND them (plus any
         // CJK bigrams) to the EXISTING FTS text. Never rebuild text from
@@ -173,9 +253,10 @@ export async function executeReenrich(db, limit = 10, { scope = 'narrow', projec
 Title: ${truncate(cand.title || '(untitled)', 200)}
 Narrative: ${truncate(cand.narrative || '(no narrative)', 500)}
 
-JSON: {"search_aliases":["alt phrasing","synonym","spelled-out jargon","CJK term if the domain word has one"]}
-Give 3-6 aliases: words a user might search for the SAME concept but that are NOT already in the title (synonyms, the spelled-out form of an acronym, the jargon term for a described symptom, a CJK translation of a key domain term).`;
-        const parsed = await callModelJSON(aliasPrompt, 'haiku', { timeout: 15000, maxTokens: 300 });
+JSON: {"search_aliases":["alt phrasing","synonym","spelled-out jargon","CJK term if the domain word has one"],"scope":"file|module|project|environment"}
+Give 3-6 aliases: words a user might search for the SAME concept but that are NOT already in the title (synonyms, the spelled-out form of an acronym, the jargon term for a described symptom, a CJK translation of a key domain term).
+scope: ${SCOPE_PROMPT_LEGEND}`;
+        const parsed = await callModelJSONAsync(aliasPrompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 300 });
         const aliasArr = parsed && Array.isArray(parsed.search_aliases)
           ? parsed.search_aliases.filter((a) => typeof a === 'string' && a.trim().length > 0)
           : [];
@@ -184,8 +265,11 @@ Give 3-6 aliases: words a user might search for the SAME concept but that are NO
         const aliasBigrams = cjkBigrams(searchAliases);
         const appendedText = [cand.text || '', searchAliases, aliasBigrams].filter(Boolean).join(' ');
         const safe = scrubRecord('observations', { text: appendedText, search_aliases: searchAliases });
-        db.prepare(`UPDATE observations SET search_aliases = ?, text = ? WHERE id = ?`)
-          .run(safe.search_aliases, safe.text, cand.id);
+        // scope rides this call for free (D#135 P3). COALESCE, not a plain set:
+        // an omitted or off-enum value normalizes to null and must not erase a
+        // classification an earlier face already wrote.
+        db.prepare(`UPDATE observations SET search_aliases = ?, text = ?, scope = COALESCE(?, scope) WHERE id = ?`)
+          .run(safe.search_aliases, safe.text, normalizeScope(parsed.scope), cand.id);
         // Refresh the TF-IDF vector from the just-updated FTS text so the new
         // aliases reach the vector arm too — the narrow/wide branch rebuilds, this
         // one must as well. No-ops when the vector arm is off / vocab unbuilt.
@@ -199,12 +283,13 @@ Title: ${truncate(cand.title || '(untitled)', 200)}
 Narrative: ${truncate(cand.narrative || '(no narrative)', 500)}
 Type: ${cand.type || 'change'}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"improved ≤120 char title","narrative":"improved 2-3 sentence narrative","concepts":["kw1","kw2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight or 'none' if routine","search_aliases":["alt query 1","alt query 2"]}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"improved ≤120 char title","narrative":"improved 2-3 sentence narrative","concepts":["kw1","kw2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight or 'none' if routine","search_aliases":["alt query 1","alt query 2"],"scope":"file|module|project|environment"}
 importance: 0=no value, 1=routine, 2=notable non-obvious insight, 3=critical. Default 1.
 lesson_learned: State what was learned. If routine, write "none".
-search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
+search_aliases: 2-6 alternative search terms (include CJK if applicable).
+scope: ${SCOPE_PROMPT_LEGEND}`;
 
-      const parsed = await callModelJSON(prompt, 'haiku', { timeout: 15000, maxTokens: 500 });
+      const parsed = await callModelJSONAsync(prompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 500 });
       if (!parsed || !parsed.title) { skipped++; continue; }
 
       // Auto-hide on importance:0 targets fully-degraded NARROW rows (this branch predates
@@ -266,10 +351,15 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
       });
       db.prepare(`
         UPDATE observations SET type=?, title=?, narrative=?, concepts=?, facts=?,
-          text=?, importance=?, lesson_learned=?, search_aliases=?, minhash_sig=?, optimized_at=?
+          text=?, importance=?, lesson_learned=?, search_aliases=?, minhash_sig=?, optimized_at=?,
+          scope=COALESCE(?, scope)
         WHERE id = ?
       `).run(type, safe.title, safe.narrative, safe.concepts, safe.facts, safe.text,
-        importance, safe.lesson_learned, safe.search_aliases, minhashSig, Date.now(), cand.id);
+        importance, safe.lesson_learned, safe.search_aliases, minhashSig, Date.now(),
+        // COALESCE (mirrors the hook-llm upgrade path): a re-enrich that omits
+        // scope, or emits an off-enum value, must never blank an existing label —
+        // and THIS update stamps optimized_at, so the loss would be permanent.
+        normalizeScope(parsed.scope), cand.id);
 
       rebuildVector(db, cand.id, { title, narrative, concepts: conceptsText, lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases });
 
@@ -289,7 +379,7 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
 // ─── Task 2: Normalize ─────────────────────────────────────────────────────
 
 const NORMALIZE_GATE_FILE = join(RUNTIME_DIR, 'last-normalize.json');
-const NORMALIZE_INTERVAL_MS = 7 * 86400000; // 7 days
+const NORMALIZE_INTERVAL_MS = 7 * DAY_MS; // 7 days
 
 // Pure gate decision (no IO) — exported for testing. Fail-OPEN on a
 // malformed-but-valid-JSON gate: a missing/non-numeric `epoch` makes
@@ -356,7 +446,7 @@ Rules:
 - Include CJK ↔ English equivalents if present
 - Skip terms that have no synonyms in the list`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    const parsed = await callModelJSONAsync(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed?.groups || !Array.isArray(parsed.groups)) return [];
     return parsed.groups.filter(g => g.canonical && Array.isArray(g.aliases) && g.aliases.length > 0);
   } catch (e) {
@@ -448,7 +538,7 @@ export async function executeNormalize(db, force = false, { project } = {}) {
 
 // ─── Task 3: Cluster-merge ─────────────────────────────────────────────────
 
-const MERGE_TIME_WINDOW_MS = 30 * 86400000;
+const MERGE_TIME_WINDOW_MS = 30 * DAY_MS;
 // Merge-review band [MERGE_JACCARD_LOW, AUTO_MERGE_THRESHOLD): titles in this
 // Jaccard range are LLM-reviewed for merge; at/above AUTO_MERGE_THRESHOLD they'd
 // already auto-merge elsewhere, below MERGE_JACCARD_LOW they're too dissimilar.
@@ -459,8 +549,7 @@ export function findMergeCandidates(db, maxClusters = 5, { project } = {}) {
   const stmt = db.prepare(`
     SELECT id, title, narrative, project, type, access_count, importance, created_at_epoch, minhash_sig, lesson_learned, concepts, facts
     FROM observations
-    WHERE COALESCE(compressed_into, 0) = 0
-      AND superseded_at IS NULL
+    WHERE ${liveObsFilterSql('')}
       AND optimized_at IS NULL
       AND title IS NOT NULL AND title != ''
       AND created_at_epoch > ?
@@ -525,7 +614,7 @@ Return ONLY valid JSON:
 - If they should NOT be merged: {"should_merge":false}
 - If they SHOULD be merged: {"should_merge":true,"merged_title":"≤120 char comprehensive title","merged_narrative":"comprehensive ≤800 char summary preserving all key details","merged_concepts":["kw1","kw2"],"merged_facts":["specific fact 1"],"merged_lesson":"synthesized non-obvious lesson or null","importance":2}`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    const parsed = await callModelJSONAsync(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed || !parsed.should_merge) return { merged: false };
 
     // Keeper = highest importance, then highest access_count. Previously access_count
@@ -643,11 +732,11 @@ export async function executeClusterMerge(db, maxClusters = 5, { project } = {})
 
 // ─── Task 4: Smart-compress ────────────────────────────────────────────────
 
-const COMPRESS_TIME_SPLIT_MS = 14 * 86400000;
+const COMPRESS_TIME_SPLIT_MS = 14 * DAY_MS;
 const COMPRESS_COSINE_THRESHOLD = 0.3;
 
 export function findSmartCompressCandidates(db, ageDays = 30, { project } = {}) {
-  const cutoff = Date.now() - ageDays * 86400000;
+  const cutoff = Date.now() - ageDays * DAY_MS;
   const projectClause = project ? 'AND project = ?' : '';
   const stmt = db.prepare(`
     SELECT id, title, narrative, lesson_learned, project, type, created_at_epoch
@@ -759,7 +848,7 @@ ${obsDescriptions}
 
 JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive summary ≤800 chars preserving key decisions and lessons","concepts":["kw1","kw2"],"facts":["all specific facts preserved"],"lesson_learned":"most important synthesized lesson or 'none'","search_aliases":["alt search 1","alt search 2"]}`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    const parsed = await callModelJSONAsync(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed || !parsed.title) return { compressed: false };
 
     // Scrub BEFORE truncate (see re-enrich note): boundary cut on scrubbed text.
@@ -870,6 +959,14 @@ export function optimizePreview(db, { project, detail = false } = {}) {
   // P1: alias-backfill eligibility — substantive rows missing search_aliases
   // (incl. lesson-bearing manual saves) that narrow+wide both skip.
   const reenrichAliases = findReenrichCandidates(db, 5000, { scope: 'aliases', project }).length;
+  // D#135 P3: the scope-backfill backlog. Reported so the one-shot drain
+  // (`optimize --run --task re-enrich --scope scopes --max N`) can be sized —
+  // the daily pass alone would take months on a multi-thousand-row pool.
+  // COUNT, not `findReenrichCandidates(5000).length`: this pool started at 2041
+  // rows against the aliases pool's ~22, and the finder selects narrative +
+  // lesson_learned per row, so counting by materialising was the one place this
+  // round pulled megabytes to print an integer. (pre-tag review NOTE 11)
+  const reenrichScopes = countReenrichCandidates(db, 'scopes', project);
 
   const concepts = extractUniqueConcepts(db, 500, { project });
   const normalizeReady = shouldRunNormalize(project) && concepts.length >= 5;
@@ -885,6 +982,7 @@ export function optimizePreview(db, { project, detail = false } = {}) {
     reenrich,
     reenrichWide,
     reenrichAliases,
+    reenrichScopes,
     normalize: normalizeReady ? concepts.length : 0,
     normalizeGateOpen: shouldRunNormalize(project),
     clusterMerge,
@@ -912,6 +1010,9 @@ export function optimizePreview(db, { project, detail = false } = {}) {
  *   slice from distributeBudget() — otherwise explicit `--max N --task re-enrich`
  *   would silently waste 60% of the requested budget.
  * @param {number} [opts.maxItems=15] Total item budget across all selected tasks.
+ *   Exception: the 'scopes' side-pass the default re-enrich run performs (D#135 P3)
+ *   is budgeted separately, up to the re-enrich slice again — see the rationale at
+ *   the call site. Its calls are enum-classification only (maxTokens 60).
  * @param {boolean} [opts.force=false] Bypass time-based gates (e.g. normalize interval).
  * @param {'narrow'|'wide'|'aliases'} [opts.reenrichScope='narrow'] Scope for the re-enrich task.
  *   'wide' targets bugfix/refactor/feature/decision with narrative but no lesson (R-7).
@@ -950,16 +1051,37 @@ export async function optimizeRun(db, { tasks, maxItems = 15, force = false, ree
             // (reachable only via manual `optimize --max ≤4`; the daily path runs reenrich=6),
             // and the starved scope self-corrects next cycle.
             // An explicit --scope aliases still runs exactly that one scope (below).
+            //
+            // D#135 P3 adds a THIRD claimant, 'scopes' (observations.scope backfill),
+            // for the same cadence reason — but it is budgeted SEPARATELY, not carved
+            // out of budget.reenrich like aliases. Two measured reasons:
+            //   • Its candidate pool is a near-superset of the others' (any live
+            //     substantive row with scope NULL: 2041 rows on 2026-08-19 vs 36 wide
+            //     and 22 alias candidates), so an adaptive half-share would not be
+            //     occasional — it would permanently halve the lesson-enrichment
+            //     cadence that the main scope exists to provide.
+            //   • It is a fundamentally cheaper call: one enum token (maxTokens 60)
+            //     against a full re-enrich's 500, so charging it one full item slot
+            //     mis-prices it by an order of magnitude.
+            // Cap is budget.reenrich, so the daily pass adds at most that many cheap
+            // classification calls and an empty pool still costs nothing.
             const half = Math.max(1, Math.floor(budget.reenrich / 2));
             const aliasBudget = Math.min(half, findReenrichCandidates(db, half, { scope: 'aliases', project }).length);
+            const scopesBudget = Math.min(
+              budget.reenrich,
+              findReenrichCandidates(db, budget.reenrich, { scope: 'scopes', project }).length,
+            );
             const mainRes = await executeReenrich(db, budget.reenrich - aliasBudget, { scope: reenrichScope, project });
             const aliasRes = aliasBudget > 0
               ? await executeReenrich(db, aliasBudget, { scope: 'aliases', project })
               : { processed: 0, skipped: 0 };
+            const scopesRes = scopesBudget > 0
+              ? await executeReenrich(db, scopesBudget, { scope: 'scopes', project })
+              : { processed: 0, skipped: 0 };
             results.reenrich = {
-              processed: (mainRes.processed || 0) + (aliasRes.processed || 0),
-              skipped: (mainRes.skipped || 0) + (aliasRes.skipped || 0),
-              byScope: { [reenrichScope]: mainRes, aliases: aliasRes },
+              processed: (mainRes.processed || 0) + (aliasRes.processed || 0) + (scopesRes.processed || 0),
+              skipped: (mainRes.skipped || 0) + (aliasRes.skipped || 0) + (scopesRes.skipped || 0),
+              byScope: { [reenrichScope]: mainRes, aliases: aliasRes, scopes: scopesRes },
             };
           } else {
             results.reenrich = await executeReenrich(db, budget.reenrich, { scope: reenrichScope, project });

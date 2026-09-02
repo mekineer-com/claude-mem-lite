@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
 import { writeFileSync, mkdirSync, rmSync, readFileSync, mkdtempSync } from 'fs';
-import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
 import Database from 'better-sqlite3';
 import { tmpdir } from 'os';
@@ -34,7 +34,7 @@ function runScriptRaw(inputStr, env = {}) {
     child.on('error', reject);
     child.stdin.write(inputStr);
     child.stdin.end();
-    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, 5000);
+    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 
@@ -86,7 +86,12 @@ describe('pre-tool-recall', () => {
     });
   });
 
-  describe('DB query pattern', () => {
+  // These two cases run a HAND-COPY of the injection SELECT, not the shipped
+  // one — they document the intended shape and cannot detect drift in
+  // scripts/pre-tool-recall.js. That is how D#162 stayed open: the copy asserted
+  // superseded/compressed exclusion while the real query's filter was untested.
+  // Guards that bind the shipped script live in the D#162 block at the bottom.
+  describe('DB query pattern (illustrative copy — see D#162 block for the real guard)', () => {
     it('uses observation_files junction table with correct filters', () => {
       const db = createTestDb();
       insertSession(db, { id: 'sess-1' });
@@ -1425,15 +1430,17 @@ describe('pre-tool-recall', () => {
       try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
     });
 
-    function seedUpsInjected(ids, ageMs = 0) {
-      // Path mirrors user-prompt-search.js INJECTED_IDS_FILE construction.
-      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test`);
-      writeFileSync(file, JSON.stringify({ ids: ids.map(String), ts: Date.now() - ageMs, count: 1 }));
+    function seedUpsInjected(ids, sessionId, ageMs = 0) {
+      // Path mirrors user-prompt-search.js injectedIdsFileFor construction —
+      // D#120: session-keyed file name, so the seed must carry the same session
+      // id the script receives on stdin or the read side derives another path.
+      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test-${sessionId}`);
+      writeFileSync(file, JSON.stringify({ ids: ids.map(String), ts: Date.now() - ageMs, count: 1, session: sessionId }));
       return file;
     }
 
     it('drops a lesson row whose ID was just injected by UPS', async () => {
-      seedUpsInjected([lessonObsId]);
+      seedUpsInjected([lessonObsId], 'sess-a3-1');
       const { stdout } = await runScript({
         tool_name: 'Edit',
         tool_input: { file_path: join(projectDir, 'shared.mjs') },
@@ -1451,7 +1458,7 @@ describe('pre-tool-recall', () => {
 
     it('keeps the lesson when UPS state is older than DEDUP_STALE_MS', async () => {
       // 10 minutes old — stale, should be ignored. Lesson should surface.
-      seedUpsInjected([lessonObsId], 10 * 60_000);
+      seedUpsInjected([lessonObsId], 'sess-a3-2', 10 * 60_000);
       const { stdout } = await runScript({
         tool_name: 'Edit',
         tool_input: { file_path: join(projectDir, 'shared.mjs') },
@@ -1483,10 +1490,174 @@ describe('pre-tool-recall', () => {
         session_id: 'sess-a3-4',
       }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
 
-      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test`);
+      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test-sess-a3-4`);
       const state = JSON.parse(readFileSync(file, 'utf8'));
       const idStrings = (state.ids || []).map(String);
       expect(idStrings).toContain(String(lessonObsId));
+    });
+  });
+
+  // ─── D#172 class (audit 2026-08-29 ALGO-4): the cross-hook dedup ran DOWNSTREAM
+  // of the SQL LIMIT, so a deduped row left its slot EMPTY instead of yielding it to
+  // the next candidate — "dedup" implemented as "shrink". Own fixture rather than the
+  // A3 block above, because it needs more rows than the cap and the A3 assertions are
+  // written against a single-row corpus.
+  describe('cross-hook dedup is a re-rank, not a truncation (ALGO-4)', () => {
+    let tmpRoot;
+    let projectDir;
+    let ids;
+    let eventIds;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-algo4-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'algo4');
+      mkdirSync(projectDir, { recursive: true });
+      mkdirSync(join(tmpRoot, 'runtime'), { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-a4', project: 'parent--algo4', memoryId: 'mem-a4' });
+      const target = join(projectDir, 'shared.mjs');
+      // Four lesson rows on one file. The query sorts lesson-first, then cite_factor
+      // DESC — so cited_count pins a deterministic rank order without relying on
+      // insertion timing (created_at is only the tertiary key and can tie at ms
+      // resolution). Ranks: A(3) > B(2) > C(1) > D(0).
+      ids = [3, 2, 1, 0].map((cited, i) => {
+        const info = insertObs(db, {
+          sessionId: 'mem-a4', project: 'parent--algo4',
+          type: 'bugfix', importance: 2,
+          title: `algo4 lesson rank ${i}`,
+          lessonLearned: `Lesson body number ${i} for the about-to-edit agent`,
+          filesModified: `["${target}"]`,
+        });
+        const id = Number(info?.lastInsertRowid ?? info);
+        db.prepare('UPDATE observations SET cited_count = ? WHERE id = ?').run(cited, id);
+        return id;
+      });
+      // Four EVENTS rows on a DIFFERENT file, so the events arm can be exercised in
+      // isolation (the observations query returns nothing for this path and the merge
+      // is events-only). All carry a body, so the events ORDER BY reduces to
+      // `created_at_epoch DESC` — rank is pinned by the timestamps, not by insert order.
+      const evtFile = join(projectDir, 'events-only.mjs');
+      const now = Date.now();
+      eventIds = [0, 1, 2, 3].map((k) => {
+        const info = db.prepare(`
+          INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+          VALUES (?, 'lesson', ?, ?, ?, 2, ?)
+        `).run(
+          'parent--algo4',
+          `algo4 event rank ${k}`,
+          `Event body number ${k} for the about-to-edit agent`,
+          JSON.stringify([evtFile]),
+          now - k * 60_000,
+        );
+        return Number(info.lastInsertRowid);
+      });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    it('still fills the slot when UPS already injected every row the old LIMIT could reach', async () => {
+      // Edit path: obsLimit was a flat 2, so seeding the top TWO ranks emptied the
+      // whole obs source. With the dedup slack the SELECT reaches rank 3, and the
+      // face keeps emitting.
+      // VERIFIED RED: reverting `obsLimit` to `(isRead ? 1 : 2)` makes this assertion
+      // fail — stdout carries no `#<id>` for any of the four rows (measured
+      // 2026-09-01, same fixture).
+      const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-1');
+      writeFileSync(file, JSON.stringify({
+        ids: [ids[0], ids[1]].map(String), ts: Date.now(), count: 2, session: 'sess-a4-1',
+      }));
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a4-1',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      // Assert the emptiness FIRST and by name: the pre-fix behaviour is that the
+      // face emits nothing at all, and letting JSON.parse throw on '' reports that as
+      // "Unexpected end of JSON input" — a parse error where the defect is a silenced
+      // injection surface.
+      expect(stdout, 'obs source was truncated to nothing by the dedup').not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      // The two deduped ids must stay out — the slack must not defeat the dedup.
+      expect(ctx).not.toContain(`#${ids[0]}`);
+      expect(ctx).not.toContain(`#${ids[1]}`);
+      // ...and the next-ranked row must take the freed slot.
+      expect(ctx).toContain(`#${ids[2]}`);
+    });
+
+    it('emits the top rank unchanged when nothing was deduped (slack is not a widening)', async () => {
+      // Negative control: with no UPS state the seen-set is empty, dedupSlack is 0,
+      // and the LIMITs are exactly what they were before ALGO-4. Without this case a
+      // slack that ALWAYS over-fetched would pass the test above while quietly
+      // inflating the PreToolUse injection budget.
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a4-2',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain(`#${ids[0]}`);
+      // mergeCap for Edit is 3, and only 2 obs rows were ever fetched pre-ALGO-4;
+      // rank 4 must not appear however wide the pool got.
+      expect(ctx).not.toContain(`#${ids[3]}`);
+    });
+
+    it('fills the slot on the READ path, where one dedup hit used to silence the face', async () => {
+      // The pre-tag review's S-3: the release text leads with the Read case (`obsLimit`
+      // 1, `mergeCap` 1, so ONE dedup hit empties the whole face) while both cases above
+      // drive Edit. Testing the arm the headline is about, not the neighbouring one.
+      // VERIFIED RED: reverting `obsLimit` to `(isRead ? 1 : 2)` empties stdout.
+      const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-4');
+      writeFileSync(file, JSON.stringify({
+        ids: [ids[0]].map(String), ts: Date.now(), count: 1, session: 'sess-a4-4',
+      }));
+
+      const { stdout } = await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a4-4',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      expect(stdout, 'Read path silenced: obsLimit 1 minus one dedup hit left zero rows').not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).not.toContain(`#${ids[0]}`);
+      expect(ctx).toContain(`#${ids[1]}`);
+      // mergeCap is 1 on Read — the slack must not turn a one-row face into a two-row one.
+      expect(ctx).not.toContain(`#${ids[2]}`);
+    });
+
+    it('applies the same slack to the EVENTS arm', async () => {
+      // The pre-tag review found the case above does NOT cover `eventsLimit`: the
+      // fixture seeded only observations, so reverting the events slack stayed green
+      // across the whole suite. The events arm has the identical defect — its LIMIT is
+      // also upstream of the same JS dedup — and on a Read (`eventsLimit` 1) one dedup
+      // hit silences it outright. Driven through a file that has NO observation rows,
+      // so the merge is events-only and the assertion cannot be satisfied by the obs arm.
+      // VERIFIED RED: reverting `eventsLimit` to `(isRead ? 1 : 2)` empties stdout.
+      const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-3');
+      writeFileSync(file, JSON.stringify({
+        ids: [eventIds[0], eventIds[1]].map(String), ts: Date.now(), count: 2, session: 'sess-a4-3',
+      }));
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'events-only.mjs') },
+        session_id: 'sess-a4-3',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      expect(stdout, 'events source was truncated to nothing by the dedup').not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).not.toContain(`#${eventIds[0]}`);
+      expect(ctx).not.toContain(`#${eventIds[1]}`);
+      expect(ctx).toContain(`#${eventIds[2]}`);
     });
   });
 
@@ -1763,6 +1934,123 @@ describe('pre-tool-recall', () => {
       expect(bodyIdx).toBeGreaterThanOrEqual(0);
       expect(titleIdx).toBeGreaterThanOrEqual(0);
       expect(bodyIdx).toBeLessThan(titleIdx);
+    });
+  });
+
+  // ─── D#162: live-row + lookback filters on the SHIPPED query ───────────────
+  // The `DB query pattern` block above hand-copies this SELECT, so it kept
+  // passing while nothing tested the real one: deleting
+  // `AND ${liveObsFilterSql('o')}` from scripts/pre-tool-recall.js left all
+  // 4881 tests green. That let a retracted (superseded) or compacted
+  // (compressed_into) lesson reach the highest-cite-rate injection face in the
+  // repo — and superseded-leak is this project's most-reopened defect class.
+  //
+  // Assertion shape matters (feedback_necessary_not_sufficient_assertions):
+  // each case seeds a live row on the SAME file as the excluded row, so the
+  // test cannot pass by the query returning nothing. The excluded row is
+  // always the NEWER one, so with the filter gone it sorts first and renders
+  // within the Edit path's 2-row obs limit.
+  describe('live-row + lookback filters, shipped query (D#162)', () => {
+    let tmpRoot;
+    let projectDir;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-live-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'livetest');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-live', project: 'parent--livetest', memoryId: 'mem-live' });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    function seedObs(file, lesson, extra = {}) {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertObs(db, {
+        sessionId: 'mem-live', project: 'parent--livetest',
+        type: 'bugfix', importance: 2,
+        title: 'seeded lesson', lessonLearned: lesson,
+        filesModified: JSON.stringify([file]),
+        ...extra,
+      });
+      db.close();
+    }
+
+    function editFile(name, session) {
+      return runScript({
+        tool_name: 'Edit',
+        session_id: session,
+        tool_input: { file_path: join(projectDir, name) },
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+    }
+
+    it('excludes a superseded observation while still injecting the live one', async () => {
+      seedObs('sup.mjs', 'live lesson that must survive', { epochOffset: -60_000 });
+      seedObs('sup.mjs', 'retracted lesson must not inject', {
+        supersededAt: new Date().toISOString(),
+        supersededBy: 999,
+      });
+      const { stdout } = await editFile('sup.mjs', 'sess-live-sup');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('live lesson that must survive');
+      expect(ctx).not.toContain('retracted lesson must not inject');
+    });
+
+    it('excludes a compressed observation while still injecting the live one', async () => {
+      seedObs('comp.mjs', 'live lesson beside a tombstone', { epochOffset: -60_000 });
+      seedObs('comp.mjs', 'compressed tombstone must not inject', { compressedInto: 999 });
+      const { stdout } = await editFile('comp.mjs', 'sess-live-comp');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('live lesson beside a tombstone');
+      expect(ctx).not.toContain('compressed tombstone must not inject');
+    });
+
+    // compressed_into = -2 is the pending-purge marker, not a keeper id — a
+    // `> 0` test would let it through, which is why liveObsFilterSql uses
+    // `COALESCE(...) = 0`.
+    it('excludes a pending-purge (compressed_into = -2) observation', async () => {
+      seedObs('purge.mjs', 'live lesson beside a purge marker', { epochOffset: -60_000 });
+      seedObs('purge.mjs', 'pending-purge row must not inject', { compressedInto: -2 });
+      const { stdout } = await editFile('purge.mjs', 'sess-live-purge');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('live lesson beside a purge marker');
+      expect(ctx).not.toContain('pending-purge row must not inject');
+    });
+
+    // Pre-tag review of this very round: the clause ONE LINE ABOVE the one this
+    // block was opened to guard had the same problem. `AND o.importance >= 2`
+    // could be relaxed to `>= 0` with 237 related tests green — the noise gate
+    // on the repo's highest-VOLUME injection face, deletable without a red
+    // test. The only case that looked like it covered this
+    // (`tests/memory-inject.test.mjs` "only returns importance>=2") binds
+    // fileEdgeMatchOnly's own hand-copied gate, not the shipped query — the
+    // exact D#163 shape, found one altitude down.
+    it('excludes a below-threshold-importance observation while injecting the live one', async () => {
+      seedObs('imp.mjs', 'importance-2 lesson must survive', { epochOffset: -60_000 });
+      seedObs('imp.mjs', 'importance-1 lesson must not inject', { importance: 1 });
+      const { stdout } = await editFile('imp.mjs', 'sess-live-imp');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('importance-2 lesson must survive');
+      expect(ctx).not.toContain('importance-1 lesson must not inject');
+    });
+
+    // Same untested-clause argument as the live filter: the 60-day
+    // `created_at_epoch > cutoff` lookback had no probe either.
+    it('excludes an observation older than the 60-day lookback', async () => {
+      seedObs('old.mjs', 'recent lesson inside the window', { epochOffset: -60_000 });
+      seedObs('old.mjs', 'stale lesson outside the window', { epochOffset: -90 * 86400000 });
+      const { stdout } = await editFile('old.mjs', 'sess-live-old');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('recent lesson inside the window');
+      expect(ctx).not.toContain('stale lesson outside the window');
     });
   });
 });

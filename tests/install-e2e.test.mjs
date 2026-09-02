@@ -125,12 +125,18 @@ describe('E2E: Plugin install mode', () => {
   // tests/audit-silent-20260814.test.mjs, which diffs this file against a real
   // `install --dev` run — this case never noticed that install.mjs was missing an
   // entire event (audit B3, 2026-08-14).
-  it('hooks/hooks.json declares all 6 hook events', () => {
+  it('hooks/hooks.json declares all 7 hook events', () => {
     const hooks = readJson('hooks/hooks.json');
     expect(hooks.hooks).toBeTruthy();
     expect(Object.keys(hooks.hooks).sort()).toEqual(
-      ['PostToolUse', 'PreCompact', 'PreToolUse', 'SessionStart', 'Stop', 'UserPromptSubmit'],
+      ['PostToolUse', 'PostToolUseFailure', 'PreCompact', 'PreToolUse', 'SessionStart', 'Stop', 'UserPromptSubmit'],
     );
+
+    // PostToolUseFailure (D#170) — a SEPARATE event, not a variant of PostToolUse, which
+    // Claude Code does not fire for a tool call it judged failed. Scoped to Bash: the
+    // surface it feeds queries on a command plus its output.
+    expect(hooks.hooks.PostToolUseFailure[0].matcher).toBe('Bash');
+    expect(hooks.hooks.PostToolUseFailure[0].hooks[0].command).toContain('hook.mjs post-tool-failure');
 
     // PreCompact — re-emits the memory block BEFORE compaction rewrites the transcript.
     expect(hooks.hooks.PreCompact[0].hooks[0].command).toContain('hook.mjs pre-compact');
@@ -155,7 +161,11 @@ describe('E2E: Plugin install mode', () => {
 
     // PreToolUse Agent|Task subagent-injection hook (P0)
     const agentInject = preToolUse.find(h => h.matcher === 'Agent|Task');
-    expect(agentInject.hooks[0].command).toContain('pre-agent-inject.js');
+    // The registered command is the bash prefilter, not the Node entry (audit P2-5): a
+    // default-off feature must not start an interpreter on every Agent dispatch. The .sh
+    // execs the .js when the flag is on.
+    expect(agentInject.hooks[0].command).toContain('pre-agent-inject.sh');
+    expect(agentInject.hooks[0].command.startsWith('bash ')).toBe(true);
 
     // PostToolUse — the '*' bash prefilter plus the edit-only bind-salience companion
     // (audit B6, 2026-08-14: post-tool-recall.js shipped signed + tested but was
@@ -269,7 +279,8 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     // Agent|Task subagent-injection hook (P0)
     const agentMatcher = preToolUse.find(h => h.matcher === 'Agent|Task');
     expect(agentMatcher).toBeTruthy();
-    expect(agentMatcher.hooks[0].command).toContain('pre-agent-inject.js');
+    expect(agentMatcher.hooks[0].command).toContain('pre-agent-inject.sh');
+    expect(agentMatcher.hooks[0].command.startsWith('bash ')).toBe(true);
 
     // UserPromptSubmit has both search + hook handlers
     const userPromptHooks = settings.hooks.UserPromptSubmit[0].hooks.map(h => h.command);

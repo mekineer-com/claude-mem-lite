@@ -12,10 +12,58 @@ const _cache = new Map();
 /**
  * Infer a sanitized project name from CLAUDE_PROJECT_DIR, PWD, or cwd.
  * Format: "parent--basename" with non-alphanumeric chars replaced by hyphens.
+ *
+ * Deliberately does NOT anchor on the git work-tree root. That was tried and reverted
+ * before it shipped: it fixes `cd src/auth && claude-mem-lite recent` (session rooted at
+ * the repo root, CLI run deeper) but BREAKS the mirror case, which is more common —
+ * CLAUDE_PROJECT_DIR is the directory Claude Code was started in, not the repo root, so
+ * `cd packages/api && claude` makes hooks write `packages--api` while a plain terminal in
+ * the same directory would walk to the work-tree root and read `mono--monorepo`.
+ * Reproduced pre-tag: hooks saved to `packages--api`, `recent` answered
+ * `No recent observations (h1--mono)`. Splitting a monorepo user's namespace silently is
+ * worse than the subdirectory case, and unlike it, cwd-derivation at least keeps the hook
+ * and CLI faces agreeing whenever the session root and cwd match. A correct fix has to
+ * consult the DB for which candidate actually holds rows; this module is DB-free and on
+ * the hook hot path, so it is not the place. Tracked as deferred work.
+ *
  * @returns {string} Sanitized project identifier safe for use in filenames
  */
 export function inferProject() {
-  const p = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
+  return projectNameFromDir(inferProjectDir());
+}
+
+/**
+ * The DIRECTORY `inferProject()` derives its name from — the session's project root.
+ *
+ * Callers that read the filesystem on behalf of the current project (git state, tasks,
+ * adoption sentinel) must use THIS, not `process.cwd()`. The two diverge whenever the
+ * process was not spawned with cwd == project root, and the result is a surface that
+ * labels directory A's git/tasks with directory B's project name. That was live in the
+ * startup dashboard: `buildDashboard({ project: inferProject(), projectPath: process.cwd() })`
+ * — the identity came from the env, the filesystem root from the process. In production the
+ * two happen to coincide, so only the test face showed it (a hook subprocess spawned with the
+ * repo root as cwd read the REAL repo's git state, and the assertion pinning the dashboard
+ * leg passed or failed on whether the host tree was dirty).
+ *
+ * @returns {string} Absolute project root directory.
+ */
+export function inferProjectDir() {
+  return process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
+}
+
+/**
+ * The naming rule alone, applied to an arbitrary directory: "parent--basename", sanitized.
+ *
+ * Split out of inferProject() so lib/cli-project.mjs can build its second candidate (the git
+ * work-tree root) with THIS rule rather than a copy of it — two copies of the rule would let
+ * the CLI face and the hook face drift apart on the next sanitization change, which is the
+ * exact class of bug this module's candidate-selection exists to close. Still DB-free and
+ * allocation-cheap, so the hook hot path is unaffected.
+ *
+ * @param {string} p Absolute directory path
+ * @returns {string} Sanitized project identifier safe for use in filenames
+ */
+export function projectNameFromDir(p) {
   const base = basename(p);
   const parent = basename(dirname(p));
   const raw = parent && parent !== '.' && parent !== '/' ? `${parent}--${base}` : base;

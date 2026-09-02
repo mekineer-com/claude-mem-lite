@@ -3,6 +3,7 @@
 
 import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── Why these multipliers exist (read before "simplifying" them) ────────────
 //
 // The recency-decay, type-quality, project-boost, importance, cite, and noise
@@ -23,23 +24,24 @@ import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 // Where a multiplier reads 0 it is a benchmark-MISMATCH artifact (the instrument
 // can't vary that axis), NOT proven dead weight. Decision: KEEP them; do NOT
 // delete on "0 lift". Guardrail: the ci-gate `hybrid_over_bm25 >= -0.05` floor
-// (benchmark/ci-gate.mjs) covers the full modelled chain
-// (decay/type/project/importance/access/lesson); cite + noise live on the
-// injection path (hook-memory.mjs) with no recall-benchmark coverage. Genuine
-// validation of the prior-encoding axes needs a labeled real-dev-memory eval.
+// (benchmark/ci-gate.mjs) covers the full modelled chain — D#121: cite + noise
+// joined the matrix MULT_EXPR after M-3 put them in FULL_SCORE (fixture carries
+// zero cite/noise state, so both read 0 by construction, same caveat as lesson;
+// their real-SQL direction pins live in benchmark/events-pipeline-probes.mjs).
+// Genuine validation of the prior-encoding axes needs a labeled real-dev-memory eval.
 
 // ─── Type-Differentiated Recency Decay ──────────────────────────────────────
 
 /** Recency half-life per observation type (in milliseconds) */
 export const DECAY_HALF_LIFE_BY_TYPE = {
-  decision:  90 * 86400000,  // 90 days — architectural decisions persist
-  discovery: 60 * 86400000,  // 60 days — learned patterns last
-  feature:   30 * 86400000,  // 30 days — feature work is mid-range
-  bugfix:    14 * 86400000,  // 14 days — bugs are usually one-off
-  refactor:  14 * 86400000,  // 14 days — code cleanup
-  change:     7 * 86400000,  //  7 days — routine changes decay fast
+  decision:  90 * DAY_MS,  // 90 days — architectural decisions persist
+  discovery: 60 * DAY_MS,  // 60 days — learned patterns last
+  feature:   30 * DAY_MS,  // 30 days — feature work is mid-range
+  bugfix:    14 * DAY_MS,  // 14 days — bugs are usually one-off
+  refactor:  14 * DAY_MS,  // 14 days — code cleanup
+  change:     7 * DAY_MS,  //  7 days — routine changes decay fast
 };
-export const DEFAULT_DECAY_HALF_LIFE_MS = 14 * 86400000;
+export const DEFAULT_DECAY_HALF_LIFE_MS = 14 * DAY_MS;
 
 // ─── BM25 Weight Constants ──────────────────────────────────────────────────
 // Single source of truth for FTS5 BM25 weight expressions.
@@ -78,15 +80,29 @@ export const TYPE_DECAY_CASE = `(
  * The old (pre-R2) table had bugfix=0.75 < change=0.8, inverted vs reality.
  * Applied as: BM25 × time_decay × TYPE_QUALITY × project_boost × importance
  */
+export const TYPE_QUALITY = {
+  decision: 1.5,
+  discovery: 1.3,
+  bugfix: 1.1,
+  feature: 1.0,
+  refactor: 0.6,
+  change: 0.5,
+};
+
+/** Multiplier for a type not in the table (legacy rows, manual saves). */
+export const TYPE_QUALITY_DEFAULT = 1.0;
+
+/**
+ * The SQL form, generated from TYPE_QUALITY rather than written beside it.
+ * The table used to exist three times — here, hook-context.mjs, hook-memory.mjs — with
+ * "aligned with scoring-sql.mjs (R2)" comments as the only thing keeping them equal
+ * (audit 2026-08-22, P2-10). Values happened to agree; the next re-weighting is what the
+ * copies were waiting for. Both JS consumers now import TYPE_QUALITY from here.
+ */
 export const TYPE_QUALITY_CASE = `(
   CASE o.type
-    WHEN 'decision'  THEN 1.5
-    WHEN 'discovery' THEN 1.3
-    WHEN 'bugfix'    THEN 1.1
-    WHEN 'feature'   THEN 1.0
-    WHEN 'refactor'  THEN 0.6
-    WHEN 'change'    THEN 0.5
-    ELSE 1.0
+${Object.entries(TYPE_QUALITY).map(([t, w]) => `    WHEN '${t}' THEN ${w.toFixed(1)}`).join('\n')}
+    ELSE ${TYPE_QUALITY_DEFAULT.toFixed(1)}
   END
 )`;
 

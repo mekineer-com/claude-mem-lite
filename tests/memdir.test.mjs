@@ -89,6 +89,21 @@ describe('sentinel IO (writePluginSection / readMemoryIndex / removePluginSectio
     expect(readFileSync(join(memdir, 'MEMORY.md'), 'utf8')).toBe(before);
   });
 
+  // v3.40 defect class, twin missed: String.prototype.replace INTERPRETS `$&`, `$1`,
+  // "$`" and `$'` in a STRING second argument. claudemd.mjs:163 was fixed to pass a
+  // function; memdir.mjs's update path kept the string form. contentLine is
+  // caller-supplied, so a `$&` in it would expand to the ENTIRE matched sentinel block,
+  // duplicating it into MEMORY.md. Latent today (no production caller passes one), which
+  // is exactly why it needs a test rather than a note.
+  it('writes $-sequences in contentLine literally on the update path', () => {
+    writePluginSection(memdir, { slug, version: 'v1', contentLine: 'plain' });
+    writePluginSection(memdir, { slug, version: 'v2', contentLine: 'cost is $& and $1 and $`' });
+    const body = readFileSync(join(memdir, 'MEMORY.md'), 'utf8');
+    expect(body).toContain('cost is $& and $1 and $`');
+    // The tell for expansion: the block's own begin marker appearing twice.
+    expect(body.split(`<!-- ${slug}:begin`).length - 1).toBe(1);
+  });
+
   it('upgrades v1 → v2 replacing the whole sentinel block', () => {
     writePluginSection(memdir, { slug, version: 'v1', contentLine: 'old' });
     const r = writePluginSection(memdir, { slug, version: 'v2', contentLine: 'new' });

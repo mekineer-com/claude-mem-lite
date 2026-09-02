@@ -1,3 +1,4 @@
+import { DAY_MS } from './lib/time-constants.mjs';
 // claude-mem-lite: String formatting and display utilities
 // Extracted from utils.mjs for focused responsibility
 
@@ -231,7 +232,7 @@ export function isoWeekKey(epochMs) {
   const tmp = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   tmp.setUTCDate(tmp.getUTCDate() + 4 - (tmp.getUTCDay() || 7));
   const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
-  const weekNum = Math.ceil(((tmp - yearStart) / 86400000 + 1) / 7);
+  const weekNum = Math.ceil(((tmp - yearStart) / DAY_MS + 1) / 7);
   const isoYear = tmp.getUTCFullYear();
   return `${isoYear}-W${String(weekNum).padStart(2, '0')}`;
 }

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve } from 'path';
+import { SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 
 const SCRIPT = resolve(import.meta.dirname, '../benchmark/confine-tools.js');
 function run(input) {
@@ -11,7 +12,7 @@ function run(input) {
     c.on('close', (code) => res({ out, code }));
     c.on('error', rej);
     c.stdin.write(JSON.stringify(input)); c.stdin.end();
-    setTimeout(() => { c.kill(); rej(new Error('timeout')); }, 5000);
+    setTimeout(() => { c.kill(); rej(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 

@@ -4,14 +4,24 @@
 
 import { homedir } from 'os';
 import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
-import { truncate, typeIcon, inferProject, scrubSecrets } from './utils.mjs';
+import { truncate, typeIcon, inferProject, scrubSecrets, COMPRESSED_PENDING_PURGE } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
-import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
+// READ commands resolve the project DB-aware: a subdirectory whose own name holds no rows
+// falls back to the enclosing work-tree root, so `cd src/auth && … recent` reads what the
+// session's hooks wrote. WRITE commands (save / defer add / restore / import-jsonl) keep
+// plain inferProject() — pre-tag review reproduced the reason: for a read, "cwd holds
+// nothing" means there is nothing to lose, but for a write it is the normal precondition of
+// a project about to be born, and absorbing it into the enclosing repo strands the row once
+// the session's hooks start writing the subdirectory's own name. Hook-side is untouched.
+import { resolveCliProject as cliProject } from './lib/cli-project.mjs';
 import { _resetVocabCache, vecTextForRow, vectorsEnabled } from './tfidf.mjs';
-import { autoBoostIfNeeded, reRankWithContext } from './search-scoring.mjs';
+import { reRankWithContext } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
+import { fetchObsDetail, fetchPromptDetail, fetchEventDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, PROMPT_DETAIL_FIELDS, EVENT_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
+import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
-import { ensureRegistryDb, upsertResource } from './registry.mjs';
+import { ensureRegistryDb, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
+import { IMPORT_STRING_FIELDS, importResource, removeResource, reindexResources } from './lib/registry-core.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { computeFunnel, formatFunnel, computeSweep, formatSweep, DEFAULT_SWEEP_FLOORS, DEFAULT_SWEEP_MARGINS } from './registry-recommend.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -20,10 +30,10 @@ import {
   recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   hardDeleteCandidateCount,
-  OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
+  OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD, resolveDefaultMaintainOps,
 } from './lib/maintain-core.mjs';
 import { snapshotDb, listSnapshots, backupBudgetBytes } from './lib/db-backup.mjs';
-import { deleteObservations } from './lib/delete-core.mjs';
+import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
@@ -31,6 +41,7 @@ import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
 import { parseIntFlag, isNumericToken } from './lib/cli-flags.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { auditMemdir, memdirPath } from './memdir.mjs';
 import { aggregateProjectCiteRecall } from './lib/citation-tracker.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
@@ -45,7 +56,7 @@ import { isNativeBindingError, healAndReexec } from './lib/binding-probe.mjs';
 import { CLI_PATH, CLI_INVOKE } from './cli-path.mjs';
 import { parseArgs, out, outVerbatim, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue, obsFieldLabel, formatPendingPurgeLine } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
-import { rebuildObservationDerived, normalizeScope, insertObservationVector } from './lib/observation-write.mjs';
+import { normalizeScope, insertObservationVector, applyObsUpdate } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { fetchRecent, RECENT_MAX } from './lib/recent-core.mjs';
@@ -54,7 +65,20 @@ import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipel
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
 import { computeSearchTelemetry, formatSearchTelemetryReport } from './lib/search-telemetry.mjs';
-import { computeCitationFunnelTrend } from './lib/citation-tracker.mjs';
+import { computeCitationFunnelTrend, computeSurfaceFunnel, DECAY_DENOMINATOR_SURFACES } from './lib/citation-tracker.mjs';
+
+// Human labels for citation_surface_log.surface. Padded to a common width so
+// the citation-stats face table lines up; the enum itself lives in
+// lib/citation-tracker.mjs (CITATION_SURFACES).
+const SURFACE_LABELS = {
+  pretool:        'PreToolUse recall  ',
+  ups:            'UserPromptSubmit   ',
+  error_recall:   'error-recall       ',
+  fyi:            'FYI (prompt-search)',
+  task_imperative: 'task-imperative    ',
+  keyctx:         'Key Context        ',
+  subagent:       'subagent (dispatch)',
+};
 import { aggregateMetrics, readMetrics } from './lib/metrics.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
@@ -162,7 +186,7 @@ async function cmdSearch(db, args, { llm } = {}) {
   const emitDeferredTrailer = () => {
     if (!wantDeferredTrailer) return;
     try {
-      const rows = searchDeferredWork(db, query, project || inferProject());
+      const rows = searchDeferredWork(db, query, project || cliProject(db));
       for (const line of formatDeferredSearchTrailer(rows, 'claude-mem-lite get D#<id>')) out(line);
     } catch { /* trailer is best-effort; never break search */ }
   };
@@ -224,7 +248,7 @@ async function cmdSearch(db, args, { llm } = {}) {
 
   const res = await coreRunSearchPipeline(
     {
-      db, currentProject: project ? null : inferProject(), env: process.env,
+      db, currentProject: project ? null : cliProject(db), env: process.env,
       searchObservationsHybrid, deepSearch, shouldEscalateToDeep, autoDeepLlmReady,
       reRankWithContext, llm,
     },
@@ -237,11 +261,11 @@ async function cmdSearch(db, args, { llm } = {}) {
       obsTypeFallback: false,            // #8217 removed list-by-type fallback from the CLI
       crossSourceEpochSortNoFts: false,  // CLI never reaches cross-source with empty ftsQuery (fails earlier)
       rerankPolicy: 'cli',               // re-rank/supersede on any obs; re-sort gated on cross-source
-      rerankProject: project || inferProject(),
+      rerankProject: project || cliProject(db),
       recentListingNoFts: false,
       tolerateMissingFts: true,          // pre-FTS legacy DBs: swallow session/prompt FTS errors
       tierPosition: 'early',             // tier filter inside the obs block (before sessions/prompts)
-      tierProject: project || inferProject(),
+      tierProject: project || cliProject(db),
     }
   );
   const isDeep = res.isDeep;
@@ -392,7 +416,7 @@ function cmdRecent(db, args) {
   const limit = isValid
     ? rawLimit
     : parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: RECENT_MAX });
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
   const jsonOutput = flags.json === true || flags.json === 'true';
 
   // `recent --type bugfix` previously parsed as a silent no-op — users naturally
@@ -501,7 +525,6 @@ function cmdRecall(db, args) {
   }
 }
 
-const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
 
 // Time-field formatting moved to cli/common.mjs so the CLI `get` and the MCP
 // `mem_get` (server.mjs) share one source and can't drift (the drift bug:
@@ -514,18 +537,16 @@ export { OBS_TIME_FIELDS, formatObsFieldValue };
 export async function cmdSearchForTest(db, args, opts) { return cmdSearch(db, args, opts); }
 
 function renderObsRows(db, ids, requestedFields) {
-  const placeholders = ids.map(() => '?').join(',');
-  try {
-    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
-    autoBoostIfNeeded(db, ids);
-  } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
-
-  const rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  // Access-bump + fetch via the shared get-core (P2-12) — single source with mem_get.
+  const rows = fetchObsDetail(db, ids);
   if (rows.length === 0) return null;
   const fields = requestedFields || OBS_FIELDS;
   const parts = [];
   for (const r of rows) {
     const lines = [`#${r.id} [${r.type}] ${fmtDateShort(r.created_at)}`];
+    // Retraction first (shared with mem_get via get-core) — see supersededNotice.
+    const retracted = supersededNotice(r);
+    if (retracted) lines.push(retracted);
     for (const f of fields) {
       if (f === 'id' || f === 'type' || f === 'created_at') continue;
       const val = r[f];
@@ -548,45 +569,64 @@ function renderSessionRows(db, ids) {
   const parts = [];
   for (const r of rows) {
     const lines = [`S#${r.id} ${fmtDateShort(r.created_at)}`];
-    if (r.request) lines.push(`Request: ${r.request}`);
-    if (r.completed) lines.push(`Completed: ${r.completed}`);
-    if (r.investigated) lines.push(`Investigated: ${r.investigated}`);
-    if (r.learned) lines.push(`Learned: ${r.learned}`);
-    if (r.next_steps) lines.push(`Next steps: ${r.next_steps}`);
-    if (r.project) lines.push(`Project: ${r.project}`);
+    // SESSION_DETAIL_FIELDS (get-core, P2-12): the FULL render set — the old
+    // 6-field subset made remaining_items/notes/files_* searchable-but-invisible.
+    for (const f of SESSION_DETAIL_FIELDS) {
+      if (f === 'id' || f === 'created_at') continue;   // already in the header
+      const val = r[f];
+      if (val === null || val === undefined || val === '') continue;
+      const label = f[0].toUpperCase() + f.slice(1).replace(/_/g, ' ');
+      lines.push(`${label}: ${val}`);
+    }
     parts.push(lines.join('\n'));
   }
   return { text: parts.join('\n\n'), count: rows.length };
 }
 
+// The CLI's established labels for the prompt/event detail faces. Sharing the FIELD SET
+// with MCP (P2-6) must not rename what users already grep for, so the columns that had a
+// label keep it; anything added later falls back to title-case.
+const CLI_DETAIL_LABELS = {
+  prompt_text: 'Text',
+  content_session_id: 'Session',
+  file_paths: 'Files',
+  git_sha: 'Git',
+};
+
+/** Label a column for the CLI's `Label: value` render style. */
+const cliFieldLabel = (f) =>
+  CLI_DETAIL_LABELS[f] || f[0].toUpperCase() + f.slice(1).replace(/_/g, ' ');
+
 function renderPromptRows(db, ids) {
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  const rows = fetchPromptDetail(db, ids);
   if (rows.length === 0) return null;
   const parts = [];
   for (const r of rows) {
     const lines = [`P#${r.id} ${fmtDateShort(r.created_at)}`];
-    if (r.prompt_text) lines.push(`Text: ${r.prompt_text}`);
-    if (r.content_session_id) lines.push(`Session: ${r.content_session_id}`);
+    // id and created_at are already in the header (same convention as the session face).
+    for (const f of PROMPT_DETAIL_FIELDS) {
+      if (f === 'id' || f === 'created_at') continue;
+      const val = r[f];
+      if (val === null || val === undefined || val === '') continue;
+      lines.push(`${cliFieldLabel(f)}: ${val}`);
+    }
     parts.push(lines.join('\n'));
   }
   return { text: parts.join('\n\n'), count: rows.length };
 }
 
 function renderEventRows(db, ids) {
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`SELECT * FROM events WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  const rows = fetchEventDetail(db, ids);   // derives created_at from created_at_epoch
   if (rows.length === 0) return null;
   const parts = [];
   for (const r of rows) {
-    // events store the distilled lesson in `body`; only *_epoch is available for the date.
-    const lines = [`E#${r.id} [${r.event_type}] ${r.created_at_epoch ? fmtDateShort(new Date(r.created_at_epoch).toISOString()) : ''}`];
-    if (r.title) lines.push(`Title: ${r.title}`);
-    if (r.body) lines.push(`Body: ${r.body}`);
-    if (r.project) lines.push(`Project: ${r.project}`);
-    if (r.importance !== null && r.importance !== undefined) lines.push(`Importance: ${r.importance}`);
-    if (r.file_paths) lines.push(`Files: ${r.file_paths}`);
-    if (r.git_sha) lines.push(`Git: ${r.git_sha}`);
+    const lines = [`E#${r.id} [${r.event_type}] ${r.created_at ? fmtDateShort(r.created_at) : ''}`];
+    for (const f of EVENT_DETAIL_FIELDS) {
+      if (f === 'id' || f === 'event_type' || f === 'created_at') continue;   // in the header
+      const val = r[f];
+      if (val === null || val === undefined || val === '') continue;
+      lines.push(`${cliFieldLabel(f)}: ${val}`);
+    }
     parts.push(lines.join('\n'));
   }
   return { text: parts.join('\n\n'), count: rows.length };
@@ -1049,7 +1089,7 @@ function cmdDeferAdd(db, args) {
 
 function cmdDeferList(db, args) {
   const { flags } = parseArgs(args);
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
   const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 100 });
   const list = listOpenWithOrdinal(db, project, limit);
   if (list.length === 0) {
@@ -1088,7 +1128,7 @@ function cmdDeferDrop(db, args) {
   // without N shell invocations.
   const rawTokens = idStr.split(',').map(s => s.trim()).filter(Boolean);
   const tokens = rawTokens.map(t => /^\d+$/.test(t) ? parseInt(t, 10) : t);
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
 
   let realIds;
   try {
@@ -1144,7 +1184,7 @@ async function cmdStats(db, args) {
       project,
       days,
       now,
-      recordingFailures: countRecentHookErrors(join(DB_DIR, 'runtime'), now - Math.min(days, 14) * 86400000, 'search-telemetry:'),
+      recordingFailures: countRecentHookErrors(join(DB_DIR, 'runtime'), now - Math.min(days, 14) * DAY_MS, 'search-telemetry:'),
     });
     out(jsonOutput ? JSON.stringify(report) : formatSearchTelemetryReport(report));
     return;
@@ -1205,13 +1245,16 @@ async function cmdStats(db, args) {
     obsTotal, sessTotal, promptTotal, obsRecent, sessRecent,
     types, projects, daily, tokenEst, avgImp, lowVal, lowSignalTitle,
     noiseRatio, lowSignalRatio, compressedCount, supersededOnlyCount, tierMap,
-  } = computeStatsFeed(db, { project, days, now });
+    // currentProject steers the TIER context only (the report itself stays global unless
+    // --project was given). Without it, `stats` from a subdirectory tiered every row against
+    // the empty cwd-derived name while `recent` had already resolved to the work-tree root.
+  } = computeStatsFeed(db, { project, currentProject: cliProject(db), days, now });
 
   // Hook self-observation: count PreToolUse / Skill-bridge script failures
   // recorded in the last 24h. Surfaces silent breakage (DB corruption,
   // CC upstream field rename) that would otherwise stay invisible — the
   // failure mode that left code-graph's matcher bug undetected for 10 sessions.
-  const hookErrors24h = countRecentHookErrors(join(DB_DIR, 'runtime'), now - 86400000);
+  const hookErrors24h = countRecentHookErrors(join(DB_DIR, 'runtime'), now - DAY_MS);
 
   // M-9 (audit 2026-08-14): disk footprint — a "lite" store had accumulated 360MB of
   // pre-maintain snapshots against a 59MB DB with nothing reporting it. Cheap probes
@@ -1329,7 +1372,7 @@ function cmdContext(db, args) {
   // Generate context live from DB — same builder the SessionStart hook uses.
   // Pre-v2.30 this command parsed a snapshot out of CLAUDE.md, but the hook no
   // longer writes there; DB is now the single source of truth.
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
   const block = buildSessionContextLines(db, project).trim();
 
   if (!block) {
@@ -1369,7 +1412,7 @@ function cmdContext(db, args) {
 
 function cmdBrowse(db, args) {
   const { flags } = parseArgs(args);
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
   const tierFilter = flags.tier || null;
   if (tierFilter && !['working', 'active', 'archive'].includes(tierFilter)) {
     fail(`[mem] Invalid tier: "${tierFilter}". Use: working, active, or archive`);
@@ -1379,53 +1422,13 @@ function cmdBrowse(db, args) {
   const jsonOutput = flags.json === true || flags.json === 'true';
   const now = Date.now();
 
-  const ctx = {
-    now,
-    currentProject: project,
-    currentSessionId: getActiveSessionId(db, project),
-  };
-  const params = tierSqlParams(ctx);
-
-  const tiers = ['working', 'active', 'archive'];
-  const tierLabels = { working: '🔴 Working Memory', active: '🟡 Active Memory', archive: '🔵 Archive' };
-  const showTiers = tierFilter ? [tierFilter] : tiers;
-
-  // Collect data first (for JSON), then format. The text path also prints
-  // tier headers as it walks; refactored to two passes so the JSON shape can
-  // include row arrays alongside totals.
-  const tierData = {};
-  const tierCounts = {};
-  let grandTotal = 0;
-
-  for (const tier of showTiers) {
-    const countRow = db.prepare(`
-      SELECT COUNT(*) as c FROM (
-        SELECT ${TIER_CASE_SQL} as tier FROM observations
-        WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-      ) WHERE tier = ?
-    `).get(...params, project, tier);
-    const count = countRow?.c ?? 0;
-    tierCounts[tier] = count;
-    grandTotal += count;
-
-    // Archive in unfiltered view: keep count but skip row fetch (matches text path).
-    const skipRows = tier === 'archive' && !tierFilter;
-    if (count === 0 || skipRows) {
-      tierData[tier] = { count, rows: [] };
-      continue;
-    }
-
-    const rows = db.prepare(`
-      SELECT * FROM (
-        SELECT id, type, title, importance, created_at_epoch, created_at, ${TIER_CASE_SQL} as tier
-        FROM observations
-        WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-      ) WHERE tier = ?
-      ORDER BY created_at_epoch DESC
-      LIMIT ?
-    `).all(...params, project, tier, limit);
-    tierData[tier] = { count, rows };
-  }
+  // Shared collection (lib/browse-core, P2-12) — single source with mem_browse.
+  const { showTiers, tierData, tierCounts, grandTotal } = collectBrowseTiers(db, {
+    project, tierFilter, limit, now,
+    currentSessionId: getActiveMemorySessionId(db, project),
+  });
+  const tiers = BROWSE_TIERS;
+  const tierLabels = BROWSE_TIER_LABELS;
 
   if (jsonOutput) {
     const tiersOut = {};
@@ -1483,13 +1486,6 @@ function cmdBrowse(db, args) {
   }
 }
 
-function getActiveSessionId(db, project) {
-  const row = db.prepare(
-    "SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND status = 'active' ORDER BY started_at_epoch DESC LIMIT 1"
-  ).get(project);
-  return row?.memory_session_id ?? '';
-}
-
 // ─── Delete ──────────────────────────────────────────────────────────────────
 
 function cmdDelete(db, args) {
@@ -1521,8 +1517,8 @@ function cmdDelete(db, args) {
   }
 
   const confirm = flags.confirm === true || flags.confirm === 'true';
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`SELECT id, type, title, project FROM observations WHERE id IN (${placeholders})`).all(...ids);
+  // Shared preview body (lib/delete-core, P2-12) — single source with mem_delete.
+  const { rows, lines: previewLines } = previewDeleteRows(db, ids);
 
   if (rows.length === 0) {
     fail('[mem] No observations found for given IDs');
@@ -1531,9 +1527,7 @@ function cmdDelete(db, args) {
 
   if (!confirm) {
     out(`[mem] Preview: ${rows.length} observation(s) will be deleted:`);
-    for (const r of rows) {
-      out(`  #${r.id} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${r.project}`);
-    }
+    for (const line of previewLines) out(line);
     out('[mem] Run with --confirm to execute deletion.');
     return;
   }
@@ -1582,8 +1576,7 @@ function cmdUpdate(db, args) {
   // (#8470). Reject cleanly via the shared guard — single source with the other commands.
   if (rejectBareStringFlags(flags, ['title', 'narrative', 'lesson', 'lesson-learned', 'concepts'])) return;
 
-  const updates = [];
-  const params = [];
+  const fields = {};
   if (flags.title !== undefined) {
     // Reject empty title — clears the observation's identifier and would render it
     // as `(untitled)` in every listing. Almost always an accidental shell-stripped arg.
@@ -1591,7 +1584,7 @@ function cmdUpdate(db, args) {
       fail('[mem] --title cannot be empty. Pass a non-empty string or omit the flag to leave the title unchanged.');
       return;
     }
-    updates.push('title = ?'); params.push(scrubSecrets(flags.title));
+    fields.title = flags.title;
   }
   if (flags.narrative !== undefined) {
     // Reject empty (mirror --title): an explicit '' would blank the narrative
@@ -1600,7 +1593,7 @@ function cmdUpdate(db, args) {
       fail('[mem] --narrative cannot be empty. Omit the flag to leave it unchanged.');
       return;
     }
-    updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative));
+    fields.narrative = flags.narrative;
   }
   if (flags.type) {
     const validTypes = OBS_TYPE_SET;
@@ -1608,7 +1601,7 @@ function cmdUpdate(db, args) {
       fail(`[mem] Invalid type "${flags.type}". Valid: ${[...validTypes].join(', ')}`);
       return;
     }
-    updates.push('type = ?'); params.push(flags.type);
+    fields.type = flags.type;
   }
   if (flags.importance) {
     const imp = parseInt(flags.importance, 10);
@@ -1618,7 +1611,7 @@ function cmdUpdate(db, args) {
       fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
       return;
     }
-    updates.push('importance = ?'); params.push(imp);
+    fields.importance = imp;
   }
   if (flags.lesson !== undefined || flags['lesson-learned'] !== undefined) {
     const rawLesson = flags.lesson ?? flags['lesson-learned'] ?? '';
@@ -1633,8 +1626,7 @@ function cmdUpdate(db, args) {
       fail('[mem] --lesson cannot be empty. Omit the flag to leave it unchanged.');
       return;
     }
-    updates.push('lesson_learned = ?');
-    params.push(scrubSecrets(rawLesson));
+    fields.lesson_learned = rawLesson;
   }
   // Scrub like the sibling text fields above (title/narrative/lesson) and the MCP twin
   // mem_update — concepts is a scrub-target + FTS-indexed column, so a raw secret here
@@ -1644,24 +1636,18 @@ function cmdUpdate(db, args) {
       fail('[mem] --concepts cannot be empty. Omit the flag to leave it unchanged.');
       return;
     }
-    updates.push('concepts = ?'); params.push(scrubSecrets(flags.concepts));
+    fields.concepts = flags.concepts;
   }
 
-  if (updates.length === 0) {
+  // Shared mutation (lib/observation-write applyObsUpdate, P2-12): scrub + UPDATE +
+  // derived-column rebuild in one transaction — single source with MCP mem_update.
+  const updatedCols = applyObsUpdate(db, id, fields);
+  if (updatedCols.length === 0) {
     fail('[mem] No fields to update. Use --title, --type, --importance, --lesson/--lesson-learned, --narrative, --concepts');
     return;
   }
 
-  params.push(id);
-
-  // Atomic: update fields + rebuild derived columns (FTS text + vector) via the
-  // shared core — single source with MCP mem_update (lib/observation-write.mjs).
-  db.transaction(() => {
-    db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-    rebuildObservationDerived(db, id);
-  })();
-
-  out(`[mem] Updated #${id}: ${updates.map(u => u.split(' =')[0]).join(', ')}`);
+  out(`[mem] Updated #${id}: ${updatedCols.join(', ')}`);
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -1676,11 +1662,14 @@ function cmdExport(db, args) {
   if (rejectBareStringFlags(flags, ['project', 'type', 'from', 'to'])) return;
   const wheres = [];
   const params = [];
-  // --include-compressed: include compressed observations (aligned with MCP mem_export)
-  if (!(flags['include-compressed'] === true || flags['include-compressed'] === 'true')) {
-    wheres.push('COALESCE(compressed_into, 0) = 0');
+  // --include-compressed: include compressed observations (aligned with MCP mem_export).
+  // Superseded rows are excluded either way; the flag only toggles the compressed half
+  // of the live-row pair (backup/export of tombstones is opt-in, retractions are not).
+  if (flags['include-compressed'] === true || flags['include-compressed'] === 'true') {
+    wheres.push('superseded_at IS NULL');
+  } else {
+    wheres.push(liveObsFilterSql(''));
   }
-  wheres.push('superseded_at IS NULL');
 
   const project = flags.project ? resolveProject(db, flags.project) : null;
   if (project) { wheres.push('project = ?'); params.push(project); }
@@ -1704,7 +1693,7 @@ function cmdExport(db, args) {
   if (flags.to) {
     exportToEpoch = new Date(flags.to).getTime();
     if (isNaN(exportToEpoch)) { fail(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
-    if (/^\d{4}-\d{2}-\d{2}$/.test(flags.to)) exportToEpoch += 86400000 - 1;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(flags.to)) exportToEpoch += DAY_MS - 1;
     wheres.push('created_at_epoch <= ?'); params.push(exportToEpoch);
   }
   if (exportFromEpoch !== null && exportToEpoch !== null && exportFromEpoch > exportToEpoch) {
@@ -1835,7 +1824,14 @@ function cmdRestore(db, argv) {
     // weekly-summary keeper already absorbed (duplicate search hits, and the marker's
     // target id is meaningless in this store). Reject rather than remap; the content
     // lives on in the keeper.
-    if (r.compressed_into) { tombstoned++; continue; }
+    // D#122: COMPRESSED_PENDING_PURGE (-2) is NOT keeper-absorbed — those rows have
+    // no keeper, so rejecting them silently loses their only copy. Restore them
+    // live; the maintain decay pipeline will re-evaluate them like any other row.
+    // COMPRESSED_AUTO (-1) stays REJECTED by design (review 2026-08-16): those rows
+    // were deliberately retired by the quality pipeline (idle-cleanup/optimize mark
+    // importance-1 aged rows) — restoring them live would resurrect adjudicated
+    // noise, unlike -2 (a purge QUEUE the user may still be racing to undo).
+    if (r.compressed_into && r.compressed_into !== COMPRESSED_PENDING_PURGE) { tombstoned++; continue; }
     const project = projOverride || r.project || inferProject();
     const createdEpoch = Number.isFinite(Number(r.created_at_epoch)) ? Number(r.created_at_epoch) : Date.now();
     // Durable exact-dup guard — saveObservation's 5-min Jaccard window can't catch a
@@ -1902,8 +1898,22 @@ function cmdRestore(db, argv) {
   // ones that parsed.
   const totalMalformed = malformed + parseFailures;
   const totalLines = rows.length + parseFailures;
-  const tombstoneNote = tombstoned > 0 ? `, ${tombstoned} compressed member(s) rejected (already absorbed by their summary keeper)` : '';
-  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped${tombstoneNote}, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
+  const tombstoneNote = tombstoned > 0 ? `, ${tombstoned} compressed member(s) rejected (keeper-absorbed or auto-retired tombstones)` : '';
+  // Past tense only when rows were actually written. `Restore (dry-run): 6 restored` reads
+  // as done to anyone skimming past the parenthetical, and this command's whole job is to
+  // let a user check a backup BEFORE trusting it.
+  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} ${dryRun ? 'would be restored (at most)' : 'restored'}`
+    + `, ${skipped} duplicate(s) ${dryRun ? 'would be skipped' : 'skipped'}${tombstoneNote}`
+    + `, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
+  if (dryRun) {
+    // The preview applies the durable exact-dup guard (project+title+created_at) but NOT
+    // saveObservation's Jaccard near-duplicate collapse, which only exists once rows are
+    // being written. Measured: a backup holding two same-titled weekly summaries previewed
+    // 10 and restored 9. Simulating Jaccard here would mean a second copy of the dedup rule
+    // — the drift class this codebase keeps paying for — so the number is labelled an upper
+    // bound instead. Run without --dry-run for the exact count.
+    out('[mem] Note: the preview does not simulate near-duplicate collapse, so the real run may restore fewer.');
+  }
   // Name the lossiness where the user meets it. Export omits related_ids and drops
   // superseded rows, and restore re-inserts under fresh AUTOINCREMENT ids — so no
   // cross-link can survive the round-trip. That is a deliberate format tradeoff (stored
@@ -1944,7 +1954,7 @@ function cmdCompress(db, args) {
     }
     ageDays = parsed;
   }
-  const cutoff = Date.now() - ageDays * 86400000;
+  const cutoff = Date.now() - ageDays * DAY_MS;
   const project = flags.project ? resolveProject(db, flags.project) : null;
 
   const candidates = selectCompressionCandidates(db, { cutoff, project });
@@ -2016,7 +2026,7 @@ function cmdMaintain(db, args) {
     out(`  Stale (>30d, imp=1, no access, never injected): ${stats.stale}`);
     out(`  Broken (no title/narrative): ${stats.broken}`);
     out(`  Boostable (accessed>3, imp<3): ${stats.boostable}`);
-    out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, imp>1): ${stats.pinned} — run: maintain execute --ops demote_pinned`);
+    out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, above floor): ${stats.pinned} — floored by the default maintain set since v3.76.0, no lesson → 1, lesson → 2 (opt out: CLAUDE_MEM_SKIP_DEMOTE_PINNED=1)`);
     out(formatPendingPurgeLine(stats.pendingPurge));
     if (duplicates.length > 0) {
       const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
@@ -2051,9 +2061,11 @@ function cmdMaintain(db, args) {
   const VALID_OPS = ['cleanup', 'decay', 'boost', 'demote_pinned', 'dedup', 'purge_stale', 'rebuild_vectors', 'vacuum'];
   // Distinguish flag-absent (use default op set) from flag-present-but-empty
   // (`--ops ""`, e.g. an unset shell var). The latter previously coerced via `||`
-  // to the destructive default cleanup,decay,boost and EXECUTED it; route it to the
-  // VALID_OPS check below instead so it's rejected like `--ops " "` / `--ops "decay,"`.
-  const opsStr = flags.ops === undefined ? 'cleanup,decay,boost' : String(flags.ops);
+  // to the destructive default set and EXECUTED it; route it to the VALID_OPS check
+  // below instead so it's rejected like `--ops " "` / `--ops "decay,"`. (That default
+  // was the literal `cleanup,decay,boost` when this was written; it now comes from
+  // DEFAULT_MAINTAIN_OPS, which is why the list is no longer spelled out here.)
+  const opsStr = flags.ops === undefined ? resolveDefaultMaintainOps().join(',') : String(flags.ops);
   const ops = opsStr.split(',').map(s => s.trim());
   const invalidOps = ops.filter(op => !VALID_OPS.includes(op));
   if (invalidOps.length > 0) {
@@ -2082,7 +2094,7 @@ function cmdMaintain(db, args) {
     }
     retainDays = parsed;
   }
-  const retainCutoff = Date.now() - retainDays * 86400000;
+  const retainCutoff = Date.now() - retainDays * DAY_MS;
   // purge_stale is the only DELETE here — require --confirm so a mis-typed run can't wipe rows.
   const confirmed = flags.confirm === true || flags.confirm === 'true';
 
@@ -2142,17 +2154,24 @@ function cmdMaintain(db, args) {
       results.push(`Decayed ${decayed} stale observations, marked ${idleMarked} idle as pending-purge${decayCap}`);
     }
 
-    if (ops.includes('demote_pinned')) {
-      // Repair the citation-decay blind spot: decay protects injection_count>0, so a
-      // heavily-injected-but-uncited memory stays pinned at max importance forever.
-      // demotePinned (maintain-core) drops it to 1 in one pass. Floor 1, not purge.
-      const demoted = demotePinned(db, mctx);
-      results.push(`Demoted ${demoted} pinned-but-uncited observations to importance 1 (inj>=${PINNED_INJ_THRESHOLD}, cited=0)${capHint(demoted)}`);
-    }
-
     if (ops.includes('boost')) {
       const boosted = boostAccessed(db, mctx);
       results.push(`Boosted ${boosted} frequently-accessed observations${capHint(boosted)}`);
+    }
+
+    // AFTER boost, matching server.mjs and hook.mjs. This block used to sit BEFORE
+    // it, and the order was load-bearing in the wrong direction: boostAccessed lifts
+    // any access_count>3 row with importance<3, so demoting a pinned row to 1 and
+    // then boosting handed it straight back at 2 — the demotion silently undone
+    // inside a single maintain run. DEFAULT_MAINTAIN_OPS pins the order; this block
+    // has to physically follow the boost block for that order to be real.
+    if (ops.includes('demote_pinned')) {
+      // Repair the citation-decay blind spot: decay protects injection_count>0, so a
+      // heavily-injected-but-uncited memory stays pinned at max importance forever.
+      // demotePinned (maintain-core) floors it in one pass: no lesson_learned -> 1,
+      // lesson-bearing -> 2 (v3.76.1 dual floor). Floor, not purge.
+      const demoted = demotePinned(db, mctx);
+      results.push(`Demoted ${demoted} pinned-but-uncited observations (inj>=${PINNED_INJ_THRESHOLD}, cited=0; no lesson → importance 1, lesson → 2)${capHint(demoted)}`);
     }
 
     if (ops.includes('dedup') && flags['merge-ids']) {
@@ -2318,18 +2337,13 @@ function cmdRegistry(_memDb, args) {
     if (action === 'list') {
       const typeFilter = flags.type;
       const listLimit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
-      const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
-      const params = typeFilter ? [typeFilter, 'active'] : ['active'];
-      const allResources = rdb.prepare(`
-        SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
-        FROM resources ${where} ORDER BY adopt_count DESC, recommend_count DESC, type, name
-      `).all(...params);
+      // Shared ranked query + row line (registry.mjs, P2-12): COALESCE ordering and
+      // the 80-char/adopt:0 row shape had drifted between the faces.
+      const allResources = listResourcesRanked(rdb, { type: typeFilter });
       if (allResources.length === 0) { out('[mem] No resources found.'); return; }
       const resources = allResources.slice(0, listLimit);
       out(`[mem] Resources (showing ${resources.length} of ${allResources.length}):`);
-      for (const r of resources) {
-        out(`  ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count} adopt:${r.adopt_count} — ${truncate(r.capability_summary || '', 50)}`);
-      }
+      for (const r of resources) out(`  ${formatRegistryListLine(r)}`);
       if (allResources.length > listLimit) {
         out(`[mem] Use --limit N to see more, or "registry search <query>" to find specific resources.`);
       }
@@ -2337,25 +2351,17 @@ function cmdRegistry(_memDb, args) {
     }
 
     if (action === 'stats') {
-      const total = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
-      const byType = rdb.prepare('SELECT type, COUNT(*) as c FROM resources WHERE status = ? GROUP BY type').all('active');
-      const topAdopted = rdb.prepare(
-        'SELECT name, type, adopt_count, recommend_count FROM resources WHERE status = ? AND adopt_count > 0 ORDER BY adopt_count DESC LIMIT 10'
-      ).all('active');
-      const zeroAdopt = rdb.prepare(
-        'SELECT COUNT(*) as c FROM resources WHERE status = ? AND recommend_count > 0 AND adopt_count = 0'
-      ).get('active');
-      const userAdded = rdb.prepare(
-        "SELECT COUNT(*) as c FROM resources WHERE status = ? AND source = 'user'"
-      ).get('active');
+      // Shared collection (registry.mjs collectRegistryStats, P2-12) — single
+      // source with the MCP mem_registry stats action.
+      const s = collectRegistryStats(rdb);
       out(`[mem] Registry Stats:`);
-      out(`  Total active: ${total.c}`);
-      for (const t of byType) out(`  ${t.type}: ${t.c}`);
-      out(`  User-added: ${userAdded.c}`);
-      out(`  Zero adoption (recommended but never adopted): ${zeroAdopt.c}`);
-      if (topAdopted.length > 0) {
+      out(`  Total active: ${s.total}`);
+      for (const t of s.byType) out(`  ${t.type}: ${t.c}`);
+      out(`  User-added: ${s.userAdded}`);
+      out(`  Zero adoption (recommended but never adopted): ${s.zeroAdopt}`);
+      if (s.topAdopted.length > 0) {
         out('  Top adopted:');
-        for (const r of topAdopted) out(`    ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
+        for (const r of s.topAdopted) out(`    ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
       }
       return;
     }
@@ -2374,24 +2380,12 @@ function cmdRegistry(_memDb, args) {
         fail(`[mem] Invalid --source "${flags.source}". Valid: preinstalled, user, github`);
         return;
       }
-      // Preserve provenance on a metadata-only re-import: default source to 'user' only for
-      // a genuinely NEW resource. Re-importing an existing github/preinstalled row without
-      // --source must not flip it to 'user' (which also mis-grants the user-source rank boost).
-      let source = flags.source;
-      if (!source) {
-        const existing = rdb.prepare('SELECT source FROM resources WHERE type = ? AND name = ?').get(resourceType, name);
-        source = existing ? existing.source : 'user';
-      }
-      const fields = { name, type: resourceType, status: 'active', source };
-      for (const f of ['repo-url', 'local-path', 'invocation-name', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases']) {
-        const camel = f.replace(/-([a-z])/g, (_, c) => '_' + c);
-        fields[camel] = flags[f] || '';
-      }
-      const id = upsertResource(rdb, fields);
-      // User-imported resources get 'installed' quality tier (user explicitly chose to add them)
-      if (id && !flags.source) {
-        rdb.prepare("UPDATE resources SET quality_tier = 'installed' WHERE id = ?").run(id);
-      }
+      // Provenance preservation + the 'installed' tier grant live in lib/registry-core.mjs,
+      // shared with the mem_registry MCP twin (audit 2026-08-22 P1-3). CLI flags are
+      // kebab-case; the core's field list is the canonical snake_case source.
+      const fields = {};
+      for (const f of IMPORT_STRING_FIELDS) fields[f] = flags[f.replace(/_/g, '-')] || '';
+      const { id } = importResource(rdb, { name, type: resourceType, source: flags.source, fields });
       out(`[mem] Imported: ${resourceType}:${name} (id=${id})`);
       if (!flags['capability-summary'] && !flags['use-cases']) {
         out('[mem] Tip: Add --capability-summary or --use-cases so the resource appears in searches.');
@@ -2406,17 +2400,16 @@ function cmdRegistry(_memDb, args) {
       const name = flags.name;
       const resourceType = flags['resource-type'];
       if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry remove --name N --resource-type skill|agent'); return; }
-      const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(resourceType, name);
-      out(result.changes > 0
+      const { removed } = removeResource(rdb, { name, type: resourceType });
+      out(removed
         ? `[mem] Removed: ${resourceType}:${name}`
         : `[mem] Not found: ${resourceType}:${name}`);
       return;
     }
 
     if (action === 'reindex') {
-      rdb.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')");
-      const count = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
-      out(`[mem] FTS5 reindexed. ${count.c} active resources.`);
+      const { activeCount } = reindexResources(rdb);
+      out(`[mem] FTS5 reindexed. ${activeCount} active resources.`);
       return;
     }
   } finally {
@@ -2546,8 +2539,7 @@ function cmdCitationStats(db, args) {
            SUM(CASE WHEN uncited_streak >= 2 THEN 1 ELSE 0 END) AS at_risk
       FROM observations
      WHERE created_at_epoch >= ?
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   GROUP BY project
   ORDER BY resolved DESC
   `).all(cutoff);
@@ -2556,8 +2548,7 @@ function cmdCitationStats(db, args) {
     SELECT id, project, type, title, importance, uncited_streak, cited_count
       FROM observations
      WHERE uncited_streak >= 2
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   ORDER BY uncited_streak DESC, importance ASC
      LIMIT 20
   `).all();
@@ -2566,8 +2557,7 @@ function cmdCitationStats(db, args) {
     SELECT id, project, type, title, importance, cited_count
       FROM observations
      WHERE importance >= 3 AND cited_count >= 1
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   ORDER BY cited_count DESC
      LIMIT 10
   `).all();
@@ -2577,8 +2567,7 @@ function cmdCitationStats(db, args) {
       FROM observations
      WHERE demoted_at IS NOT NULL
        AND demoted_at >= ?
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   ORDER BY demoted_at DESC
      LIMIT 10
   `).all(cutoff);
@@ -2593,8 +2582,7 @@ function cmdCitationStats(db, args) {
   const pollutedRows = db.prepare(`
     SELECT COUNT(*) AS n FROM observations
      WHERE cited_count > decay_seen_count
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   `).get();
   const dataPollutionNote = pollutedRows.n > 0
     ? `${pollutedRows.n} obs have cited_count > decay_seen_count (pre-v34 backfill — invariant holds for new data).`
@@ -2603,6 +2591,8 @@ function cmdCitationStats(db, args) {
   // R1: per-session invocation→cite funnel trend (citation_log). Same `days` window
   // as the per-project cite rate above; funnel.prior/delta_pt show the direction.
   const funnel = computeCitationFunnelTrend(db, { days });
+  // v45: per-injection-face split of the same funnel (citation_surface_log).
+  const surfaceFunnel = computeSurfaceFunnel(db, { days });
 
   // Survivorship-honesty: the per-project rate (cited_count/decay_seen_count over
   // SURVIVING in-window obs) is doubly biased — GC drops uncited obs from the
@@ -2621,7 +2611,7 @@ function cmdCitationStats(db, args) {
   }
 
   if (json) {
-    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted, data_pollution_note: dataPollutionNote, funnel }, null, 2));
+    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted, data_pollution_note: dataPollutionNote, funnel, surface_funnel: surfaceFunnel }, null, 2));
     return;
   }
 
@@ -2656,6 +2646,38 @@ function cmdCitationStats(db, args) {
   }
   out(trendLine);
   out('');
+
+  // v45: the same funnel split by INJECTION FACE. The aggregate above says
+  // whether effectiveness is rising; this says WHICH face to aim a lever at.
+  out(`Cite rate by injection face (last ${days}d):`);
+  out('  a per-face VIEW, not a partition — do NOT reconcile against the funnel above: faces overlap (an obs carried by two counts in both) and the funnel also counts cite-back signals that belong to no face:');
+  if (surfaceFunnel.unavailable) {
+    // The read FAILED — a missing/unreadable citation_surface_log. Pre-b4 this
+    // rendered identically to an empty window, so the #10650 shape (table never
+    // created, `no such table` swallowed into the debug log) read as "no data
+    // yet" for as long as the surface stayed unmetered.
+    out(`  (UNAVAILABLE — the per-face table could not be read: ${surfaceFunnel.unavailable})`);
+    out('  this is a failure, not an empty window: run `claude-mem-lite fts-check` to repair the schema');
+  } else if (surfaceFunnel.surfaces.length === 0) {
+    out('  (no rows in this window yet — rows accrue at Stop, one per injection face per session)');
+  } else {
+    for (const s of surfaceFunnel.surfaces) {
+      const pct = (s.rate * 100).toFixed(1) + '%';
+      // Which faces actually move importance is NOT readable from the rates —
+      // and an annotated keyctx beside a bare `subagent` reads as "that one
+      // does feed decay", which is false. Derived from the exported sets so
+      // the note cannot drift from the behaviour it describes. (The example
+      // used to name task_imperative; it joined the denominator on 2026-08-25
+      // once its rate was read, leaving `subagent` as the bare non-decay face.)
+      const note = s.surface === 'keyctx'
+        ? '  (promotion-only: never demotes)'
+        : (DECAY_DENOMINATOR_SURFACES.includes(s.surface)
+          ? ''
+          : '  (metered only: outside the decay denominator)');
+      out(`  ${SURFACE_LABELS[s.surface] || s.surface}  inj ${String(s.injected).padStart(4)}  cited ${String(s.cited).padStart(4)}  ${pct.padStart(6)}  over ${s.sessions} session(s)${note}`);
+    }
+  }
+  out('');
   out('Active decay queue (uncited_streak >= 2, next miss → demote):');
   if (decayQueue.length === 0) out('  (none)');
   for (const r of decayQueue) {
@@ -2671,7 +2693,7 @@ function cmdCitationStats(db, args) {
   out(`Recently demoted (last ${days}d, importance ↓):`);
   if (demoted.length === 0) out('  (none)');
   for (const r of demoted) {
-    const ago = Math.round((Date.now() - r.demoted_at) / 86400000);
+    const ago = Math.round((Date.now() - r.demoted_at) / DAY_MS);
     out(`  #${r.id} [${r.type}] ${(r.title || '').slice(0, 60)}   imp=${r.importance}   ${ago}d ago`);
   }
 }
@@ -2795,10 +2817,17 @@ Commands:
 
   maintain <scan|execute>  Memory maintenance
     --ops O             Comma-separated: cleanup,decay,boost,demote_pinned,dedup,purge_stale,rebuild_vectors,vacuum
+                        Default when omitted: cleanup,decay,boost,demote_pinned (in that order)
     --merge-ids K:R,... For dedup: keepId:removeId pairs (e.g. 10:11,20:21:22)
     --project P         Filter by project
     --retain-days N     For purge_stale: keep last N days (default 30)
-                        demote_pinned: importance→1 for inj>=8 & cited=0 (clears pinned noise)
+                        demote_pinned: floors importance for inj>=8 & cited=0 — to 1 with no
+                        lesson_learned, to 2 with one (clears pinned noise; a lesson-bearing
+                        row keeps eligibility on every importance>=2 injection face).
+                        In the default set since v3.76.0; runs AFTER boost, which would
+                        otherwise hand the row straight back. Opt out of the DEFAULT with
+                        CLAUDE_MEM_SKIP_DEMOTE_PINNED=1 — an explicit --ops demote_pinned
+                        still runs.
                         vacuum: reclaim freelist dead space (whole-DB, ignores --project)
 
   optimize              LLM-powered memory optimization (preview by default)
@@ -2806,15 +2835,21 @@ Commands:
     --run-all           Execute bypassing gates
     --task T            Comma-separated: re-enrich,normalize,cluster-merge,smart-compress
     --max N             Max items per task (1-100, default 15)
-    --scope S           re-enrich scope: narrow (default) | wide | aliases
+    --scope S           re-enrich scope: narrow (default) | wide | aliases | scopes
                         (aliases: backfill search_aliases on substantive rows that
                          lack them — incl. lesson-bearing manual saves — adds ONLY
                          aliases, never rewrites title/narrative/lesson)
-    --project P         Limit to a single project (.|current = inferProject())
+                        (scopes: backfill the applicability label observations.scope
+                         on rows that lack it — writes ONLY that column, never stamps
+                         optimized_at; feeds CLAUDE_MEM_SCOPE_FILTER)
+    --project P         Limit to a single project (.|current = the current project)
     --verbose / -v      Preview also dumps cluster contents + re-enrich samples
 
   doctor                Environment diagnostics and benchmarks
     --benchmark         Run perf benchmark and emit JSON
+    --metrics           Summarize the recorded metrics window (CLAUDE_MEM_METRICS=1)
+    --session-audit     Audit session/episode state for orphans and drift
+    --json              Machine-readable output (plain doctor run)
 
   fts-check <check|rebuild>  FTS5 index check or rebuild
 
@@ -2851,6 +2886,7 @@ Commands:
     import              Import resource --name N --resource-type T [--repo-url U] [--local-path P] [--use-cases U]
     remove              Remove resource --name N --resource-type T
     reindex             Rebuild FTS5 index
+    recommend-stats     Shadow recommendation funnel [--days N] [--sweep] [--json]
 
   import-jsonl <file-or-dir>      Import Claude Code JSONL transcripts (cold-start backfill)
     --project P         Project name (default: inferred from cwd)
@@ -2868,6 +2904,8 @@ Commands:
     recent [N]          Most recent events [--type T] [--project P]
     show <id>           Show full event row by id
     delete <id1,id2,…>  Delete events by ID (preview by default; use --confirm to execute)
+    promote             Promote insight-bearing events (body + importance>=2) to searchable
+                        observations (preview by default; use --execute to apply)
 
     Valid types: bugfix, lesson, bug, discovery, refactor, feature, observation, decision
     --files (plural, comma-split) preferred; --file (singular) kept for back-compat.
@@ -3009,14 +3047,18 @@ async function cmdImportJsonl(db, argv) {
     totalSkip += r.skipped;
     totalOrphans += r.orphans || 0;
     totalRecognized += r.recognized || 0;
-    out(`[mem] ${f}: +${r.prompts} prompts, +${r.observations} observations, ${r.orphans || 0} orphan tool_use, ${r.skipped} skipped`);
+    out(`[mem] ${f}: +${r.prompts} prompts, +${r.observations} observations`
+      + `${r.orphans ? ` (${r.orphans} from unpaired tool_use)` : ''}, ${r.skipped} skipped`);
   }
   const errorTail = errorCount > 0 ? `, ${errorCount} file(s) errored` : '';
-  out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations, ${totalOrphans} orphan tool_use, ${totalSkip} skipped from ${files.length} file(s)${errorTail}.`);
-  if (totalPrompts > 0 || totalObs > 0 || totalOrphans > 0) {
-    // Orphan tool_use events persist as (truncated) observations, so they count as
-    // "something was imported" — otherwise an orphan-only first import would wrongly
-    // fall through to the "already imported" no-op branch below.
+  out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations`
+    + `${totalOrphans ? ` (${totalOrphans} from unpaired tool_use)` : ''}`
+    + `, ${totalSkip} skipped from ${files.length} file(s)${errorTail}.`);
+  if (totalPrompts > 0 || totalObs > 0) {
+    // Orphan tool_use events persist as (truncated) observations and are counted INSIDE
+    // totalObs (lib/import-jsonl.mjs), so they already count as "something was imported"
+    // — an orphan-only first import must not fall through to the "already imported"
+    // no-op branch below.
     out(`[mem] Try: claude-mem-lite recent 5 --project ${project}`);
   } else if (totalRecognized > 0) {
     // Lines WERE Claude Code transcript events but produced no new rows — the file
@@ -3144,27 +3186,27 @@ async function cmdOptimize(db, args) {
   let reenrichScope = 'narrow';
   if (scopeIdx >= 0 && args[scopeIdx + 1] !== undefined) {
     const raw = args[scopeIdx + 1];
-    if (raw !== 'narrow' && raw !== 'wide' && raw !== 'aliases') {
-      fail(`[mem] Invalid --scope "${raw}". Use: narrow, wide, aliases`);
+    if (raw !== 'narrow' && raw !== 'wide' && raw !== 'aliases' && raw !== 'scopes') {
+      fail(`[mem] Invalid --scope "${raw}". Use: narrow, wide, aliases, scopes`);
       return;
     }
     reenrichScope = raw;
   }
   // --project <name> filters all 4 tasks to one project. Opt-in; absence
   // preserves prior cross-project default. `.` or `current` auto-resolve via
-  // inferProject() so users don't need to remember the exact name.
+  // the CLI project resolver so users don't need to remember the exact name.
   const projectIdx = args.indexOf('--project');
   let project;
   if (projectIdx >= 0 && args[projectIdx + 1]) {
     const raw = args[projectIdx + 1];
-    project = (raw === '.' || raw === 'current') ? inferProject() : raw;
+    project = (raw === '.' || raw === 'current') ? cliProject(db) : raw;
   }
 
   if (!run && !runAll) {
     const preview = optimizePreview(db, { project, detail: verbose });
     out('[mem] 🔍 LLM Optimization Preview:');
     if (project) out(`  Project filter: ${project}`);
-    out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}${preview.reenrichAliases ? `  (aliases scope: ${preview.reenrichAliases})` : ''}`);
+    out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}${preview.reenrichAliases ? `  (aliases scope: ${preview.reenrichAliases})` : ''}${preview.reenrichScopes ? `  (scopes scope: ${preview.reenrichScopes})` : ''}`);
     out(`  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`);
     // "candidates" matches the MCP wording (server.mjs mem_optimize preview) AND the
     // Re-enrich line just above, which already read that way on both surfaces. The two
@@ -3220,6 +3262,7 @@ import { cmdDoctor } from './cli/doctor.mjs';
 // cmdActivity (T7 v2.31) extracted to cli/activity.mjs (v2.41 split).
 import { cmdActivity } from './cli/activity.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── Main Entry Point ────────────────────────────────────────────────────────
 
 export async function run(argv) {

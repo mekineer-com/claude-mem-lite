@@ -10,7 +10,8 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr } from '../utils.mjs';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
 import { ensureRegistryDb } from '../registry.mjs';
-import { createTestDb, insertSession, insertObs, insertPrompt } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs, insertPrompt, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
+import { injectedIdsFileName } from '../lib/injected-ids.mjs';
 import { typeIcon, truncate } from '../utils.mjs';
 import {
   shouldSkip,
@@ -704,7 +705,7 @@ function runScript(hookData, extraEnv = {}) {
 
     // Safety timeout — script should never hang, but if it does, kill it
     // to avoid stalling the test suite.
-    const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+    const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, SUBPROCESS_TIMEOUT_MS);
 
     proc.on('exit', () => {
       clearTimeout(killTimer);
@@ -744,6 +745,22 @@ describe('user-prompt-search subprocess integration', () => {
     cleanupTestFiles();
   });
 
+  // Audit 2026-08-22 P2-13 fixture. This surface runs sanitizeFtsQuery on EVERY prompt
+  // (0.8ms normal, 6.2ms on a 64KB ASCII prompt, 31.8ms on a 64KB CJK one), so the query
+  // is capped at 2000 chars / 64 meaningful terms here while explicit `search` stays
+  // uncapped. Proving the hook PASSES the cap needs behaviour, not a unit test on the
+  // option.
+  const CAP_PROMPT = 'how do I fix the zqx_widget_cache invalidation race condition';
+  function seedCapFixture() {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fixed the zqx_widget_cache invalidation race',
+      text: 'zqx_widget_cache invalidation race condition on concurrent writes',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+  }
+
   it('skips short messages and produces no output', async () => {
     const { stdout } = await runScript({ prompt: 'hi' });
     expect(stdout).toBe('');
@@ -770,7 +787,7 @@ describe('user-prompt-search subprocess integration', () => {
   it('produces no output when no matching observations exist', async () => {
     const { stdout } = await runScript({
       prompt: 'How do I implement the new feature for data visualization?',
-    });
+    }, { CLAUDE_MEM_UPS_REQUIRE_SIGNAL: '0' });
     expect(stdout).toBe('');
     expect(db.prepare('SELECT returned_count FROM search_runs').get()).toEqual({ returned_count: 0 });
   });
@@ -789,14 +806,14 @@ describe('user-prompt-search subprocess integration', () => {
       session_id: 'telemetry-dedup',
       prompt: 'how do I fix the authentication middleware token expiry validation',
     };
-    const first = await runScript(payload);
+    const first = await runScript(payload, { CLAUDE_MEM_UPS_REQUIRE_SIGNAL: '0' });
     const searchId = Number(first.stdout.match(/Search (\d+) — rate relevance/)?.[1]);
     expect(searchId).toBeGreaterThan(0);
     expect(db.prepare('SELECT returned_count FROM search_runs WHERE search_id = ?').get(searchId))
       .toEqual({ returned_count: 3 });
     expect(db.prepare('SELECT COUNT(*) c FROM search_results WHERE search_id = ?').get(searchId).c).toBe(3);
 
-    const second = await runScript(payload);
+    const second = await runScript(payload, { CLAUDE_MEM_UPS_REQUIRE_SIGNAL: '0' });
     expect(second.stdout).toBe('');
     expect(db.prepare('SELECT COUNT(*) c FROM search_runs').get().c).toBe(1);
   });
@@ -811,7 +828,7 @@ describe('user-prompt-search subprocess integration', () => {
     db.pragma('wal_checkpoint(FULL)');
     const runtimeDir = join(testDir, 'runtime');
     mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(join(runtimeDir, '.claude-mem-injected-test--project'), JSON.stringify({
+    writeFileSync(join(runtimeDir, injectedIdsFileName('test--project', 'telemetry-cap')), JSON.stringify({
       ids: [], ts: Date.now(), count: 15, session: 'telemetry-cap',
     }));
     const { stdout } = await runScript({
@@ -862,7 +879,7 @@ describe('user-prompt-search subprocess integration', () => {
       let stderr = '';
       proc.stdout.on('data', (d) => { stdout += d.toString(); });
       proc.stderr.on('data', (d) => { stderr += d.toString(); });
-      const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+      const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, SUBPROCESS_TIMEOUT_MS);
       proc.on('exit', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr }); });
       proc.on('error', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr }); });
       proc.stdin.write('not valid json');
@@ -885,7 +902,7 @@ describe('user-prompt-search subprocess integration', () => {
         let stderr = '';
         proc.stdout.on('data', (d) => { stdout += d.toString(); });
         proc.stderr.on('data', (d) => { stderr += d.toString(); });
-        const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+        const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, SUBPROCESS_TIMEOUT_MS);
         proc.on('exit', (c) => { clearTimeout(killTimer); resolvePromise({ stdout, stderr, code: c }); });
         proc.on('error', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr, code: -1 }); });
         proc.stdin.write(payload);
@@ -930,6 +947,37 @@ describe('user-prompt-search subprocess integration', () => {
     expect(stdout).not.toContain('Modified authentication.mjs');
   });
 
+  // Audit 2026-08-22 P2-13: this surface runs sanitizeFtsQuery on EVERY prompt, with
+  // only a 64KB byte guard upstream — 0.8ms on a normal prompt, 6.2ms on a 64KB ASCII
+  // one, 31.8ms on a 64KB CJK one, all paid before the model sees the turn. The query
+  // is now capped at 2000 characters / 64 meaningful terms HERE, while an explicit
+  // `search` stays uncapped.
+  //
+  // Wiring, not seam: a unit test on sanitizeFtsQuery proves the option works and proves
+  // nothing about whether this hook passes it. The pair below is behavioural — same
+  // identifier, once inside the cap and once past it.
+  it('P2-13: the capped surface still injects on a normal prompt', async () => {
+    // The regression this guards: capping the query must not change the common path.
+    seedCapFixture();
+    const { stdout } = await runScript({ prompt: CAP_PROMPT });
+    expect(stdout).toContain('zqx_widget_cache');
+  });
+
+  // NOT asserted here, deliberately: "an identifier past the 2000-character cap stops
+  // matching". It is true, and on this surface it cannot be shown without also showing
+  // something else. Any filler long enough to push a term past 2000 characters adds
+  // dozens of terms to an AND-joined FTS query, and that alone kills the match —
+  // measured both ways: with unrelated-word filler the match dies at 1200 characters,
+  // well under the cap, and with pure stop-word filler the query degenerates to
+  // stop-words-only (sanitizeFtsQuery keeps them when filtering would empty the query)
+  // and matches the fixture for the wrong reason. A case written either way passes
+  // whether or not the cap exists. The cap itself is pinned in tests/fts-query-caps.test.mjs
+  // against the real query builder this hook calls.
+  //
+  // Worth recording as a finding rather than a limitation: it means the cap costs close
+  // to nothing in practice — a prompt long enough to be truncated was already producing
+  // a query too diluted to match.
+
   // v2.34.3: top-|rel| sanity gate. BM25_MIN_SCORE filters per-row; this floor
   // gates the entire FTS set. Noise prompts produce OR-fallback leakage where
   // every hit shares one tangential stem — per-row filtering leaves them all.
@@ -946,7 +994,13 @@ describe('user-prompt-search subprocess integration', () => {
     db.pragma('wal_checkpoint(FULL)');
     const { stdout } = await runScript(
       { prompt: 'how do I fix the authentication middleware token expiry validation' },
-      { CLAUDE_MEM_UPS_TOP_MIN: '1e9' },
+      // Pin the corpus ramp off (corpusFloorScale returns 1 when the reference is <= 1).
+      // This fixture holds ONE observation, and the ramp now scales the floors
+      // by the corpus's max attainable IDF — which is 0 on a 1-row index, so both floors
+      // collapse to 0 and no gate can fire. That relaxation is the cold-start fix
+      // (tests/ups-cold-start-injection.test.mjs); this test is about the gate mechanism,
+      // so it asks for the calibrated scale explicitly instead of relying on corpus size.
+      { CLAUDE_MEM_UPS_TOP_MIN: '1e9', CLAUDE_MEM_UPS_FLOOR_REF_CORPUS: '1' },
     );
     expect(stdout).toBe('');
   });
@@ -1043,7 +1097,9 @@ describe('user-prompt-search subprocess integration', () => {
     db.pragma('wal_checkpoint(FULL)');
     const { stdout } = await runScript(
       { prompt: 'how do I fix the OAuth token refresh double-redirect' },
-      { CLAUDE_MEM_UPS_TOP_MIN: '0.0000001' },
+      // CLAUDE_MEM_UPS_FLOOR_REF_CORPUS=1 pins the corpus ramp off — see the top-|rel|
+      // gate test above for why a 1-row fixture otherwise has both floors at 0.
+      { CLAUDE_MEM_UPS_TOP_MIN: '0.0000001', CLAUDE_MEM_UPS_FLOOR_REF_CORPUS: '1' },
     );
     expect(stdout).toBe('');
   });
@@ -1134,6 +1190,166 @@ describe('user-prompt-search subprocess integration', () => {
       { prompt: 'parsing FTS5 boolean operator precedence in our sanitizer' },
     );
     expect(stdout).toBe('');
+  });
+
+  // ─── D#172 class (audit 2026-08-29 ALGO-2 / ALGO-5): a SQL LIMIT sitting upstream
+  // of a JS-side relevance filter bounds REACHABILITY, not output width.
+
+  // Corpus for the two ALGO-2 cases. The 50 off-topic rows are load-bearing: without
+  // them FTS5's IDF degenerates, bm25() comes back ~0 for every row, and the per-row
+  // BM25_MIN_SCORE floor empties the pool — the fixture would then "pass" the negative
+  // case for a reason that has nothing to do with the bypass. Measured with them
+  // present: decoys bm25 -26.296 at composite ranks 1-3, identifier row -7.209 at
+  // rank 4, i.e. one place outside the LIMIT-3 window the bypass used to read from.
+  function seedIdentifierBypassCorpus() {
+    const TOPICS = ['oauth token refresh', 'sqlite wal checkpoint', 'docker layer prune',
+      'react hydration ssr', 'grpc deadline retry'];
+    for (let i = 0; i < 50; i++) {
+      insertObs(db, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'change',
+        title: `${TOPICS[i % 5]} note ${i}`, text: `${TOPICS[i % 5]} details ${i}`, importance: 1,
+      });
+    }
+    for (let i = 0; i < 3; i++) {
+      insertObs(db, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+        title: `Cache invalidation racing under concurrent writes ${i}`,
+        text: 'cache invalidation racing concurrent writes contention analysis',
+        importance: 3,
+      });
+    }
+    // Same `type` as the decoys on purpose. The prompt below starts with "why", which
+    // detectIntent maps to a type-filtered search — a SECOND reachability bound that
+    // would drop this row at the SQL level before the pool question is ever reached,
+    // and the first draft of this fixture failed for that reason, not the one under
+    // test. Keeping all four rows one type makes the case hold whether the typed query
+    // matches (all four in the pool) or returns nothing (untyped retry, all four again).
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+      title: 'zqx_widget_cache eviction note',
+      text: 'zqx_widget_cache eviction bookkeeping',
+      importance: 1,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+  }
+
+  it('ALGO-2: identifier bypass reaches a row below the main LIMIT window', async () => {
+    // The bypass exists so a named-identifier hit survives the SET floors. It used to
+    // pick from `ftsRows` — the same LIMIT-3 window — so it could only restore rows the
+    // sort had already ranked top-3, and the df=1 identifier row its own docblock
+    // argues for was unreachable. TOP_MIN is pinned huge so the set floor drops the
+    // whole FTS set, leaving the bypass as the only path to output.
+    // VERIFIED RED: with the bypass reading `ftsRows` (the pre-fix expression) stdout
+    // is empty — measured 2026-09-01 on this fixture.
+    seedIdentifierBypassCorpus();
+    const { stdout } = await runScript(
+      { prompt: 'why does the zqx_widget_cache invalidation keep racing under concurrent writes' },
+      { CLAUDE_MEM_UPS_IDENTIFIER_BYPASS: '1', CLAUDE_MEM_UPS_TOP_MIN: '1e9' },
+    );
+    expect(stdout, 'identifier row unreachable — bypass still bounded by the main LIMIT').not.toBe('');
+    expect(stdout).toContain('zqx_widget_cache');
+    // Control on the SAME run: the three decoys are ranks 1-3 and were dropped by the
+    // set floor. They must stay dropped — the bypass restores identifier matches, not
+    // "whatever the wider pool now contains". Without this assertion an accidental
+    // `ftsRows = ftsPool` would pass the line above while quadrupling the injected set.
+    expect(stdout, 'set floor stopped binding — the pool widening leaked non-identifier rows')
+      .not.toContain('Cache invalidation racing under concurrent writes');
+  });
+
+  it('ALGO-2: no identifier in the prompt → the wider pool changes nothing', async () => {
+    // Same corpus, prompt names no identifier: promptIdentifiers is empty, the bypass
+    // is a no-op, and the set floor must still empty the output. Pins that the pool
+    // sizing did not become an injection-budget widening in its own right.
+    seedIdentifierBypassCorpus();
+    const { stdout } = await runScript(
+      { prompt: 'why does the invalidation keep racing under concurrent writes here' },
+      { CLAUDE_MEM_UPS_IDENTIFIER_BYPASS: '1', CLAUDE_MEM_UPS_TOP_MIN: '1e9' },
+    );
+    expect(stdout).toBe('');
+  });
+
+  it('ALGO-5: prompt-fallback survives a CJK-precision drop of its top row', async () => {
+    // searchByUserPrompts filters rows through cjkPrecisionOk AFTER the SQL LIMIT, and
+    // PROMPT_FALLBACK_LIMIT ships at 1 — so dropping one row dropped the whole face.
+    // The decoy is the shape that motivates the filter: unicode61 degrades a CJK query
+    // to single-char AND, so text sharing only the individual characters matches FTS
+    // while containing none of the query's keywords.
+    // VERIFIED RED: with the SQL LIMIT back at `limit` (1) stdout is empty — measured
+    // 2026-09-01 on this fixture.
+    //
+    // WHY THE FIXTURE LOOKS LIKE SPACED CJK. `user_prompts_fts` is declared with no
+    // `tokenize=` clause, and FTS5's default tokenizer indexes a contiguous CJK run as
+    // ONE token ('分页接口' is a single term, not 分/页/接/口 — verified against
+    // fts5vocab on SQLite 3.53.1). Unlike `observations_fts`, whose write path folds
+    // space-separated CJK bigrams into the `text` COLUMN (buildFtsTextField in
+    // hook-llm.mjs, derivedText in lib/observation-write.mjs, lib/save-enrich.mjs — all
+    // append cjkBigrams(title + narrative) to the derived text blob), this table holds
+    // only raw prompt_text — so a CJK query's bigrams can match only where the prompt itself
+    // has them as isolated runs. That also means the AND pass cannot match here (it
+    // requires the noise bigram '的边' as its own run), so this exercises the OR
+    // fallback, which is the branch on which cjkPrecisionOk is reachable at all.
+    //
+    // The 40 filler prompts are load-bearing, not padding: with only the two rows below
+    // present, FTS5's IDF degenerates and bm25() returns -0.000 for BOTH — the decoy
+    // then leads only by rowid tie-break, so the fixture would be asserting on insertion
+    // order rather than on rank. With the fillers: decoy -27.465, good row -11.763.
+    for (let i = 0; i < 40; i++) {
+      insertPrompt(db, {
+        contentSessionId: 's1', promptNumber: 100 + i,
+        text: `unrelated prompt ${i} about docker layers kafka rebalance tls handshake cron skew`,
+      });
+    }
+    // Decoy ranks #1: it hits the query's ASCII synonym arms plus the noise bigram, so
+    // it matches MORE OR-terms than the real answer — while containing none of the CJK
+    // keywords cjkPrecisionOk requires ('分页','接口','问题','处理'), so the filter
+    // rejects it. That combination is the whole point: the row the SQL ranks first is
+    // the row the JS filter throws away.
+    insertPrompt(db, {
+      contentSessionId: 's1', promptNumber: 1,
+      text: 'pagination api endpoint issue problem 的边 边界',
+    });
+    insertPrompt(db, {
+      contentSessionId: 's1', promptNumber: 2,
+      text: '分页 接口 的 边界 问题 上次 处理 过 的 那个 补丁 细节 都 在 那次 讨论 里面 很 长 的 一 段 记录',
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: '分页接口的边界问题怎么处理' },
+      { CLAUDE_MEM_UPS_REQUIRE_SIGNAL: '0' },
+    );
+    expect(stdout, 'prompt-fallback silenced by a filter running downstream of LIMIT 1').not.toBe('');
+    expect(stdout).toContain('分页 接口');
+    expect(stdout, 'the row cjkPrecisionOk rejects must not be what surfaced').not.toContain('pagination api endpoint');
+  });
+
+  it('ALGO-5: over-fetching does not widen the injection budget', async () => {
+    // Binding guard for the trailing `.slice(0, limit)`. The pre-tag review found that
+    // the case above does NOT pin it: only one row there survives cjkPrecisionOk, so
+    // slice-vs-no-slice returns the same single row and deleting the slice stayed green
+    // across the whole suite. It is not a cosmetic call — the pool is `limit × 5` capped
+    // at 25, and PROMPT_FALLBACK_LIMIT ships at 1 precisely because this path has NO
+    // quality gate (only BM25 ordering), so an unsliced pool is an injection-budget
+    // blowout. Three filter-passing rows, exactly one rendered.
+    // VERIFIED RED: deleting `.slice(0, limit)` renders 3 `P#` lines instead of 1.
+    for (let i = 0; i < 40; i++) {
+      insertPrompt(db, {
+        contentSessionId: 's1', promptNumber: 200 + i,
+        text: `unrelated prompt ${i} about docker layers kafka rebalance tls handshake cron skew`,
+      });
+    }
+    insertPrompt(db, { contentSessionId: 's1', promptNumber: 1, text: '分页 接口 的 边界 问题 上次 处理 过 的 那个 补丁 甲' });
+    insertPrompt(db, { contentSessionId: 's1', promptNumber: 2, text: '分页 接口 的 边界 问题 后来 又 处理 了 一次 乙' });
+    insertPrompt(db, { contentSessionId: 's1', promptNumber: 3, text: '分页 接口 的 边界 问题 第三 次 处理 的 记录 丙' });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: '分页接口的边界问题怎么处理' },
+      { CLAUDE_MEM_UPS_REQUIRE_SIGNAL: '0' },
+    );
+    expect(stdout, 'all three rows pass the filter — the face must not go silent').not.toBe('');
+    expect(
+      (stdout.match(/P#\d+/g) || []).length,
+      'prompt-fallback emitted more than PROMPT_FALLBACK_LIMIT rows — the pool leaked',
+    ).toBe(1);
   });
 });
 

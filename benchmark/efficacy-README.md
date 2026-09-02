@@ -257,7 +257,17 @@ production. (2) **Power** — n=2 commits / 1 model, both commits now have a val
 but not equal to a genuine spec — the residual 2/8 is the attribution gap.
 
 **Verdict: NET-POSITIVE → the live UserPromptSubmit task-imperative emitter (Phase 2) is ship-eligible**,
-behind `CLAUDE_MEM_TASK_IMPERATIVE` (default off); flipping the default on stays gated on the live
-cite-recall canary not regressing (spec §5.3). Rig infra is permanent (`lib/task-imperative.mjs`,
+behind `CLAUDE_MEM_TASK_IMPERATIVE` (default off).
+
+**Update 2026-08-16 (D#137) — the default flip is abandoned; the flag is EXPERIMENTAL.** The flip was
+gated on a live cite-recall canary, and the canary can never reach n. Replaying
+`selectImperativeLesson` over the last 400 real prompts, the gate opened 76 times = **19.0%** — CJK
+prompts 57/352 = **16.2%**, ASCII prompts 19/48 = **39.6%**. `rankImperativeCandidates` requires
+identifier overlap between the prompt and the lesson body/title, and a Chinese prompt carries few symbol
+anchors; with 88% of this install's prompts in Chinese the emitter fires about once every six prompts.
+That is the gate's DESIGN ceiling (precision-first anchoring), not a defect, so waiting longer does not
+help. Reviving the flip requires a CJK-viable anchor proven in A/B *without* a precision loss — a
+separate piece of work, not a canary. (Do not cite D#56's 53.8% adoption figure — #10425 corrected it
+as a small-n artifact.) Rig infra stays permanent (`lib/task-imperative.mjs`,
 `lib/efficacy-arms.mjs` `taskSuffixForArm`). Spec/plan:
 `docs/superpowers/specs|plans/2026-06-29-task-imperative-memory-injection*` (local-only).

@@ -20,9 +20,39 @@ if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
     });
     process.stderr.write('[claude-mem-lite] Dependencies installed\n');
   } catch (e) {
-    // Plugin-cache / multi-user / disk-full installs can fail here. Without this
-    // catch the user sees a Node stack trace; with it they get an actionable line.
-    const detail = e.message?.split('\n')[0] || e.code || 'unknown error';
+    // Plugin-cache / multi-user / disk-full installs can fail here, and this is not a
+    // rare path: Claude Code materializes each new plugin-cache version WITHOUT
+    // node_modules, so the guard above opens on the first MCP launch after every
+    // plugin update. Without this catch the user sees a Node stack trace.
+    //
+    // `.split('\n')[0]` is CORRECT here, unlike the four binding-error sites fixed in
+    // v3.70.2, and the difference is the `stdio` above: stderr is **inherit**, so
+    // npm's own diagnosis (`npm error code EROFS`, `path …`, `rofs EROFS: read-only
+    // file system …`) has already streamed straight to the user's terminal by the time
+    // we get here — verified by running this file against an unwritable ROOT. With
+    // stderr inherited, execSync's `e.message` holds only "Command failed: <cmd>";
+    // there is no captured diagnosis to lose. Do NOT "fix" this by piping stderr to
+    // recover it: piping is what made a compiling better-sqlite3 look hung under the
+    // 5-min bash timeout (bug audit 2026-05), which is why stderr is inherited.
+    //
+    // A pre-tag review measured `e.message` under `stdio: 'pipe'`, where stderr IS
+    // folded into the message, and concluded this line drops the diagnosis. It does
+    // not — the stdio differs. Recorded here because the same wrong conclusion is
+    // easy to reach from the code alone.
+    //
+    // `e.status` not `e.code`: execSync failures carry the exit status on `status`,
+    // so the old `|| e.code` rung was dead.
+    // `?? null` not `!= null`: the loose form is the idiom, but this file is
+    // linted under `eqeqeq: always`, and rewriting it as `!== undefined` would
+    // be a BEHAVIOUR change — execSync reports a signal kill with `status: null`,
+    // which `!== undefined` accepts and would render as "npm exited null".
+    // Coalescing first keeps the original both-nullish semantics exactly, `0`
+    // included.
+    const status = e?.status ?? null;
+    const detail = e?.message?.split('\n')[0]
+      || (status !== null ? `npm exited ${status}` : '')
+      || (e?.signal ? `npm killed by ${e.signal}` : '')
+      || 'unknown error';
     process.stderr.write(`[claude-mem-lite] npm install failed in ${ROOT} — ${detail}\n`);
     process.stderr.write(`[claude-mem-lite] Likely cause: read-only directory, disk full, or network blocked.\n`);
     process.stderr.write(`[claude-mem-lite] Repair: cd "${ROOT}" && npm install --omit=dev\n`);

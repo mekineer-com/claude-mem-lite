@@ -91,6 +91,55 @@ describe('sweepOrphanEpisodeFiles', () => {
     expect(remaining).toEqual(['cite-recall-foo.json', 'session-bar']);
   });
 
+  // ── FLOW-3 (2026-08-29 audit): three of the four crash-residue families were unreachable ──
+  //
+  // This runtime dir writes four temp-name families, each the middle of a rename-or-unlink
+  // pair that leaks if the process dies between the steps. The predicate covered only
+  // `.claim-`, whose own comment states exactly that reason. Neither of the other clauses
+  // could reach the rest: `reads-<p>.txt.collect-<ts>` does not end in `.txt`, and
+  // `ep-<p>.json.tmp-<pid>` does not start with `ep-flush-`.
+  describe('crash residue from the rename/unlink window', () => {
+    it('sweeps all four families on the SHORT clock, not just .claim-', () => {
+      // 2h old: past the 1h residue cutoff, well inside the 24h reads cutoff — so this
+      // also pins that residue is clocked as residue, not as a reads tracker.
+      const age = 2 * 3600 * 1000;
+      writeWithMtime('ep-projects--mem.json.claim-123-999', age);
+      writeWithMtime('reads-projects--mem.txt.collect-1699999999', age);
+      writeWithMtime('reads-projects--mem.txt.trim-4242', age);
+      writeWithMtime('ep-projects--mem.json.tmp-4242', age);
+
+      expect(sweepOrphanEpisodeFiles(dir)).toBe(4);
+      expect(readdirSync(dir)).toEqual([]);
+    });
+
+    it('leaves residue younger than the 1h cutoff alone', () => {
+      // An in-flight rename must never be raced — the reason every clause here is age-gated.
+      writeWithMtime('reads-projects--mem.txt.collect-1699999999', 10 * 60 * 1000);
+      expect(sweepOrphanEpisodeFiles(dir)).toBe(0);
+      expect(readdirSync(dir)).toEqual(['reads-projects--mem.txt.collect-1699999999']);
+    });
+
+    it('does not sweep the LIVE episode buffer of a project whose name contains .tmp-', () => {
+      // What the end-anchor actually protects. `ep-x.tmp-y.json` is the episode file of a
+      // project whose sanitized name contains the token — an UNANCHORED pattern matches it
+      // and sweeps it as residue one hour into a session still writing to it.
+      //
+      // The first version of this case used `reads-x.tmp-y.txt` and proved nothing: that
+      // name ends in `.txt`, so `isReads` selects the 24h cutoff whether or not the anchor
+      // is there. Dropping the anchor killed no test, and a pre-tag reviewer caught it.
+      writeWithMtime('ep-x.tmp-y.json', 2 * 3600 * 1000);
+      expect(sweepOrphanEpisodeFiles(dir)).toBe(0);
+      expect(readdirSync(dir)).toEqual(['ep-x.tmp-y.json']);
+    });
+
+    it('a reads tracker for such a project keeps the 24h clock', () => {
+      writeWithMtime('reads-x.tmp-y.txt', 2 * 3600 * 1000);
+      expect(sweepOrphanEpisodeFiles(dir)).toBe(0);
+      // …and is still swept once it really is abandoned.
+      expect(sweepOrphanEpisodeFiles(dir, { readsAgeMs: 3600 * 1000 })).toBe(1);
+    });
+  });
+
   it('honors a custom `now` so callers can pin time for deterministic assertions', () => {
     const t0 = 1_000_000_000_000;
     const stale = writeWithMtime('ep-flush-stale.json', 0);

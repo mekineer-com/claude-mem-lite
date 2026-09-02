@@ -200,10 +200,10 @@ export const KNOWN_CLI_FLAGS = new Set([
   'after', 'age-days', 'all', 'anchor', 'batch', 'before', 'benchmark', 'body', 'branch',
   'capability-summary', 'category', 'closes-deferred', 'concepts', 'confirm', 'days', 'deep',
   'detail', 'domain-tags', 'dry-run', 'enrich', 'execute', 'fields', 'file', 'files', 'floors',
-  'force', 'format', 'from', 'has', 'help', 'id', 'ids', 'content', 'importance', 'include-compressed', 'include-noise',
+  'force', 'format', 'from', 'help', 'id', 'ids', 'content', 'importance', 'include-compressed', 'include-noise',
   'intent-tags', 'invocation-name', 'json', 'key', 'keywords', 'lesson', 'lesson-learned', 'limit',
   'local-path', 'margins', 'max', 'memdir', 'merge-ids', 'metrics', 'name', 'narrative', 'no-deep',
-  'offset', 'ops', 'or', 'out', 'priority', 'project', 'quality', 'query', 'reason', 'repo-url',
+  'offset', 'ops', 'or', 'priority', 'project', 'quality', 'query', 'reason', 'repo-url',
   'rerank', 'resource-type', 'retain-days', 'retry', 'run', 'run-all', 'scope', 'search-telemetry', 'session-audit',
   'sidechain', 'since', 'sort', 'source', 'status', 'sweep', 'task', 'tech-stack', 'text', 'tier', 'title',
   'to', 'trigger-patterns', 'type', 'use-cases', 'verbose',
@@ -217,6 +217,15 @@ export const KNOWN_CLI_FLAGS = new Set([
   // warn-on-every-unknown-flag flip turned the omission into a false warning on a
   // documented, working command.
   'prompts-limit',
+  // Entries here MUST be read by a `claude-mem-lite` subcommand. A flag that no
+  // command reads is worse than an absent one: it converts the "ignored, it had no
+  // effect" warning into silence, so the user's dropped flag reads as accepted.
+  // `out` sat here until the 2026-08-17 e2e round for that exact reason: `--out` is a
+  // benchmark-script flag (benchmark/longmemeval-rerank.mjs), never a CLI one, so
+  // `export --out backup.json` printed the whole export to stdout and said nothing
+  // about the file it did not write. `has` went the same round: no reader, no help
+  // entry, and (per the v3.34.0 notes) the source of the misleading "did you mean
+  // --has?" suggestion. Locked by tests/cli-flag-allowlist.test.mjs.
 ]);
 
 /** Levenshtein distance, early-exit past `max` (cheap enough for a handful of flags). */

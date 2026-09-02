@@ -22,9 +22,10 @@ vi.mock('../utils.mjs', () => ({
 
 // vi.mock factories are hoisted above imports, so shared mock fns must come
 // from vi.hoisted (top-level consts are not yet initialized at factory time).
-const { callHaikuMock, detectModeMock } = vi.hoisted(() => ({
+const { callHaikuMock, detectModeMock, execClaudeCliSyncMock } = vi.hoisted(() => ({
   callHaikuMock: vi.fn(),
   detectModeMock: vi.fn(),
+  execClaudeCliSyncMock: vi.fn(),
 }));
 vi.mock('../haiku-client.mjs', () => ({
   getClaudePath: vi.fn(() => '/usr/bin/claude'),
@@ -32,6 +33,13 @@ vi.mock('../haiku-client.mjs', () => ({
   flattenForCLI: vi.fn((p) => (typeof p === 'string' ? p : `${p.system}\n${p.user}`)),
   detectMode: detectModeMock,
   callHaiku: callHaikuMock,
+  // The `claude -p` argv/env contract (and the flag-compat retry) now lives in
+  // ONE runner in haiku-client, asserted there; this file's job is that the CLI
+  // leg still routes through it rather than re-inlining its own spawn.
+  execClaudeCliSync: execClaudeCliSyncMock,
+  // callLLM's default timeout argument — a full mock must carry it or every
+  // routing case throws before reaching the branch under test.
+  BG_LLM_TIMEOUT_MS: 45000,
 }));
 
 vi.mock('../memdir.mjs', () => ({
@@ -94,18 +102,26 @@ describe('hook-shared callLLM — provider routing', () => {
     expect(callHaikuMock).toHaveBeenCalledWith('x', expect.objectContaining({ timeout: 20000 }));
   });
 
-  it('falls back to the claude CLI (execFileSync) in cli mode', async () => {
+  it('falls back to the shared claude-CLI runner in cli mode', async () => {
     detectModeMock.mockReturnValue('cli');
-    vi.mocked(execFileSync).mockReturnValue('  cli summary  ');
+    execClaudeCliSyncMock.mockReturnValue('  cli summary  ');
 
-    const out = await callLLM('summarize this');
+    // A {system, user} prompt, not a bare string: with a string the flattenForCLI
+    // mock is the identity function, so asserting on the input proved only that
+    // the test supplied it — skipping _flattenForCLI entirely would have passed,
+    // and with it the injection boundary marker that wraps untrusted user text.
+    const out = await callLLM({ system: 'SYS', user: 'summarize this' }, 20000);
 
     expect(out).toBe('cli summary');
     expect(callHaikuMock).not.toHaveBeenCalled();
-    expect(execFileSync).toHaveBeenCalledWith(
-      '/usr/bin/claude',
-      ['-p', '--model', 'haiku'],
-      expect.objectContaining({ encoding: 'utf8' }),
+    expect(execClaudeCliSyncMock).toHaveBeenCalledWith(
+      'haiku',
+      { input: 'SYS\nsummarize this', timeout: 20000 },
     );
+    // Drift guard: this leg used to hand-roll its own execFileSync with a
+    // duplicated argv+env pair, which is how the headless flags could be pinned
+    // at three sites and lost at the fourth. Re-inlining a spawn here fails both
+    // assertions — the shared runner is the only sanctioned path.
+    expect(execFileSync).not.toHaveBeenCalled();
   });
 });

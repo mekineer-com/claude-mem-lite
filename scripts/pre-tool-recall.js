@@ -8,28 +8,66 @@ import { existsSync, readFileSync, mkdirSync } from 'fs';
 import { basename, join } from 'path';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
+import { injectedIdsFileName } from '../lib/injected-ids.mjs';
+import { liveObsFilterSql } from '../lib/inject-search-core.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
+import { cooldownPathFor as sharedCooldownPathFor } from '../lib/cooldown-path.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
-import { fileMatchClause, fileMatchParams } from '../lib/file-edge-match.mjs';
+import { fileMatchClause, fileMatchParams, basenameAnySep } from '../lib/file-edge-match.mjs';
 import { fileIntelFor } from '../lib/file-intel.mjs';
 import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/reread-guard.mjs';
 import { recordMetric } from '../lib/metrics.mjs';
 import { presentIdents } from '../lib/lesson-idents.mjs';
 import { neutralizeContextDelimiters } from '../format-utils.mjs';
+// D#154: the one stdout writer. This script has THREE emit sites (Read→Edit ack,
+// repeated-read guard, lesson block) and they stay one document because each branch
+// process.exit()s before reaching the next.
+//
+// Be precise about what routing them through the queue does and does not buy, because an
+// earlier version of this comment claimed "a second write is now impossible by
+// construction" and that is FALSE (pre-tag review, v3.80.0): each site flushes
+// IMMEDIATELY after queueing, and the flush resets the queue — so queue→flush→queue→flush
+// emits two documents exactly like two raw writes would. Merging is a property of
+// DEFERRING the flush (what hook.mjs does with a single flush at the end of its dispatch),
+// not of using the queue.
+//
+// What it does buy: one construction site instead of three, so the "only the writer
+// assembles an envelope" invariant is checkable (tests/hook-script-stdout-contract.test.mjs),
+// and the merge is AVAILABLE to anyone who later defers the flush. The mutual exclusion
+// itself is still control flow — the process.exit(0) below.
+//
+// Import-free module, no runtime deps — nothing added to this script's load cost.
+import { queueHookContext, flushHookStdout } from '../lib/hook-stdout.mjs';
+// Recall queries the SAVE-path project, so this MUST produce the same string as the
+// save path. It used to be a hand-kept copy of the same 6 lines; that copy had already
+// drifted once (missing the process.env.PWD fallback, so a symlinked project dir
+// recalled nothing) and would have drifted again when the 2026-08-17 e2e round taught inferProject to
+// anchor on the git work-tree root. project-utils.mjs is a leaf module over path/fs/os
+// only — cheaper than several imports this script already carries.
+import { inferProject } from '../project-utils.mjs';
 
+import { DAY_MS } from '../lib/time-constants.mjs';
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
 // whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
 // per-component overrides for tests that mix isolated + real paths.
 const DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
 const DB_PATH = process.env.CLAUDE_MEM_DB_PATH || join(DATA_DIR, 'claude-mem-lite.db');
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
-// A3 (v2.83): cross-hook dedup window — must mirror DEDUP_STALE_MS in
-// scripts/prompt-search-utils.mjs. UPS writes
-// `runtime/.claude-mem-injected-<project>` after each inject; we read it to
-// drop IDs the agent already saw in this 5-min window. Standalone fast-path
-// (#8447) so we inline the constant rather than importing the helper.
-const CROSS_HOOK_DEDUP_MS = 5 * 60 * 1000;
+// A3 (v2.83): cross-hook dedup window. UPS writes
+// `runtime/.claude-mem-injected-<project>` after each inject; we read it to drop IDs the
+// agent already saw in this window. Imported, not inlined (ARCH-3): the copy's stated
+// reason — keep this standalone fast path import-free (#8447) — was retired by v3.80.0,
+// which already imports lib modules here, and the inlined value silently encoded the
+// same premise twice.
+import { DEDUP_STALE_MS as CROSS_HOOK_DEDUP_MS } from './prompt-search-utils.mjs';
+// Upper bound on the over-fetch the cross-hook dedup buys itself (ALGO-4). The dedup
+// runs in JS after the SELECTs, so each LIMIT is raised by the seen-set size to keep the
+// dedup a re-ranking rather than a truncation. This cap exists because the seen-set is
+// read from a file on disk: it is bounded by UPS's own per-prompt budget in practice
+// (MAX_RESULTS 3), but an unbounded value read off disk must never size a query. 5 is
+// well above that budget and still leaves the worst case at 2+5=7 rows per SELECT.
+const CROSS_HOOK_DEDUP_SLACK_MAX = 5;
 // v2.33.1: cooldown path is session-scoped so same-file-twice within one
 // session never re-injects (was: global file, 5-min window). Cross-session:
 // fresh file, fresh nudges — this is intended. No session_id → fall back to
@@ -76,6 +114,45 @@ const EDGE_DECAY_K = Math.max(1, Number.isNaN(EDGE_DECAY_K_RAW) ? 3 : EDGE_DECAY
 // environment-scoped observations (tooling/CI/network gotchas that apply in
 // ANY project) stop firing on FILE-triggered recall; they stay reachable via
 // search / UPS / error-recall. NULL scope (legacy / manual rows) always passes.
+//
+// DO NOT TURN THIS ON, AND DO NOT REBUILD IT AS A DOWN-WEIGHT (D#153, closed
+// 2026-08-25). Its premise is that environment-scoped rows are the low-relevance
+// class on THIS face. Measured on the live corpus with the shipped extractors —
+// `node benchmark/citation-live-replay.mjs --by-scope`, 1122 transcripts — the
+// `pretool` face (this one) cites:
+//   environment 47.5% (67/141)  CI [39.5, 55.7]
+//   project     44.3% (293/661) CI [40.6, 48.1]
+//   file        40.0% (2/5)  ·  (gone) 37.1% (185/498)  ·  module 36.5% (31/85)
+//   (null)      34.9% (45/129)          ·  face overall 41.0% (623/1519)
+// environment is the best-citing scope bucket on the face the filter gates. The
+// CIs for environment and project OVERLAP, so "environment leads" is NOT
+// established; what is refuted is "environment is the class to suppress".
+// Its interval sits above module and null, which is the comparison that matters
+// for a lever whose whole premise is that this bucket is the weak one.
+//
+// The earlier redesign sketch (multiplicative demotion at the TYPE_QUALITY layer
+// instead of a WHERE-clause exclusion) fixes the failure mode that was measured
+// in 2026-08 — 173 recall groups going empty — but it would still down-rank this
+// bucket, so it was NOT built. Kept as an off switch rather than deleted: the
+// column and the label are used elsewhere, and a flag nobody flips costs nothing
+// as long as the reason not to flip it is written down, which is this paragraph.
+//
+// NOT corroborated by #10720, though an earlier draft of this note said so. That
+// observation is a scope LABEL distribution (364 labelled DB rows: project 184 /
+// environment 114 / module 50 / file 16), which establishes the filter's blast
+// radius — environment is 31.3% of labels, not the near-no-op it looked like at 8
+// rows — and says nothing about relevance. The refutation rests on the by-scope
+// replay alone.
+//
+// Caliber caveat, so the numbers are re-derivable rather than quotable: the six
+// buckets sum to exactly 1519, the face's own pair count, because 498 ids whose
+// observation has since left the table are reported as `(gone)` rather than
+// dropped. Those are an OLD cohort (max id 8880 against a corpus reaching 10850)
+// from id bands where the surviving population is ~81% `(null)` and ~2.5%
+// environment, so the missing bucket cannot plausibly be environment-heavy;
+// environment and project pairs sit in the same bands, so the head-to-head is not
+// era-confounded. The `(null)` bucket and the face-overall figure ARE, being
+// dominated by legacy rows.
 const SCOPE_FILTER_ON = ['1', 'on', 'true', 'yes'].includes(
   String(process.env.CLAUDE_MEM_SCOPE_FILTER || '').toLowerCase());
 const FILE_INTEL_MIN_TOKENS = Math.max(1,
@@ -92,10 +169,14 @@ const REREAD_MIN_TOKENS = Math.max(1,
 // Edit cost 15-30 disk stats per call. SessionStart fires once at session boot,
 // which is enough to keep RUNTIME_DIR from growing unbounded.
 
+// Path rule lives in lib/cooldown-path.mjs — this script WRITES the file that
+// lib/cite-back-hint.mjs and lib/edge-attribution.mjs read, and a writer/reader
+// disagreement does not error, it silently reads a file nobody wrote (ARCH-2). The
+// no-session legacy fallback stays here: it is this script's own back-compat, not part
+// of the shared naming rule.
 function cooldownPathFor(sessionId) {
   if (!sessionId) return LEGACY_COOLDOWN_PATH;
-  const safe = String(sessionId).replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
-  return join(RUNTIME_DIR, `pre-recall-cooldown-${safe}.json`);
+  return sharedCooldownPathFor(RUNTIME_DIR, sessionId);
 }
 
 // Comprehension-bridge (CLAUDE_MEM_SALIENCE=bridge): rewrite the top bound lesson
@@ -124,21 +205,6 @@ async function bridgeTopLesson(rows, changeText) {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-// SYNC: must produce the SAME string as utils.mjs::inferProject (the path obs are SAVED
-// under) and the bash post-tool-use.sh fast-path — recall queries the SAVE-path project.
-// This previously used process.cwd() WITHOUT the process.env.PWD fallback the other two
-// have, so under a symlinked project dir (PWD = logical/symlinked path, cwd = resolved)
-// with CLAUDE_PROJECT_DIR unset it computed a DIFFERENT project than the save path and
-// silently recalled nothing. Resolution order + sanitize + 100-char cap now match utils.
-function inferProject() {
-  const dir = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-  const base = basename(dir);
-  const parent = basename(join(dir, '..'));
-  const raw = (parent && parent !== '.' && parent !== '/')
-    ? `${parent}--${base}` : base;
-  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100);
-}
-
 function readCooldown(cooldownPath) {
   try { return JSON.parse(readFileSync(cooldownPath, 'utf8')); } catch { return {}; }
 }
@@ -153,11 +219,14 @@ function entryTimestamp(v) {
 }
 
 // A3 (v2.83): cross-hook injected-IDs store. UPS writes
-// `runtime/.claude-mem-injected-<project>` with {ids, ts, count}. We read
-// inside the staleness window, filter overlaps from PreToolUse output, then
-// merge back so the next UPS sees what we emitted too.
-function crossHookInjectedFile(project) {
-  return join(RUNTIME_DIR, `.claude-mem-injected-${project}`);
+// `runtime/.claude-mem-injected-<project>-<session>` with {ids, ts, count}. We
+// read inside the staleness window, filter overlaps from PreToolUse output,
+// then merge back so the next UPS sees what we emitted too.
+// D#120: the file is keyed per SESSION (payload-only keying let two concurrent
+// windows clobber each other's marker). Derivation shared via lib/injected-ids.mjs
+// (pure, no deps — within the standalone fast-path budget, #8447).
+function crossHookInjectedFile(project, sessionId) {
+  return join(RUNTIME_DIR, injectedIdsFileName(project, sessionId));
 }
 
 // M-6 (audit 2026-08-14): the marker file is keyed by PROJECT, so two concurrent
@@ -168,7 +237,7 @@ function crossHookInjectedFile(project) {
 // session-key fix. Legacy payloads without `session` keep the old behavior.
 function readCrossHookInjected(project, sessionId) {
   try {
-    const raw = readFileSync(crossHookInjectedFile(project), 'utf8');
+    const raw = readFileSync(crossHookInjectedFile(project, sessionId), 'utf8');
     const { ids, ts, session } = JSON.parse(raw);
     if (session && sessionId && session !== sessionId) return new Set();
     if (!ts || Date.now() - ts > CROSS_HOOK_DEDUP_MS) return new Set();
@@ -181,7 +250,7 @@ function mergeCrossHookInjected(project, newIds, sessionId) {
   if (!newIds || newIds.length === 0) return;
   try {
     mkdirSync(RUNTIME_DIR, { recursive: true });
-    const file = crossHookInjectedFile(project);
+    const file = crossHookInjectedFile(project, sessionId);
     let prev = { ids: [], ts: 0, count: 0 };
     try {
       const raw = readFileSync(file, 'utf8');
@@ -307,16 +376,11 @@ try {
       const wasReadMode = typeof entry === 'object' && entry.mode === 'read';
       if (!isRead && wasReadMode && seenIds.length > 0 && !SALIENCE_LEGACY) {
         const idList = seenIds.map(id => `#${id}`).join(', ');
-        process.stdout.write(JSON.stringify({
-          suppressOutput: true,
-          hookSpecificOutput: {
-            hookEventName: 'PreToolUse',
-            additionalContext: [
-              '[mem] PreToolUse recall — system-injected context, continue your planned action:',
-              `[mem] ⚠ Lessons ${idList} were shown when you Read ${basename(filePath)} — ${ACTIVE_DIRECTIVE}`,
-            ].join('\n'),
-          },
-        }));
+        queueHookContext('PreToolUse', [
+          '[mem] PreToolUse recall — system-injected context, continue your planned action:',
+          `[mem] ⚠ Lessons ${idList} were shown when you Read ${basename(filePath)} — ${ACTIVE_DIRECTIVE}`,
+        ].join('\n'));
+        flushHookStdout();
         cooldown[filePath] = { ...entry, mode: 'edit' };
         writeCooldown(cooldownPath, cooldown, isSessionScoped);
       } else if (isRead && !REREAD_GUARD_OFF && typeof entry === 'object' && entry.reread) {
@@ -324,16 +388,11 @@ try {
         // nudge to reuse what's already in context. Read-only; never throws.
         const meta = readFileMeta(filePath);
         if (shouldWarnReread(entry.reread, meta ? meta.mtimeMs : null, isFullRead, REREAD_MIN_TOKENS)) {
-          process.stdout.write(JSON.stringify({
-            suppressOutput: true,
-            hookSpecificOutput: {
-              hookEventName: 'PreToolUse',
-              additionalContext: [
-                '[mem] PreToolUse recall — system-injected context, continue your planned action:',
-                buildRereadWarning(basename(filePath), entry.reread.tokens),
-              ].join('\n'),
-            },
-          }));
+          queueHookContext('PreToolUse', [
+            '[mem] PreToolUse recall — system-injected context, continue your planned action:',
+            buildRereadWarning(basename(filePath), entry.reread.tokens),
+          ].join('\n'));
+          flushHookStdout();
           recordMetric(DATA_DIR, { event: 'reread_warn' }); // tier-1 firing counter (②)
         }
       }
@@ -357,7 +416,14 @@ try {
 
   try {
     const project = inferProject();
-    const fname = basename(filePath);
+    // Same any-separator split the observations leg gets through fileMatchParams
+    // (pre-tag review of v3.76.2, SF-1/S1). This derivation feeds the EVENTS leg
+    // ~120 lines below, which matches a JSON array inside events.file_paths rather
+    // than the observation_files junction, so it cannot use fileMatchClause — but it
+    // needs the same key, and host-native `basename` gave it the whole path for a
+    // Windows-shaped payload. Fixing the observations leg alone would have left this
+    // hook recalling lessons but no events.
+    const fname = basenameAnySep(filePath);
     // Escape LIKE wildcards (still needed below for the events file_paths arms)
     const escaped = fname.replace(/%/g, '\\%').replace(/_/g, '\\_');
     // P0 (D#78): path-boundary match — editing utils.mjs must NOT pull lessons
@@ -367,7 +433,7 @@ try {
     const fileMatch = fileMatchClause('of2');
     const fileParams = fileMatchParams(filePath);
     // 60-day lookback to avoid surfacing ancient observations
-    const cutoff = Date.now() - 60 * 86400000;
+    const cutoff = Date.now() - 60 * DAY_MS;
 
     // Surface actionable lessons first, then high-importance bugfix/decision observations.
     // Priority: 1) observations with lesson_learned (most actionable for preventing repeat bugs)
@@ -392,7 +458,18 @@ try {
           (o.lesson_learned IS NOT NULL AND o.lesson_learned != '')
           OR (o.type IN ('bugfix', 'decision') AND ${notLowSignalSql})
         )`;
-    const obsLimit = isRead ? 1 : 2;
+    // Cross-hook dedup slack (audit 2026-08-29 ALGO-4, the D#172 shape again). The
+    // dedup below drops rows UPS already injected this prompt, and it used to run
+    // DOWNSTREAM of these LIMITs — so a deduped row left its slot EMPTY instead of
+    // yielding it to the next candidate, i.e. "dedup" was implemented as "shrink".
+    // On a Read (obsLimit 1 / eventsLimit 1) one dedup hit silenced the whole face.
+    // Read the seen-set FIRST and over-fetch by its size so the dedup removes rows
+    // from a pool that still has enough left to fill the cap. Capped at
+    // CROSS_HOOK_DEDUP_SLACK_MAX: the seen-set is bounded by UPS's own per-prompt
+    // budget in practice, but it is read off disk and must not size a query.
+    const crossHookSeen = readCrossHookInjected(project, sessionId);
+    const dedupSlack = Math.min(crossHookSeen.size, CROSS_HOOK_DEDUP_SLACK_MAX);
+    const obsLimit = (isRead ? 1 : 2) + dedupSlack;
     // A1.5 (v2.83.2): cite_factor as a tertiary sort key. When multiple file-
     // matching lessons exist, the one with proven cite history outranks the
     // merely-most-recent one. Single-match files unchanged (obsLimit=1 Read /
@@ -428,8 +505,7 @@ try {
       JOIN observation_files of2 ON of2.obs_id = o.id
       WHERE o.project = ?
         AND o.importance >= 2
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+        AND ${liveObsFilterSql('o')}
         AND o.created_at_epoch > ?
         AND ${fileMatch}
         ${edgeDecayFilter}
@@ -463,7 +539,7 @@ try {
       ? "AND body IS NOT NULL AND body != ''"
       : `AND ((body IS NOT NULL AND body != '')
           OR (event_type IN ('bugfix', 'decision', 'lesson') AND ${buildNotLowSignalSql('')}))`;
-    const eventsLimit = isRead ? 1 : 2;
+    const eventsLimit = (isRead ? 1 : 2) + dedupSlack;
     let eventRows = [];
     try {
       eventRows = db.prepare(`
@@ -490,7 +566,7 @@ try {
     // P1 (D#78): tag each row's source table — events share the numeric id
     // space with observations, and the Stop-side edge attribution must never
     // feed an event id into observation_files updates.
-    const crossHookSeen = readCrossHookInjected(project, sessionId);
+    // (crossHookSeen is read above, before the two SELECTs — it sizes their LIMITs.)
     const sourcedRows = [
       ...rows.map(r => ({ ...r, src: 'obs' })),
       ...eventRows.map(r => ({ ...r, src: 'evt' })),
@@ -601,13 +677,8 @@ try {
     }
 
     if (lines.length > 0) {
-      process.stdout.write(JSON.stringify({
-        suppressOutput: true,
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          additionalContext: lines.join('\n'),
-        },
-      }));
+      queueHookContext('PreToolUse', lines.join('\n'));
+      flushHookStdout();
     }
     // Cooldown applies on ALL branches (including silent-Read) so subsequent
     // calls on the same file in the same session don't re-query — preserving

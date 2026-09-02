@@ -10,16 +10,18 @@ vi.mock('../hook-semaphore.mjs', () => ({
   releaseLLMSlot: vi.fn(),
 }));
 vi.mock('../haiku-client.mjs', () => ({
-  callModelJSON: vi.fn(),
-  callLLMWithModel: vi.fn(),
+  callModelJSONAsync: vi.fn(),
+  // Real export consumed by hook-optimize's LLM call sites; a mock without it
+  // throws before any branch under test runs.
+  BG_LLM_TIMEOUT_MS: 45000,
 }));
-import { callModelJSON } from '../haiku-client.mjs';
+import { callModelJSONAsync } from '../haiku-client.mjs';
 
 const LONG = 'A concurrent-deduction race let two requests read the same balance and both deduct, double-spending; the fix serializes with SELECT ... FOR UPDATE row locking so the second waits.';
 
 describe('re-enrich must not downgrade importance/type (R3 L-H1)', () => {
   let db;
-  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-1', project: 'test' }); callModelJSON.mockReset(); });
+  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-1', project: 'test' }); callModelJSONAsync.mockReset(); });
   afterEach(() => { db.close(); });
 
   it('preserves a user-set importance (3) and specific type (bugfix) when the LLM re-judges them down', async () => {
@@ -28,7 +30,7 @@ describe('re-enrich must not downgrade importance/type (R3 L-H1)', () => {
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
     // Re-enrich is an "add a lesson" pass; the LLM prompt defaults importance to 1 and may
     // re-guess type. It must not overwrite the stored importance/type downward.
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       type: 'change', importance: 1,
       title: 'Serialize balance deductions', narrative: 'Row locking serializes concurrent deductions.',
       lesson_learned: 'Money-mutating reads need SELECT ... FOR UPDATE, not a plain SELECT',
@@ -45,7 +47,7 @@ describe('re-enrich must not downgrade importance/type (R3 L-H1)', () => {
     const { executeReenrich } = await import('../hook-optimize.mjs');
     insertObs(db, { type: 'feature', importance: 1, title: 'Add CSV export to reports', narrative: LONG });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       type: 'feature', importance: 3,
       title: 'Streaming CSV export for large reports', narrative: 'Paginated streaming exporter avoids OOM.',
       lesson_learned: 'Stream large exports; never build the whole CSV in memory',
@@ -58,7 +60,7 @@ describe('re-enrich must not downgrade importance/type (R3 L-H1)', () => {
 
 describe('cluster-merge preserve-on-empty for keeper metadata (R3 L-M1)', () => {
   let db;
-  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-1', project: 'test' }); callModelJSON.mockReset(); });
+  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-1', project: 'test' }); callModelJSONAsync.mockReset(); });
   afterEach(() => { db.close(); });
 
   it('keeps keeper concepts/facts/narrative when the LLM omits merged_concepts/facts/narrative', async () => {
@@ -75,7 +77,7 @@ describe('cluster-merge preserve-on-empty for keeper metadata (R3 L-M1)', () => 
     expect(clusters[0][0].concepts, 'findMergeCandidates must SELECT concepts').toBeDefined();
     expect(clusters[0][0].facts, 'findMergeCandidates must SELECT facts').toBeDefined();
 
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       should_merge: true,
       merged_title: 'alpha beta gamma delta merged',
       merged_lesson: 'oauth refresh tokens must rotate',

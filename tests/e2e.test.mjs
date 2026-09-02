@@ -177,11 +177,14 @@ describe('Suite 1: Full Session Lifecycle', () => {
     expect(sessions.c).toBe(0);
   });
 
-  it('session-start creates session row and outputs context', () => {
+  it('session-start creates session row (and skips the context wrapper when empty)', () => {
     const { stdout, exitCode } = runHook('session-start', { env: { HOME: tmpHome } });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain('<claude-mem-context>');
-    expect(stdout).toContain('</claude-mem-context>');
+    // This fixture's DB holds no observations/summaries, so there is no context body.
+    // The hook now omits the wrapper rather than injecting an empty
+    // `<claude-mem-context></claude-mem-context>` pair — see
+    // tests/session-start-empty-context.test.mjs for the populated counterpart.
+    expect(stdout).not.toContain('<claude-mem-context>');
 
     // Session file created
     const sf = getSessionFile(tmpHome);
@@ -482,12 +485,17 @@ describe('Suite 2: Episode Buffer Management', () => {
     expect(parsed.hookSpecificOutput.additionalContext).toMatch(/\[mem\] episode flushed: \d+ entries/);
   });
 
-  it('SessionStart flush receipt + dashboard stay newline-delimited (no }{ collision)', () => {
-    // Regression: when a leftover significant episode flushes at SessionStart (common
-    // after /clear or /compact), flushEpisode wrote its hookSpecificOutput receipt with
-    // NO trailing newline, then the startup dashboard wrote a second one — landing as
-    // `}{` on one line. Claude Code's line-based JSON parser then dropped both, losing
-    // the episode-flush / cite-back context exactly at the session boundary.
+  it('SessionStart flush receipt + dashboard arrive as ONE envelope', () => {
+    // History, in two corrections. First: flushEpisode wrote its receipt with no
+    // trailing newline and the dashboard wrote a second object right after, landing as
+    // `}{`. The fix added the newline, on the belief that Claude Code parsed stdout
+    // line by line. v3.70.0 disproved that belief — 2.1.234's parser JSON.parses the
+    // WHOLE trimmed stdout and falls back to plain text on throw, so TWO envelopes on
+    // two lines were never both delivered either; for SessionStart the raw JSON went
+    // to the model as literal text. This assertion used to check only the `}{` shape
+    // and per-line parseability, which the two-envelope state satisfies — it passed
+    // against the pre-v3.70 code (pre-tag review, test-effectiveness SHOULD-FIX-1).
+    // Now it pins the real contract: exactly one document, carrying both surfaces.
     runHook('session-start', { env: { HOME: tmpHome } });
     // Build a leftover episode (below the 10-entry auto-flush threshold).
     for (let i = 0; i < 2; i++) {
@@ -500,13 +508,18 @@ describe('Suite 2: Episode Buffer Management', () => {
     }
     // SessionStart (clear) flushes the leftover episode AND prints the dashboard.
     const { stdout } = runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env: { HOME: tmpHome } });
+    expect(stdout.trim(), 'the leftover episode + dashboard produced no output at all').not.toBe('');
     expect(stdout).not.toContain('}{');
-    // Every emitted JSON line must parse independently.
-    for (const line of stdout.split('\n')) {
-      const t = line.trim();
-      if (!t.startsWith('{')) continue;
-      expect(() => JSON.parse(t)).not.toThrow();
-    }
+    // The whole stdout — not each line — must be one JSON document.
+    const parsed = JSON.parse(stdout.trim());
+    expect(parsed.suppressOutput).toBe(true);
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('SessionStart');
+    // Both surfaces ride it: the flushed episode receipt and the dashboard.
+    expect(parsed.hookSpecificOutput.additionalContext).toMatch(/\[mem\] episode flushed: \d+ entries/);
+    // And nothing rides outside it.
+    expect(stdout.trim().split('\n').filter((l) => l.trim() && !l.startsWith('{')).length === 0
+      || parsed.hookSpecificOutput.additionalContext.length > 0).toBe(true);
+    expect(stdout.split('\n').filter((l) => l.trim().startsWith('{'))).toHaveLength(1);
   });
 
   it('skipped tools (Read, Glob) do not create entries', () => {
@@ -1050,6 +1063,190 @@ describe('Suite 6: Error Recall', () => {
   });
 });
 
+// D#170. Claude Code does NOT fire PostToolUse for a tool call it judged failed — those
+// go to a separate `PostToolUseFailure` event. Registering only PostToolUse made this
+// plugin blind to every host-flagged failure, so the only "failures" error-recall saw
+// were commands that exited 0 while printing error-ish text.
+//
+// The payload is not PostToolUse's: the failure text lives in `error` (there is no
+// `tool_response`) and `is_interrupt` marks a cancellation. Reading the wrong field
+// would make this path silently do nothing, which looks exactly like the old behaviour
+// — so the field name is asserted directly rather than inferred from a passing case.
+describe('Suite 6b: PostToolUseFailure — host-flagged failures reach error-recall (D#170)', () => {
+  const FAILURE_TEXT = "Error: ENOENT: no such file or directory, open '/app/package.json'\n"
+    + '    at Object.openSync (node:fs:596:3)';
+
+  const failurePayload = (over = {}) => JSON.stringify({
+    hook_event_name: 'PostToolUseFailure',
+    tool_name: 'Bash',
+    tool_input: { command: 'node scripts/build.mjs' },
+    tool_use_id: 'toolu_d170',
+    error: FAILURE_TEXT,
+    ...over,
+  });
+
+  function seed() {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, lesson_learned, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'ENOENT package.json missing openSync build', 'bugfix', 'ENOENT on package.json means the cwd is wrong', '', '', 'Run the build from the package root, not from scripts/.', '', '', '[]', '[]', 2, ?, ?)
+    `).run(sessionId, now.toISOString(), now.getTime());
+    db.close();
+  }
+
+  it('injects for a failure PostToolUse never sees, on its OWN event envelope', () => {
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload(),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+
+    expect(stdout).toContain('[claude-mem-lite] Related memories found for this error');
+    expect(stdout).toContain('Run the build from the package root');
+
+    // The envelope's event name is the field a copy-paste from the PostToolUse path
+    // gets wrong, and the host rejects a mismatch — so the injection would vanish while
+    // every other assertion here still passed.
+    const parsed = stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const hint = parsed.find((p) => p.hookSpecificOutput?.additionalContext?.includes('Related memories'));
+    expect(hint).toBeTruthy();
+    expect(hint.hookSpecificOutput.hookEventName).toBe('PostToolUseFailure');
+
+    // Its own counter: the volume this event adds has to be readable on its own rather
+    // than merged into the surface's existing total.
+    const rows = readMetricRows(tmpHome);
+    expect(rows.filter((r) => r.event === 'error_recall_failure').length).toBe(1);
+    expect(rows.filter((r) => r.event === 'error_recall').length).toBe(0);
+  });
+
+  it('reads the failure from `error`, NOT from `tool_response`', () => {
+    // The wiring bug this whole suite exists to catch. Same text, delivered under
+    // PostToolUse's field name: a handler that reached for `tool_response` would pass
+    // every other case in this file and do nothing in production.
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: JSON.stringify({
+        hook_event_name: 'PostToolUseFailure',
+        tool_name: 'Bash',
+        tool_input: { command: 'node scripts/build.mjs' },
+        tool_use_id: 'toolu_d170',
+        tool_response: FAILURE_TEXT,
+      }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout).not.toContain('Related memories found for this error');
+  });
+
+  // A refusal whose text WOULD produce query terms and WOULD match the seeded row.
+  //
+  // The first version of this pair used `§8 SAFETY (immutable): denied …`, and both cases
+  // were vacuous: `planErrorRecall` returns null on it (no `error`/`fail`/`not found`
+  // wording, no namer), so the surface injects nothing whatever the gate does. Mutation
+  // proved it — disabling ONLY the refusal branch passed every test in the release. The
+  // text below carries `ENOENT` and `package.json`, which the seeded memory matches, so
+  // the ONLY thing keeping this quiet is the gate.
+  const REFUSAL_WITH_TERMS = '[claudemd] §11 memory-hint: refused — the ENOENT probe on '
+    + "package.json was blocked before it ran.\nError: command not executed.";
+
+  it('stays silent for a tool-chain refusal', () => {
+    // 68.9% of host-flagged Bash failures on the maintainer's machine. Injecting three
+    // memories because a policy hook denied a command is noise by construction.
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload({
+        error: REFUSAL_WITH_TERMS,
+        tool_input: { command: 'node scripts/build.mjs' },
+      }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout).not.toContain('Related memories found for this error');
+    expect(readMetricRows(tmpHome).filter((r) => r.event === 'error_recall_failure').length).toBe(0);
+  });
+
+  it('...and the SAME text without the refusal marker DOES inject', () => {
+    // The negative control the case above needs. Without it, "stays silent" could still
+    // be satisfied by text that matches nothing — which is exactly how the first version
+    // of this pair passed while the gate was disconnected. Strip only the `[claudemd] §11`
+    // marker; every query term stays.
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload({
+        error: REFUSAL_WITH_TERMS.replace('[claudemd] §11 memory-hint: refused — the', 'The'),
+        tool_input: { command: 'node scripts/build.mjs' },
+      }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout, 'the refusal case must be silent because of the MARKER, not because its text matches nothing')
+      .toContain('Related memories found for this error');
+  });
+
+  it('stays silent when the user interrupted the command', () => {
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload({ is_interrupt: true }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout).not.toContain('Related memories found for this error');
+  });
+
+  it('is scoped to Bash even if a hand-edited matcher widens the registration', () => {
+    // install.mjs writes a SECOND registration into the user's settings.json; the
+    // manifest matcher is not the only thing that decides what arrives here.
+    //
+    // The input DELIBERATELY carries a `command`. A first version of this case sent an
+    // Edit payload with only `file_path`, which the downstream "no command string"
+    // guard rejected — so deleting the tool_name check entirely left the case green and
+    // the guard it names untested. Mutation caught that; the payload below is the
+    // difference between asserting a necessary condition and asserting this one.
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload({
+        tool_name: 'Edit',
+        tool_input: { command: 'node scripts/build.mjs', file_path: '/app/x.mjs' },
+      }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout).not.toContain('Related memories found for this error');
+  });
+
+  it('a Bash failure carrying no command injects nothing', () => {
+    // The guard the Bash-scoping case above leans on, pinned in its own right. Review
+    // flagged the two as entangled: the scoping case was rescued by THIS guard in a
+    // first draft, and once that was fixed nothing was left asserting this one.
+    //
+    // It is not merely defensive. Without it the payload still reaches selectErrorRecall
+    // with `cmd: undefined`, planErrorRecall extracts terms from the error text alone,
+    // and the surface injects — attributing a recall to a command it never saw.
+    seed();
+    for (const toolInput of [{}, { command: '' }, { command: 42 }, { file_path: '/app/x.mjs' }]) {
+      const { stdout } = runHook('post-tool-failure', {
+        stdin: failurePayload({ tool_input: toolInput }),
+        env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+      });
+      expect(stdout, `tool_input=${JSON.stringify(toolInput)}`)
+        .not.toContain('Related memories found for this error');
+    }
+  });
+
+  it('honours the kill switch, and only "off" trips it', () => {
+    seed();
+    const off = runHook('post-tool-failure', {
+      stdin: failurePayload(),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1', CLAUDE_MEM_ERROR_RECALL_ON_FAILURE: 'off' },
+    });
+    expect(off.stdout).not.toContain('Related memories found for this error');
+    // A typo must not silently revert the feature.
+    const typo = runHook('post-tool-failure', {
+      stdin: failurePayload(),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1', CLAUDE_MEM_ERROR_RECALL_ON_FAILURE: '0' },
+    });
+    expect(typo.stdout).toContain('Related memories found for this error');
+  });
+});
+
 describe('Suite 7: Secret Scrubbing E2E', () => {
   it('post-tool-use with password=secret scrubs episode desc', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
@@ -1134,7 +1331,10 @@ describe('Suite 8a: Additional E2E', () => {
       env: { HOME: freshHome, CLAUDE_PROJECT_DIR: freshProjDir },
     });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain('<claude-mem-context>');
+    // A first-run install has nothing to inject, and the hook now writes no
+    // empty `<claude-mem-context>` wrapper. The DB-creation assertion below is what this
+    // case is actually about.
+    expect(stdout).not.toContain('<claude-mem-context>');
 
     // DB should have been created
     const dbPath = join(freshHome, '.claude-mem-lite', 'claude-mem-lite.db');
@@ -1329,8 +1529,12 @@ describe('Suite 8a: Additional E2E', () => {
 
     db.close();
 
-    // Session-start triggers auto-compression
+    // P2-11: auto-compress marking moved off the SessionStart transaction onto the 24h
+    // auto-maintain cadence, so it is driven explicitly here (SKIP_MAINTAIN is set in this
+    // harness, so the background spawn never races the read below). The project scope is
+    // argv[3] — the same scope the SessionStart transaction always applied.
     runHook('session-start', { env: { HOME: tmpHome } });
+    runHook('auto-maintain', { env: { HOME: tmpHome }, args: ['parent--testproj'] });
 
     const db2 = openTestDb(tmpHome);
     const obs = db2.prepare('SELECT id, importance, compressed_into FROM observations ORDER BY id').all();

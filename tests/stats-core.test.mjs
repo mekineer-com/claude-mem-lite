@@ -70,6 +70,36 @@ describe('computeStatsFeed', () => {
     }
   });
 
+  it('tiers against the caller-supplied current project, not only inferProject()', () => {
+    // v3.72.0 made CLI READ commands resolve the project DB-aware, but this feed still asked
+    // inferProject() for its TIER context — so from a subdirectory `recent` answered about
+    // the work-tree root while `stats` tiered every row against the empty cwd-derived name.
+    // Measured: with the right current project the rows split {active:3, working:1}; with a
+    // name that holds nothing they collapse to {active:4}, because tier classification is
+    // relative to the project you are standing in. (D#144, pre-tag review finding 7.)
+    const db = createTestDb();
+    try {
+      const now = seed(db);
+      const mine = computeStatsFeed(db, { currentProject: 'proj-a', days: 30, now });
+      const stranger = computeStatsFeed(db, { currentProject: 'nobody--here', days: 30, now });
+      expect(mine.tierMap, `the current project made no difference to tiering: ${JSON.stringify(mine.tierMap)}`)
+        .not.toEqual(stranger.tierMap);
+      // And an explicit --project filter still wins over the ambient current project.
+      const filtered = computeStatsFeed(db, { project: 'proj-a', currentProject: 'nobody--here', days: 30, now });
+      expect(filtered.tierMap).toEqual(computeStatsFeed(db, { project: 'proj-a', days: 30, now }).tierMap);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('the CLI passes its DB-aware project into the feed; the MCP twin keeps inferProject()', () => {
+    // The MCP server has no CLI-layer resolver (it runs where Claude Code started it), so the
+    // default must stay inferProject() — the fix threads a value in from the CLI only.
+    const cli = readFileSync(join(ROOT, 'mem-cli.mjs'), 'utf8');
+    expect(cli, 'cmdStats must hand computeStatsFeed the DB-aware current project')
+      .toMatch(/computeStatsFeed\(db, \{[^}]*currentProject/);
+  });
+
   it('both surfaces (server.mjs + mem-cli.mjs) import the shared feed — no inline twin left', () => {
     for (const f of ['server.mjs', 'mem-cli.mjs']) {
       const src = readFileSync(join(ROOT, f), 'utf8');

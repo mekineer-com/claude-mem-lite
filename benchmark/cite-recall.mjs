@@ -35,6 +35,9 @@ import { readdirSync, readFileSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
+// One caliber for `#NN`, owned by the production extractor this benchmark re-derives.
+import { OBS_ID_DIGITS, citationIdRe } from '../lib/citation-tracker.mjs';
+import { wilson95 } from './wilson.mjs';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -52,7 +55,10 @@ if (!Number.isFinite(START) || !Number.isFinite(END) || START >= END) {
   process.exit(2);
 }
 
-const ID_RE = /#(\d{2,6})\b/g;
+// Imported, not re-typed: this file's numerator was `{2,6}` while its OWN denominator
+// (INJECTED_ROW_RE below) was `{1,7}`, so any id the denominator admitted and the
+// numerator could not see counted as injected-never-cited and biased cite-rate DOWN.
+const ID_RE = citationIdRe();
 const INJECT_MARKER = /\[mem\]/;
 // Path B (hook.mjs <memory-context> semantic injection) carries NO [mem] marker —
 // its lines are `- [type] title (#id)`. Pre-2026-06-29 this tool's [mem]-only gate
@@ -83,7 +89,8 @@ const ERR_RECALL_MARKER = /Related memories found for this error/;
 // A genuine injected lesson row starts (after ≤6 spaces of indent) with `#NN [type]`.
 // Bounded type list mirrors observations.type CHECK; `.exec` (non-global) returns the
 // FIRST match, so a `#NN` quoted later in the same row's body is not captured.
-const INJECTED_ROW_RE = /^\s{0,6}#(\d{1,7})\s+\[(?:bugfix|decision|change|discovery|feature|refactor|lesson)\]/;
+const INJECTED_ROW_RE = new RegExp(
+  `^\\s{0,6}#(${OBS_ID_DIGITS})\\s+\\[(?:bugfix|decision|change|discovery|feature|refactor|lesson)\\]`);
 
 function extractIds(text) {
   const ids = new Set();
@@ -106,17 +113,6 @@ function extractRowIds(textLines) {
 function* lines(file) {
   const buf = readFileSync(file, 'utf8');
   for (const line of buf.split('\n')) if (line) yield line;
-}
-
-// Wilson score 95% confidence interval for a binomial proportion.
-function wilson95(successes, trials) {
-  if (trials === 0) return [0, 0];
-  const p = successes / trials;
-  const z = 1.96;
-  const denom = 1 + (z * z) / trials;
-  const center = (p + (z * z) / (2 * trials)) / denom;
-  const margin = (z * Math.sqrt((p * (1 - p) + (z * z) / (4 * trials)) / trials)) / denom;
-  return [Math.max(0, center - margin), Math.min(1, center + margin)];
 }
 
 const candidateFiles = readdirSync(DIR)

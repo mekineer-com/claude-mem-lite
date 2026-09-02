@@ -10,9 +10,10 @@ import {
   getCurrentBranch, notLowSignalTitleClause,
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
+import { BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, vecTextForRow } from './tfidf.mjs';
-import { insertObservationRow, insertObservationFiles, insertObservationVector, normalizeScope } from './lib/observation-write.mjs';
+import { insertObservationRow, insertObservationFiles, insertObservationVector, normalizeScope, SCOPE_PROMPT_LEGEND } from './lib/observation-write.mjs';
 import { DEDUP_JACCARD_THRESHOLD, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
@@ -23,6 +24,8 @@ import { isNoiseObservation, capNoiseImportance, isLowYieldChangeObs } from './l
 import { episodeHasSignificantContent } from './hook-episode.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 // T9: memdir-incompatible types live in the `events` table, not `observations`.
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
 const EVENT_TYPE_SET = new Set(EVENT_TYPES);
@@ -84,7 +87,7 @@ export function recordRetryAttempt(db, recovered, bucket = dateBucketUtc()) {
  * YYYY-MM-DD lexicographic order).
  */
 export function readRetryStats(db, days = 30) {
-  const cutoff = new Date(Date.now() - days * 86400000);
+  const cutoff = new Date(Date.now() - days * DAY_MS);
   return db.prepare(
     `SELECT date_bucket, attempts, recovered FROM lesson_retry_stats
      WHERE date_bucket >= ? ORDER BY date_bucket DESC`
@@ -205,8 +208,8 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     // 3-day Jaccard catches near-duplicates without blocking legitimately new observations
     const LOW_SIGNAL = LOW_SIGNAL_TITLE;
     if (obs.title && LOW_SIGNAL.test(obs.title)) {
-      const sevenDaysAgo = now.getTime() - 7 * 86400000;
-      const threeDaysAgo = now.getTime() - 3 * 86400000;
+      const sevenDaysAgo = now.getTime() - 7 * DAY_MS;
+      const threeDaysAgo = now.getTime() - 3 * DAY_MS;
       // Phase 1: exact title match within 7 days
       const exactDup = db.prepare(`
         SELECT 1 FROM observations
@@ -349,7 +352,18 @@ export function persistHaikuSummary(db, summary, ctx) {
 
     if (ctx.preSavedObsId) {
       const id = db.transaction(() => {
-        db.prepare(`DELETE FROM observations WHERE id = ?`).run(ctx.preSavedObsId);
+        // Same live-row guard as the in-place upgrade (FLOW-7). If auto-dedup superseded
+        // or compressed the pre-saved row while this worker was in flight, that row is no
+        // longer ours to hard-delete — a keeper may have absorbed it, and children can
+        // point at it through compressed_into. Leave it to the maintenance path, which
+        // recovers children before deleting; the event still gets written either way.
+        const removed = db.prepare(
+          `DELETE FROM observations WHERE id = ? AND ${liveObsFilterSql('')}`,
+        ).run(ctx.preSavedObsId).changes;
+        if (removed === 0) {
+          debugLog('DEBUG', 'llm-episode',
+            `upgrade-delete: pre-saved obs #${ctx.preSavedObsId} no longer live — left in place`);
+        }
         return insertEvent();
       })();
       return { table: 'events', id };
@@ -509,14 +523,19 @@ export function buildDegradedTitle(episode) {
 // processed), so without this the in-flight episode is silently lost on abnormal
 // termination — and spawning a detached child from a dying process is unreliable, so
 // the save must be synchronous (audit #6). Never throws; returns the obs id or null.
-export function saveEpisodeImmediate(episode, externalDb) {
+// `scope` names the CALLER in hook-error telemetry. Audit 2026-08-22 P2-9 folded
+// flushEpisodeGroup's hand-copied version of this block into this function; without the
+// parameter all three paths would report failures under one label, and "the immediate
+// save threw" means different things on the normal flush, the lock-contended Stop
+// fallback, and the shutdown salvage.
+export function saveEpisodeImmediate(episode, externalDb, scope = 'saveEpisodeImmediate') {
   try {
     if (!episode || !Array.isArray(episode.entries) || episode.entries.length === 0) return null;
     if (!episodeHasSignificantContent(episode)) return null;
     const obs = buildImmediateObservation(episode);
     return saveObservation(obs, episode.project, episode.sessionId, externalDb) || null;
   } catch (e) {
-    debugCatch(e, 'saveEpisodeImmediate');
+    debugCatch(e, scope);
     return null;
   }
 }
@@ -738,7 +757,7 @@ type: pick by strongest signal. decision = explicit tradeoff / "chose X over Y b
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
 importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
 lesson_learned: The non-obvious insight a future session would benefit from. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". Look hard before giving up — most coding episodes contain at least one micro-lesson (an undocumented flag, a surprising default, a debugging shortcut, an unexpected interaction). If literally no insight worth teaching (e.g. version bump, whitespace fix, file rename), output JSON null. Do NOT invent a lesson, do NOT write the strings "none"/"n/a"/"todo"/"tbd"/"-" — those will be discarded as noise.
-scope: where does the lesson APPLY (not where it was learned)? file = specific to the touched file(s)' own code. module = a directory/subsystem of this project. project = a project-wide convention, architecture, or workflow. environment = a tooling/OS/CI/network/registry/service quirk (proxy, npm, git, GitHub, shell, runner, editor) that would hold in ANY project — even though some project files were touched when it surfaced. When lesson_learned is null, still classify the episode's dominant subject.
+scope: ${SCOPE_PROMPT_LEGEND}
 search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
 
   let prompt;
@@ -856,7 +875,7 @@ ${actionList}`;
         const retrySlot = await acquireLLMSlot();
         try {
           const retryPrompt = buildLessonRetryPrompt(episode, parsed);
-          const retryRaw = retrySlot ? await callLLM(retryPrompt, 10000) : null;
+          const retryRaw = retrySlot ? await callLLM(retryPrompt, BG_LLM_TIMEOUT_MS) : null;
           if (retryRaw) {
             const retry = parseJsonFromLLM(retryRaw);
             const retryLesson = typeof retry?.lesson === 'string' ? retry.lesson.trim() : '';
@@ -1007,12 +1026,18 @@ ${actionList}`;
           lesson_learned: obs.lessonLearned || null,
           search_aliases: obs.searchAliases || null,
         });
-        db.prepare(`
+        // The live-row guard (FLOW-7, 2026-08-29 audit). This worker is 2-5s behind the
+        // foreground pre-save, and auto-dedup can supersede or compress that row inside
+        // the window. An unguarded `WHERE id = ?` then writes the whole enrichment onto a
+        // tombstone: `changes` is 1, nothing looks wrong, and the row it landed on is
+        // excluded from every read face by liveObsFilterSql. Same clause as those read
+        // faces, so "what the update may touch" and "what a query may return" cannot drift.
+        const upgraded = db.prepare(`
           UPDATE observations SET type=?, title=?, subtitle=?,
             narrative=COALESCE(NULLIF(?, ''), narrative), concepts=?, facts=?,
             text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?,
             scope=COALESCE(?, scope)
-          WHERE id = ?
+          WHERE id = ? AND ${liveObsFilterSql('')}
         `).run(
           obs.type, safe.title, safe.subtitle,
           safe.narrative,
@@ -1024,23 +1049,38 @@ ${actionList}`;
           safe.search_aliases,
           normalizeScope(obs.scope),
           episode.savedId
-        );
-        savedId = episode.savedId;
-        savedTable = 'observations';
-        debugLog('DEBUG', 'llm-episode', `upgraded pre-saved obs #${savedId}`);
+        ).changes;
 
-        // Update TF-IDF vector with enriched content
-        try {
-          const vocab = getVocabulary(db);
-          if (vocab) {
-            const vecText = vecTextForRow({ title: obs.title, narrative: obs.narrative, concepts: conceptsText, lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases });
-            const vec = computeVector(vecText, vocab);
-            if (vec) {
-              db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-                .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+        if (upgraded === 0) {
+          // The pre-saved row is gone or tombstoned. Dropping the enrichment here is the
+          // silent-loss shape this repository keeps paying for, so save it as a fresh row
+          // and let the normal dedup path decide whether it merges into the keeper.
+          debugLog('DEBUG', 'llm-episode',
+            `pre-saved obs #${episode.savedId} no longer live — saving enrichment as a fresh row`);
+          const result = persistHaikuSummary(db, obsToSummary(obs), {
+            project: episode.project,
+            session_id: episode.sessionId,
+          });
+          savedId = result.id;
+          savedTable = result.table;
+        } else {
+          savedId = episode.savedId;
+          savedTable = 'observations';
+          debugLog('DEBUG', 'llm-episode', `upgraded pre-saved obs #${savedId}`);
+
+          // Update TF-IDF vector with enriched content
+          try {
+            const vocab = getVocabulary(db);
+            if (vocab) {
+              const vecText = vecTextForRow({ title: obs.title, narrative: obs.narrative, concepts: conceptsText, lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases });
+              const vec = computeVector(vecText, vocab);
+              if (vec) {
+                db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+                  .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+              }
             }
-          }
-        } catch (e) { debugCatch(e, 'handleLLMEpisode-vector'); }
+          } catch (e) { debugCatch(e, 'handleLLMEpisode-vector'); }
+        }
       }
     } else {
       // Clean insert (no pre-save) — dispatcher routes by type.
@@ -1135,7 +1175,7 @@ ${obsList}`;
 
     let raw, llmParsed;
     try {
-      raw = await callLLM(prompt, 20000);
+      raw = await callLLM(prompt, BG_LLM_TIMEOUT_MS);
       llmParsed = parseJsonFromLLM(raw);
     } finally {
       releaseLLMSlot();

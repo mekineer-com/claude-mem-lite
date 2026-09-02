@@ -59,8 +59,18 @@ function makeReleaseDir(version = '1.1.0') {
   return dir;
 }
 
+// hook-update picks its transport from the proxy env: a proxy → CONNECT tunnel,
+// none → native fetch. Every test here stubs globalThis.fetch, so on a developer
+// machine that HAS HTTPS_PROXY set (the exact machine the tunnel was written
+// for) the stub would be bypassed and these tests would hit the real network.
+// Neutralize the four vars httpConnectProxyFor reads — same guard as
+// tests/haiku-client.test.mjs. Restored in afterEach.
+const PROXY_ENV_VARS = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'];
+const originalProxyEnv = Object.fromEntries(PROXY_ENV_VARS.map((v) => [v, process.env[v]]));
+
 async function loadModule(env = {}) {
   vi.resetModules();
+  for (const v of PROXY_ENV_VARS) delete process.env[v];
   delete process.env.CLAUDE_PLUGIN_ROOT;
   delete process.env.CLAUDE_MEM_SKIP_UPDATE;
   // `process.env.X = undefined` coerces to the STRING "undefined", which the
@@ -77,6 +87,9 @@ async function loadModule(env = {}) {
 afterEach(() => {
   mockedExecSync.mockReset();
   globalThis.fetch = originalFetch;
+  for (const [k, v] of Object.entries(originalProxyEnv)) {
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
   delete process.env.CLAUDE_PLUGIN_ROOT;
   delete process.env.CLAUDE_MEM_SKIP_UPDATE;
   delete process.env.CLAUDE_MEM_DIR;
@@ -387,6 +400,86 @@ describe('code/data dir separation under relocation (D#27)', () => {
     const { getCurrentVersion } = await loadModule({ CLAUDE_MEM_DIR: dataDir, HOME: home });
     // Pre-fix INSTALL_DIR = DB_DIR = dataDir → would read the 1.0.0 decoy.
     expect(getCurrentVersion()).toBe('2.0.0');
+  });
+
+  // Pure-plugin install: ~/.claude-mem-lite holds only DB + runtime state, no
+  // package.json, so INSTALL_DIR read fails and pre-fix returned '0.0.0' — which
+  // made checkForUpdate compute hasUpdate=true and nag every SessionStart. Fix
+  // reads the running plugin-cache version from CLAUDE_PLUGIN_ROOT.
+  it('getCurrentVersion reads CLAUDE_PLUGIN_ROOT package.json in plugin mode when the code dir has none', async () => {
+    const home = makeDir('mem-update-home');
+    mkdirSync(join(home, '.claude-mem-lite', 'runtime'), { recursive: true });  // state only, no package.json
+    const pluginRoot = makeDir('mem-plugin-root');
+    writeFileSync(join(pluginRoot, 'package.json'), JSON.stringify({ version: '3.84.0' }, null, 2));
+    const { getCurrentVersion } = await loadModule({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot });
+    // Pre-fix: no package.json in the code dir → catch → '0.0.0'.
+    expect(getCurrentVersion()).toBe('3.84.0');
+  });
+
+  // The case above leaves only ONE readable package.json, so it passes under either
+  // precedence — it cannot pin the order. This one can, and the order is a contract:
+  // getCurrentVersion also answers "which tree is about to be overwritten" for
+  // repair()'s rollback guard (install.mjs → isRepairDowngrade), and attemptHeal
+  // spawns repair WITHOUT an env override, so CLAUDE_PLUGIN_ROOT is set in that child
+  // too. A hybrid install (managed code dir + plugin cache) legitimately carries two
+  // different versions — reading the cache's would judge one tree by the other's.
+  it('getCurrentVersion prefers the code dir over CLAUDE_PLUGIN_ROOT when BOTH carry a package.json', async () => {
+    const { home } = makeCodeHome('3.70.0');           // managed code install, lagging
+    const pluginRoot = makeDir('mem-plugin-root');
+    writeFileSync(join(pluginRoot, 'package.json'), JSON.stringify({ version: '3.84.0' }, null, 2));
+    const { getCurrentVersion } = await loadModule({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot });
+    expect(getCurrentVersion()).toBe('3.70.0');
+  });
+
+  // A version-less package.json must FALL THROUGH, not return undefined. Not
+  // because comparing would throw — compareVersions coerces undefined to 0.0.0 via
+  // `pa[i] || 0` on a NaN parse — but precisely BECAUSE it does: undefined is the
+  // '0.0.0' permanent-hasUpdate bug wearing a different hat, and it renders the
+  // banner as `(current: vundefined)`.
+  it('getCurrentVersion falls through a package.json that carries no version field', async () => {
+    const home = makeDir('mem-update-home');
+    const codeDir = join(home, '.claude-mem-lite');
+    mkdirSync(codeDir, { recursive: true });
+    writeFileSync(join(codeDir, 'package.json'), JSON.stringify({ name: 'claude-mem-lite' }, null, 2));
+    writeFileSync(join(codeDir, 'server.mjs'), '// code server');
+    const pluginRoot = makeDir('mem-plugin-root');
+    writeFileSync(join(pluginRoot, 'package.json'), JSON.stringify({ version: '3.84.0' }, null, 2));
+    const { getCurrentVersion } = await loadModule({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot });
+    expect(getCurrentVersion()).toBe('3.84.0');
+
+    // …and to the last resort when nothing readable is left.
+    const bare = makeDir('mem-update-home');
+    mkdirSync(join(bare, '.claude-mem-lite'), { recursive: true });
+    writeFileSync(join(bare, '.claude-mem-lite', 'package.json'), JSON.stringify({ name: 'x' }, null, 2));
+    const { getCurrentVersion: bareVersion } = await loadModule({ HOME: bare });
+    expect(bareVersion()).toBe('0.0.0');
+  });
+
+  // The reported symptom itself (PR #17), end-to-end rather than at the accessor:
+  // a pure-plugin install whose cache is already current must produce NO banner.
+  // Pre-fix the version read returned '0.0.0', so compareVersions('3.84.0','0.0.0')
+  // > 0 persisted updateAvailable:true and getCachedUpdateBanner rendered
+  // `(current: v0.0.0)` on every SessionStart.
+  it('a current pure-plugin install reports no update and emits no SessionStart banner', async () => {
+    // Production shape, not a relocation: the data dir IS ~/.claude-mem-lite, and it
+    // holds only runtime state — the code lives in the cache.
+    const home = makeDir('mem-update-home');
+    const dataDir = join(home, '.claude-mem-lite');
+    mkdirSync(join(dataDir, 'runtime'), { recursive: true });
+    const pluginRoot = makeDir('mem-plugin-root');
+    writeFileSync(join(pluginRoot, 'package.json'), JSON.stringify({ version: '3.84.0' }, null, 2));
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true, status: 200,
+      json: async () => ({ tag_name: 'v3.84.0', tarball_url: 'https://example.com/release.tgz' }),
+    });
+    const { checkForUpdate, getCachedUpdateBanner } = await loadModule({
+      CLAUDE_PLUGIN_ROOT: pluginRoot, HOME: home,
+    });
+
+    expect(await checkForUpdate({ force: true })).toBeNull();
+    const state = JSON.parse(readFileSync(join(dataDir, 'runtime', 'update-state.json'), 'utf8'));
+    expect(state.updateAvailable).toBe(false);
+    expect(getCachedUpdateBanner()).toBeNull();
   });
 
   it('installExtractedRelease defaults its target to the homedir code dir, not CLAUDE_MEM_DIR', async () => {

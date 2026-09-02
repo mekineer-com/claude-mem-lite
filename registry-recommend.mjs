@@ -1,19 +1,46 @@
 // Intent-based skill recommendation — Phase 1 (shadow).
 // See docs/superpowers/specs/2026-06-23-skill-recommendation-loop-design.md
 //
-// Phase-1 invariant: shadow AND live only LOG. Neither emits to stdout nor writes
-// invocations/recommend_count. Live injection is Phase 2. `off` skips all work.
+// Phase-1 invariant: the engine only LOGS. It never emits to stdout and never writes
+// invocations/recommend_count. Live injection is Phase 2 and does not exist yet, so
+// `live` resolves to shadow with a one-time warning (see UNIMPLEMENTED_MODES).
+// `off` skips all work.
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, appendFileSync, readdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { resolveDataDir } from './lib/resolve-data-dir.mjs';
 import { searchResources, cjkIntentTokens } from './registry-retriever.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 const VALID_MODES = new Set(['shadow', 'live', 'off']);
+// Phase 2 (live injection) was never built. `live` stayed in VALID_MODES and
+// getRecommendMode returned it verbatim, so setting it bought a user exactly
+// nothing and said nothing — the run behaved as shadow while the mode field in
+// every logged row claimed 'live'. Audit 2026-08-22 P2-5: an accepted value that
+// silently means something else is worse than an unsupported one. It still parses
+// (nobody's config breaks), it now resolves to what actually happens, and it says
+// so once per process.
+export const RECOMMEND_MODE_UNIMPLEMENTED = new Set(['live']);
+let warnedUnimplemented = false;
 
-/** Recommendation mode from env; default 'shadow', unknown → 'shadow'. */
-export function getRecommendMode() {
+/** The mode the environment ASKED for — 'live' included. For diagnostics (doctor). */
+export function getRequestedRecommendMode() {
   const raw = (process.env.CLAUDE_MEM_RECOMMEND_MODE || 'shadow').toLowerCase().trim();
   return VALID_MODES.has(raw) ? raw : 'shadow';
+}
+
+/** Recommendation mode actually in effect; default 'shadow', unknown → 'shadow'. */
+export function getRecommendMode() {
+  const requested = getRequestedRecommendMode();
+  if (!RECOMMEND_MODE_UNIMPLEMENTED.has(requested)) return requested;
+  if (!warnedUnimplemented && !process.env.MEM_QUIET_HOOKS) {
+    warnedUnimplemented = true;
+    // stderr, once: hook stdout is a parsed envelope and must not carry this.
+    process.stderr.write(
+      `[claude-mem-lite] CLAUDE_MEM_RECOMMEND_MODE=${requested} is not implemented `
+      + '(live injection is Phase 2); running in shadow mode — nothing is injected. '
+      + 'Set shadow or off to silence this.\n');
+  }
+  return 'shadow';
 }
 
 // Provisional gate thresholds — calibrated from shadow data before Phase 2 (spec §8).
@@ -137,7 +164,7 @@ export function gcOldShadowShards(retainDays = 90) {
   try {
     const dir = shadowDir();
     if (!existsSync(dir)) return 0;
-    const cutoff = new Date(Date.now() - retainDays * 86_400_000).toISOString().slice(0, 10);
+    const cutoff = new Date(Date.now() - retainDays * DAY_MS).toISOString().slice(0, 10);
     let removed = 0;
     for (const name of readdirSync(dir)) {
       const m = /^(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(name);
@@ -155,7 +182,7 @@ export function logShadowAdoption(project, rec) { appendShadow({ ts: new Date().
 /** Yield parsed shadow rows from the last `days` daily shards. */
 export function* readShadowLog(days = 7) {
   for (let i = 0; i < days; i++) {
-    const d = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
+    const d = new Date(Date.now() - i * DAY_MS).toISOString().slice(0, 10);
     let raw;
     try { raw = readFileSync(join(shadowDir(), `${d}.jsonl`), 'utf8'); } catch { continue; }
     for (const line of raw.split('\n')) { if (!line) continue; try { yield JSON.parse(line); } catch { /* skip malformed */ } }

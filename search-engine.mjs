@@ -6,7 +6,7 @@
 // module exists to eliminate.
 
 import {
-  OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE,
+  OBS_BM25, TYPE_QUALITY_CASE,
   DEFAULT_DECAY_HALF_LIFE_MS,
   notLowSignalTitleClause, LOW_SIGNAL_TITLE,
   relaxFtsQueryToOr, debugLog, debugCatch, estimateTokens,
@@ -15,6 +15,7 @@ import {
 import { citeFactorClause } from './scoring-sql.mjs';
 import { getVocabulary, computeVector, vectorSearch, rrfMerge, vectorsEnabled } from './tfidf.mjs';
 import { extractPRFTerms, expandQueryByConcepts } from './search-scoring.mjs';
+import { liveObsFilterSql, recencyDecaySql } from './lib/inject-search-core.mjs';
 
 // Scoring expressions — full adds project boost + access bonus; simple is for
 // expansion paths where boost would over-amplify already-loose matches.
@@ -35,7 +36,7 @@ import { extractPRFTerms, expandQueryByConcepts } from './search-scoring.mjs';
 // carry zero cite/noise state); the behavioral pin lives in
 // tests/audit-fixes-20260816.test.mjs (M-3).
 const FULL_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * MAX(0, ? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
+  * ${recencyDecaySql({ tsExpr: 'MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))' })}
   * ${TYPE_QUALITY_CASE}
   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
@@ -44,11 +45,16 @@ const FULL_SCORE = `${OBS_BM25}
   * ${noisePenaltyClause('o')}
   * ${citeFactorClause('o')}`;
 
+// D#121: noisePenalty joins SIMPLE (an entrenched-noise row demoted 0.2× on every
+// direct surface re-entered concept/PRF expansion at full magnitude); citeFactor
+// stays OUT deliberately — it can amplify 3×, and SIMPLE exists precisely to avoid
+// amplifying already-loose expansion matches. Noise only shrinks: safe direction.
 const SIMPLE_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * MAX(0, ? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
+  * ${recencyDecaySql({ tsExpr: 'MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))' })}
   * ${TYPE_QUALITY_CASE}
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
-  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))`;
+  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))
+  * ${noisePenaltyClause('o')}`;
 
 // Shared column set for fetching an observation surfaced by the vector arm — used by BOTH
 // the RRF-merge branch (FTS also had results) and the FTS-empty fallback branch. Single
@@ -71,8 +77,7 @@ export function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset,
     FROM observations_fts
     JOIN observations o ON observations_fts.rowid = o.id
     WHERE observations_fts MATCH ?
-      AND COALESCE(o.compressed_into, 0) = 0
-      AND o.superseded_at IS NULL
+      AND ${liveObsFilterSql('o')}
       AND (? IS NULL OR o.project = ?)
       AND (? IS NULL OR o.type = ?)
       AND (? IS NULL OR o.created_at_epoch >= ?)
@@ -123,8 +128,7 @@ export function countObsFtsMatches(db, { ftsQuery, args = {}, epochFrom = null, 
       FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
       WHERE observations_fts MATCH ?
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+        AND ${liveObsFilterSql('o')}
         AND (? IS NULL OR o.project = ?)
         AND (? IS NULL OR o.type = ?)
         AND (? IS NULL OR o.created_at_epoch >= ?)
@@ -316,8 +320,7 @@ function expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includ
   const topResults = db.prepare(`
     SELECT o.title, o.narrative FROM observations_fts
     JOIN observations o ON observations_fts.rowid = o.id
-    WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
-      AND o.superseded_at IS NULL
+    WHERE observations_fts MATCH ? AND ${liveObsFilterSql('o')}
       AND (? IS NULL OR o.project = ?)
     ORDER BY ${OBS_BM25}
     LIMIT 8
@@ -384,10 +387,9 @@ export function findFtsAnchor(db, { ftsQuery, project = null, nowT = null, halfL
     JOIN observations o ON observations_fts.rowid = o.id
     WHERE observations_fts MATCH ?
       AND (? IS NULL OR o.project = ?)
-      AND COALESCE(o.compressed_into, 0) = 0
-      AND o.superseded_at IS NULL
+      AND ${liveObsFilterSql('o')}
     ORDER BY ${OBS_BM25}
-      * (1.0 + EXP(-0.693 * MAX(0, ? - o.created_at_epoch) / ${halfLifeMs}.0))
+      * ${recencyDecaySql({ tsExpr: 'o.created_at_epoch', halfLifeSql: `${halfLifeMs}.0` })}
     LIMIT 1
   `;
   const stmt = db.prepare(sql);
@@ -412,7 +414,7 @@ export function searchObservationsHybrid(db, ctx) {
 
   if (!ftsQuery) {
     const params = [];
-    const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
+    const wheres = [liveObsFilterSql('')];
     if (args.project) { wheres.push('project = ?'); params.push(args.project); }
     if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
     if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
@@ -467,8 +469,12 @@ export function searchObservationsHybrid(db, ctx) {
   // rescued rows now (they are the only relevance evidence available).
   if (results.length > 0 && results.length < Math.ceil(limit / 2)) {
     const existingIds = new Set(results.map(r => r.id));
+    // D#122 ②: capture the PRIMARY count before concept expansion mutates
+    // `results` — PRF's >=3 gate is meant to read direct-match evidence, not
+    // rows the concept pass just added.
+    const primaryCount = results.length;
     expandObsByConceptCo(db, ctx, now, existingIds, results, includeNoise);
-    expandObsByPRF(db, ctx, now, results.length, existingIds, results, includeNoise);
+    expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includeNoise);
   }
 
   // Vector search + RRF hybrid merge

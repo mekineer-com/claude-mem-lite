@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { extractInjectedFromPreToolUse, extractCitationsFromTranscript, applyCitationDecay, computeCitationAdoption } from '../lib/citation-tracker.mjs';
+import { extractInjectedFromPreToolUse, extractCitationsFromTranscript, applyCitationDecay, computeCitationAdoption, redirectSupersededIds } from '../lib/citation-tracker.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 describe('extractInjectedFromPreToolUse', () => {
@@ -707,5 +707,42 @@ describe('applyCitationDecay — superseded keeper redirect (D#61)', () => {
     const k = row(keeper);
     expect(k.cited_count).toBe(1);
     expect(k.decay_seen_count).toBe(1);
+  });
+});
+
+// D#139 — redirectSupersededIds promises "callers own their input sets": every
+// return, including the two bail-outs, is a COPY. Both callers (applyCitationDecay,
+// recordCitationSurfaces) happen not to mutate the result today, so reverting either
+// bail-out to `return src` left all 71 surface-funnel + decay cases green. Nothing
+// pinned the alias contract itself — this does, at the only two places it can break.
+describe('redirectSupersededIds copy-on-bail contract (D#139)', () => {
+  // FAILS IF: `if (!db || !project) return new Set(src)` becomes `return src` —
+  // the caller's own Set is handed back and a downstream .add() mutates it.
+  it('the no-db bail-out returns a copy, not the caller\'s Set', () => {
+    const input = new Set([1, 2]);
+    const out = redirectSupersededIds(null, 'p1', input);
+    expect(out).not.toBe(input);
+    out.add(999);
+    expect([...input], 'caller\'s Set was mutated through the returned alias').toEqual([1, 2]);
+  });
+
+  it('the no-project bail-out returns a copy too', () => {
+    const input = new Set([7]);
+    const out = redirectSupersededIds({}, null, input);
+    expect(out).not.toBe(input);
+    out.add(8);
+    expect([...input]).toEqual([7]);
+  });
+
+  // FAILS IF: the prepare-catch bail-out becomes `return src`. A db handle whose
+  // prepare() throws is the real shape here (closed/corrupt DB mid-Stop).
+  it('the prepare-failure bail-out returns a copy', () => {
+    const input = new Set([42]);
+    const brokenDb = { prepare() { throw new Error('database connection is closed'); } };
+    const out = redirectSupersededIds(brokenDb, 'p1', input);
+    expect(out).not.toBe(input);
+    expect([...out]).toEqual([42]);   // contents preserved: bail-out is pass-through
+    out.add(43);
+    expect([...input]).toEqual([42]);
   });
 });

@@ -10,7 +10,7 @@ import { resolve, join } from 'path';
 import { writeFileSync, mkdirSync, rmSync, mkdtempSync, existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { initSchema } from '../schema.mjs';
-import { insertSession, insertObs } from './test-helpers.mjs';
+import { insertSession, insertObs, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import Database from 'better-sqlite3';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-tool-recall.js');
@@ -34,7 +34,7 @@ function runScript(input, env = {}) {
     child.on('error', reject);
     child.stdin.write(JSON.stringify(input));
     child.stdin.end();
-    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, 5000);
+    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 

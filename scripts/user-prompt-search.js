@@ -4,26 +4,36 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause, stripPrivate, neutralizeContextDelimiters, MAX_UPS_PROMPT_BYTES } from '../utils.mjs';
-import { citeFactorClause } from '../scoring-sql.mjs';
+import { relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, notLowSignalTitleClause, stripPrivate, neutralizeContextDelimiters, MAX_UPS_PROMPT_BYTES } from '../utils.mjs';
+import { liveObsFilterSql, injectionRelevanceSql } from '../lib/inject-search-core.mjs';
+import { fileMatchClause, fileMatchParams, basenameAnySep } from '../lib/file-edge-match.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
+import { upsFtsQuery } from '../lib/ups-query.mjs';
+import { corpusFloorScale } from '../lib/relevance-floor.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join, sep } from 'path';
 import { pathToFileURL } from 'url';
 import Database from 'better-sqlite3';
 import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, extractDeferredRefs, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
+import { injectedIdsFileName } from '../lib/injected-ids.mjs';
 import { getDeferredByIds } from '../lib/deferred-work.mjs';
 import { recommendSkill } from '../registry-recommend.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
 import { countHookEligibleCorpus, recordSearch } from '../lib/search-telemetry.mjs';
 
+import { DAY_MS } from '../lib/time-constants.mjs';
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 // Telemetry sink (lib/hook-telemetry.mjs contract): env override for tests, else
 // <data-dir>/runtime — the same dir the sibling hook scripts + `stats` read.
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DB_DIR, 'runtime');
-const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferProject()}`);
+// D#120: one marker file per CC session — payload-only session keying (M-6) let
+// two concurrent windows full-replace each other's marker, killing dedup between
+// them and resetting `count` on every alternation. Derived per invocation once
+// the session id is parsed from stdin; no session id → legacy project-keyed file.
+const injectedIdsFileFor = (sessionId) =>
+  join(DB_DIR, 'runtime', injectedIdsFileName(inferProject(), sessionId));
 // Per-prompt UPS cap. Cut from 5 → 3 after the 2026-05-09 per-hook recall
 // scan (#8255): UPS contributed 74% of silent injected IDs (131/177) at 26%
 // recall, vs PreToolUse:Read at 94% recall on a tighter file-keyed set.
@@ -32,7 +42,7 @@ const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferP
 // gated by explicit "before/previously/记得" prompts where breadth is the
 // point). Env override for projects that want broader recall or to A/B.
 const MAX_RESULTS = Number(process.env.CLAUDE_MEM_UPS_MAX_RESULTS || 3);
-const LOOKBACK_MS = 60 * 86400000; // 60 days
+const LOOKBACK_MS = 60 * DAY_MS; // 60 days
 
 // v2.56.x: Past-similar-questions fallback row cap. Cut from 3 → 1 after
 // 30d transcript scan (#8062 follow-up, 2026-05-09) showed UPS prompt-fallback
@@ -41,6 +51,12 @@ const LOOKBACK_MS = 60 * 86400000; // 60 days
 // quality gate — only BM25 ordering — so additional rows inflate noise without
 // improving signal. Env-overridable for projects that want broader prompt recall.
 const PROMPT_FALLBACK_LIMIT = Number(process.env.CLAUDE_MEM_UPS_PROMPT_FALLBACK_LIMIT || 1);
+// Over-fetch factor for that cap. searchByUserPrompts filters rows in JS (cjkPrecisionOk)
+// AFTER the SQL LIMIT, so the LIMIT bounds reachability, not just output width — see the
+// comment at the query. These size the pool only; the function still returns at most
+// PROMPT_FALLBACK_LIMIT rows, so widening them cannot inflate the injection budget.
+const PROMPT_FALLBACK_POOL_FACTOR = 5;
+const PROMPT_FALLBACK_POOL_MAX = 25;
 
 // T3 (v2.31): per-row BM25 magnitude floor. OBS_BM25 (in scoring-sql.mjs)
 // returns the raw bm25() value — negative, smaller = better. Multiplied by
@@ -67,7 +83,7 @@ const PROMPT_MIN_LENGTH = 15;
 // v2.33.1: follow-up prompts ("前面那个", "继续 X", "再看看 Y") are short by
 // nature but semantically depend on prior turns. Once a session has injected
 // memory at least once, relax gates so short follow-ups still get recall.
-// Detection: INJECTED_IDS_FILE count > 0 within DEDUP_STALE_MS window.
+// Detection: injected-ids marker count > 0 within DEDUP_STALE_MS window.
 const FOLLOWUP_PROMPT_MIN_LENGTH = 8;
 const FOLLOWUP_BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN_FOLLOWUP || 5e-6);
 
@@ -122,61 +138,19 @@ const OR_TOP_BM25_FLOOR = TOP_REL_FLOOR === 0
 
 // ─── Corpus-size normalization of the absolute floors (v3.61.0) ─────────────
 //
-// Both floors above are ABSOLUTE magnitudes, but the quantity they gate is not
-// scale-free: FTS5 bm25 carries an IDF term ≈ ln(N/df), so the SAME hit scores
-// higher on a bigger index. Measured on one fixed query + one fixed target row,
-// padding the corpus with distinct filler (2026-08-13 dogfood):
+// Moved to lib/relevance-floor.mjs when error-recall became the second injection
+// face needing the same ramp — one body rather than two hand-mirrored copies, the
+// drift class this project keeps paying for. The calibration history that explains
+// the ramp SHAPE (the 0/8 fresh-install measurement, the ln-vs-idf re-measure)
+// moved with the code; read it there before changing a floor.
 //
-//   totalObs   10     40     100    300
-//   top|bm25|  10.0   18.6   24.2   30.7      ← same row, same query
-//
-// The floors were calibrated at `projects--mem, 584 obs` (CHANGELOG v2.43.x /
-// v2.34.3). Comparing a log-N quantity against that constant therefore does not
-// mean "weak match" on a small index — it means "small index". A brand-new
-// install measured 0/8 injections on a realistic first-day corpus (10 memories,
-// 8 recall questions whose correct target ranked #1 in 4/5 scored cases): every
-// one was dropped by the OR floor at |bm25| 3.8–15.2 < 30. The plugin is inert
-// during exactly the window where a new user decides whether it earns its keep.
-//
-// Fix: scale both floors by ln(N+1)/ln(N_REF+1), capped at 1.0 — the same log
-// shape the IDF term has, so the SIGNAL↔NOISE separation the maintainer measured
-// (signal ≥41, noise ≤22 at N_REF) is preserved proportionally at any N. At
-// N ≥ N_REF the factor is exactly 1.0, so every established install keeps
-// byte-identical behavior; only genuinely-new installs relax.
-//
-// N counts the WHOLE observations table, not the project: FTS5 computes IDF over
-// the entire index and `o.project = ?` is a post-MATCH filter. Verified — a
-// 2-row project on a 302-row install scores 31.5, matching the 300-row global
-// baseline, not the 10-row one. So a new project on an established install is
-// (correctly) unaffected by this ramp.
-const FLOOR_REF_CORPUS = Number(process.env.CLAUDE_MEM_UPS_FLOOR_REF_CORPUS || 584);
+// Re-exported so callers here and tests/ups-corpus-floor-scale.test.mjs keep the
+// existing import path.
+export { corpusFloorScale };
 
-/**
- * Scale factor in (0, 1] for the absolute score floors, by total corpus size.
- *
- * Short-circuits with a bounded probe: if a row exists at offset N_REF-1 the
- * corpus is at or above the reference and the factor is 1.0 — no COUNT scan on
- * the large corpora where the answer is always 1.0 anyway.
- *
- * @param {object} db Open better-sqlite3 handle.
- * @returns {number} Multiplier for TOP_REL_FLOOR / OR_TOP_BM25_FLOOR.
- */
-export function corpusFloorScale(db) {
-  if (FLOOR_REF_CORPUS <= 1) return 1;
+function isFollowUpSession(injectedIdsFile) {
   try {
-    const atRef = db.prepare('SELECT 1 FROM observations LIMIT 1 OFFSET ?').get(FLOOR_REF_CORPUS - 1);
-    if (atRef) return 1;
-    const { c = 0 } = db.prepare('SELECT count(*) AS c FROM observations').get() || {};
-    return Math.min(1, Math.log(c + 1) / Math.log(FLOOR_REF_CORPUS + 1));
-  } catch {
-    // Any probe failure → behave exactly as before the ramp existed.
-    return 1;
-  }
-}
-
-function isFollowUpSession() {
-  try {
-    const raw = readFileSync(INJECTED_IDS_FILE, 'utf8');
+    const raw = readFileSync(injectedIdsFile, 'utf8');
     const { ts, count = 0 } = JSON.parse(raw);
     if (!ts || Date.now() - ts > DEDUP_STALE_MS) return false;
     return count > 0;
@@ -291,7 +265,18 @@ export function hasExplicitSignal(text, { errSig, files, intent } = {}) {
 // ×3 runs) → VERDICT NET-POSITIVE. The only behavior delta is on-topic eagerness (naming
 // an identifier surfaces its obs) — the highest-precision injection trigger there is. The
 // prose stop-list (IDENTIFIER_STOPWORDS) keeps the extractor off ordinary English.
+// Query caps live in lib/ups-query.mjs — shared with `hook.mjs user-prompt`, the OTHER
+// hook this same event fires. v3.75.0 capped this face only; a second copy of the
+// constants here is what would let them drift apart again.
+
 export const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS !== '0';
+// How far past the main LIMIT the bypass may look, and how many rows it may pull from
+// there (ALGO-2). These size the CANDIDATE POOL only — the injected set is still capped
+// by MAX_RESULTS downstream, so neither widens the injection budget. Kept small on
+// purpose: rows this deep matched the prompt weakly overall, and the identifier hit is
+// the only reason they are admitted at all.
+const IDENTIFIER_BYPASS_POOL_EXTRA = 7;
+const IDENTIFIER_BYPASS_DEEP_MAX = 2;
 const TECH_IDENTIFIER_RE_G = new RegExp(TECH_IDENTIFIER_RE.source, 'g');
 
 // All tech-identifier tokens in `text`, lowercased + de-duped (for case-insensitive
@@ -329,7 +314,7 @@ export function rowMatchesIdentifier(row, idsLower) {
 // importance/type/decay inflation.
 export function searchByFts(db, queryText, project, limit, typeFilter,
                             { nowT = Date.now(), epochTo = null } = {}) {
-  const ftsQuery = sanitizeFtsQuery(queryText);
+  const ftsQuery = upsFtsQuery(queryText);
   if (!ftsQuery) return { rows: [], mode: null };
 
   const cutoff = nowT - LOOKBACK_MS;
@@ -349,12 +334,7 @@ export function searchByFts(db, queryText, project, limit, typeFilter,
   const sql = `
     SELECT o.id, o.type, o.title, o.lesson_learned,
            ${OBS_BM25} as bm25_raw,
-           ${OBS_BM25}
-             * (1.0 + EXP(-0.693 * MAX(0, ? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
-             * ${TYPE_QUALITY_CASE}
-             * (0.5 + 0.5 * COALESCE(o.importance, 1))
-             * ${noisePenaltyClause('o')}
-             * ${citeFactorClause('o')} as relevance
+           ${injectionRelevanceSql('o')} as relevance
     FROM observations_fts
     JOIN observations o ON o.id = observations_fts.rowid
     WHERE observations_fts MATCH ?
@@ -362,8 +342,7 @@ export function searchByFts(db, queryText, project, limit, typeFilter,
       AND o.importance >= 1
       AND o.created_at_epoch > ?
       AND (? IS NULL OR o.created_at_epoch <= ?)
-      AND COALESCE(o.compressed_into, 0) = 0
-      AND o.superseded_at IS NULL
+      AND ${liveObsFilterSql('o')}
       AND ${notLowSignalTitleClause('o')}
       ${typeClause}
     ORDER BY relevance
@@ -397,10 +376,13 @@ function searchByFile(db, files, project, limit) {
   const results = [];
 
   for (const file of files.slice(0, 3)) {
-    const basename = file.split('/').pop();
+    // Shared predicate (pre-tag review of v3.76.2, SF-1/S2). This leg used
+    // `file.split('/').pop()` — weaker than node:path `basename`, since it misses '\'
+    // even ON a Windows host — plus a bare `%<basename>` suffix LIKE with no path
+    // boundary, so a prompt mentioning `utils.mjs` recalled `bash-utils.mjs` lessons.
+    // fileMatchClause's four arms and fileMatchParams' escaping are the single home.
+    const basename = basenameAnySep(file);
     if (!basename || basename.length < 2) continue;
-    const escaped = basename.replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const likePattern = `%${escaped}`;
 
     // R1: exclude LOW_SIGNAL degraded titles from file-level recall.
     const rows = db.prepare(`
@@ -409,14 +391,13 @@ function searchByFile(db, files, project, limit) {
       JOIN observation_files of2 ON of2.obs_id = o.id
       WHERE o.project = ?
         AND o.importance >= 1
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+        AND ${liveObsFilterSql('o')}
         AND o.created_at_epoch > ?
-        AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+        AND ${fileMatchClause('of2')}
         AND ${notLowSignalTitleClause('o')}
       ORDER BY o.created_at_epoch DESC
       LIMIT ?
-    `).all(project, cutoff, file, likePattern, limit);
+    `).all(project, cutoff, ...fileMatchParams(file), limit);
 
     results.push(...rows);
   }
@@ -438,7 +419,7 @@ function searchByFile(db, files, project, limit) {
 // sparser and more surface-form than observations; the gate would rarely
 // fire and mostly kill real hits).
 function searchByUserPrompts(db, queryText, project, limit) {
-  const ftsQuery = sanitizeFtsQuery(queryText);
+  const ftsQuery = upsFtsQuery(queryText);
   if (!ftsQuery) return [];
 
   const cutoff = Date.now() - LOOKBACK_MS;
@@ -459,12 +440,20 @@ function searchByUserPrompts(db, queryText, project, limit) {
     LIMIT ?
   `;
 
-  let rows = db.prepare(sql).all(ftsQuery, project, cutoff, limit);
+  // Over-fetch, because the cjkPrecisionOk filter below runs in JS (audit 2026-08-29
+  // ALGO-5, the D#172 shape). At the shipped PROMPT_FALLBACK_LIMIT of 1 the SQL LIMIT
+  // was a REACHABILITY bound sitting upstream of a relevance filter: dropping one row
+  // dropped the whole face, so a CJK prompt whose best BM25 match happened to be a
+  // false bigram hit injected NOTHING even when rank 2 was a real match. Fetch a pool,
+  // filter, then take `limit` — same ORDER BY, so the old result is a prefix of this
+  // one and a row can only be added, never displaced by something worse.
+  const poolLimit = Math.min(limit * PROMPT_FALLBACK_POOL_FACTOR, PROMPT_FALLBACK_POOL_MAX);
+  let rows = db.prepare(sql).all(ftsQuery, project, cutoff, poolLimit);
 
   if (rows.length === 0) {
     const orQuery = relaxFtsQueryToOr(ftsQuery);
     if (orQuery) {
-      try { rows = db.prepare(sql).all(orQuery, project, cutoff, limit); } catch {}
+      try { rows = db.prepare(sql).all(orQuery, project, cutoff, poolLimit); } catch {}
     }
   }
 
@@ -472,7 +461,7 @@ function searchByUserPrompts(db, queryText, project, limit) {
   // FTS degrades CJK bigram queries to single-char AND, letting any prose
   // sharing common chars leak through. Drop rows that miss < 20% of query
   // bigrams/keywords as contiguous substrings. Non-CJK queries bypass.
-  return rows.filter(r => cjkPrecisionOk(queryText, r.prompt_text));
+  return rows.filter(r => cjkPrecisionOk(queryText, r.prompt_text)).slice(0, limit);
 }
 
 function searchRecent(db, project, limit) {
@@ -485,8 +474,7 @@ function searchRecent(db, project, limit) {
     FROM observations
     WHERE project = ?
       AND importance >= 1
-      AND COALESCE(compressed_into, 0) = 0
-      AND superseded_at IS NULL
+      AND ${liveObsFilterSql('')}
       AND created_at_epoch > ?
       AND ${notLowSignalTitleClause('')}
     ORDER BY created_at_epoch DESC
@@ -637,6 +625,9 @@ async function main() {
   // would never legitimately be wrapped in <private>).
   if (rawPrompt.startsWith('<task-notification>')) return;
 
+  // D#120: session-keyed dedup marker — every read/write below uses this path.
+  const injectedIdsFile = injectedIdsFileFor(hookData.session_id);
+
   // Strip <private>...</private> blocks before length gates and FTS query
   // construction — private content must not pad effective length nor leak
   // into the FTS MATCH query terms. Mirrors hook.mjs handleUserPrompt.
@@ -666,7 +657,7 @@ async function main() {
       // Namespace dedup ids as "D<id>" (parity with the "P<id>" prompt-corpus
       // convention) so obs ids can't collide in the shared injected-ids file.
       const dedupIds = openRows.map(r => `D${r.id}`);
-      if (openRows.length > 0 && !shouldSkipByDedup(dedupIds, INJECTED_IDS_FILE, hookData.session_id)) {
+      if (openRows.length > 0 && !shouldSkipByDedup(dedupIds, injectedIdsFile, hookData.session_id)) {
         const lines = ['[mem] Deferred work referenced in prompt (open items, full detail):'];
         for (const r of openRows) {
           const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
@@ -685,7 +676,7 @@ async function main() {
           let prevIds = [];
           let prevCount = 0;
           try {
-            const prev = JSON.parse(readFileSync(INJECTED_IDS_FILE, 'utf8'));
+            const prev = JSON.parse(readFileSync(injectedIdsFile, 'utf8'));
             // M-6: inherit only same-session (or legacy) state — another session's
             // ids/count must not carry over. Atomic write below: a torn concurrent
             // write left the shared marker as invalid JSON (dedup silently off).
@@ -695,7 +686,7 @@ async function main() {
               prevCount = prev.count || 0;
             }
           } catch {}
-          atomicWriteFileSync(INJECTED_IDS_FILE, JSON.stringify({
+          atomicWriteFileSync(injectedIdsFile, JSON.stringify({
             ids: [...new Set([...prevIds.map(String), ...dedupIds])],
             ts: Date.now(),
             count: prevCount + 1,
@@ -714,7 +705,7 @@ async function main() {
   // "fix bug now") that carry too few content tokens for a meaningful FTS lookup.
   // v2.33.1: follow-up prompts in an already-active session get a lower gate —
   // short continuations ("前面那个?", "does it work?") depend on prior context.
-  const followUp = isFollowUpSession();
+  const followUp = isFollowUpSession(injectedIdsFile);
   const promptMinLen = followUp ? FOLLOWUP_PROMPT_MIN_LENGTH : PROMPT_MIN_LENGTH;
   if (computeEffectiveLen(promptText.trim()) < promptMinLen) { try { db?.close(); } catch {} return; }
   const bm25Floor = followUp ? FOLLOWUP_BM25_MIN_SCORE : BM25_MIN_SCORE;
@@ -763,12 +754,22 @@ async function main() {
     // when CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=0 (bypass is default-on), then it is a no-op.
     const promptIdentifiers = IDENTIFIER_BYPASS ? extractTechIdentifiers(promptText) : [];
 
-    if (intent?.useRecent) {
-      // Recall intent: show recent observations
-      searchExecuted = true;
-      searchMode = 'recent';
-      rows = searchRecent(db, project, intent.limit);
-    } else if (REQUIRE_EXPLICIT_SIGNAL && !signalPresent) {
+    // Recall intent ("之前 / previously / 记得 …") used to short-circuit straight to
+    // searchRecent, discarding the prompt text — so the most explicit memory request a
+    // user can make was the one answered without reading what they asked about. Measured
+    // on a 600-row corpus, two prompts one word apart: "分页接口又报 500 了，边界问题怎么处理"
+    // put the right row at rank 1, while "…之前那个边界问题是怎么处理的" surfaced NEITHER it
+    // nor anything related — 5 unrelated recency rows instead. Adding the recall keyword
+    // removed the answer and spent the injection budget on noise.
+    //
+    // Recency is still the right answer for a CONTENTLESS recall prompt ("之前我们在做什么"),
+    // which has no topic to match — so it becomes a FALLBACK (below) rather than a
+    // short-circuit. The explicit-signal gate needs no recall-intent carve-out:
+    // hasExplicitSignal already returns true whenever `intent` is truthy, and recall intent
+    // implies that, so a recall prompt cannot reach the no-signal branch. (An earlier draft
+    // added `!recentFallback &&` here; review showed the condition was dead.)
+    const recentFallback = Boolean(intent?.useRecent);
+    if (REQUIRE_EXPLICIT_SIGNAL && !signalPresent) {
       // No explicit signal — skip FTS pipeline + prompt-fallback. sigRows
       // is already empty (errSig was null else signalPresent would be true).
       // Registry skill pointer below remains unaffected (its own name match).
@@ -777,12 +778,24 @@ async function main() {
       // FTS search: use the prompt as query, optionally type-filtered
       searchExecuted = true;
       const files = filesForGate;
-      let ftsResult = searchByFts(db, promptText, project, intent?.limit || MAX_RESULTS, intent?.type || null);
+      const mainLimit = intent?.limit || MAX_RESULTS;
+      // Over-fetch ONLY to feed the identifier bypass below (audit 2026-08-29 ALGO-2,
+      // the D#172 shape). The bypass used to select from `ftsRows`, i.e. from the same
+      // LIMIT-`mainLimit` window it exists to rescue rows into — so it could only ever
+      // recover a row the composite sort had ALREADY ranked top-3, and the df=1
+      // identifier row its own docblock argues for (rare token, so BM25-strong on the
+      // term but easily out-ranked by rows matching more of the prompt) was unreachable.
+      // `ftsRows` stays the exact old head slice, so the main path is byte-identical;
+      // only the bypass sees deeper. Pool sizing is bypass-only: with the bypass off
+      // this is the old query verbatim.
+      const poolLimit = IDENTIFIER_BYPASS ? mainLimit + IDENTIFIER_BYPASS_POOL_EXTRA : mainLimit;
+      let ftsResult = searchByFts(db, promptText, project, poolLimit, intent?.type || null);
       // Fallback: if typed search returned nothing, retry without type filter
       if (ftsResult.rows.length === 0 && intent?.type) {
-        ftsResult = searchByFts(db, promptText, project, intent.limit || MAX_RESULTS, null);
+        ftsResult = searchByFts(db, promptText, project, poolLimit, null);
       }
-      let ftsRows = ftsResult.rows;
+      const ftsPool = ftsResult.rows;
+      let ftsRows = ftsPool.slice(0, mainLimit);
       const ftsMode = ftsResult.mode;
       searchMode = ftsMode === 'OR' ? 'or_fallback' : 'normal';
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
@@ -802,9 +815,26 @@ async function main() {
       // Capture rows that exact-match a prompt identifier BEFORE the set-floors below;
       // they carry independent precision signal (sigRows/fileRows rationale) and are
       // restored after the floors so a low top-score can't drop a named-identifier hit.
-      const bypassRows = (IDENTIFIER_BYPASS && promptIdentifiers.length > 0)
-        ? ftsRows.filter(r => rowMatchesIdentifier(r, promptIdentifiers))
-        : [];
+      // STRICTLY ADDITIVE to the pre-ALGO-2 behaviour: `head` is what this expression
+      // used to return (the post-floor rows of the old LIMIT window that match an
+      // identifier), and `deep` adds at most IDENTIFIER_BYPASS_DEEP_MAX rows from
+      // beyond that window. The audit prescribed a standalone LIMIT-2 SELECT; a capped
+      // tail of the SAME query is the same reach with one fewer FTS scan, and it cannot
+      // regress the head — a flat cap of 2 over the merged set could have, by evicting
+      // a third head row that ships today.
+      const bypassFloorOk = (r) => typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor;
+      let bypassRows = [];
+      if (IDENTIFIER_BYPASS && promptIdentifiers.length > 0) {
+        const head = ftsPool.slice(0, mainLimit)
+          .filter(bypassFloorOk)
+          .filter(r => rowMatchesIdentifier(r, promptIdentifiers));
+        const headIds = new Set(head.map(r => r.id));
+        const deep = ftsPool.slice(mainLimit)
+          .filter(bypassFloorOk)
+          .filter(r => !headIds.has(r.id) && rowMatchesIdentifier(r, promptIdentifiers))
+          .slice(0, IDENTIFIER_BYPASS_DEEP_MAX);
+        bypassRows = [...head, ...deep];
+      }
 
       // v2.43.x: OR-mode raw-BM25 floor. In OR-fallback mode the composite
       // TOP_REL_FLOOR below is inflated by importance × type_quality × decay
@@ -855,6 +885,13 @@ async function main() {
       rows = rows.slice(0, MAX_RESULTS);
     }
 
+    // Recall-intent fallback (see the `recentFallback` rationale above): only when the
+    // prompt named nothing the corpus matches. A contentless "之前我们在做什么" lands here
+    // and behaves exactly as it did before; a topical recall prompt no longer does.
+    if (rows.length === 0 && recentFallback) {
+      rows = searchRecent(db, project, intent.limit);
+    }
+
     // A (v2.32.8): prepend error-signature hits (higher precision), dedup, cap.
     if (sigRows.length > 0) {
       const sigIds = new Set(sigRows.map(r => r.id));
@@ -885,7 +922,7 @@ async function main() {
       try {
         telemetrySearchId = recordSearch(db, {
           project,
-          query: sanitizeFtsQuery(promptText) || '',
+          query: upsFtsQuery(promptText) || '',
           surface: 'user_prompt_hook',
           searchMode,
           matchedCount: 0,
@@ -896,8 +933,7 @@ async function main() {
         recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
       }
     }
-    const dedupSkip = candidateIds.length > 0
-      && shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE, hookData.session_id);
+    const dedupSkip = shouldSkipByDedup(candidateIds, injectedIdsFile, hookData.session_id);
 
     const output = !dedupSkip
       ? (rows.length > 0 ? formatResults(rows) : formatPromptResults(promptRows))
@@ -910,7 +946,7 @@ async function main() {
           : promptRows.map(r => ({ ...r, source: 'prompt', text: r.prompt_text }));
         telemetrySearchId = recordSearch(db, {
           project,
-          query: sanitizeFtsQuery(promptText) || '',
+          query: upsFtsQuery(promptText) || '',
           surface: 'user_prompt_hook',
           searchMode,
           matchedCount: telemetryRows.length,
@@ -926,14 +962,14 @@ async function main() {
       try {
         let prevCount = 0;
         try {
-          const prev = JSON.parse(readFileSync(INJECTED_IDS_FILE, 'utf8'));
+          const prev = JSON.parse(readFileSync(injectedIdsFile, 'utf8'));
           // M-6: same-session (or legacy) count only; atomic write (torn-write guard).
           if (prev.ts && Date.now() - prev.ts < DEDUP_STALE_MS
               && !(prev.session && hookData.session_id && prev.session !== hookData.session_id)) {
             prevCount = prev.count || 0;
           }
         } catch {}
-        atomicWriteFileSync(INJECTED_IDS_FILE, JSON.stringify({
+        atomicWriteFileSync(injectedIdsFile, JSON.stringify({
           ids: candidateIds,
           ts: Date.now(),
           count: prevCount + 1,

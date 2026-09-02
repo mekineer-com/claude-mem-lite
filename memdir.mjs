@@ -209,7 +209,11 @@ export function writePluginSection(memdir, { slug, version, contentLine, force =
     }
   }
 
-  const next = raw.replace(match[0], freshSection);
+  // Function form, NOT the string form: a string second argument has `$&` / `$1` /
+  // "$`" / `$'` interpreted, and freshSection carries caller-supplied contentLine — a
+  // `$&` there would expand to the whole matched sentinel block. Same fix claudemd.mjs
+  // took at its own replace (v3.40); this was the twin that kept the string form.
+  const next = raw.replace(match[0], () => freshSection);
   const changed = next !== raw;
   if (changed) atomicWrite(path, next);
   writeState(memdir, slug, { version, bodyHash: freshHash, writtenAt: new Date().toISOString() });

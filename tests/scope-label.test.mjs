@@ -14,9 +14,9 @@ import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { spawn } from 'child_process';
 import Database from 'better-sqlite3';
-import { createTestDb, insertSession } from './test-helpers.mjs';
+import { createTestDb, insertSession, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
-import { insertObservationRow, normalizeScope } from '../lib/observation-write.mjs';
+import { insertObservationRow, normalizeScope, SCOPE_PROMPT_LEGEND } from '../lib/observation-write.mjs';
 import { saveObservation } from '../hook-llm.mjs';
 
 describe('scope schema (v43 batch)', () => {
@@ -116,7 +116,42 @@ describe('episode prompts instruct Haiku to emit scope', () => {
   });
 
   it('shared schema tail defines scope semantics including the environment class', () => {
-    expect(src).toMatch(/scope: .*environment/);
+    // The legend became a shared constant in D#135 P3 — three write faces classify
+    // scope now (episode summarizer, save-enrich, re-enrich) and hand-copied
+    // definitions would drift. Assert what actually ships: hook-llm interpolates
+    // the constant, and the constant carries the semantics.
+    expect(src).toMatch(/scope: \$\{SCOPE_PROMPT_LEGEND\}/);
+    expect(SCOPE_PROMPT_LEGEND).toMatch(/where does the lesson APPLY/);
+    expect(SCOPE_PROMPT_LEGEND).toMatch(/environment = a tooling\/OS\/CI/);
+  });
+
+  // Counts, not existence. `toMatch` succeeds on ANY single occurrence, so the
+  // first version of this guard survived deleting the legend from the aliases
+  // prompt while its `"scope":"..."` JSON key stayed — a prompt asking for a
+  // classification with no definition, i.e. exactly the per-face drift the
+  // shared constant exists to prevent. Demonstrated survivor, pre-tag review.
+  // `keys` and `legends` are pinned SEPARATELY per file because they are not
+  // 1:1 by design: hook-llm's two episode templates (single- and multi-entry)
+  // both append one shared schema tail, so 2 keys share 1 legend. Asserting
+  // keys <= legends would therefore fail on correct code, and asserting only
+  // "at least one legend" is what let the survivor through. Two numbers per
+  // file catch drift in either direction.
+  const LEGEND_SITES = [
+    ['../hook-llm.mjs', { keys: 2, legends: 1 }],        // 2 templates, 1 shared tail
+    ['../lib/save-enrich.mjs', { keys: 1, legends: 1 }], // save-time enrichment
+    ['../hook-optimize.mjs', { keys: 3, legends: 3 }],   // narrow/wide + aliases + scopes
+  ];
+
+  it('every scope-classifying prompt renders the shared legend — by count, per file', () => {
+    for (const [file, expected] of LEGEND_SITES) {
+      const text = readFileSync(resolve(import.meta.dirname, file), 'utf8');
+      const legends = (text.match(/scope: \$\{SCOPE_PROMPT_LEGEND\}/g) || []).length;
+      const keys = (text.match(/"scope":"file\|module\|project\|environment"/g) || []).length;
+      expect(legends, `${file} should render the legend ${expected.legends}x`).toBe(expected.legends);
+      expect(keys, `${file} should ask for the scope key ${expected.keys}x`).toBe(expected.keys);
+      // A face that inlined its own wording instead of importing the constant.
+      expect(text).not.toMatch(/where does the lesson APPLY/);
+    }
   });
 });
 
@@ -137,7 +172,7 @@ describe('pre-tool-recall CLAUDE_MEM_SCOPE_FILTER (opt-in)', () => {
       child.on('error', reject);
       child.stdin.write(JSON.stringify(input));
       child.stdin.end();
-      setTimeout(() => { child.kill(); reject(new Error('timeout')); }, 5000);
+      setTimeout(() => { child.kill(); reject(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
     });
   }
 

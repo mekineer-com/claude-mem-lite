@@ -154,7 +154,8 @@ describe('D#25 export → restore round-trip', () => {
     writeFileSync(expFile, runCli(['export', '--format', 'jsonl'], srcDir).stdout);
     const r = runCli(['restore', expFile, '--dry-run'], dstDir);
     expect(r.stdout).toMatch(/dry-run/);
-    expect(r.stdout).toMatch(/2 restored/);
+    // Conditional wording: the preview must not claim past-tense work (tests/restore-dry-run-honesty).
+    expect(r.stdout).toMatch(/2 would be restored/);
     const db = new Database(join(dstDir, 'claude-mem-lite.db'));
     const count = db.prepare('SELECT COUNT(*) c FROM observations').get().c;
     db.close();

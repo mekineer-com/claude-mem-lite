@@ -4,7 +4,7 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
-import { debugCatch } from './utils.mjs';
+import { debugCatch, truncate } from './utils.mjs';
 
 // ─── Schema ──────────────────────────────────────────────────────────────────
 
@@ -512,4 +512,56 @@ export function upsertResource(db, r) {
     const row = db.prepare('SELECT id FROM resources WHERE type = ? AND name = ?').get(r.type, r.name);
     return row?.id || 0;
   })();
+}
+
+// ─── P2-12: registry stats/list twin cores (audit 2026-08-14) ────────────────
+// The five stats statements + the list row line were duplicated in mem-cli.mjs
+// and server.mjs and had already drifted (truncate 50 vs 80; `adopt:null` on
+// one face; the COALESCE ordering fix landed on the MCP face only). Data
+// collection + row-line shape live here; faces keep their own headers/limits.
+
+/**
+ * Collect the five stat groups the `registry stats` twin renders.
+ * @param {import('better-sqlite3').Database} rdb registry DB handle
+ * @returns {{total:number, byType:Array<{type:string,c:number}>, topAdopted:object[], zeroAdopt:number, userAdded:number}}
+ */
+export function collectRegistryStats(rdb) {
+  const total = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
+  const byType = rdb.prepare('SELECT type, COUNT(*) as c FROM resources WHERE status = ? GROUP BY type').all('active');
+  const topAdopted = rdb.prepare(
+    'SELECT name, type, adopt_count, recommend_count FROM resources WHERE status = ? AND adopt_count > 0 ORDER BY adopt_count DESC LIMIT 10'
+  ).all('active');
+  const zeroAdopt = rdb.prepare(
+    'SELECT COUNT(*) as c FROM resources WHERE status = ? AND recommend_count > 0 AND adopt_count = 0'
+  ).get('active');
+  const userAdded = rdb.prepare(
+    "SELECT COUNT(*) as c FROM resources WHERE status = ? AND source = 'user'"
+  ).get('active');
+  return { total: total.c, byType, topAdopted, zeroAdopt: zeroAdopt.c, userAdded: userAdded.c };
+}
+
+/**
+ * Ranked resource listing for the `registry list` twin: adoption first, then
+ * recommendation, NULL counts coalesced (the un-coalesced face sorted NULLs
+ * apart AND rendered "adopt:null").
+ * @param {import('better-sqlite3').Database} rdb
+ * @param {{type?: string}} [opts]
+ * @returns {object[]}
+ */
+export function listResourcesRanked(rdb, { type } = {}) {
+  const where = type ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
+  const params = type ? [type, 'active'] : ['active'];
+  return rdb.prepare(`
+    SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
+    FROM resources ${where}
+    ORDER BY COALESCE(adopt_count, 0) DESC, COALESCE(recommend_count, 0) DESC, type, name
+  `).all(...params);
+}
+
+/** One list row, shared shape: `S name (invocation) — rec:N adopt:N — summary…` (80-char summary cap).
+ *  truncate(), not a hand-rolled slice (adversarial review 2026-08-16): the shared
+ *  helper flattens newlines (this is a one-row-per-resource listing) and never
+ *  splits a UTF-16 surrogate pair — a bare slice emitted lone surrogates. */
+export function formatRegistryListLine(r) {
+  return `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count ?? 0} adopt:${r.adopt_count ?? 0} — ${truncate(r.capability_summary || '', 80)}`;
 }

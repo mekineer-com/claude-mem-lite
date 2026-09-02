@@ -27,6 +27,9 @@ import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
+// One caliber for `#NN`, owned by the production extractor (was a hand-copied `{2,6}`).
+import { citationIdRe } from '../lib/citation-tracker.mjs';
+import { wilson95 } from './wilson.mjs';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -41,7 +44,7 @@ const DAY = 86400000;
 const GAP_MS = 1 * DAY;                 // skip same-work-unit follow-up fixes
 const WINDOWS = [7 * DAY, 14 * DAY, 30 * DAY];
 
-const ID_RE = /#(\d{2,6})\b/g;
+const ID_RE = citationIdRe();
 const INJECT_MARKER = /\[mem\]/;
 // pre-tool-recall.js injects "[mem] Lessons for <file>:" — the file the lesson
 // pool was keyed to. This ties an injection to a concrete file deterministically.
@@ -56,13 +59,6 @@ function extractIds(text) {
   const ids = new Set();
   if (typeof text === 'string') for (const m of text.matchAll(ID_RE)) ids.add(m[1]);
   return ids;
-}
-function wilson95(s, n) {
-  if (n === 0) return [0, 0];
-  const p = s / n, z = 1.96, d = 1 + (z * z) / n;
-  const c = (p + (z * z) / (2 * n)) / d;
-  const m = (z * Math.sqrt((p * (1 - p) + (z * z) / (4 * n)) / n)) / d;
-  return [Math.max(0, c - m), Math.min(1, c + m)];
 }
 
 // ── git: basename -> sorted[] of fix: commit epochs (ms) ─────────────────────

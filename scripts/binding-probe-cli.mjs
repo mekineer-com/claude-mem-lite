@@ -32,6 +32,15 @@ const ROOT = process.env.PROBE_ROOT || join(dirname(fileURLToPath(import.meta.ur
 // broken flag, and a helperless broken tree is repaired by the hook-launcher
 // path instead. Out of process like every other probe here — loading a stale
 // .node caches a dead module handle for the rest of THIS process.
+// Output-identical twin of lib/binding-probe.mjs::flattenBindingError, kept here
+// because bareProbe runs when lib/ could not be imported. Same 240 cap, same
+// ellipsis, same 'unknown' floor — asserted for parity by the tests.
+function flattenLocal(err, max = 240) {
+  const s = String(err ?? '').replace(/\s+/g, ' ').trim();
+  if (!s) return 'unknown';
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
 function bareProbe(root) {
   const script =
     'try {'
@@ -42,10 +51,30 @@ function bareProbe(root) {
   const r = spawnSync(process.execPath, ['-e', script], { stdio: 'pipe', timeout: 8000 });
   if (!r.error && r.status === 0) return true;
   // Say WHY. The inline predecessor printed the cause here; dropping it left the
-  // user with setup.sh's generic "binding unusable" and nothing to act on.
-  const why = String(r.stdout || '').trim().split('\n')[0]
-    || (r.error && r.error.message)
-    || `probe exited ${r.status ?? `on signal ${r.signal}`}`;
+  // user with setup.sh's generic "binding unusable" and nothing to act on. Flattened
+  // rather than first-lined: Node's ABI message puts the filename on line 0 and the
+  // NODE_MODULE_VERSION pair on lines 2-3, so `.split('\n')[0]` said WHERE but never
+  // WHY — for the exact fault this probe exists to find.
+  //
+  // Flattening is inlined, NOT lib/binding-probe.mjs::flattenBindingError, because
+  // this function is the fallback for a tree where lib/ failed to import — `helpers`
+  // is still null on every path that reaches here.
+  //
+  // The twin must stay byte-identical in OUTPUT, and it did not: the first draft
+  // capped with a bare `.slice(0, 240)` while the shared helper appends an ellipsis,
+  // so they already disagreed at the one boundary the duplication exists to protect.
+  // A comment is not a guard, and this repo's hand-maintained twins have drifted
+  // before. tests/binding-error-diagnosis.test.mjs now drives THIS path in a
+  // lib/-less tree and asserts parity with the shared helper.
+  // Order matters: flattenLocal floors to the string 'unknown', which is truthy, so
+  // `flattenLocal(x) || fallback` would make the fallbacks unreachable and swallow a
+  // spawn error or an exit code whenever the child printed nothing. Pick the source
+  // FIRST, then flatten it.
+  const printed = String(r.stdout || '').trim();
+  const spawnErr = r.error && r.error.message;
+  const why = printed ? flattenLocal(printed)
+    : spawnErr ? flattenLocal(spawnErr)
+      : `probe exited ${r.status ?? `on signal ${r.signal}`}`;
   process.stderr.write(`[claude-mem-lite] binding probe: ${why}\n`);
   return false;
 }
@@ -82,9 +111,9 @@ try {
 }
 const release = helpers.acquireLock(lockPath);
 if (!release) {
-  const firstLine = String(first.error).split('\n')[0];
   process.stderr.write(
-    `[claude-mem-lite] binding probe: ${firstLine} (another install/repair in flight — deferring heal)\n`,
+    `[claude-mem-lite] binding probe: ${helpers.flattenBindingError(first.error)} `
+    + '(another install/repair in flight — deferring heal)\n',
   );
   process.exit(1);
 }

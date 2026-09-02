@@ -118,7 +118,15 @@ describe('server.mjs instructions-mode stderr trace', () => {
     return spawnSync('node', [serverPath], {
       input: '',
       env,
-      timeout: 3000,
+      // This budget only guards against a hang — it is not what the three cases
+      // below measure, and every one of them asserts on stderr CONTENT. At 3000ms
+      // it was measuring machine load instead: a cold `node server.mjs` costs
+      // ~0.3s idle, but the pre-commit hook runs the whole suite and vitest's
+      // worker fan-out pushes load past 20 on a 24-core box, at which point the
+      // spawn is killed and `stderr` comes back empty — three failures whose
+      // durations were all exactly 3000ms (2026-08-16). 20s matches the sibling
+      // runServer in wal-recovery.test.mjs and weakens no assertion.
+      timeout: 20000,
       encoding: 'utf8',
     });
   }

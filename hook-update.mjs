@@ -13,6 +13,11 @@ import { debugCatch, debugLog } from './utils.mjs';
 // extracted tarball's own source-files.mjs inside installExtractedRelease.
 // See loadReleaseManifest below.
 import { SOURCE_FILES as LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES as LOCAL_HOOK_SCRIPT_FILES } from './source-files.mjs';
+// Native fetch ignores HTTP(S)_PROXY. Without this the whole update path — the
+// version check AND the release download — dies instantly behind a proxy, and
+// because checkForUpdate is silent on network failure the plugin then reports
+// itself permanently up to date. Same tunnel the OpenRouter call site uses.
+import { httpConnectProxyFor, getViaConnectProxy } from './lib/proxy-fetch.mjs';
 import { acquireLock } from './lib/proc-lock.mjs';
 import { atomicWriteFileSync } from './lib/atomic-write.mjs';
 import { verifyReleaseFiles, verifyManifestSignature } from './lib/release-digest.mjs';
@@ -234,7 +239,17 @@ async function fetchWithTimeout(url, headers) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal, headers });
+    // Proxy configured → CONNECT tunnel; otherwise native fetch, byte-for-byte
+    // the previous behaviour. Both shapes expose { status, ok, json() }, and the
+    // tunnel REJECTS on transport failure exactly as a failed fetch does, so the
+    // catch below still returns null and the caller still stays silent.
+    // The AbortController above governs only the fetch branch; the tunnel takes
+    // the same budget as an explicit argument and bounds the whole call with it
+    // (redirect chain included). (pre-tag review NOTE 7)
+    const proxy = httpConnectProxyFor(url);
+    const res = proxy
+      ? await getViaConnectProxy(proxy, url, { headers, timeout: FETCH_TIMEOUT_MS })
+      : await fetch(url, { signal: controller.signal, headers });
     if (res.status === 403 || res.status === 429) {
       // 429 = GitHub secondary rate limit (403 = primary). Both must route to the 6h
       // rate-limit backoff, not the 24h transient-failure path — else a 429 defers the
@@ -261,11 +276,44 @@ export function compareVersions(a, b) {
   return 0;
 }
 
+// The version of the code this install runs. INSTALL_DIR is asked FIRST and the
+// plugin cache is a FALLBACK, not a precedence — the order is load-bearing in
+// both directions:
+//
+//   • Plugin cache reachable at all (PR #17): a pure-plugin ~/.claude-mem-lite/
+//     holds only the DB + runtime state and never any source — the same invariant
+//     syncDataDirFromCache states from the other side in its
+//     `no-existing-code-install` guard — so the INSTALL_DIR read cannot succeed
+//     there and the '0.0.0' last resort made checkForUpdate compute
+//     hasUpdate=true forever, nagging `(current: v0.0.0)` at every SessionStart
+//     on a fully current cache.
+//   • INSTALL_DIR still first: this is also the "which tree is about to be
+//     overwritten" answer for repair()'s signed-release rollback guard
+//     (install.mjs → isRepairDowngrade), and repair is spawned by
+//     scripts/hook-launcher.mjs's attemptHeal WITHOUT an env override, so
+//     CLAUDE_PLUGIN_ROOT is set in that child too. On a hybrid install the two
+//     trees legitimately differ — that drift is the entire reason
+//     syncDataDirFromCache exists — and answering with the cache's version would
+//     judge one tree by the other's.
+//
+// A package.json with no `version` field falls through rather than returning
+// undefined. compareVersions does NOT blow up on it — `String(undefined)` parses
+// to [NaN] and every read is `pa[i] || 0`, so undefined degrades to exactly
+// 0.0.0: the same permanent hasUpdate=true this function exists to prevent, plus
+// a banner rendered as `(current: vundefined)` from the persisted state.
 export function getCurrentVersion() {
   try {
     const pkg = JSON.parse(readFileSync(join(INSTALL_DIR, 'package.json'), 'utf8'));
-    return pkg.version;
-  } catch { return '0.0.0'; }
+    if (pkg.version) return pkg.version;
+  } catch { /* no code install here → try the running plugin cache */ }
+  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  if (pluginRoot) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(pluginRoot, 'package.json'), 'utf8'));
+      if (pkg.version) return pkg.version;
+    } catch { /* fall through to the last resort */ }
+  }
+  return '0.0.0';
 }
 
 // SWITCHABLE_PATHS = everything in SOURCE_FILES plus the recursive dirs that
@@ -452,16 +500,24 @@ export function verifyDownloadedRelease(extractedDir, manifestBytes, signatureB6
 
 // Fetch a GitHub Release asset as a Buffer. Host-locked to github.com (the asset
 // browser_download_url); GitHub's own 302 to its CDN is followed by fetch.
-async function fetchAssetBuffer(url) {
+export async function fetchAssetBuffer(url) {
+  // Host lock is checked BEFORE transport selection, so having a proxy
+  // configured can never route around this supply-chain guard.
   if (!/^https:\/\/github\.com\/[\w./%~-]+$/.test(url || '')) {
     throw new Error(`rejected asset url: ${url}`);
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    // getViaConnectProxy follows redirects itself — native fetch does that for
+    // free, and this URL always 302s from github.com to the asset CDN, so a
+    // tunnel without redirect handling would hand back an empty 302 body.
+    const proxy = httpConnectProxyFor(url);
+    const res = proxy
+      ? await getViaConnectProxy(proxy, url, { timeout: FETCH_TIMEOUT_MS })
+      : await fetch(url, { signal: controller.signal, redirect: 'follow' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return Buffer.from(await res.arrayBuffer());
+    return proxy ? res.buffer() : Buffer.from(await res.arrayBuffer());
   } finally {
     clearTimeout(timeout);
   }

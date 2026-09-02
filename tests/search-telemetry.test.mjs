@@ -29,7 +29,7 @@ function seedObservation(db, { project = 'telemetry-test', title = 'Alpha teleme
   `).run(project, title, title, new Date(now).toISOString(), now).lastInsertRowid);
 }
 
-describe('search telemetry v45', () => {
+describe('search telemetry on schema v46', () => {
   const tempDirs = [];
   afterEach(() => {
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -37,8 +37,8 @@ describe('search telemetry v45', () => {
 
   it('creates both tables, self-heals a missing table, and cascades run deletion', () => {
     const db = openDb();
-    expect(CURRENT_SCHEMA_VERSION).toBe(45);
-    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(45);
+    expect(CURRENT_SCHEMA_VERSION).toBe(46);
+    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(46);
     const id = recordSearch(db, {
       project: 'p', query: 'alpha', surface: 'mcp_search', client: 'test',
       results: [{ source: 'obs', id: 1, title: 'Alpha' }],
@@ -50,7 +50,7 @@ describe('search telemetry v45', () => {
     db.exec('DROP TABLE search_results');
     initSchema(db);
     expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'search_results'").get().name).toBe('search_results');
-    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(45);
+    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(46);
     db.close();
   });
 
@@ -60,7 +60,7 @@ describe('search telemetry v45', () => {
     db.exec('DROP TABLE search_results; DROP TABLE search_runs; UPDATE schema_version SET version = 44;');
     initSchema(db);
     initSchema(db);
-    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(45);
+    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(46);
     expect(db.prepare("SELECT COUNT(*) c FROM pragma_table_info('search_results') WHERE name = 'relevance'").get().c).toBe(1);
     db.close();
   });

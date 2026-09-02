@@ -5,10 +5,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, isPathConfined, stripPrivate } from './utils.mjs';
+import { truncate, typeIcon, inferProject, fmtDate, debugLog, debugCatch, isPathConfined, stripPrivate } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
-import { reRankWithContext, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
+import { reRankWithContext, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -19,12 +19,13 @@ import {
   recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   hardDeleteCandidateCount,
-  OP_CAP, STALE_AGE_MS,
+  OP_CAP, STALE_AGE_MS, resolveDefaultMaintainOps, DEFAULT_MAINTAIN_OPS,
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
-import { deleteObservations } from './lib/delete-core.mjs';
+import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
+import { fetchObsDetail, fetchPromptDetail, fetchEventDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, PROMPT_DETAIL_FIELDS, EVENT_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
+import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
-import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
 import { formatObsFieldValue, obsFieldLabel, formatPendingPurgeLine } from './cli/common.mjs';
@@ -47,12 +48,14 @@ function descriptionOf(name) {
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
-import { ensureRegistryDb, upsertResource } from './registry.mjs';
+import { ensureRegistryDb, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
+import { IMPORT_STRING_FIELDS, importResource, removeResource, reindexResources } from './lib/registry-core.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
-import { rebuildObservationDerived } from './lib/observation-write.mjs';
+import { applyObsUpdate } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { fetchRecent } from './lib/recent-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
@@ -663,8 +666,6 @@ server.registerTool(
       return { content: [{ type: 'text', text: 'No valid IDs provided.' }] };
     }
 
-    const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
-
     // `fields` filter only makes sense for obs rows; session/prompt ignore it.
     // Validate when obs is queried — throw on all-invalid, note on partial-invalid.
     let fieldsNote = '';
@@ -686,16 +687,15 @@ server.registerTool(
     const foundBySource = { obs: new Set(), session: new Set(), prompt: new Set(), event: new Set() };
 
     if (bySrc.obs.length > 0) {
-      const ph = bySrc.obs.map(() => '?').join(',');
-      try {
-        db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${ph})`).run(Date.now(), ...bySrc.obs);
-        autoBoostIfNeeded(db, bySrc.obs);
-      } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
-      const rows = db.prepare(`SELECT * FROM observations WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.obs);
+      // Access-bump + fetch via the shared get-core (P2-12) — single source with CLI get.
+      const rows = fetchObsDetail(db, bySrc.obs);
       const renderFields = obsFieldFilter || OBS_FIELDS;
       for (const row of rows) {
         foundBySource.obs.add(row.id);
         const lines = [`── #${row.id} ──`];
+        // Retraction first (shared with the CLI `get` via get-core) — see supersededNotice.
+        const retracted = supersededNotice(row);
+        if (retracted) lines.push(retracted);
         for (const f of renderFields) {
           const val = row[f];
           if (val === null || val === undefined || val === '') continue;
@@ -714,7 +714,9 @@ server.registerTool(
     if (bySrc.session.length > 0) {
       const ph = bySrc.session.map(() => '?').join(',');
       const rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.session);
-      const sessFields = ['id', 'request', 'investigated', 'learned', 'completed', 'next_steps', 'files_read', 'files_edited', 'notes', 'project', 'created_at', 'memory_session_id', 'prompt_number'];
+      // SESSION_DETAIL_FIELDS (get-core, P2-12): shared full set — adds remaining_items
+      // (searchable via FTS but previously unrendered on BOTH detail faces).
+      const sessFields = SESSION_DETAIL_FIELDS;
       for (const row of rows) {
         foundBySource.session.add(row.id);
         const lines = [`── S#${row.id} ──`];
@@ -729,34 +731,31 @@ server.registerTool(
     }
 
     if (bySrc.prompt.length > 0) {
-      const ph = bySrc.prompt.map(() => '?').join(',');
-      const rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.prompt);
-      for (const row of rows) {
+      for (const row of fetchPromptDetail(db, bySrc.prompt)) {
         foundBySource.prompt.add(row.id);
         const lines = [`── P#${row.id} ──`];
-        if (row.prompt_text) lines.push(`prompt_text: ${row.prompt_text.length > 500 ? row.prompt_text.slice(0, 500) + '…' : row.prompt_text}`);
-        if (row.content_session_id) lines.push(`content_session_id: ${row.content_session_id}`);
-        if (row.prompt_number !== null && row.prompt_number !== undefined) lines.push(`prompt_number: ${row.prompt_number}`);
-        if (row.created_at) lines.push(`created_at: ${row.created_at}`);
+        for (const f of PROMPT_DETAIL_FIELDS) {
+          if (f === 'id') continue;   // already in the header
+          const val = row[f];
+          if (val === null || val === undefined || val === '') continue;
+          lines.push(`${f}: ${typeof val === 'string' && val.length > 500 ? val.slice(0, 500) + '…' : val}`);
+        }
         sections.push(lines.join('\n'));
       }
     }
 
     if (bySrc.event.length > 0) {
-      const ph = bySrc.event.map(() => '?').join(',');
-      const rows = db.prepare(`SELECT * FROM events WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.event);
-      // events carry the distilled lesson in `body` (persistHaikuSummary writes lesson_learned||narrative).
-      // No created_at ISO column (only *_epoch) — render the epoch as an ISO string for a scannable date.
-      for (const row of rows) {
+      // fetchEventDetail derives created_at from created_at_epoch (events have no ISO
+      // column), so EVENT_DETAIL_FIELDS names it like any other field on both faces.
+      for (const row of fetchEventDetail(db, bySrc.event)) {
         foundBySource.event.add(row.id);
         const lines = [`── E#${row.id} [${row.event_type}] ──`];
-        if (row.title) lines.push(`title: ${row.title}`);
-        if (row.body) lines.push(`body: ${row.body.length > 500 ? row.body.slice(0, 500) + '…' : row.body}`);
-        if (row.project) lines.push(`project: ${row.project}`);
-        if (row.importance !== null && row.importance !== undefined) lines.push(`importance: ${row.importance}`);
-        if (row.file_paths) lines.push(`file_paths: ${row.file_paths}`);
-        if (row.git_sha) lines.push(`git_sha: ${row.git_sha}`);
-        if (row.created_at_epoch) lines.push(`created_at: ${new Date(row.created_at_epoch).toISOString()}`);
+        for (const f of EVENT_DETAIL_FIELDS) {
+          if (f === 'id' || f === 'event_type') continue;   // already in the header
+          const val = row[f];
+          if (val === null || val === undefined || val === '') continue;
+          lines.push(`${f}: ${typeof val === 'string' && val.length > 500 ? val.slice(0, 500) + '…' : val}`);
+        }
         sections.push(lines.join('\n'));
       }
     }
@@ -829,21 +828,15 @@ server.registerTool(
     inputSchema: memDeleteSchema,
   },
   safeHandler(async (args) => {
-    const placeholders = args.ids.map(() => '?').join(',');
-    const rows = db.prepare(`
-      SELECT id, type, title, project FROM observations WHERE id IN (${placeholders})
-    `).all(...args.ids);
+    // Shared preview body (lib/delete-core, P2-12) — single source with CLI delete.
+    const { rows, lines: previewLines } = previewDeleteRows(db, args.ids);
 
     if (rows.length === 0) {
       return { content: [{ type: 'text', text: 'No observations found for given IDs.' }] };
     }
 
     if (!args.confirm) {
-      // Preview mode
-      const lines = [`Preview: ${rows.length} observation(s) will be deleted:\n`];
-      for (const r of rows) {
-        lines.push(`  #${r.id} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${r.project}`);
-      }
+      const lines = [`Preview: ${rows.length} observation(s) will be deleted:\n`, ...previewLines];
       lines.push(`\nCall mem_delete(ids=[...], confirm=true) to execute.`);
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
@@ -898,6 +891,9 @@ server.registerTool(
     inputSchema: memSaveSchema,
   },
   safeHandler(async (args) => {
+    // `obs_type` → `type`: the sibling read tools all name it obs_type (see the schema
+    // comment). Without this, an unknown key was dropped and the row saved as `discovery`.
+    args = applyArgAliases(args, { obs_type: 'type' });
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const project = args.project || inferProject();
 
@@ -1105,7 +1101,7 @@ server.registerTool(
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const preview = args.preview !== false;
     const ageDays = args.age_days ?? 30;
-    const cutoff = Date.now() - ageDays * 86400000;
+    const cutoff = Date.now() - ageDays * DAY_MS;
     const candidates = selectCompressionCandidates(db, { cutoff, project: args.project || null });
 
     if (candidates.length === 0) {
@@ -1216,11 +1212,11 @@ server.registerTool(
     if (action === 'execute') {
       const ops = args.operations && args.operations.length > 0
         ? args.operations
-        : ['cleanup', 'decay', 'boost'];
+        : resolveDefaultMaintainOps();
       // T2-P1-A: reject explicit empty array (vs. omitted → defaults above). Empty-array
       // callers are almost always mistakes; silently running only FTS5 optimize hides the error.
       if (args.operations && args.operations.length === 0) {
-        return { content: [{ type: 'text', text: 'operations array is empty. Pass a non-empty list (e.g. ["cleanup","decay","boost"]) or omit operations to use the default set.' }], isError: true };
+        return { content: [{ type: 'text', text: `operations array is empty. Pass a non-empty list (e.g. ${JSON.stringify(DEFAULT_MAINTAIN_OPS)}) or omit operations to use the default set.` }], isError: true };
       }
       const results = [];
       const staleAge = Date.now() - STALE_AGE_MS;
@@ -1254,7 +1250,7 @@ server.registerTool(
         // only rows a PRIOR run marked (backed up); rows decay marks below wait one cycle.
         if (ops.includes('purge_stale')) {
           const retainDays = args.retain_days ?? 30;
-          const retainCutoff = Date.now() - retainDays * 86400000;
+          const retainCutoff = Date.now() - retainDays * DAY_MS;
           if (!purgeConfirmed) {
             // Dry-run preview (parity with CLI `maintain` without --confirm): the other
             // requested non-destructive ops still run below.
@@ -1307,7 +1303,7 @@ server.registerTool(
 
         if (ops.includes('demote_pinned')) {
           const demoted = demotePinned(db, mctx);
-          results.push(`Demoted ${demoted} pinned-but-uncited observations to importance 1 (inj>=8, cited=0)` + (demoted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
+          results.push(`Demoted ${demoted} pinned-but-uncited observations (inj>=8, cited=0; no lesson → importance 1, lesson → 2)` + (demoted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('dedup') && args.merge_ids) {
@@ -1489,51 +1485,27 @@ server.registerTool(
     }
 
     if (action === 'list') {
-      const typeFilter = args.type;
-      const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
-      const params = typeFilter ? [typeFilter, 'active'] : ['active'];
-      // T3-P2-A: order by adoption then recommendation (CLI parity), and coalesce NULL counts
-      // so the output shows "adopt:0" rather than the jarring "adopt:null".
-      const resources = rdb.prepare(`
-        SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
-        FROM resources ${where}
-        ORDER BY COALESCE(adopt_count, 0) DESC, COALESCE(recommend_count, 0) DESC, type, name
-      `).all(...params);
-
+      // Shared ranked query + row line (registry.mjs, P2-12) — single source with CLI list.
+      const resources = listResourcesRanked(rdb, { type: args.type });
       if (resources.length === 0) return { content: [{ type: 'text', text: 'No resources found.' }] };
-
-      const lines = resources.map(r =>
-        `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count ?? 0} adopt:${r.adopt_count ?? 0} — ${truncate(r.capability_summary || '', 80)}`
-      );
+      const lines = resources.map(formatRegistryListLine);
       return { content: [{ type: 'text', text: `Resources (${resources.length}):\n${lines.join('\n')}` }] };
     }
 
     if (action === 'stats') {
-      const total = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
-      const byType = rdb.prepare('SELECT type, COUNT(*) as c FROM resources WHERE status = ? GROUP BY type').all('active');
-      const topAdopted = rdb.prepare(`
-        SELECT name, type, adopt_count, recommend_count
-        FROM resources WHERE status = ? AND adopt_count > 0
-        ORDER BY adopt_count DESC LIMIT 10
-      `).all('active');
-      const zeroAdopt = rdb.prepare(`
-        SELECT COUNT(*) as c FROM resources
-        WHERE status = ? AND recommend_count > 0 AND adopt_count = 0
-      `).get('active');
-      const userAdded = rdb.prepare(`
-        SELECT COUNT(*) as c FROM resources WHERE status = ? AND source = 'user'
-      `).get('active');
-
+      // Shared collection (registry.mjs collectRegistryStats, P2-12) — single
+      // source with the CLI registry stats action.
+      const s = collectRegistryStats(rdb);
       const lines = [
         `Registry Stats:`,
-        `  Total active: ${total.c}`,
-        ...byType.map(t => `  ${t.type}: ${t.c}`),
-        `  User-added: ${userAdded.c}`,
-        `  Zero adoption (recommended but never adopted): ${zeroAdopt.c}`,
+        `  Total active: ${s.total}`,
+        ...s.byType.map(t => `  ${t.type}: ${t.c}`),
+        `  User-added: ${s.userAdded}`,
+        `  Zero adoption (recommended but never adopted): ${s.zeroAdopt}`,
       ];
-      if (topAdopted.length > 0) {
+      if (s.topAdopted.length > 0) {
         lines.push('', 'Top adopted:');
-        for (const r of topAdopted) {
+        for (const r of s.topAdopted) {
           lines.push(`  ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
         }
       }
@@ -1544,19 +1516,14 @@ server.registerTool(
       if (!args.name || !args.resource_type) {
         return { content: [{ type: 'text', text: 'import requires name and resource_type' }], isError: true };
       }
-      const IMPORT_STRING_FIELDS = ['repo_url', 'local_path', 'invocation_name', 'intent_tags',
-        'domain_tags', 'trigger_patterns', 'capability_summary', 'keywords', 'tech_stack', 'use_cases'];
-      // Preserve provenance on a metadata-only re-import (parity with cmdRegistry): default
-      // source to 'user' only for a NEW resource — a partial re-upsert of an existing
-      // github/preinstalled row without `source` must not flip it to 'user'.
-      let source = args.source;
-      if (!source) {
-        const existing = rdb.prepare('SELECT source FROM resources WHERE type = ? AND name = ?').get(args.resource_type, args.name);
-        source = existing ? existing.source : 'user';
-      }
-      const fields = { name: args.name, type: args.resource_type, status: 'active', source };
+      // Provenance preservation + the 'installed' tier grant live in lib/registry-core.mjs,
+      // shared with the `registry import` CLI twin (audit 2026-08-22 P1-3). Before that
+      // extraction this side wrote its own SQL and silently skipped the tier grant.
+      const fields = {};
       for (const f of IMPORT_STRING_FIELDS) fields[f] = args[f] || '';
-      const id = upsertResource(rdb, fields);
+      const { id } = importResource(rdb, {
+        name: args.name, type: args.resource_type, source: args.source, fields,
+      });
       return { content: [{ type: 'text', text: `Imported: ${args.resource_type}:${args.name} (id=${id})` }] };
     }
 
@@ -1564,14 +1531,13 @@ server.registerTool(
       if (!args.name || !args.resource_type) {
         return { content: [{ type: 'text', text: 'remove requires name and resource_type' }], isError: true };
       }
-      const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(args.resource_type, args.name);
-      return { content: [{ type: 'text', text: result.changes > 0 ? `Removed: ${args.resource_type}:${args.name}` : 'Not found.' }] };
+      const { removed } = removeResource(rdb, { name: args.name, type: args.resource_type });
+      return { content: [{ type: 'text', text: removed ? `Removed: ${args.resource_type}:${args.name}` : 'Not found.' }] };
     }
 
     if (action === 'reindex') {
-      rdb.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')");
-      const count = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
-      return { content: [{ type: 'text', text: `FTS5 reindexed. ${count.c} active resources.` }] };
+      const { activeCount } = reindexResources(rdb);
+      return { content: [{ type: 'text', text: `FTS5 reindexed. ${activeCount} active resources.` }] };
     }
 
     if (action === 'import_url') {
@@ -1757,29 +1723,20 @@ server.registerTool(
     inputSchema: memUpdateSchema,
   },
   safeHandler(async (args) => {
+    // `obs_type` → `type`, same alias mem_save takes — see the schema comment.
+    args = applyArgAliases(args, { obs_type: 'type' });
     const obs = db.prepare('SELECT id, title FROM observations WHERE id = ?').get(args.id);
     if (!obs) return { content: [{ type: 'text', text: `Observation #${args.id} not found` }], isError: true };
 
-    const updates = [];
-    const params = [];
-    for (const [key, col] of [['title','title'],['narrative','narrative'],['type','type'],['importance','importance'],['lesson_learned','lesson_learned'],['concepts','concepts']]) {
-      if (args[key] !== undefined) {
-        updates.push(`${col} = ?`);
-        params.push(typeof args[key] === 'string' ? scrubSecrets(args[key]) : args[key]);
-      }
-    }
-    if (updates.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
+    // Shared mutation (lib/observation-write applyObsUpdate, P2-12): scrub + UPDATE +
+    // derived-column rebuild in one transaction — single source with CLI cmdUpdate.
+    const updatedCols = applyObsUpdate(db, args.id, {
+      title: args.title, narrative: args.narrative, type: args.type,
+      importance: args.importance, lesson_learned: args.lesson_learned, concepts: args.concepts,
+    });
+    if (updatedCols.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
 
-    params.push(args.id);
-
-    // Atomic: update fields + rebuild derived columns (FTS text + vector) via the
-    // shared core — single source with CLI cmdUpdate (lib/observation-write.mjs).
-    db.transaction(() => {
-      db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-      rebuildObservationDerived(db, args.id);
-    })();
-
-    return { content: [{ type: 'text', text: `Updated observation #${args.id}: ${updates.map(u => u.split(' =')[0]).join(', ')}` }] };
+    return { content: [{ type: 'text', text: `Updated observation #${args.id}: ${updatedCols.join(', ')}` }] };
   })
 );
 
@@ -1795,8 +1752,12 @@ export async function handleExportForTest(db, args) {
 async function runExport(db, args) {
   const wheres = [];
   const params = [];
-  if (!args.include_compressed) wheres.push('COALESCE(compressed_into, 0) = 0');
-  wheres.push('superseded_at IS NULL');
+  // Composed, not hand-written: the CLI twin (mem-cli.mjs cmdExport) already
+  // routes through liveObsFilterSql, and a hand-rolled copy here is how the
+  // live-row predicate drifted apart on other surfaces (P2-11/D#123). With
+  // include_compressed the compressed half is dropped but retractions still
+  // are not — tombstone export is opt-in, supersession is never exported.
+  wheres.push(args.include_compressed ? 'superseded_at IS NULL' : liveObsFilterSql(''));
   if (args.project) { wheres.push('project = ?'); params.push(_resolveProjectShared(db, args.project)); }
   if (args.type) { wheres.push('type = ?'); params.push(args.type); }
   // T3-P1-A: surface invalid dates instead of silently dropping the filter — mirrors
@@ -1909,6 +1870,7 @@ server.registerTool(
 // Handler extracted to server/fts-check.mjs (v2.41 split).
 import { handleMemFtsCheck } from './server/fts-check.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 server.registerTool(
   'mem_fts_check',
   {
@@ -1933,33 +1895,18 @@ server.registerTool(
     const limit = args.limit ?? (tierFilter ? 20 : 5);
     const now = Date.now();
 
-    // Get active session for tier classification
-    const activeSession = db.prepare(
-      "SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND status = 'active' ORDER BY started_at_epoch DESC LIMIT 1"
-    ).get(project);
-
-    const ctx = { now, currentProject: project, currentSessionId: activeSession?.memory_session_id ?? '' };
-    const params = tierSqlParams(ctx);
-
-    const tiers = ['working', 'active', 'archive'];
-    const tierLabels = { working: '🔴 Working Memory', active: '🟡 Active Memory', archive: '🔵 Archive' };
-    const showTiers = tierFilter ? [tierFilter] : tiers;
+    // Shared collection (lib/browse-core, P2-12) — single source with CLI browse.
+    const { showTiers, tierData, tierCounts, grandTotal } = collectBrowseTiers(db, {
+      project, tierFilter, limit, now,
+      currentSessionId: getActiveMemorySessionId(db, project),
+    });
+    const tiers = BROWSE_TIERS;
+    const tierLabels = BROWSE_TIER_LABELS;
 
     const lines = [`Memory Dashboard (${project})\n`];
-    let grandTotal = 0;
-    const tierCounts = {};
 
     for (const tier of showTiers) {
-      const countRow = db.prepare(`
-        SELECT COUNT(*) as c FROM (
-          SELECT ${TIER_CASE_SQL} as tier FROM observations
-          WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-        ) WHERE tier = ?
-      `).get(...params, project, tier);
-      const count = countRow?.c ?? 0;
-      tierCounts[tier] = count;
-      grandTotal += count;
-
+      const { count, rows } = tierData[tier];
       lines.push(`${tierLabels[tier]} (${count})`);
 
       if (tier === 'archive' && !tierFilter) {
@@ -1968,16 +1915,6 @@ server.registerTool(
       }
 
       if (count === 0) { lines.push(''); continue; }
-
-      const rows = db.prepare(`
-        SELECT * FROM (
-          SELECT id, type, title, created_at, created_at_epoch, ${TIER_CASE_SQL} as tier
-          FROM observations
-          WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-        ) WHERE tier = ?
-        ORDER BY created_at_epoch DESC
-        LIMIT ?
-      `).all(...params, project, tier, limit);
 
       for (const r of rows) {
         lines.push(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${fmtDate(r.created_at)}`);

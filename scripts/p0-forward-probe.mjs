@@ -11,6 +11,7 @@ import { createInterface } from 'node:readline';
 import { homedir, tmpdir } from 'node:os';
 import { noisePenaltyClause } from '../scoring-sql.mjs';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
+import { OBS_ID_DIGITS, citationIdRe } from '../lib/citation-tracker.mjs';
 
 const MEM_DB = join(resolveDataDir(process.env.CLAUDE_MEM_DIR), 'claude-mem-lite.db');
 const TRANSCRIPTS = join(homedir(), '.claude', 'projects', '-mnt-data-ssd-dev-projects-mem');
@@ -24,8 +25,14 @@ const files = readdirSync(TRANSCRIPTS)
 
 const injectedIds = new Map();
 const citedIds = new Map();
-const idRegex = /#(\d{3,6})\b/g;
-const injectLineRegex = /#\d{3,6}\s*(?:\[[a-z_]+\]|[🔴🟡🟢🔵🟣📝🔍💬])/u;
+// Calibers come from the owner (lib/citation-tracker.mjs), not from a local literal. This
+// file carried a seventh hand-written `{3,6}` — narrower than every other copy in the repo
+// at BOTH ends, so it could see neither `#1`-`#99` nor 7-digit ids — and it was found only
+// because the v3.80.0 pre-tag review noticed the sweep guard was not looking in scripts/.
+// `idRegex` is the numerator (bare `#NN` in prose); `injectLineRegex` is a denominator and
+// stays anchored by the `[type]`/icon suffix, which is what makes widening it safe here.
+const idRegex = citationIdRe();
+const injectLineRegex = new RegExp(`#${OBS_ID_DIGITS}\\s*(?:\\[[a-z_]+\\]|[🔴🟡🟢🔵🟣📝🔍💬])`, 'u');
 
 for (const f of files) {
   const rl = createInterface({ input: createReadStream(f.p), crlfDelay: Infinity });
