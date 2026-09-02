@@ -20,7 +20,7 @@ import { getDeferredByIds } from '../lib/deferred-work.mjs';
 import { recommendSkill } from '../registry-recommend.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
-import { countHookEligibleCorpus, recordSearch } from '../lib/search-telemetry.mjs';
+import { countHookEligibleCorpus, recordSearch, updateSearchCorpusCounts } from '../lib/search-telemetry.mjs';
 
 import { DAY_MS } from '../lib/time-constants.mjs';
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -1041,8 +1041,7 @@ async function main() {
     if (telemetrySearchId !== null) {
       try {
         const corpusCounts = countHookEligibleCorpus(db, project, Date.now() - LOOKBACK_MS);
-        db.prepare('UPDATE search_runs SET corpus_counts_json = ? WHERE search_id = ?')
-          .run(JSON.stringify(corpusCounts), telemetrySearchId);
+        updateSearchCorpusCounts(db, telemetrySearchId, corpusCounts);
       } catch (e) {
         recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
       }

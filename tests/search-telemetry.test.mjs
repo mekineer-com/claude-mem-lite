@@ -6,6 +6,7 @@ import { tmpdir } from 'os';
 import { CURRENT_SCHEMA_VERSION, initSchema } from '../schema.mjs';
 import {
   computeSearchTelemetry, formatSearchTelemetryReport, rateSearchResults, recordSearch,
+  updateSearchCorpusCounts,
 } from '../lib/search-telemetry.mjs';
 import { handleSearchFeedbackForTest, handleSearchForTest } from '../server.mjs';
 
@@ -90,6 +91,19 @@ describe('search telemetry on schema v46', () => {
     db.close();
   });
 
+  it('scrubs secrets before persisting queries and result labels', () => {
+    const db = openDb();
+    const searchId = recordSearch(db, {
+      query: 'deploy with api_key=sk-mykey123', surface: 'mcp_search', client: 'test',
+      results: [{ source: 'obs', id: 7, title: 'token=abc123xyz' }],
+    });
+    expect(db.prepare('SELECT query FROM search_runs WHERE search_id = ?').get(searchId).query)
+      .toBe('deploy with api_key=***');
+    expect(db.prepare('SELECT snapshot_label FROM search_results WHERE search_id = ?').get(searchId).snapshot_label)
+      .toBe('token=***');
+    db.close();
+  });
+
   it('rejects malformed, duplicate, and foreign result IDs without partial updates', () => {
     const db = openDb();
     const searchId = recordSearch(db, {
@@ -115,6 +129,26 @@ describe('search telemetry on schema v46', () => {
     expect(() => recordSearch(contender, {
       query: 'alpha', surface: 'mcp_search', client: 'test', results: [],
     })).toThrow(/locked|busy/i);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
+    writer.exec('ROLLBACK');
+    contender.close();
+    writer.close();
+  });
+
+  it('updates hook corpus counts without waiting on a locked writer', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-search-telemetry-counts-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'test.db');
+    const writer = openDb(path);
+    const contender = new Database(path);
+    contender.pragma('busy_timeout = 4321');
+    const searchId = recordSearch(contender, {
+      query: 'alpha', surface: 'user_prompt_hook', client: 'test', results: [],
+    });
+    writer.exec('BEGIN IMMEDIATE');
+    const started = Date.now();
+    expect(() => updateSearchCorpusCounts(contender, searchId, { obs: 4 })).toThrow(/locked|busy/i);
     expect(Date.now() - started).toBeLessThan(500);
     expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
     writer.exec('ROLLBACK');
@@ -165,6 +199,31 @@ describe('search telemetry on schema v46', () => {
     const pages = [...first.results, ...second.results];
     expect(new Set(pages.map(row => row.id)).size,
       JSON.stringify({ first: first.results.map(row => [row.id, row.score]), second: second.results.map(row => [row.id, row.score]) })).toBe(7);
+    db.close();
+  });
+
+  it('pages through the obs_type recent fallback beyond its first five rows', async () => {
+    const db = openDb();
+    seedObservation(db, { title: 'Decision fallback entry 0' });
+    const insert = db.prepare(`
+      INSERT INTO observations
+        (memory_session_id, project, text, type, title, created_at, created_at_epoch, importance)
+      VALUES ('memory-1', 'telemetry-test', ?, 'decision', ?, ?, ?, 3)
+    `);
+    for (let i = 1; i < 7; i++) {
+      const title = `Decision fallback entry ${i}`;
+      const now = Date.now() + i;
+      insert.run(title, title, new Date(now).toISOString(), now);
+    }
+    const first = await handleSearchForTest(db, {
+      query: 'no_matching_fts_term', project: 'telemetry-test', obs_type: 'decision', deep: false,
+    });
+    const second = await handleSearchForTest(db, {
+      query: 'no_matching_fts_term', project: 'telemetry-test', obs_type: 'decision', offset: 5, deep: false,
+    });
+    expect(first.results).toHaveLength(5);
+    expect(second.results).toHaveLength(2);
+    expect(new Set([...first.results, ...second.results].map((row) => row.id)).size).toBe(7);
     db.close();
   });
 

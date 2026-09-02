@@ -121,6 +121,7 @@ describe('consumer ledger — no inlined live-filter pairs in the converted file
     'lib/timeline-core.mjs',
     'lib/stats-core.mjs',
     'lib/search-core.mjs',
+    'lib/search-telemetry.mjs',
     'lib/maintain-core.mjs',
     'benchmark/benchmark.mjs',
   ];

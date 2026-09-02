@@ -796,7 +796,7 @@ claude-mem-lite.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CLAUDE_MEM_ALL_TOOLS` | `1` exposes all 20 MCP tools in `tools/list` instead of the 9 core ones (pre-v2.34.0 behavior). The 11 hidden tools stay callable by exact name either way. | _(9 core)_ |
+| `CLAUDE_MEM_ALL_TOOLS` | `1` exposes all 21 MCP tools in `tools/list` instead of the 10 core ones. The 11 hidden tools stay callable by exact name either way. | _(10 core)_ |
 | `CLAUDE_MEM_FILE_INTEL` | `0` disables the file-intel block injected before `Read` (past observations about the file you are about to open). | _(on)_ |
 | `CLAUDE_MEM_FILE_INTEL_MIN_TOKENS` | Files smaller than this stay silent — file-intel only pays for itself on large files. | `800` |
 | `CLAUDE_MEM_REREAD_GUARD` | `0` disables the warning when the same file is read twice in a session. Never fires on `offset`/`limit` paging. | _(on)_ |

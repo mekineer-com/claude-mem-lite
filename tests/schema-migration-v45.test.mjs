@@ -64,4 +64,51 @@ describe('schema v45 — per-surface citation funnel table', () => {
     expect(row.cited_n).toBe(2);
     db.close();
   });
+
+  it('merges the local search-telemetry v45 shape into v46', () => {
+    const db = new Database(':memory:');
+    initSchema(db);
+    db.prepare(`INSERT INTO search_runs
+      (project, query, surface, search_mode, client, created_at, created_at_epoch)
+      VALUES ('p', 'q', 'mcp_search', 'normal', 'test', 'now', 1)`).run();
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      DROP TABLE citation_surface_log;
+      ALTER TABLE observations DROP COLUMN decay_seen_at_first_cite;
+      UPDATE schema_version SET version = 45;
+    `);
+
+    initSchema(db);
+
+    expect(tableNames(db)).toContain('citation_surface_log');
+    expect(db.prepare("SELECT COUNT(*) c FROM pragma_table_info('observations') WHERE name = 'decay_seen_at_first_cite'").get().c).toBe(1);
+    expect(db.prepare('SELECT query FROM search_runs').get().query).toBe('q');
+    expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
+    db.close();
+  });
+
+  it('merges the upstream citation-funnel v45 shape into v46', () => {
+    const db = new Database(':memory:');
+    initSchema(db);
+    db.prepare(`INSERT INTO citation_surface_log
+      (project, session_id, surface, resolved_at, injected_n, cited_n)
+      VALUES ('p', 's', 'pretool', 1, 7, 2)`).run();
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      DROP TABLE search_results;
+      DROP TABLE search_runs;
+      ALTER TABLE observations DROP COLUMN decay_seen_at_first_cite;
+      UPDATE schema_version SET version = 45;
+    `);
+
+    initSchema(db);
+
+    expect(tableNames(db)).toContain('search_runs');
+    expect(tableNames(db)).toContain('search_results');
+    expect(db.prepare("SELECT COUNT(*) c FROM pragma_table_info('observations') WHERE name = 'decay_seen_at_first_cite'").get().c).toBe(1);
+    expect(db.prepare('SELECT injected_n, cited_n FROM citation_surface_log').get())
+      .toEqual({ injected_n: 7, cited_n: 2 });
+    expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
+    db.close();
+  });
 });
