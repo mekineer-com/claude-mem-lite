@@ -807,7 +807,7 @@ describe('user-prompt-search subprocess integration', () => {
       prompt: 'how do I fix the authentication middleware token expiry validation',
     };
     const first = await runScript(payload, { CLAUDE_MEM_UPS_REQUIRE_SIGNAL: '0' });
-    const searchId = Number(first.stdout.match(/Search (\d+) — rate relevance/)?.[1]);
+    const searchId = Number(first.stdout.match(/Search (\d+) — call mem_search_feedback/)?.[1]);
     expect(searchId).toBeGreaterThan(0);
     expect(db.prepare('SELECT returned_count FROM search_runs WHERE search_id = ?').get(searchId))
       .toEqual({ returned_count: 3 });

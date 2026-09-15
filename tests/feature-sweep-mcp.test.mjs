@@ -258,7 +258,7 @@ describe('MCP feature sweep: public tools', () => {
 
   itTool('mem_search_feedback', async () => {
     const search = await call('mem_search', { query: 'widget', project: PROJECT });
-    const searchId = Number(search.match(/Search (\d+) — rate relevance/)?.[1]);
+    const searchId = Number(search.match(/Search (\d+) — call mem_search_feedback/)?.[1]);
     expect(searchId).toBeGreaterThan(0);
     const result = await call('mem_search_feedback', {
       search_id: searchId,

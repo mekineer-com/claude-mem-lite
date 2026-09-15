@@ -164,7 +164,7 @@ describe('search telemetry on schema v46', () => {
     }, { clientIdentity: 'codex/1' });
     expect(result.search_id).toBeGreaterThan(0);
     expect(result.content[0].text.trim().endsWith(
-      `Search ${result.search_id} — rate relevance with mem_search_feedback; omit any result you cannot judge honestly.`
+      `Search ${result.search_id} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For a concrete retrieval-quality investigation, separately record contribution there: relevant but redundant, helpful detail or confirmation, or changed action or prevented error.`
     )).toBe(true);
     handleSearchFeedbackForTest(db, {
       search_id: result.search_id, relevant: [`#${obsId}`],

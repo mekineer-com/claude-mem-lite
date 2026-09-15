@@ -953,7 +953,7 @@ async function main() {
           results: telemetryRows,
           client: 'user_prompt_hook',
         });
-        rendered += `\nSearch ${telemetrySearchId} — rate relevance with mem_search_feedback; omit any result you cannot judge honestly.`;
+        rendered += `\nSearch ${telemetrySearchId} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For a concrete retrieval-quality investigation, separately record contribution there: relevant but redundant, helpful detail or confirmation, or changed action or prevented error.`;
       } catch (e) {
         recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
       }

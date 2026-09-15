@@ -1457,7 +1457,7 @@ describe('hook feature sweep: standalone hook scripts', () => {
     expect(r.stdout).toContain('[mem] FYI — Related memories');
     expect(r.stdout).toContain(`#${id}`);
     expect(r.stdout).toContain('Invalidate the widget cache on write');
-    const searchId = Number(r.stdout.match(/Search (\d+) — rate relevance/)?.[1]);
+    const searchId = Number(r.stdout.match(/Search (\d+) — call mem_search_feedback/)?.[1]);
     expect(searchId).toBeGreaterThan(0);
     const exposureDb = new Database(join(upsData, 'claude-mem-lite.db'));
     const exposure = exposureDb.prepare('SELECT surface, returned_count FROM search_runs WHERE search_id = ?').get(searchId);
