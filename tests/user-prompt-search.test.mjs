@@ -940,6 +940,50 @@ describe('user-prompt-search subprocess integration', () => {
     });
   });
 
+  it('does not label a filtered-out error signature as an error hit', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'TypeError cannot read properties of undefined reading foo',
+      text: 'TypeError cannot read properties of undefined reading foo',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    await runScript(
+      {
+        session_id: 'telemetry-filtered-error',
+        prompt: "TypeError: Cannot read properties of undefined (reading 'foo')",
+      },
+      { CLAUDE_MEM_UPS_BM25_MIN: '1000000' },
+    );
+    const row = db
+      .prepare('SELECT search_mode, returned_count FROM search_runs ORDER BY search_id DESC LIMIT 1')
+      .get();
+    expect(row.returned_count).toBe(0);
+    expect(['normal', 'or_fallback']).toContain(row.search_mode);
+  });
+
+  it('labels a file hit as file when an error signature finds no retained hit', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Updated auth-config.mjs settings',
+      text: 'Changed the authentication configuration',
+      filesModified: JSON.stringify(['auth-config.mjs']),
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { session_id: 'telemetry-file-mode', prompt: 'TypeError: what changed in auth-config.mjs recently?' },
+      { CLAUDE_MEM_UPS_BM25_MIN: '1000000' },
+    );
+    expect(stdout).toContain('Updated auth-config.mjs settings');
+    expect(db.prepare('SELECT search_mode FROM search_runs ORDER BY search_id DESC LIMIT 1').get()).toEqual({
+      search_mode: 'file',
+    });
+  });
+
   it('accepts both "prompt" and "user_prompt" fields', async () => {
     // Both should be accepted (the script checks hookData.prompt || hookData.user_prompt)
     const { stdout: out1 } = await runScript({ prompt: 'yes' });

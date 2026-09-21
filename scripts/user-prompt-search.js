@@ -888,7 +888,7 @@ async function main() {
       : [];
     if (errSig) {
       searchExecuted = true;
-      searchMode = 'error';
+      if (sigRows.length > 0) searchMode = 'error';
     }
 
     // v2.57.x explicit-signal gate. Compute files once for both the gate and
@@ -947,9 +947,9 @@ async function main() {
       const ftsPool = ftsResult.rows;
       let ftsRows = ftsPool.slice(0, mainLimit);
       const ftsMode = ftsResult.mode;
-      if (!errSig) searchMode = ftsMode === 'OR' ? 'or_fallback' : 'normal';
+      if (sigRows.length === 0) searchMode = ftsMode === 'OR' ? 'or_fallback' : 'normal';
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
-      if (!errSig && fileRows.length > 0) searchMode = 'file';
+      if (sigRows.length === 0 && fileRows.length > 0) searchMode = 'file';
 
       // T3 (v2.31): BM25 magnitude threshold — drop FTS hits whose relevance
       // magnitude doesn't clear the floor. This targets OR-fallback leakage
