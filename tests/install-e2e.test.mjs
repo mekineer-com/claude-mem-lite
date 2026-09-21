@@ -8,64 +8,71 @@
 //   - Smart invocation scripts presence
 //   - Directory structure matches expected layout
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { execFileSync } from 'child_process';
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
+import { makeFixtureTracker } from './test-helpers.mjs';
 
 const INSTALL_PATH = resolve('install.mjs');
 const SETUP_PATH = resolve('scripts/setup.sh');
 const PROJECT_DIR = resolve('.');
 // Use --dev mode for E2E tests: skips npm install (fast), uses symlinks, tests same hook logic
 
+const fixtures = makeFixtureTracker();
+afterAll(() => fixtures.disposeAll());
+
 function makeTmpDir() {
   const dir = join(tmpdir(), `mem-e2e-${randomUUID().slice(0, 8)}`);
   mkdirSync(dir, { recursive: true });
-  return dir;
+  return fixtures.track(dir);
 }
 
 function makeFakeClaudeBin(home) {
   const binDir = join(home, 'bin');
   mkdirSync(binDir, { recursive: true });
   const script = join(binDir, 'claude');
-  writeFileSync(script, [
-    '#!/usr/bin/env bash',
-    'set -euo pipefail',
-    `STATE="${home}/.claude/mcp-state.txt"`,
-    `mkdir -p "${home}/.claude"`,
-    'touch "$STATE"',
-    'if [[ "${1:-}" != "mcp" ]]; then exit 0; fi',
-    'shift; cmd="${1:-}"; shift || true',
-    'case "$cmd" in',
-    '  add)',
-    '    scope="user"; name=""',
-    '    while [[ $# -gt 0 ]]; do',
-    '      case "$1" in -s) scope="$2"; shift 2 ;; -t) shift 2 ;; --) break ;; *) if [[ -z "$name" && "$1" != -* ]]; then name="$1"; fi; shift ;; esac',
-    '    done',
-    '    if [[ -n "$name" ]]; then',
-    '      grep -v "^${scope}:${name}$" "$STATE" > "$STATE.tmp" 2>/dev/null || true',
-    '      mv "$STATE.tmp" "$STATE"',
-    "      printf '%s:%s\\n' \"$scope\" \"$name\" >> \"$STATE\"",
-    '    fi ;;',
-    '  remove)',
-    '    scope="user"; name=""',
-    '    while [[ $# -gt 0 ]]; do',
-    '      case "$1" in -s) scope="$2"; shift 2 ;; *) if [[ -z "$name" && "$1" != -* ]]; then name="$1"; fi; shift ;; esac',
-    '    done',
-    '    if [[ -n "$name" ]]; then',
-    '      grep -v "^${scope}:${name}$" "$STATE" > "$STATE.tmp" 2>/dev/null || true',
-    '      mv "$STATE.tmp" "$STATE"',
-    '    fi ;;',
-    '  list)',
-    '    while IFS= read -r line; do',
-    '      [[ -n "$line" ]] || continue',
-    '      name="${line#*:}"',
-    "      printf '%s: stdio\\n' \"$name\"",
-    '    done < "$STATE" ;;',
-    'esac',
-  ].join('\n'));
+  writeFileSync(
+    script,
+    [
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
+      `STATE="${home}/.claude/mcp-state.txt"`,
+      `mkdir -p "${home}/.claude"`,
+      'touch "$STATE"',
+      'if [[ "${1:-}" != "mcp" ]]; then exit 0; fi',
+      'shift; cmd="${1:-}"; shift || true',
+      'case "$cmd" in',
+      '  add)',
+      '    scope="user"; name=""',
+      '    while [[ $# -gt 0 ]]; do',
+      '      case "$1" in -s) scope="$2"; shift 2 ;; -t) shift 2 ;; --) break ;; *) if [[ -z "$name" && "$1" != -* ]]; then name="$1"; fi; shift ;; esac',
+      '    done',
+      '    if [[ -n "$name" ]]; then',
+      '      grep -v "^${scope}:${name}$" "$STATE" > "$STATE.tmp" 2>/dev/null || true',
+      '      mv "$STATE.tmp" "$STATE"',
+      '      printf \'%s:%s\\n\' "$scope" "$name" >> "$STATE"',
+      '    fi ;;',
+      '  remove)',
+      '    scope="user"; name=""',
+      '    while [[ $# -gt 0 ]]; do',
+      '      case "$1" in -s) scope="$2"; shift 2 ;; *) if [[ -z "$name" && "$1" != -* ]]; then name="$1"; fi; shift ;; esac',
+      '    done',
+      '    if [[ -n "$name" ]]; then',
+      '      grep -v "^${scope}:${name}$" "$STATE" > "$STATE.tmp" 2>/dev/null || true',
+      '      mv "$STATE.tmp" "$STATE"',
+      '    fi ;;',
+      '  list)',
+      '    while IFS= read -r line; do',
+      '      [[ -n "$line" ]] || continue',
+      '      name="${line#*:}"',
+      '      printf \'%s: stdio\\n\' "$name"',
+      '    done < "$STATE" ;;',
+      'esac',
+    ].join('\n'),
+  );
   execFileSync('chmod', ['+x', script]);
   return binDir;
 }
@@ -78,6 +85,11 @@ function runInstall(command, home, args = [], extraEnv = {}) {
       HOME: home,
       // Skip managed repo cloning by suppressing git commands
       CLAUDE_MEM_SKIP_REPOS: '1',
+      // R10 P2-17: without this, install.mjs's dogfood branch (it detects THIS repo by
+      // git remote) ran cmdAdopt against the inherited PWD — the repository root — and
+      // rewrote the tracked CLAUDE.md managed block plus .claude/plugin_claude_mem_lite.md
+      // on every `vitest run`. HOME is sandboxed here; the adopt target was not.
+      MEM_NO_AUTO_ADOPT: '1',
       ...extraEnv,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -128,9 +140,15 @@ describe('E2E: Plugin install mode', () => {
   it('hooks/hooks.json declares all 7 hook events', () => {
     const hooks = readJson('hooks/hooks.json');
     expect(hooks.hooks).toBeTruthy();
-    expect(Object.keys(hooks.hooks).sort()).toEqual(
-      ['PostToolUse', 'PostToolUseFailure', 'PreCompact', 'PreToolUse', 'SessionStart', 'Stop', 'UserPromptSubmit'],
-    );
+    expect(Object.keys(hooks.hooks).sort()).toEqual([
+      'PostToolUse',
+      'PostToolUseFailure',
+      'PreCompact',
+      'PreToolUse',
+      'SessionStart',
+      'Stop',
+      'UserPromptSubmit',
+    ]);
 
     // PostToolUseFailure (D#170) — a SEPARATE event, not a variant of PostToolUse, which
     // Claude Code does not fire for a tool call it judged failed. Scoped to Bash: the
@@ -142,25 +160,24 @@ describe('E2E: Plugin install mode', () => {
     expect(hooks.hooks.PreCompact[0].hooks[0].command).toContain('hook.mjs pre-compact');
 
     // SessionStart
-    const sessionStart = hooks.hooks.SessionStart?.[0]?.hooks?.map(h => h.command) || [];
+    const sessionStart = hooks.hooks.SessionStart?.[0]?.hooks?.map((h) => h.command) || [];
     expect(sessionStart).toContain('bash "${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh"');
     // v2.84: Node hook entries routed through hook-launcher.mjs for self-heal.
-    expect(sessionStart).toContain('node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs" hook.mjs session-start');
+    expect(sessionStart).toContain(
+      'node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs" hook.mjs session-start',
+    );
 
-    // PreToolUse — three matchers
+    // PreToolUse — two matchers (the `Skill` bridge went with the skill-registry
+    // subsystem in 2026-09; see docs/audits/20260906-145304.md)
     const preToolUse = hooks.hooks.PreToolUse;
-    expect(preToolUse).toHaveLength(3);
-    const preMatchers = preToolUse.map(h => h.matcher);
+    expect(preToolUse).toHaveLength(2);
+    const preMatchers = preToolUse.map((h) => h.matcher);
     expect(preMatchers).toContain('Edit|Write|NotebookEdit|Read');
-    expect(preMatchers).toContain('Skill');
+    expect(preMatchers).not.toContain('Skill');
     expect(preMatchers).toContain('Agent|Task');
 
-    // PreToolUse Skill bridge
-    const skillBridge = preToolUse.find(h => h.matcher === 'Skill');
-    expect(skillBridge.hooks[0].command).toContain('pre-skill-bridge.js');
-
     // PreToolUse Agent|Task subagent-injection hook (P0)
-    const agentInject = preToolUse.find(h => h.matcher === 'Agent|Task');
+    const agentInject = preToolUse.find((h) => h.matcher === 'Agent|Task');
     // The registered command is the bash prefilter, not the Node entry (audit P2-5): a
     // default-off feature must not start an interpreter on every Agent dispatch. The .sh
     // execs the .js when the flag is on.
@@ -172,9 +189,9 @@ describe('E2E: Plugin install mode', () => {
     // registered nowhere, so bind-salience component 2 could never fire).
     const postToolUse = hooks.hooks.PostToolUse;
     expect(postToolUse).toHaveLength(2);
-    const prefilter = postToolUse.find(h => h.matcher === '*');
+    const prefilter = postToolUse.find((h) => h.matcher === '*');
     expect(prefilter.hooks[0].command).toContain('post-tool-use.sh');
-    const postRecall = postToolUse.find(h => h.matcher === 'Edit|Write|NotebookEdit');
+    const postRecall = postToolUse.find((h) => h.matcher === 'Edit|Write|NotebookEdit');
     expect(postRecall, 'post-tool-recall.js must be registered on the edit tools').toBeTruthy();
     expect(postRecall.hooks[0].command).toContain('post-tool-recall.js');
 
@@ -182,9 +199,9 @@ describe('E2E: Plugin install mode', () => {
     expect(hooks.hooks.Stop).toHaveLength(1);
 
     // UserPromptSubmit
-    const userPrompt = hooks.hooks.UserPromptSubmit?.[0]?.hooks?.map(h => h.command) || [];
-    expect(userPrompt.some(c => c.includes('user-prompt-search.js'))).toBe(true);
-    expect(userPrompt.some(c => c.includes('hook.mjs'))).toBe(true);
+    const userPrompt = hooks.hooks.UserPromptSubmit?.[0]?.hooks?.map((h) => h.command) || [];
+    expect(userPrompt.some((c) => c.includes('user-prompt-search.js'))).toBe(true);
+    expect(userPrompt.some((c) => c.includes('hook.mjs'))).toBe(true);
   });
 
   it('plugin setup.sh creates node_modules symlink and clears stale MCP', () => {
@@ -198,9 +215,16 @@ describe('E2E: Plugin install mode', () => {
       symlinkSync(resolve('node_modules'), join(dataDir, 'node_modules'));
 
       // Stale global MCP that setup should clean
-      writeFileSync(join(home, '.claude.json'), JSON.stringify({
-        mcpServers: { mem: { command: 'node', args: ['old-server.mjs'] } }
-      }, null, 2));
+      writeFileSync(
+        join(home, '.claude.json'),
+        JSON.stringify(
+          {
+            mcpServers: { mem: { command: 'node', args: ['old-server.mjs'] } },
+          },
+          null,
+          2,
+        ),
+      );
 
       execFileSync('bash', [SETUP_PATH], {
         encoding: 'utf8',
@@ -230,7 +254,9 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     home = makeTmpDir();
     binDir = makeFakeClaudeBin(home);
   });
-  afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
 
   it('install creates data directory and deploys source files', () => {
     runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
@@ -239,7 +265,14 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     expect(existsSync(dataDir)).toBe(true);
 
     // Core source files present
-    const requiredFiles = ['server.mjs', 'hook.mjs', 'schema.mjs', 'utils.mjs', 'mem-cli.mjs', 'package.json'];
+    const requiredFiles = [
+      'server.mjs',
+      'hook.mjs',
+      'schema.mjs',
+      'utils.mjs',
+      'mem-cli.mjs',
+      'package.json',
+    ];
     for (const f of requiredFiles) {
       expect(existsSync(join(dataDir, f))).toBe(true);
     }
@@ -262,30 +295,29 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     expect(settings.hooks.UserPromptSubmit).toBeTruthy();
     expect(settings.hooks.PreToolUse).toBeTruthy();
 
-    // PreToolUse has three separate matchers
+    // PreToolUse has two separate matchers
     const preToolUse = settings.hooks.PreToolUse;
-    expect(preToolUse.length).toBeGreaterThanOrEqual(3);
+    expect(preToolUse.length).toBeGreaterThanOrEqual(2);
 
     // Edit/Write/Read recall hook (v2.34.6 extended Read)
-    const editMatcher = preToolUse.find(h => h.matcher === 'Edit|Write|NotebookEdit|Read');
+    const editMatcher = preToolUse.find((h) => h.matcher === 'Edit|Write|NotebookEdit|Read');
     expect(editMatcher).toBeTruthy();
     expect(editMatcher.hooks[0].command).toContain('pre-tool-recall.js');
 
-    // Skill bridge hook
-    const skillMatcher = preToolUse.find(h => h.matcher === 'Skill');
-    expect(skillMatcher).toBeTruthy();
-    expect(skillMatcher.hooks[0].command).toContain('pre-skill-bridge.js');
+    // No `Skill` matcher: the bridge was removed with the skill-registry subsystem
+    // (2026-09). Asserted negatively so a reinstated twin cannot slip back in silently.
+    expect(preToolUse.find((h) => h.matcher === 'Skill')).toBeUndefined();
 
     // Agent|Task subagent-injection hook (P0)
-    const agentMatcher = preToolUse.find(h => h.matcher === 'Agent|Task');
+    const agentMatcher = preToolUse.find((h) => h.matcher === 'Agent|Task');
     expect(agentMatcher).toBeTruthy();
     expect(agentMatcher.hooks[0].command).toContain('pre-agent-inject.sh');
     expect(agentMatcher.hooks[0].command.startsWith('bash ')).toBe(true);
 
     // UserPromptSubmit has both search + hook handlers
-    const userPromptHooks = settings.hooks.UserPromptSubmit[0].hooks.map(h => h.command);
-    expect(userPromptHooks.some(c => c.includes('user-prompt-search.js'))).toBe(true);
-    expect(userPromptHooks.some(c => c.includes('hook.mjs'))).toBe(true);
+    const userPromptHooks = settings.hooks.UserPromptSubmit[0].hooks.map((h) => h.command);
+    expect(userPromptHooks.some((c) => c.includes('user-prompt-search.js'))).toBe(true);
+    expect(userPromptHooks.some((c) => c.includes('hook.mjs'))).toBe(true);
   });
 
   it('install registers MCP server via fake claude binary', () => {
@@ -329,20 +361,29 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     const populatedHooks = {
       description: 'claude-mem-lite memory system hooks',
       hooks: {
-        UserPromptSubmit: [{
-          matcher: '*',
-          hooks: [
-            { type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-search.js"', timeout: 2 },
-            { type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/hook.mjs" user-prompt', timeout: 5 },
-          ],
-        }],
+        UserPromptSubmit: [
+          {
+            matcher: '*',
+            hooks: [
+              {
+                type: 'command',
+                command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-search.js"',
+                timeout: 2,
+              },
+              { type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/hook.mjs" user-prompt', timeout: 5 },
+            ],
+          },
+        ],
       },
     };
 
     for (const ver of ['2.28.1', '2.30.0']) {
       mkdirSync(join(cacheBase, ver, 'hooks'), { recursive: true });
       mkdirSync(join(cacheBase, ver, 'scripts'), { recursive: true });
-      writeFileSync(join(cacheBase, ver, 'hooks', 'hooks.json'), JSON.stringify(populatedHooks, null, 2) + '\n');
+      writeFileSync(
+        join(cacheBase, ver, 'hooks', 'hooks.json'),
+        JSON.stringify(populatedHooks, null, 2) + '\n',
+      );
     }
 
     runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
@@ -401,7 +442,9 @@ describe('E2E: Dev install mode (git clone --dev)', () => {
     home = makeTmpDir();
     binDir = makeFakeClaudeBin(home);
   });
-  afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
 
   it('--dev creates symlinks instead of copies', () => {
     runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
@@ -440,16 +483,16 @@ describe('E2E: Smart invocation scripts deployed', () => {
   it('plugin hooks.json references all smart invocation scripts', () => {
     const hooks = readJson('hooks/hooks.json');
 
-    // Pre-skill-bridge for Skill() interception
+    // Pre-tool-recall for Edit/Write/Read
     const preToolUse = hooks.hooks.PreToolUse;
-    const skillHook = preToolUse.find(h => h.matcher === 'Skill');
-    expect(skillHook).toBeTruthy();
-    expect(skillHook.hooks[0].command).toContain('pre-skill-bridge.js');
-    expect(skillHook.hooks[0].timeout).toBe(3);
+    const recallHook = preToolUse.find((h) => h.matcher === 'Edit|Write|NotebookEdit|Read');
+    expect(recallHook).toBeTruthy();
+    expect(recallHook.hooks[0].command).toContain('pre-tool-recall.js');
+    expect(recallHook.hooks[0].timeout).toBe(3);
 
     // User-prompt-search for L1 auto-load
     const userPrompt = hooks.hooks.UserPromptSubmit[0].hooks;
-    const searchHook = userPrompt.find(h => h.command.includes('user-prompt-search.js'));
+    const searchHook = userPrompt.find((h) => h.command.includes('user-prompt-search.js'));
     expect(searchHook).toBeTruthy();
     expect(searchHook.timeout).toBe(2);
   });
@@ -464,7 +507,6 @@ describe('E2E: Smart invocation scripts deployed', () => {
       // --dev mode creates a scripts symlink → all scripts accessible
       expect(existsSync(join(dataDir, 'scripts'))).toBe(true);
       // Verify the smart invocation scripts exist in the project
-      expect(existsSync(join(PROJECT_DIR, 'scripts', 'pre-skill-bridge.js'))).toBe(true);
       expect(existsSync(join(PROJECT_DIR, 'scripts', 'user-prompt-search.js'))).toBe(true);
       expect(existsSync(join(PROJECT_DIR, 'scripts', 'prompt-search-utils.mjs'))).toBe(true);
       expect(existsSync(join(PROJECT_DIR, 'scripts', 'pre-tool-recall.js'))).toBe(true);
@@ -481,12 +523,35 @@ describe('E2E: Version consistency across all manifests', () => {
     const pkg = readJson('package.json');
     const plugin = readJson('.claude-plugin/plugin.json');
     const marketplace = readJson('.claude-plugin/marketplace.json');
-    const claudeMd = readFileSync('CLAUDE.md', 'utf8');
 
     const version = pkg.version;
     expect(plugin.version).toBe(version);
     expect(marketplace.plugins[0].version).toBe(version);
-    expect(claudeMd).toContain(`**Version**: ${version}`);
+
+    // CLAUDE.md is developer-local and untracked (it is in .gitignore), so a fresh
+    // clone — CI included — does not have it. The three SHIPPED manifests above are
+    // checked unconditionally; the CLAUDE.md leg only runs where a REAL one exists.
+    //
+    // "Exists" is not the right predicate, and plain existsSync was measured wrong:
+    // this plugin's own SessionStart adopt hook RECREATES CLAUDE.md within seconds of
+    // it going missing, writing a file that holds nothing but the managed block. So on
+    // any adopted machine the file is present again almost immediately, carries no
+    // `**Version**:` line, and an existence check turns that into a hard failure for a
+    // developer who never touched the version at all.
+    //
+    // The predicate is therefore "is there project content OUTSIDE the managed
+    // sentinel blocks" — true for a real CLAUDE.md, false for an adopt-generated stub.
+    // Deliberately NOT a silent skip: this repo's doctrine is that a case which cannot
+    // fail is not a case, and this assertion has already caught a real defect (a
+    // reformat that dropped the literal `**Version**:` token). Where a real file is
+    // present the check is exactly as strict as before.
+    const claudeMd = existsSync('CLAUDE.md') ? readFileSync('CLAUDE.md', 'utf8') : '';
+    const outsideManagedBlocks = claudeMd
+      .replace(/<!--\s*[\w-]+:begin[^>]*-->[\s\S]*?<!--\s*[\w-]+:end\s*-->/g, '')
+      .trim();
+    if (outsideManagedBlocks) {
+      expect(claudeMd).toContain(`**Version**: ${version}`);
+    }
   });
 
   it('npm package includes all necessary files for publishing', () => {
@@ -507,16 +572,13 @@ describe('E2E: Version consistency across all manifests', () => {
     expect(files).toContain('hooks/hooks.json');
 
     // Smart invocation scripts
-    expect(files).toContain('scripts/pre-skill-bridge.js');
     expect(files).toContain('scripts/pre-agent-inject.js');
     expect(files).toContain('scripts/user-prompt-search.js');
     expect(files).toContain('scripts/prompt-search-utils.mjs');
     expect(files).toContain('scripts/pre-tool-recall.js');
 
-    // Registry + CLI
+    // CLI
     expect(files).toContain('mem-cli.mjs');
-    expect(files).toContain('registry.mjs');
-    expect(files).toContain('registry-retriever.mjs');
   });
 });
 
@@ -530,17 +592,17 @@ describe('E2E: Install prune stale modules and zero-byte DBs (v2.48 P1-4)', () =
     try {
       // Simulate a post-v2.20 install: dispatch-* removed from SOURCE_FILES but
       // leftover on disk. Mix of real + stale + protected.
-      writeFileSync(join(tmpDir, 'server.mjs'), 'real');        // in SOURCE_FILES
-      writeFileSync(join(tmpDir, 'hook.mjs'), 'real');          // in SOURCE_FILES
-      writeFileSync(join(tmpDir, 'dispatch.mjs'), 'stale');     // NOT in SOURCE_FILES
+      writeFileSync(join(tmpDir, 'server.mjs'), 'real'); // in SOURCE_FILES
+      writeFileSync(join(tmpDir, 'hook.mjs'), 'real'); // in SOURCE_FILES
+      writeFileSync(join(tmpDir, 'dispatch.mjs'), 'stale'); // NOT in SOURCE_FILES
       writeFileSync(join(tmpDir, 'dispatch-feedback.mjs'), 'stale');
       writeFileSync(join(tmpDir, 'dispatch-inject.mjs'), 'stale');
       writeFileSync(join(tmpDir, 'dispatch-workflow.mjs'), 'stale');
-      writeFileSync(join(tmpDir, 'README.txt'), 'non-mjs');     // not .mjs — don't touch
-      writeFileSync(join(tmpDir, 'package.json'), '{}');        // in SOURCE_FILES
+      writeFileSync(join(tmpDir, 'README.txt'), 'non-mjs'); // not .mjs — don't touch
+      writeFileSync(join(tmpDir, 'package.json'), '{}'); // in SOURCE_FILES
 
       const removed = pruneStaleInstallFiles(tmpDir, SOURCE_FILES);
-      const removedNames = removed.map(r => r.split('/').pop()).sort();
+      const removedNames = removed.map((r) => r.split('/').pop()).sort();
       expect(removedNames).toEqual([
         'dispatch-feedback.mjs',
         'dispatch-inject.mjs',
@@ -574,7 +636,7 @@ describe('E2E: Install prune stale modules and zero-byte DBs (v2.48 P1-4)', () =
       writeFileSync(join(tmpDir, 'ghost.db'), 'oops-data');
 
       const removed = pruneStaleInstallFiles(tmpDir, SOURCE_FILES);
-      const removedNames = removed.map(r => r.split('/').pop()).sort();
+      const removedNames = removed.map((r) => r.split('/').pop()).sort();
       expect(removedNames).toEqual(['mem.db', 'memory.db', 'registry.db']);
 
       // Whitelist intact, non-empty stale preserved
@@ -642,16 +704,18 @@ describe('E2E: Migration from older versions', () => {
       mkdirSync(oldDir, { recursive: true });
       writeFileSync(join(oldDir, 'claude-mem.db'), 'fake-legacy-db');
 
-      const output = runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+      const output = runInstall('install', home, ['--dev', '--skip-repos'], {
+        PATH: `${binDir}:${process.env.PATH}`,
+      });
       expect(output).toMatch(/backed up|backup/i);
 
       const newDir = join(home, '.claude-mem-lite');
       // Legacy DB must NOT be reused as the new DB — schema is incompatible.
       expect(existsSync(join(newDir, 'claude-mem-lite.db'))).toBe(false);
       // A timestamped backup must exist for recovery.
-      const backups = readdirSync(newDir).filter(f => f.includes('legacy-backup'));
+      const backups = readdirSync(newDir).filter((f) => f.includes('legacy-backup'));
       expect(backups.length).toBeGreaterThan(0);
-      expect(backups.some(f => /^claude-mem-lite\.db\.legacy-backup-\d+$/.test(f))).toBe(true);
+      expect(backups.some((f) => /^claude-mem-lite\.db\.legacy-backup-\d+$/.test(f))).toBe(true);
       // Legacy file moved (renamed), not copied.
       expect(existsSync(join(oldDir, 'claude-mem.db'))).toBe(false);
     } finally {
@@ -668,12 +732,111 @@ describe('E2E: Migration from older versions', () => {
       mkdirSync(dataDir, { recursive: true });
       writeFileSync(join(dataDir, 'claude-mem.db'), 'old-name-db');
 
-      const output = runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+      const output = runInstall('install', home, ['--dev', '--skip-repos'], {
+        PATH: `${binDir}:${process.env.PATH}`,
+      });
       expect(output).toContain('renamed');
 
       expect(existsSync(join(dataDir, 'claude-mem-lite.db'))).toBe(true);
       expect(existsSync(join(dataDir, 'claude-mem.db'))).toBe(false);
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('E2E: plugin-cache launch.mjs sync is version-gated (R10-P2-11)', () => {
+  // The reproduction lives in tests/sandbox/phaseB-npm.mjs §B9 and needs a real `npm i -g`,
+  // so it is not in `vitest run`. This drives the same function directly so a revert is
+  // caught in CI rather than at the next manual harness run — the harness is the reason
+  // this defect existed for releases, not the reason it will be caught.
+  //
+  // What it guards: install used to copy ITS OWN scripts/launch.mjs into every cached
+  // version dir. Entry point and library are versioned together, so an old dir then ran
+  // HEAD's launch.mjs against its own lib/ — HEAD destructures `nativeBindingRepairHint`,
+  // which v3.95.0's binding-probe does not export, and the swallowed TypeError takes the
+  // user's repair hint with it.
+  const OLD_VER = '3.95.0';
+  const SENTINEL = (v) => `// CACHE-SENTINEL ${v}\n`;
+
+  async function seedCache(home) {
+    const { MARKETPLACE_KEY } = await import('../lib/plugin-key.mjs');
+    const selfVersion = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8')).version;
+    // The whole block is inside `if (existsSync(pluginDir))` — without the marketplace
+    // clone this test would pass by never running the code it claims to guard.
+    mkdirSync(join(home, '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY), { recursive: true });
+    const cacheBase = join(home, '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
+    for (const ver of [OLD_VER, selfVersion]) {
+      mkdirSync(join(cacheBase, ver, 'scripts'), { recursive: true });
+      writeFileSync(join(cacheBase, ver, 'scripts', 'launch.mjs'), SENTINEL(ver));
+      writeFileSync(join(cacheBase, ver, 'scripts', 'launch-preflight.mjs'), SENTINEL(ver));
+    }
+    return { cacheBase, selfVersion };
+  }
+
+  const readLaunch = (cacheBase, ver) => readFileSync(join(cacheBase, ver, 'scripts', 'launch.mjs'), 'utf8');
+
+  it('a non-dev install syncs only the matching version dir', async () => {
+    const { dedupePluginCacheAndHooks } = await import('../install.mjs');
+    const home = makeTmpDir();
+    const realHome = process.env.HOME;
+    try {
+      const { cacheBase, selfVersion } = await seedCache(home);
+      process.env.HOME = home;
+      dedupePluginCacheAndHooks({ managedHooks: true, isDev: false });
+
+      expect(readLaunch(cacheBase, OLD_VER)).toContain(`CACHE-SENTINEL ${OLD_VER}`);
+      expect(readLaunch(cacheBase, selfVersion)).not.toContain('CACHE-SENTINEL');
+      // The sync is not merely skipped for old dirs — the file it writes is the real one.
+      expect(readLaunch(cacheBase, selfVersion)).toBe(
+        readFileSync(join(PROJECT_DIR, 'scripts', 'launch.mjs'), 'utf8'),
+      );
+    } finally {
+      process.env.HOME = realHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('dev mode still syncs every version dir (issue #15 keeps working)', async () => {
+    const { dedupePluginCacheAndHooks } = await import('../install.mjs');
+    const home = makeTmpDir();
+    const realHome = process.env.HOME;
+    try {
+      const { cacheBase, selfVersion } = await seedCache(home);
+      process.env.HOME = home;
+      dedupePluginCacheAndHooks({ managedHooks: true, isDev: true });
+
+      expect(readLaunch(cacheBase, OLD_VER)).not.toContain('CACHE-SENTINEL');
+      expect(readLaunch(cacheBase, selfVersion)).not.toContain('CACHE-SENTINEL');
+    } finally {
+      process.env.HOME = realHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('no cached version dir ends up calling an export its own lib lacks', async () => {
+    // The behavioural statement of the defect, independent of how the gate is spelled.
+    const { dedupePluginCacheAndHooks } = await import('../install.mjs');
+    const home = makeTmpDir();
+    const realHome = process.env.HOME;
+    try {
+      const { cacheBase } = await seedCache(home);
+      mkdirSync(join(cacheBase, OLD_VER, 'lib'), { recursive: true });
+      writeFileSync(
+        join(cacheBase, OLD_VER, 'lib', 'binding-probe.mjs'),
+        'export function ensureBetterSqlite3Working() {}\nexport function probeBindingInFreshProcess() {}\n',
+      );
+      process.env.HOME = home;
+      dedupePluginCacheAndHooks({ managedHooks: true, isDev: false });
+
+      const launch = readLaunch(cacheBase, OLD_VER);
+      const probe = readFileSync(join(cacheBase, OLD_VER, 'lib', 'binding-probe.mjs'), 'utf8');
+      const missing = ['nativeBindingRepairHint', 'ensureBetterSqlite3Working'].filter(
+        (sym) => launch.includes(sym) && !probe.includes(`export function ${sym}`),
+      );
+      expect(missing).toEqual([]);
+    } finally {
+      process.env.HOME = realHome;
       rmSync(home, { recursive: true, force: true });
     }
   });

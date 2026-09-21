@@ -8,7 +8,7 @@
 //
 //   - eslint listed `scripts/**` in its `ignores`, so 4470 lines across 17 files
 //     were never linted at all — five of them (post-tool-use, pre-agent-inject,
-//     pre-tool-recall, pre-skill-bridge, user-prompt-search) fire on every hook
+//     pre-tool-recall, user-prompt-search) fire on every hook
 //     event in production.
 //   - knip DOES scan the directory, but knip.json lists `scripts/*.{mjs,js}` as
 //     ENTRY points, and an entry point's exports are exempt from the
@@ -39,7 +39,9 @@ const ROOT = resolve(new URL('..', import.meta.url).pathname);
 const SCRIPTS_DIR = join(ROOT, 'scripts');
 
 function scriptsMatching(re) {
-  return readdirSync(SCRIPTS_DIR).filter(f => re.test(f)).sort();
+  return readdirSync(SCRIPTS_DIR)
+    .filter((f) => re.test(f))
+    .sort();
 }
 
 test('eslint lints every JS file under scripts/ — the directory is not ignored', async () => {
@@ -86,11 +88,12 @@ test('every shipped shell script under scripts/ is in the ci.yml shellcheck comm
   // Anchored to a line that ACTUALLY RUNS: a bare `.includes('run: shellcheck')` also
   // matches the same text commented out, so replacing the step with `run: echo skipping`
   // and leaving the original as a `#` comment kept this green (post-release review).
-  const runLine = ci.split('\n')
-    .map(l => l.trim())
-    .find(l => !l.startsWith('#') && l.startsWith('run: shellcheck'));
+  const runLine = ci
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => !l.startsWith('#') && l.startsWith('run: shellcheck'));
   expect(runLine, 'ci.yml has no active `run: shellcheck` step').toBeTruthy();
 
-  const missing = shFiles.filter(f => !runLine.includes(`scripts/${f}`));
+  const missing = shFiles.filter((f) => !runLine.includes(`scripts/${f}`));
   expect(missing).toEqual([]);
 });

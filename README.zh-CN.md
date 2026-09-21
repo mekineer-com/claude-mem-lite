@@ -2,9 +2,9 @@
 
 # claude-mem-lite
 
-`claude-mem-lite` 是 **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**（Anthropic 官方 CLI 编程代理）的 **持久化记忆系统**（也称 **长期记忆 / 跨会话上下文 / Claude Code 记忆插件**）。它以 **[MCP](https://modelcontextprotocol.io/) 服务器** + Claude Code 钩子（hooks）的形式运行，在编码会话中自动捕获观察记录、决策、bug 修复，并通过 FTS5 全文检索 + TF-IDF 向量的混合检索召回历史上下文。
+`claude-mem-lite` 是 **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**（Anthropic 官方 CLI 编程代理）的 **持久化记忆系统**（也称 **长期记忆 / 跨会话上下文 / Claude Code 记忆插件**）。它以 **[MCP](https://modelcontextprotocol.io/) 服务器** + Claude Code 钩子（hooks）的形式运行，在编码会话中自动捕获观察记录、决策、bug 修复，并通过 FTS5 全文检索（BM25 + 查询扩展）召回历史上下文。
 
-与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本估算下降约 600 倍 —— 见下方成本模型，属架构估算而非实测基准）；FTS5 + TF-IDF 混合检索在 30 个查询的基准上达到 **Recall@10 = 0.90 / Precision@10 = 0.85**（复现命令见[搜索质量](#搜索质量)一节）。
+与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本估算下降约 600 倍 —— 见下方成本模型，属架构估算而非实测基准）；FTS5 检索在 30 个查询的基准上达到 **Recall@10 = 0.90 / Precision@10 = 0.85**（复现命令见[搜索质量](#搜索质量)一节）。
 
 无需外部服务。单一 SQLite 数据库。开销极低。
 
@@ -54,7 +54,7 @@
 
 ## 功能特性
 
-- **自动捕获** -- 挂载到 Claude Code 生命周期（PostToolUse、PreToolUse、SessionStart、Stop、UserPromptSubmit），无需手动操作即可记录观察
+- **自动捕获** -- 挂载到 Claude Code 生命周期（`hooks/hooks.json` 里的七个事件：SessionStart、PreCompact、PreToolUse、PostToolUse、PostToolUseFailure、Stop、UserPromptSubmit），无需手动操作即可记录观察
 - **FTS5 搜索** -- 基于 BM25 排名的全文搜索，覆盖观察、会话摘要和用户提示，支持重要度加权
 - **时间线浏览** -- 基于锚点的时间上下文窗口，按时间顺序浏览观察
 - **Episode 批处理** -- 将相关文件操作分组为连贯的 episode，再进行 LLM 编码
@@ -81,18 +81,13 @@
 - **原子写入** -- 所有文件写入（episode、CLAUDE.md）使用 write-to-tmp + rename 防止崩溃时损坏
 - **健壮锁机制** -- PID 感知的锁文件，自动清理过期（>30s）或孤儿（PID 已死）锁
 - **过期会话清理** -- 活跃超过 24 小时的会话在下次启动时自动标记为 abandoned
-- **智能调用** -- 三层调用系统：L1 自动加载（UserPromptSubmit 匹配 skill 名注入内容 + `Read()` 路径），L2 Bridge（PreToolUse 拦截 `Skill()` 误调），L3 显式调用（`mem_use` MCP 工具）。managed 资源用 `Read("~/.claude-mem-lite/managed/.../SKILL.md")`，原生插件用 `Skill("full:name")`
-- **资源注册表** -- 对已安装的 skill 和 agent 建立 FTS5 索引，支持复合评分和调用追踪。搜索结果区分 managed（Read 路径）vs native（Skill 全名）调用方式
-- **统一资源发现** -- 共享文件系统遍历层（`resource-discovery.mjs`），运行时扫描器和离线索引器共用，支持扁平目录、插件嵌套和松散 `.md` 文件
-- **领域同义词扩展** -- 注册表搜索查询自动扩展领域同义词（如 "修复" → fix, debug, bugfix, repair, error）
-- **持久化冷却机制** -- 5 分钟跨会话冷却 + 同会话去重，避免重复推荐 skill 自动加载
+- **领域同义词扩展** -- 搜索查询自动扩展领域同义词（如 "修复" → fix, debug, bugfix, repair, error）
 - **多 provider LLM 调用** -- provider 优先级 `ANTHROPIC_API_KEY`（直连 Anthropic API）→ `OPENROUTER_API_KEY`（OpenRouter，OpenAI 兼容，可用 `OPENROUTER_MODEL` 指向任意模型）→ 无 key 时回退 `claude -p` CLI
 - **Haiku 熔断器** -- 连续 3 次 LLM 失败后，禁用 Haiku 调度 5 分钟，防止级联延迟
 - **否定意图感知** -- 正确处理 "不要测试了，先修 bug" 等复杂提示，排除被否定的意图，支持中英文混合输入
 - **可配置 LLM 模型** -- 通过 `CLAUDE_MEM_MODEL` 环境变量在 Haiku（快速/低成本）和 Sonnet（深度分析）之间切换
 - **数据库自动恢复** -- 启动时检测并清理损坏的 WAL/SHM 文件；定期 WAL checkpoint 防止无限增长
 - **Schema 自动迁移** -- 每次启动运行幂等的 `ALTER TABLE` 迁移，安全地添加新列和索引，不丢失数据
-- **探索奖励** -- 注册表中的新资源在复合排名中获得公平机会；高推荐零采纳的"僵尸"资源被惩罚
 - **LLM 并发控制** -- 基于文件的信号量将后台 worker 限制为 2 个并发 LLM 调用，防止资源争用
 - **stdin 溢出保护** -- Hook 输入在 256KB 处截断，对超大工具输出使用正则挽救关键信息
 - **跨会话交接** -- 在 `/clear` 或 `/exit` 时捕获会话状态（请求、已完成工作、后续步骤、关键文件），下次会话检测到继续意图时自动注入上下文（支持显式关键词和 FTS5 术语重叠匹配）
@@ -105,16 +100,22 @@
 
 | 平台 | 状态 | 说明 |
 |------|------|------|
-| **Linux** | 支持 | 主要开发和测试平台 |
+| **Linux** | 支持 | 主要开发和测试平台；整个 CI 矩阵都跑在这里 |
 | **macOS** | 支持 | 完全兼容（Intel 和 Apple Silicon） |
-| **Windows** | 暂不支持 | 使用 POSIX shell 脚本（`post-tool-use.sh`、`setup.sh`）和 Unix 文件锁；WSL2 可能可用但未经测试 |
+| **Windows** | 可安装，但无 CI 覆盖 | MCP server、CLI 和 `node` 类 hook 均可用（`better-sqlite3` 自带 `win32-x64` / `win32-arm64` 预编译产物，无需编译）。**有三个 hook 命令走 `bash`** —— `setup.sh`、`post-tool-use.sh`、`pre-agent-inject.sh` —— 需要 PATH 上有 Git for Windows 或 WSL；`bash` 找不到时 `claude-mem-lite doctor` 会报出来。GitHub Actions 没有 Windows runner，所以这一行依据的是用户报告（[#28](https://github.com/sdsrss/claude-mem-lite/issues/28)）而不是绿色流水线 |
+| **WSL2** | 未测试 | 底层就是 Linux，预期与 Linux 行一致；但无人报告过实际结果 |
+
+v5.1.0 到 v6.1.0 之间，`package.json` 声明的是 `os: ["darwin", "linux"]`。那是 npm 的**安装**门禁，不是运行时检查：
+在 Windows 上它让 `npm install` 以 `EBADPLATFORM` 退出，而插件启动器每次插件更新后的首次 MCP 启动都要跑这条
+安装 —— 于是 server 起不来，`/mcp` 报 `CONNECTION_CLOSED`。现在 `win32` 已加入该列表。仍不在列表内的平台会拿到
+一条同时点明“声明了什么”和“当前是什么”的消息，而不是一句猜测。
 
 ## 环境要求
 
-- **Node.js** >= 18
+- **Node.js** >= 22（v4.0.0 起：better-sqlite3 13 要求 >=22，Node 20 已于 2026-04 EOL；`package.json` 的 `engines` 是唯一事实来源）
 - **Claude Code** CLI 已安装并配置（`claude` 命令可用）
-- **SQLite3** 支持（由 `better-sqlite3` 提供，安装时编译）
-- **平台**：Linux 或 macOS（参见[平台支持](#平台支持)）
+- **SQLite3** 支持（由 `better-sqlite3` 13 提供，它自带 8 个平台的预编译产物，这些平台上都不需要编译器；没有对应预编译产物的平台才会回退到源码编译）
+- **平台**：Linux 或 macOS；Windows 可安装运行，但无 CI 覆盖，且三个 hook 需要 Git Bash 或 WSL（参见[平台支持](#平台支持)）
 
 ## 安装
 
@@ -150,13 +151,13 @@ node install.mjs install
 ### 安装过程
 
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
-2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 20 个工具（9 个核心通过 `tools/list` 暴露 + 11 个隐藏但可调；完整表见 Usage 段）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
+2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 19 个工具（10 个核心通过 `tools/list` 暴露 + 9 个隐藏但可调；完整表见 Usage 段）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
 
 > **自动 adopt 会写进你的项目，且每次 SessionStart 都跑（v3.13+）。** 插件向**项目自己的 `<cwd>/CLAUDE.md`**（通常是会进 git 的文件）写入一个 slug 限定的**托管块**，外加 `<cwd>/.claude/plugin_claude_mem_lite.md` 详情文件。该块是一条提升 Claude 主动调用 `mem_recall` / `mem_save` 的 system-authority 指针；块以外的内容逐字保留，也能与其它插件的块共存于同一文件。这是**每次** SessionStart 都做的幂等同步，不只是第一次——块被删掉会重新写回，出货模板变了会刷新。**任何安装路径都生效**（npm、npx、`/plugin`、手动），**无需再手动跑 `/adopt`**。
 >
 > 关闭方式：项目级 `claude-mem-lite adopt --disable`（重新启用用 `--enable`）；全局 `export MEM_NO_AUTO_ADOPT=1`；只冻结模板刷新用 `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`。`claude-mem-lite unadopt` 可移除托管块与详情文件。手动 `/adopt` 仍保留用于编辑后重写或 `--all` 批量场景。
-3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
-4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库、运行时和托管资源文件
+3. **配置钩子** -- 全部七个生命周期事件：`SessionStart`、`PreCompact`、`PreToolUse`、`PostToolUse`、`PostToolUseFailure`、`Stop`、`UserPromptSubmit`
+4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库与运行时文件
 5. **自动迁移** -- 自动检测 `~/.claude-mem/`（原版 claude-mem）或 `~/claude-mem-lite/`（v0.5 前的非隐藏目录），将数据库和运行时文件迁移到 `~/.claude-mem-lite/`，原目录保持不变
 6. **初始化数据库** -- SQLite WAL 模式，FTS5 索引在服务器首次启动时创建
 
@@ -188,39 +189,118 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 ```
 ~/.claude-mem-lite/
   claude-mem-lite.db       # SQLite 数据库 — 记忆（WAL 模式）
-  resource-registry.db     # SQLite 数据库 — skill/agent 注册表
   runtime/
     session-<project>    # 活跃会话状态
     ep-<project>.json    # Episode 缓冲区
     ep-flush-*.json      # 已刷新的 episode，等待处理
     reads-<project>.txt  # Read 文件路径（刷新时收集）
   managed/
-    skills/              # 独立 skill：{name}/SKILL.md
-    agents/              # Agent 插件：{group}/agents/{name}.md + skills/*/SKILL.md
     repos/               # 浅克隆的源代码仓库
 ```
+
+<!-- normalize-per-project-note:start -->
+## 升级到 6.8.0
+
+**升级后有两处变化，都不需要你做什么，也都不是 schema 变更——旧版本仍能打开这个数据库。**
+
+*第一次开库会做一次性回填。* 6.7.2 之前从 transcript 导入的观察，带着「修改过的文件」列表，
+却没有在文件召回所 JOIN 的联结表里留下行，所以按文件去问永远找不到它们。原来的修复门是
+「这张表完全为空」——任何一次正常的 `mem_save` 都会让它永久为假。现在它按自己的标记每个库跑
+一次，失败则下次开库重试。从没跑过 `import-jsonl` 的库匹配不到任何行，代价为零。
+
+这些行会经 `recall` / `mem_recall` 和 UserPromptSubmit 这条路变得可达。两个边界，都是实测的：
+
+- **不会**经 pre-tool 召回钩子变得可达——那条腿只收 `importance >= 2`，而导入的行一律是 `1`。
+- **不覆盖 6.7.2 之前导入的 `NotebookEdit` 行**。它们当时存下来的「修改过的文件」列表是空的
+  （那时的导入器读 `file_path`，而 `NotebookEdit` 给的是 `notebook_path`），而回填按该列非空
+  筛选，于是跳过它们。这一部分要靠重新导入该 transcript 来恢复——6.7.2 把路径写进了去重键所用的
+  标题，重导才开始有效。
+
+*`doctor --json` 的输出形状变了。* 带修复命令的检查项现在把命令放在 `details` 数组里——此前
+人类界面拿到命令、JSON 界面只拿到诊断。另外四个检查项（dev drift、managed files、hook 脚本的
+两条）现在报 `"level": "fail"`，此前报 `"warn"`，并新增 `"glyph": "warn"` 记录它们在屏幕上
+仍渲染为 ⚠ 而非 ✗。它们一直都计入 issue 总数和退出码，现在 level 与之一致。如果你按
+`level === "fail"` 过滤，会多看到四条此前漏掉的发现。`issues` 计数、摘要行和退出码不变。
+
+## 升级到 6.1.0
+
+**只有一个默认行为改变，且只影响每日后台任务。** 6.1.0 之前，无人值守的 `normalize` 会一次性
+读取**所有项目**的概念词表，作为一个列表发给模型，再把答案写回每个项目——于是一个项目存储的内容
+可以左右应用到另一个不相干项目行上的同义词分组。现在它按项目逐个跑独立的一趟。
+
+| | 6.1.0 之前 | 6.1.0 |
+|---|---|---|
+| 无人值守 `normalize` | 一趟扫全部项目的词表 | 每项目一趟，单次运行最多 8 个，轮转 |
+| 跨项目同义词统一 | 自动进行 | 不再发生 |
+| 不带 `--project` 的 `optimize --run --task normalize` | 一趟跨项目 | 同样扇出 |
+
+**你可能会注意到：** 一个项目里的 `k8s` 和另一个项目里的 `kubernetes` 不再被每日任务合并。
+没有任何数据被删除，没有行被移动到别的项目，检索行为也不变——变的只是后台任务会统一哪些词。
+
+**这个修复是单向的。** 早先跨项目运行已经统一过的词不会被还原。被替换掉的原词会作为搜索别名
+保留在该行上，所以那些行仍然能用旧写法搜到；但没有任何记录能说明哪一次统一来自别的项目。
+
+**想保留旧行为：** 设置 `CLAUDE_MEM_NORMALIZE_CROSS_PROJECT=1`。它恢复的是跨项目的**作用域**，
+而这个作用域正是它交出去的那道防线。本次新增的另外两项检查（概念词的形状门、以及「模型的答案
+只能使用语料中本就存在的词」）在该路径上确实仍然生效，但后者此时是拿**全部项目词表的并集**来判定的，
+因此它不再能阻止一个项目的词进入另一个项目的行。只有当你确实需要跨项目统一、并且信任库中每个项目
+的内容时才设置它。前台的 `optimize` 运行在该标志被设置时会打印警告；`claude-mem-lite doctor`
+会把它报成 ⚠——每日任务跑在一个 stderr 已关闭的 worker 里，它自己无法告诉你。
+<!-- normalize-per-project-note:end -->
+
+<!-- vector-arm-removal-note:start -->
+## 升级到 6.0.0（破坏性变更）
+
+**默认检索路径不变。** 6.0.0 移除了 TF-IDF 向量臂——它自 3.17.0 起就默认关闭，如果你从未设置过
+CLAUDE_MEM_VECTORS，升级前后行为完全一致，无需任何操作。
+
+三个面被移除：
+
+| 移除项 | 现在的行为 |
+|---|---|
+| `CLAUDE_MEM_VECTORS=1` | 失效。设置它不再有任何作用。 |
+| `maintain execute --ops rebuild_vectors` | 退出码 1：`Unknown operation(s): rebuild_vectors`。 |
+| `observation_vectors`、`vocab_state` 两张表 | 由 schema 迁移 v49 在首次打开时 DROP。 |
+
+**这个迁移是单向的。** 一旦 6.0.0 打开过你的数据库，旧版本就会拒绝它——`schema.mjs` 的
+forward-incompat 守卫会抛出 *"DB schema is v49 but this claude-mem-lite binary supports up to
+v48"*。想继续用向量臂，请在**升级之前**锁定 `claude-mem-lite@5.6.0`；如果已经升级又需要回退，
+只能重新升级、把 `CLAUDE_MEM_DIR` 指向一个新目录，或从升级前的备份恢复
+（`claude-mem-lite export` 或数据目录下的快照）。
+
+移除原因：直接对着出货路径实测，该臂在两个基准语料上都是负的——包括「词表不匹配」这个向量臂唯一
+的存在理由（Recall@10 0.3407 → 0.3018，P95 延迟约 +88%）。观察记录不会丢失，丢的只是派生的向量索引。
+<!-- vector-arm-removal-note:end -->
 
 ## 使用方法
 
 ### MCP 工具
 
-v2.34.0 起服务端注册 17 个工具，但 `tools/list` 只暴露 6 个 **核心** 工具；其余
-11 个 **隐藏** 工具仍然注册在 MCP 层（按名 `tools/call` 仍命中），只是不会出现
-在列表响应里，以避免 Claude Code 会话启动时加载 11 份额外的工具 schema。隐藏
-工具走下面表格的 CLI 入口。
+v2.34.0 起服务端只把一部分工具暴露给 `tools/list`。当前是 19 个工具，其中 10 个
+**核心** 工具出现在列表里，另外 9 个 **隐藏** 工具仍然注册在 MCP 层（按名
+`tools/call` 仍命中），只是不出现在列表响应里，以避免 Claude Code 会话启动时
+多加载 9 份工具 schema。隐藏工具走下面表格的 CLI 入口。
 
-**核心（6 个，暴露给 Claude Code）**
+（这里长期写着 17 / 6 / 11，而英文 README 写着 20 / 9 / 11 —— 两个都不对。
+`tool-schemas.mjs` 是唯一事实来源，`tests/tool-count-docs.test.mjs` 现在把两份
+README 和 `docs/ARCHITECTURE.md` 都钉在它上面。）
+
+**核心（10 个，暴露给 Claude Code）**
 
 | 工具 | 描述 |
 |------|------|
 | `mem_search` | 基于 BM25 排名的 FTS5 全文搜索。支持按类型、项目、日期范围、重要度过滤。 |
+| `mem_search_feedback` | 为带 Search ID 的搜索结果记录稀疏相关性标签。 |
 | `mem_recent` | 显示最近的观察，按时间排序。快速查看最新活动。 |
 | `mem_recall` | 召回与文件相关的观察。编辑文件前使用，回顾过去的修复和上下文。 |
 | `mem_timeline` | 围绕锚点按时间顺序浏览观察。 |
 | `mem_get` | 获取指定观察 ID 的完整详情（包含重要度和关联 ID）。 |
 | `mem_save` | 手动保存记忆/观察。 |
+| `mem_defer` | 记录一条跨会话待办（deferred work）。 |
+| `mem_defer_list` | 列出当前项目未关闭的待办。 |
+| `mem_defer_drop` | 带理由地关闭一条待办。 |
 
-**隐藏但可按名调用（11 个，走 CLI）**
+**隐藏但可按名调用（9 个，走 CLI）**
 
 | 工具 | 对应 CLI | 说明 |
 |------|----------|------|
@@ -228,13 +308,11 @@ v2.34.0 起服务端注册 17 个工具，但 `tools/list` 只暴露 6 个 **核
 | `mem_stats` | `claude-mem-lite stats` | 计数、类型分布、每日活动。 |
 | `mem_delete` | `claude-mem-lite delete <id>` | 预览 / 确认流程，FTS5 自动清理。 |
 | `mem_compress` | `claude-mem-lite compress` | 压缩旧的低价值观察（默认 preview；`--execute` 执行）。 |
-| `mem_maintain` | `claude-mem-lite maintain scan --ops dedup,decay` | 去重 / decay / 清理 / 向量重建（`scan` 预览，`execute` 执行）。 |
+| `mem_maintain` | `claude-mem-lite maintain scan --ops dedup,decay` | 去重 / decay / 清理 / vacuum（`scan` 预览，`execute` 执行）。 |
 | `mem_optimize` | `claude-mem-lite optimize` | LLM 深度优化：re-enrich / normalize / cluster-merge（默认 preview；`--run` 执行）。 |
 | `mem_export` | `claude-mem-lite export` | JSON / JSONL 导出，支持项目/类型/日期过滤。 |
 | `mem_fts_check` | `claude-mem-lite fts-check <check\|rebuild>` | FTS5 完整性检查与重建。 |
 | `mem_browse` | `claude-mem-lite browse` | 分层仪表盘（working / active / archive）。 |
-| `mem_registry` | `claude-mem-lite registry <action>` | 列 / 搜索 / 导入 / 移除 skill / agent。 |
-| `mem_use` | _MCP only_ | 从 registry 按名载入 skill / agent。 |
 
 ### 技能命令（在 Claude Code 聊天中使用）
 
@@ -370,17 +448,9 @@ PostToolUse（每次工具执行）
   -> 为有意义的 episode 启动 LLM episode worker
   -> 错误触发回忆：搜索记忆中相关的历史修复
 
-PreToolUse（工具执行前）
-  -> L2 Skill Bridge：拦截对 managed 资源的 Skill() 调用
-     -> 匹配 managed 路径 → 输出内容 + mem_use() 提示
-     -> 未匹配 → 静默放行到原生 handler
-
 UserPromptSubmit（两个并行路径）
   -> [user-prompt-search.js] 通过 FTS5 + 活跃文件上下文自动搜索记忆
   -> [user-prompt-search.js] 注入相关历史观察（按时效和重要性加权）
-  -> [user-prompt-search.js] L1 Skill 自动加载：匹配 prompt 中的 managed skill 名
-     -> 加载内容 + 便携 ~ 路径 + Read() 调用指引
-     -> source="managed-skill|managed-agent", path="~/.claude-mem-lite/managed/..."
   -> [hook.mjs] 捕获用户提示文本到 user_prompts 表
   -> [hook.mjs] 递增会话提示计数器
   -> [hook.mjs] 交接：检测继续意图 → 注入上一次会话上下文
@@ -392,36 +462,6 @@ Stop
   -> 标记会话为已完成
   -> 启动 LLM 摘要 worker（轮询等待）
 ```
-
-### 智能调用系统
-
-三层调用系统确保 managed 资源（`~/.claude-mem-lite/managed/` 中的 skill 和 agent）能被正确调用：
-
-```
-L1 自动加载（UserPromptSubmit，<50ms）
-  -> 匹配 prompt 中的 managed skill/agent 名称
-  -> 加载 SKILL.md / {name}.md 内容
-  -> 输出：Read("~/.claude-mem-lite/managed/.../path.md") 调用指引
-  -> 截断时提供 mem_use(name="...") 备选
-
-L2 Bridge（PreToolUse Skill hook，<30ms）
-  -> 拦截 Skill("name") 调用，查询 managed 注册表
-  -> 匹配到 → 输出内容 + mem_use() 提示（防止原生 handler 报错）
-  -> 未匹配 → 放行到原生 Skill handler
-
-L3 显式调用（mem_use MCP 工具）
-  -> 按名称精确匹配 + FTS5 模糊回退
-  -> 返回完整内容 + 便携路径供 Read() 重载
-```
-
-**调用方式区分：**
-
-| 资源类型 | 位置 | 调用方式 |
-|---------|------|---------|
-| Managed skill | `~/.claude-mem-lite/managed/skills/` | `Read("~/.../SKILL.md")` 或 `mem_use(name="...")` |
-| Managed agent | `~/.claude-mem-lite/managed/agents/` | `Read("~/.../{name}.md")` 或 `mem_use(name="...", type="agent")` |
-| 原生插件 skill | `~/.claude/plugins/cache/` | `Skill("plugin:skill-name")` |
-| 用户自建 skill | `~/.claude/skills/` | `Skill("name")` |
 
 ### Episode 编码
 
@@ -445,7 +485,8 @@ node install.mjs install              # 安装并配置
 node install.mjs uninstall            # 移除（保留数据）
 node install.mjs uninstall --purge    # 移除并删除所有数据
 node install.mjs status               # 显示当前状态
-node install.mjs doctor               # 诊断问题
+node cli.mjs doctor                   # 诊断问题（用 cli.mjs 而非 install.mjs，见下方说明）
+node cli.mjs repair                   # 从最新签名发布恢复损坏的安装
 node install.mjs cleanup-hooks        # 只清理 settings.json 中残留的 claude-mem-lite hooks
 node install.mjs update               # 强制检查并安装更新（direct install / npx 模式）
 
@@ -456,13 +497,22 @@ npx claude-mem-lite doctor            # 诊断问题
 ```
 
 说明：
+- `doctor` 与 `repair` 写成 `cli.mjs` 而不是 `install.mjs`，是有意的。这两条恰恰是安装
+  已经坏掉时才会用到的命令，而 `install.mjs` 在执行第一行代码之前要解析十几个静态
+  import——少一个文件就直接吐一段 Node 栈，而不是告诉你少了哪个文件。`cli.mjs` 没有
+  任何本地静态 import，会捕获这种失败并说出缺失的文件和修复命令。列表中其余命令两种
+  写法都一样。
 - 插件模式只提示可用更新，不会自更新插件文件。
 - direct install / npx 模式保留自动更新，并使用 staged replacement；若依赖安装失败会回滚。
 - 如果你禁用了插件，但 `~/.claude/settings.json` 里还有旧的 mem hooks，可运行 `node install.mjs cleanup-hooks`。
 
 ### doctor
 
-检查 Node.js 版本、依赖、服务器/钩子文件、数据库完整性、FTS5 索引和残留进程。
+检查 Node.js 版本、依赖、服务器/钩子文件、数据库完整性、FTS5 索引、残留进程、MCP 注册状态，
+以及 marketplace clone 是否还能被更新。
+
+它用 `claude mcp list` 回答注册状态那一问，而这会**对你配置的每个 MCP server 做健康检查**——
+也就是逐个短暂启动，包括远程 endpoint。`status` 刻意不这么做：插件形态下它从 manifest 回答。
 
 ### status
 
@@ -470,7 +520,7 @@ npx claude-mem-lite doctor            # 诊断问题
 
 ### 故障恢复（安装卡死 / hook 报错）
 
-如果你看到 PreToolUse:Read/Edit/Skill hook 报 `ERR_MODULE_NOT_FOUND`，或者 `claude-mem-lite` 命令本身因为 import 错误崩溃，多半是被部分自动更新坑了——更新器复制了新脚本但漏了配套的 `lib/*` 文件，hook 链就此断掉（连下一次本可自愈的自动更新也跑不了）。
+如果你看到 PreToolUse:Read/Edit hook 报 `ERR_MODULE_NOT_FOUND`，或者 `claude-mem-lite` 命令本身因为 import 错误崩溃，多半是被部分自动更新坑了——更新器复制了新脚本但漏了配套的 `lib/*` 文件，hook 链就此断掉（连下一次本可自愈的自动更新也跑不了）。
 
 **v2.84.0+** 提供 `repair` 子命令，从 GitHub 最新 release 重新同步：
 
@@ -481,8 +531,10 @@ claude-mem-lite repair
 **如果 `repair` 自己也跑不起来**（bin 比 v2.84.0 旧，或 bin 也坏了），用这条单行命令——它把最新 tarball 拉到临时目录、跑 *那份* tarball 里的 `install.mjs`，完全不依赖你磁盘上的任何文件：
 
 ```bash
-T=$(mktemp -d) && curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/tarball | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install
+T=$(mktemp -d) && U=$(curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/releases/latest | grep -o '"tarball_url"[^,]*' | cut -d'"' -f4) && curl -sL "$U" | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install
 ```
+
+它会先解析出最新 **release** 的 tag。shell 单行命令无法像 `repair` 那样校验 release 签名，所以跑它等于你自己做了一次信任决定——这也是它排在最后、而不是被优先推荐的原因。
 
 跑完之后，`~/.claude-mem-lite/` 就和最新 release 对齐，`claude-mem-lite repair` 下次再遇到类似问题也能直接用了。
 
@@ -505,6 +557,17 @@ npx claude-mem-lite uninstall --purge
 数据默认保留在 `~/.claude-mem-lite/` 中。如需删除：
 ```bash
 rm -rf ~/.claude-mem-lite/
+```
+
+**`/plugin uninstall` 不会删 plugin cache。** Claude Code 会把每个版本展开到
+`~/.claude/plugins/cache/` 下，各带一份 `node_modules`。插件还装着的时候，这些会被裁剪到最新
+三个版本（SessionStart 会做，更新路径也会做），所以这个目录是有上限的——实测 241 MB——而不是无限
+增长。但 `/plugin uninstall` 只移除 manifest，插件又没有可挂的卸载生命周期钩子，于是钩子停止触发，
+剩下的东西再也没人回收。`claude-mem-lite uninstall` 能回收它，但 `/plugin uninstall` 之后这个命令
+可能已经不在 PATH 上了。所以要么**先**跑它，要么自己删：
+
+```bash
+rm -rf ~/.claude/plugins/cache/sdsrss/claude-mem-lite
 ```
 
 ### 混装残留（用过多种安装方式的话务必看一下）
@@ -548,13 +611,6 @@ claude-mem-lite/
   format-utils.mjs     # 字符串格式化：截断、类型图标、日期/时间格式化
   hash-utils.mjs       # MinHash 签名、Jaccard 相似度（去重用）
   bash-utils.mjs       # Bash 输出显著性检测：错误、测试、构建、部署
-  # 智能调度
-  dispatch.mjs         # 三级调度编排：快速过滤、上下文信号、FTS5、Haiku
-  dispatch-inject.mjs  # 注入模板渲染：skill/agent 推荐
-  registry.mjs         # 资源注册表 DB：schema、CRUD、FTS5、调用追踪
-  registry-retriever.mjs # FTS5 检索：同义词扩展与复合评分
-  registry-scanner.mjs # 文件系统扫描器：读取内容 + 哈希，委托发现层
-  resource-discovery.mjs # 共享发现层：扁平目录、插件嵌套、松散 .md 文件
   haiku-client.mjs     # 统一 Haiku LLM 封装：直连 API 或 CLI 回退
   # 安装与配置
   install.mjs          # CLI 安装器：设置、卸载、状态、诊断（npx/git clone 模式）
@@ -563,12 +619,11 @@ claude-mem-lite/
   scripts/
     setup.sh           # Setup 钩子：npm install + 迁移（隐藏目录 + 旧目录）
     post-tool-use.sh   # Bash 预过滤器：~5ms 跳过噪声，追踪 Read 路径
-    user-prompt-search.js # UserPromptSubmit 钩子：自动搜索记忆 + L1 skill 自动加载
-    pre-skill-bridge.js  # PreToolUse 钩子：L2 managed skill 桥接
+    user-prompt-search.js # UserPromptSubmit 钩子：用户提问时自动搜索记忆
     pre-tool-recall.js   # PreToolUse 钩子：Edit/Write 前文件教训回忆
+    post-tool-recall.js  # PostToolUse 钩子：工具失败后的错误召回
+    pre-agent-inject.sh  # PreToolUse 钩子：为子代理注入上下文
     prompt-search-utils.mjs # 共享逻辑：跳过模式、意图检测、名称匹配
-    convert-commands.mjs # 将 command .md 转换为托管插件中的 SKILL.md
-    index-managed.mjs  # 托管资源离线索引器
   # 测试和基准（仅开发）
   tests/               # 单元、属性、集成、契约、E2E、管线测试
   benchmark/           # BM25 搜索质量基准 + CI 门控
@@ -577,7 +632,7 @@ claude-mem-lite/
 ## 搜索质量
 
 基于 200 条观察和 30 个查询（标准 + 困难负样本类别）的基准测试结果，测量的是
-**production-hybrid** 检索路径（FTS5 BM25 + TF-IDF 向量 + RRF）——也就是 `mem_search` /
+**production-hybrid** 检索路径（真实的 `searchObservationsHybrid`）——也就是 `mem_search` /
 `recall` 实际走的那条路径：
 
 | 指标 | 得分（production-hybrid） |
@@ -592,9 +647,11 @@ claude-mem-lite/
 > 固定语料、固定查询集、无采样）。CI 参考快照是 `benchmark/baseline.json`，
 > `npm run benchmark:gate` 在偏离超过 5% 时让构建失败。本 README 中所有检索指标都以此为唯一来源。
 
-> **关于测量路径。** 本表早期版本报告的是 *lexical* 纯 FTS 路径（Precision@10 0.96、
-> P95 0.15ms）。混合向量臂用 precision@10 换取更高的 recall / nDCG / MRR——它会召回超出字面
-> 匹配的语义相关候选；门控现在测量混合路径，所以这些数字反映的是 `mem_search` 的真实行为。
+> **关于测量路径。** 本表测量的始终是 `mem_search` 实际走的那条路径，所以数字变过两次。
+> 早期版本报告的是更窄的纯 FTS 测量口径（Precision@10 0.96、P95 0.15ms）；后来一版把
+> precision 的下降归因于「TF-IDF 向量臂用 precision 换 recall」。**那个归因是错的，该说法已撤回**
+> ——门控的 `hybrid_over_bm25` 差值两个臂都不执行向量路径，根本量不到这笔交换。该臂后来被直接
+> A/B 实测，两个语料上都是负的，已移除；此处的数字就是不含向量臂的出货路径。
 
 ## 开发
 
@@ -611,7 +668,7 @@ npm run benchmark:gate    # CI 门控：指标回退超过 5% 容差时失败
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `CLAUDE_MEM_DIR` | 自定义数据目录。所有数据库、运行时文件和托管资源均存储在此。 | `~/.claude-mem-lite/` |
+| `CLAUDE_MEM_DIR` | 自定义数据目录。所有数据库与运行时文件均存储在此。 | `~/.claude-mem-lite/` |
 | `CLAUDE_MEM_MODEL` | 后台 LLM 调用模型（Episode 提取、会话总结、调度）。可选 `haiku` 或 `sonnet`。 | `haiku` |
 | `ANTHROPIC_API_KEY` | Anthropic API key。设置后所有后台 LLM 调用直连 Anthropic Messages API（带 prompt caching），优先级最高。 | _(未设 → CLI)_ |
 | `OPENROUTER_API_KEY` | OpenRouter API key（OpenAI 兼容）。当**未设** `ANTHROPIC_API_KEY` 时用于后台 LLM 调用；两者都未设则回退到 `claude -p` CLI。 | _(未设)_ |

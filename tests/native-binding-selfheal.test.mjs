@@ -14,16 +14,23 @@
 //   3. a breakage marker is recorded on EVERY failing fire (even when the hint
 //      is rate-limited) so the next session-start can heal unattended.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { acquireLock } from '../lib/proc-lock.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
+
+// Module-level, distinct from the block-scoped REPO_ROOT further down (that one is local to
+// the rebuild-binding describe). dirname(fileURLToPath(...)) + join, never new URL() —
+// tests/no-url-module-paths.test.mjs.
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 import {
   isNativeBindingError,
   healAndReexec,
+  ensureBetterSqlite3Working,
   NATIVE_BINDING_REBUILD_CMD,
+  NATIVE_BINDING_SOURCE_BUILD_CMD,
   BINDING_HEAL_GUARD_ENV,
 } from '../lib/binding-probe.mjs';
 import {
@@ -41,9 +48,13 @@ describe('isNativeBindingError — one classifier for the whole fault family', (
   });
 
   it('classifies the ABI-mismatch message (the field failure)', () => {
-    expect(isNativeBindingError(new Error(
-      "The module '/x/better_sqlite3.node'\nwas compiled against a different Node.js version using\nNODE_MODULE_VERSION 127. This version of Node.js requires\nNODE_MODULE_VERSION 137.",
-    ))).toBe(true);
+    expect(
+      isNativeBindingError(
+        new Error(
+          "The module '/x/better_sqlite3.node'\nwas compiled against a different Node.js version using\nNODE_MODULE_VERSION 127. This version of Node.js requires\nNODE_MODULE_VERSION 137.",
+        ),
+      ),
+    ).toBe(true);
   });
 
   it('classifies the bindings-not-found message (stale/absent build dir)', () => {
@@ -51,11 +62,17 @@ describe('isNativeBindingError — one classifier for the whole fault family', (
   });
 
   it('classifies "did not self-register" (rebuild landed under an already-dlopen\'d module)', () => {
-    expect(isNativeBindingError(new Error("Module did not self-register: '/x/better_sqlite3.node'."))).toBe(true);
+    expect(isNativeBindingError(new Error("Module did not self-register: '/x/better_sqlite3.node'."))).toBe(
+      true,
+    );
   });
 
   it('does NOT classify a corrupt-DB error — a rebuild cannot fix data corruption', () => {
-    expect(isNativeBindingError(Object.assign(new Error('database disk image is malformed'), { code: 'SQLITE_CORRUPT' }))).toBe(false);
+    expect(
+      isNativeBindingError(
+        Object.assign(new Error('database disk image is malformed'), { code: 'SQLITE_CORRUPT' }),
+      ),
+    ).toBe(false);
   });
 
   it('does NOT classify unrelated errors, null, or undefined', () => {
@@ -67,6 +84,92 @@ describe('isNativeBindingError — one classifier for the whole fault family', (
   it('exports the exact rebuild command (npm >= 12 needs the allow-scripts bypass)', () => {
     expect(NATIVE_BINDING_REBUILD_CMD).toContain('npm rebuild better-sqlite3');
     expect(NATIVE_BINDING_REBUILD_CMD).toContain('--dangerously-allow-all-scripts');
+  });
+});
+
+// v4.0.0. better-sqlite3 13 carries NO install script — it ships prebuilds instead — so
+// `npm rebuild better-sqlite3` has nothing to run and exits 0 printing "rebuilt dependencies
+// successfully" while producing no `.node`. On a platform 13 ships no prebuild for, the heal
+// chain therefore reported success over a still-broken install. These pin the source-compile
+// fallback that closes it, and pin that it does NOT fire when the npm path already worked.
+describe('ensureBetterSqlite3Working — source-compile fallback when npm rebuild heals nothing', () => {
+  it('falls through to the source build when rebuild exits 0 but the binding is still dead', async () => {
+    const cmds = [];
+    let verifyCalls = 0;
+    const r = await ensureBetterSqlite3Working('/inst', {
+      probe: () => ({ ok: false, error: 'Could not locate the bindings file' }),
+      // Dead after the npm rebuild (call 1), alive after the source build (call 2).
+      verify: () => ({ ok: ++verifyCalls >= 2, error: 'still dead' }),
+      exec: (cmd) => cmds.push(cmd),
+    });
+    expect(r).toEqual({ ok: true, action: 'compiled' });
+    expect(cmds).toEqual([NATIVE_BINDING_REBUILD_CMD, NATIVE_BINDING_SOURCE_BUILD_CMD]);
+  });
+
+  it('does NOT run the source build when npm rebuild already fixed it', async () => {
+    const cmds = [];
+    const r = await ensureBetterSqlite3Working('/inst', {
+      probe: () => ({ ok: false, error: 'dead' }),
+      verify: () => ({ ok: true }),
+      exec: (cmd) => cmds.push(cmd),
+    });
+    expect(r).toEqual({ ok: true, action: 'rebuilt' });
+    expect(cmds).toEqual([NATIVE_BINDING_REBUILD_CMD]);
+  });
+
+  it('reports the source build failing instead of claiming a heal', async () => {
+    const r = await ensureBetterSqlite3Working('/inst', {
+      probe: () => ({ ok: false, error: 'dead' }),
+      verify: () => ({ ok: false, error: 'still dead' }),
+      exec: (cmd) => {
+        if (cmd === NATIVE_BINDING_SOURCE_BUILD_CMD) throw new Error('no compiler');
+      },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('source build failed');
+    expect(r.error).toContain('no compiler');
+  });
+
+  // A20260906-R8b-P0-1 (found by independent review of v4.0.0, reproduced before fixing).
+  //
+  // The source build is `node-gyp clean && node-gyp rebuild`, so it DELETES build/ before it
+  // starts. Under a caller with a small time budget it is therefore not merely useless but
+  // DESTRUCTIVE: measured on a tree whose compiled binding opened a DB, a 20 s cap killed the
+  // rebuild at 20.02 s (SIGTERM) and left no `.node` — `DB opens: YES` became `NO`. The hook
+  // path (scripts/binding-probe-cli.mjs) injects `exec` with exactly that 20 s cap while a
+  // full compile takes ~41 s here, and it re-runs on every SessionStart because setup.sh only
+  // writes its marker on success. The old suppression looked only at an injected `rebuild`,
+  // which that caller does not inject — so the one caller that had a budget was the one caller
+  // the guard missed.
+  it('does not attempt the source build when the caller opts out', async () => {
+    const cmds = [];
+    const r = await ensureBetterSqlite3Working('/inst', {
+      probe: () => ({ ok: false, error: 'Could not locate the bindings file' }),
+      verify: () => ({ ok: false, error: 'still dead' }),
+      exec: (cmd) => cmds.push(cmd),
+      sourceBuild: false,
+    });
+    expect(r.ok).toBe(false);
+    // Premise: the npm step still ran, so the opt-out disabled the source build specifically
+    // rather than short-circuiting the whole chain.
+    expect(cmds).toEqual([NATIVE_BINDING_REBUILD_CMD]);
+    expect(r.error).not.toContain('source build');
+  });
+
+  it('the time-budgeted hook path opts out', () => {
+    // scripts/binding-probe-cli.mjs runs under the SessionStart hook cap and injects a 20 s
+    // exec. It must not reach a step that deletes build/ before compiling.
+    const src = readFileSync(join(REPO, 'scripts/binding-probe-cli.mjs'), 'utf8');
+    expect(src, 'the hook probe must pass sourceBuild:false').toMatch(/sourceBuild:\s*false/);
+    // Premise: it still injects the capped exec this guard exists because of.
+    expect(src).toMatch(/timeout:\s*20000/);
+  });
+
+  it('the source-build command targets the package, not the project', () => {
+    // A bare `npm run build-release` in the project would run OUR script of that name (or
+    // none); it has to be --prefix'd into node_modules/better-sqlite3.
+    expect(NATIVE_BINDING_SOURCE_BUILD_CMD).toContain('--prefix node_modules/better-sqlite3');
+    expect(NATIVE_BINDING_SOURCE_BUILD_CMD).toContain('build-release');
   });
 });
 
@@ -82,8 +185,15 @@ describe('healAndReexec — CLI-side heal must re-exec, never retry in-process',
       installDir: '/some/dir',
       argv: ['/usr/bin/node', '/x/cli.mjs', 'save', 'hello'],
       env: {},
-      ensure: async () => { c.ensure++; return { ok: true, action: 'rebuilt' }; },
-      reexec: (argv, env) => { c.reexec++; reexecArgs = { argv, env }; return 0; },
+      ensure: async () => {
+        c.ensure++;
+        return { ok: true, action: 'rebuilt' };
+      },
+      reexec: (argv, env) => {
+        c.reexec++;
+        reexecArgs = { argv, env };
+        return 0;
+      },
       log: (m) => c.logs.push(m),
     });
     expect(r).toEqual({ healed: true, exitCode: 0 });
@@ -112,8 +222,14 @@ describe('healAndReexec — CLI-side heal must re-exec, never retry in-process',
       installDir: '/some/dir',
       argv: ['node', 'cli.mjs', 'stats'],
       env: { [BINDING_HEAL_GUARD_ENV]: '1' },
-      ensure: async () => { c.ensure++; return { ok: true, action: 'rebuilt' }; },
-      reexec: () => { c.reexec++; return 0; },
+      ensure: async () => {
+        c.ensure++;
+        return { ok: true, action: 'rebuilt' };
+      },
+      reexec: () => {
+        c.reexec++;
+        return 0;
+      },
       log: (m) => c.logs.push(m),
     });
     expect(r.healed).toBe(false);
@@ -128,8 +244,14 @@ describe('healAndReexec — CLI-side heal must re-exec, never retry in-process',
       installDir: '/some/dir',
       argv: ['node', 'cli.mjs', 'stats'],
       env: {},
-      ensure: async () => { c.ensure++; return { ok: false, error: 'no prebuild, no compiler' }; },
-      reexec: () => { c.reexec++; return 0; },
+      ensure: async () => {
+        c.ensure++;
+        return { ok: false, error: 'no prebuild, no compiler' };
+      },
+      reexec: () => {
+        c.reexec++;
+        return 0;
+      },
       log: (m) => c.logs.push(m),
     });
     expect(r.healed).toBe(false);
@@ -143,7 +265,9 @@ describe('healAndReexec — CLI-side heal must re-exec, never retry in-process',
       installDir: '/some/dir',
       argv: ['node', 'cli.mjs', 'stats'],
       env: {},
-      ensure: async () => { throw new Error('npm missing'); },
+      ensure: async () => {
+        throw new Error('npm missing');
+      },
       reexec: () => 0,
       log: () => {},
     });
@@ -154,11 +278,19 @@ describe('healAndReexec — CLI-side heal must re-exec, never retry in-process',
 
 describe('native-binding breakage marker — the unattended-heal trigger', () => {
   let dir;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'cml-nbb-')); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cml-nbb-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it('records reason + event + ts, and reads back', () => {
-    recordNativeBindingBreakage(dir, { reason: 'ABI 127 vs 137', event: 'user-prompt', now: 1_700_000_000_000 });
+    recordNativeBindingBreakage(dir, {
+      reason: 'ABI 127 vs 137',
+      event: 'user-prompt',
+      now: 1_700_000_000_000,
+    });
     expect(existsSync(join(dir, NATIVE_BINDING_BROKEN_MARKER))).toBe(true);
     const b = readNativeBindingBreakage(dir);
     expect(b.reason).toContain('127');
@@ -199,14 +331,19 @@ describe('native-binding breakage marker — the unattended-heal trigger', () =>
 });
 
 // The field outage's 79 log entries came from scripts/pre-tool-recall.js and
-// scripts/pre-skill-bridge.js — STANDALONE hook scripts that never import
-// hook.mjs, so hook.mjs's dispatch catch (and its marker) could not see them.
+// scripts/pre-skill-bridge.js (the latter removed in 2026-09 with the skill
+// registry) — STANDALONE hook scripts that never import hook.mjs, so hook.mjs's
+// dispatch catch (and its marker) could not see them.
 // recordHookError is the one choke point every hook script funnels through, so
 // the flag lives there and covers scripts written later for free.
 describe('recordHookError — the standalone hook scripts must arm the heal too', () => {
   let dir;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'cml-nbt-')); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cml-nbt-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it('flags a native-binding db-open failure from a standalone script', () => {
     const err = Object.assign(new Error('NODE_MODULE_VERSION 127 vs 137'), { code: 'ERR_DLOPEN_FAILED' });
@@ -222,7 +359,7 @@ describe('recordHookError — the standalone hook scripts must arm the heal too'
   });
 
   it('still writes its JSONL shard (the flag is additive, not a replacement)', () => {
-    recordHookError('skill-bridge:db-open', Object.assign(new Error('x'), { code: 'ERR_DLOPEN_FAILED' }), dir);
+    recordHookError('ups:db-open', Object.assign(new Error('x'), { code: 'ERR_DLOPEN_FAILED' }), dir);
     expect(existsSync(join(dir, 'hook-errors'))).toBe(true);
   });
 });
@@ -304,5 +441,137 @@ describe('formatHookError — the hint must name a repair that actually applies'
     // `repair` re-downloads + signature-verifies a whole release and fails closed
     // offline — wrong-sized (and often impossible) for a local ABI rebuild.
     expect(line).not.toMatch(/cli\.mjs repair/);
+  });
+});
+
+// ── The prebuild that is present and will not load ──────────────────────────
+//
+// Found 2026-09-06 by running tests/sandbox/phaseB-npm.mjs against a corrupted
+// `prebuilds/linux-x64.node`: `claude-mem-lite rebuild-binding` — the foreground repair
+// doctor tells users to run, the one deliberately given no time budget — exited 1, and the
+// manual command it printed could not fix it either. doctor stayed red permanently.
+//
+// The mechanism, measured in a scratch tree with a control (`docs/measurement/findings.md`):
+// better-sqlite3 13's `lib/binding.js` picks `prebuilds/<target>.node` on EXISTENCE alone
+// and prefers it over `build/`. So a prebuild that is present and unloadable — an old
+// glibc, a truncated download, the wrong arch baked into an image — shadows the binding the
+// source-compile fallback produces. Corrupt prebuild + healthy build/Release → `wrong ELF
+// class`; move the prebuild aside → loads; remove both → fails (the control proving
+// build/Release is what saved it). v4.0.0 added the source build for "a platform 13 ships no
+// prebuild for" and this is its neighbour: a prebuild that exists but cannot be used.
+//
+// These tests build the fixture around the REAL `lib/binding.js` from the installed
+// dependency, so a future version that changes how a prebuild is chosen breaks them here
+// rather than in the field.
+describe('ensureBetterSqlite3Working — an unloadable prebuild shadows the source build', () => {
+  const made = [];
+  const realBindingJs = join(REPO, 'node_modules', 'better-sqlite3', 'lib', 'binding.js');
+
+  /** The prebuild basename this platform resolves, or null when 13 ships none for it. */
+  function prebuildName() {
+    const r = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `const b=require(${JSON.stringify(realBindingJs)});` +
+          `process.stdout.write((b.getPrebuildPath&&b.getPrebuildPath())||'')`,
+      ],
+      { encoding: 'utf8' },
+    );
+    const p = (r.stdout || '').trim();
+    return p ? p.split(/[\\/]/).pop() : null;
+  }
+
+  /** A tree shaped like a real install: the dependency's own resolver + a junk prebuild. */
+  function fixture({ withPrebuild = true } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-prebuild-'));
+    made.push(dir);
+    const pkg = join(dir, 'node_modules', 'better-sqlite3');
+    mkdirSync(join(pkg, 'lib'), { recursive: true });
+    mkdirSync(join(pkg, 'prebuilds'), { recursive: true });
+    writeFileSync(join(dir, 'package.json'), '{"name":"host","version":"1.0.0"}');
+    writeFileSync(join(pkg, 'package.json'), '{"name":"better-sqlite3","version":"13.0.0"}');
+    writeFileSync(join(pkg, 'lib', 'binding.js'), readFileSync(realBindingJs));
+    const name = prebuildName();
+    const prebuild = name ? join(pkg, 'prebuilds', name) : null;
+    if (withPrebuild && prebuild) writeFileSync(prebuild, Buffer.from('\x7fELF broken-abi'));
+    return { dir, prebuild };
+  }
+
+  afterEach(() => {
+    for (const d of made.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it('moves the unloadable prebuild aside so the compiled binding is the one that loads', async () => {
+    const { dir, prebuild } = fixture();
+    if (!prebuild) return; // platform 13 ships no prebuild for — covered by the case below
+    const cmds = [];
+    let prebuildPresentAtCompile = null;
+    const r = await ensureBetterSqlite3Working(dir, {
+      probe: () => ({ ok: false, error: 'wrong ELF class: ELFCLASS32' }),
+      // Models the resolver rather than a call counter: this tree only becomes loadable
+      // once the shadowing prebuild is out of the way. A stub that just returns ok on the
+      // second call would pass without the fix.
+      verify: () => (existsSync(prebuild) ? { ok: false, error: 'wrong ELF class' } : { ok: true }),
+      exec: (cmd) => {
+        cmds.push(cmd);
+        if (cmd === NATIVE_BINDING_SOURCE_BUILD_CMD) prebuildPresentAtCompile = existsSync(prebuild);
+      },
+    });
+    // `quarantined` is not decoration: rebuild-binding prints it, because silently moving a
+    // file inside the user's node_modules is not something they should have to discover.
+    expect(r).toEqual({ ok: true, action: 'compiled', quarantined: prebuild });
+    expect(cmds).toEqual([NATIVE_BINDING_REBUILD_CMD, NATIVE_BINDING_SOURCE_BUILD_CMD]);
+    // Ordering matters: compiling first and quarantining after would leave the same dead
+    // tree on a build that takes minutes.
+    expect(prebuildPresentAtCompile, 'quarantine must precede the compile').toBe(false);
+    expect(existsSync(prebuild)).toBe(false);
+    expect(existsSync(`${prebuild}.unusable`), 'kept, not deleted').toBe(true);
+  });
+
+  it('puts the prebuild back when the compile did not fix it either', async () => {
+    const { dir, prebuild } = fixture();
+    if (!prebuild) return;
+    const before = readFileSync(prebuild);
+    const r = await ensureBetterSqlite3Working(dir, {
+      probe: () => ({ ok: false, error: 'wrong ELF class' }),
+      verify: () => ({ ok: false, error: 'wrong ELF class' }),
+      exec: () => {},
+    });
+    expect(r.ok).toBe(false);
+    // Leave no worse: a tree we could not repair must come back exactly as it was, or the
+    // next `npm rebuild` reinstall has one fewer file than it started with.
+    expect(existsSync(prebuild), 'restored on failure').toBe(true);
+    expect(readFileSync(prebuild)).toEqual(before);
+    expect(existsSync(`${prebuild}.unusable`)).toBe(false);
+  });
+
+  it('changes nothing on a platform that ships no prebuild (the v4.0.0 case)', async () => {
+    const { dir } = fixture({ withPrebuild: false });
+    let verifyCalls = 0;
+    const cmds = [];
+    const r = await ensureBetterSqlite3Working(dir, {
+      probe: () => ({ ok: false, error: 'Could not locate the bindings file' }),
+      verify: () => ({ ok: ++verifyCalls >= 2, error: 'still dead' }),
+      exec: (cmd) => cmds.push(cmd),
+    });
+    expect(r).toEqual({ ok: true, action: 'compiled' });
+    expect(cmds).toEqual([NATIVE_BINDING_REBUILD_CMD, NATIVE_BINDING_SOURCE_BUILD_CMD]);
+  });
+
+  it('does not touch the prebuild on the time-budgeted path that opts out of the compile', async () => {
+    const { dir, prebuild } = fixture();
+    if (!prebuild) return;
+    const r = await ensureBetterSqlite3Working(dir, {
+      probe: () => ({ ok: false, error: 'wrong ELF class' }),
+      verify: () => ({ ok: false, error: 'wrong ELF class' }),
+      exec: () => {},
+      sourceBuild: false,
+    });
+    expect(r.ok).toBe(false);
+    // Quarantining without a compile to follow it turns "broken addon" into "no addon" —
+    // strictly worse, and this is the SessionStart path (scripts/binding-probe-cli.mjs).
+    expect(existsSync(prebuild)).toBe(true);
+    expect(existsSync(`${prebuild}.unusable`)).toBe(false);
   });
 });

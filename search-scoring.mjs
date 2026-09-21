@@ -1,5 +1,5 @@
-// claude-mem-lite shared search-scoring / ranking helpers: re-ranking, supersede
-// marking, PRF term extraction, concept-expansion — plus the MCP instructions
+// claude-mem-lite shared search-scoring / ranking helpers: re-ranking, PRF term
+// extraction, concept-expansion — plus the MCP instructions
 // builder and idle-cleanup/access-boost side helpers. Used by the MCP server,
 // the CLI (mem-cli), and search-engine; originally extracted from server.mjs for
 // testability (server.mjs has top-level side effects), hence the former
@@ -12,6 +12,18 @@ import { CLI_INVOKE } from './cli-path.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
 import { DAY_MS } from './lib/time-constants.mjs';
+// The pinned-but-uncited threshold, from the module that OWNS the rule (`demotePinned` and
+// its forecast both read it there). Imported rather than restated: a second hand-typed copy
+// of this number is exactly what produced the `inj>=8` report-string drift in server.mjs.
+// (The v3.76.0 scan-vs-execute drift was a different constant — two copies of the FLOOR,
+// `importance > 1`; do not cite it for this one.) The edge is cheap: `lib/maintain-core.mjs`
+// has five direct imports — `utils.mjs`, `lib/dedup-constants.mjs`,
+// `lib/inject-search-core.mjs`, `lib/time-constants.mjs` and `lib/db-backup.mjs` — three of
+// which this module already imports directly, and the 16-file closure resolves to nothing
+// but node builtins (`fs`, `path`, `child_process`, `node:os`, `node:path`) — no
+// third-party package, so no native dependency, and no edge back to this file (the three
+// "search-scoring" strings in that graph are all comments).
+import { PINNED_INJ_THRESHOLD } from './lib/maintain-core.mjs';
 // ─── MCP Server Instructions Builder ───────────────────────────────────────
 // Phase A (v2.31.3+): when quiet=true, drops WHEN-TO-USE proactive-trigger and
 // Decision-rules sections; keeps the irreducible CLI/MCP tool list. Intended
@@ -79,13 +91,23 @@ export function reRankWithContext(db, results, project) {
   if (!results || results.length === 0) return;
   // Get recently active files (last 2 hours, same project) via observation_files junction table
   const twoHoursAgo = Date.now() - 2 * 3600000;
-  const recentFiles = db.prepare(`
+  const recentFiles = db
+    .prepare(
+      `
     SELECT DISTINCT of2.filename FROM observation_files of2
     JOIN observations o ON o.id = of2.obs_id
-    WHERE o.project = ? AND o.created_at_epoch > ?
-  `).all(project, twoHoursAgo);
+    -- R11 A-P3-3: liveObsFilterSql, not the bare window. This is a READ path, so it is
+    -- outside the settled list of 11 observation WRITES, and it was granting a boost of
+    -- up to 1.3x from filenames contributed by rows no retrieval surface can return.
+    -- The superseded half is the one that fires unattended (exact auto-dedup tombstones
+    -- a duplicate save immediately); every automatic compressed_into writer gates on a
+    -- 14-day floor, so that half needs an explicit \`compress\` to reach a fresh row.
+    WHERE o.project = ? AND o.created_at_epoch > ? AND ${liveObsFilterSql('o')}
+  `,
+    )
+    .all(project, twoHoursAgo);
 
-  const activeFiles = new Set(recentFiles.map(r => r.filename));
+  const activeFiles = new Set(recentFiles.map((r) => r.filename));
   if (activeFiles.size === 0) return;
 
   // Pre-compute active directories for directory-level matching
@@ -96,13 +118,13 @@ export function reRankWithContext(db, results, project) {
   }
 
   // Batch-fetch observation_files for all obs result IDs
-  const obsResults = results.filter(r => r.source === 'obs' && r.id);
+  const obsResults = results.filter((r) => r.source === 'obs' && r.id);
   if (obsResults.length === 0) return;
-  const obsIds = obsResults.map(r => r.id);
+  const obsIds = obsResults.map((r) => r.id);
   const placeholders = obsIds.map(() => '?').join(',');
-  const fileRows = db.prepare(
-    `SELECT obs_id, filename FROM observation_files WHERE obs_id IN (${placeholders})`
-  ).all(...obsIds);
+  const fileRows = db
+    .prepare(`SELECT obs_id, filename FROM observation_files WHERE obs_id IN (${placeholders})`)
+    .all(...obsIds);
 
   // Build map: obs_id → [filenames]
   const obsFileMap = new Map();
@@ -114,9 +136,9 @@ export function reRankWithContext(db, results, project) {
   for (const result of obsResults) {
     const resultFiles = obsFileMap.get(result.id);
     if (!resultFiles || resultFiles.length === 0) continue;
-    const exactMatches = resultFiles.filter(f => activeFiles.has(f)).length;
+    const exactMatches = resultFiles.filter((f) => activeFiles.has(f)).length;
     // Directory-level: same parent dir but different file (half weight)
-    const dirMatches = resultFiles.filter(f => {
+    const dirMatches = resultFiles.filter((f) => {
       if (activeFiles.has(f)) return false; // already counted as exact
       const lastSlash = f.lastIndexOf('/');
       return lastSlash > 0 && activeDirs.has(f.substring(0, lastSlash));
@@ -124,7 +146,7 @@ export function reRankWithContext(db, results, project) {
     const fileOverlap = (exactMatches + 0.5 * dirMatches) / resultFiles.length;
     // BM25 scores are negative — multiply by >1 makes more negative = better rank
     if (result.score !== null && result.score !== undefined && fileOverlap > 0) {
-      result.score *= (1.0 + 0.3 * fileOverlap);
+      result.score *= 1.0 + 0.3 * fileOverlap;
     }
   }
   // Note: caller re-sorts the main results array after this — no sort needed here
@@ -138,8 +160,18 @@ export function reRankWithContext(db, results, project) {
 /** @type {Set<string>} Common words excluded from PRF term extraction */
 export const PRF_STOP_WORDS = new Set([
   ...BASE_STOP_WORDS,
-  'use', 'used', 'using', 'new', 'added', 'updated',
-  'file', 'files', 'code', 'change', 'changed', 'changes',
+  'use',
+  'used',
+  'using',
+  'new',
+  'added',
+  'updated',
+  'file',
+  'files',
+  'code',
+  'change',
+  'changed',
+  'changes',
 ]);
 
 /**
@@ -155,9 +187,11 @@ export function extractPRFTerms(results, ftsQuery, limit = 3) {
   // query term (e.g. "authenticate" when the user searched "authentication") are also
   // excluded, not just the exact surface form.
   const queryTokens = new Set(
-    ftsQuery.replace(/["()]/g, ' ').split(/\s+/)
-      .map(t => porterStem(t.toLowerCase()))
-      .filter(t => t.length > 1 && t !== 'or' && t !== 'and')
+    ftsQuery
+      .replace(/["()]/g, ' ')
+      .split(/\s+/)
+      .map((t) => porterStem(t.toLowerCase()))
+      .filter((t) => t.length > 1 && t !== 'or' && t !== 'and'),
   );
 
   // Bucket morphological variants by porter STEM so "cache"/"caching"/"cached" jointly
@@ -172,13 +206,16 @@ export function extractPRFTerms(results, ftsQuery, limit = 3) {
   // narratives) made `stemSurfaces[stem] ||= new Map()` read the INHERITED function
   // as truthy, skip the assignment, and crash on sm.get (surfaced 2026-08-16 when
   // the M-2 gate fix first ran PRF over OR-rescued rows).
-  const stemDocCount = Object.create(null);   // stem -> # of top docs it appears in (the >=2 bar)
-  const stemSurfaces = Object.create(null);   // stem -> Map(surface -> total occurrences)
+  const stemDocCount = Object.create(null); // stem -> # of top docs it appears in (the >=2 bar)
+  const stemSurfaces = Object.create(null); // stem -> Map(surface -> total occurrences)
   const docCount = Math.min(results.length, 8);
   for (let i = 0; i < docCount; i++) {
     const r = results[i];
     const text = ((r.title || '') + ' ' + (r.narrative || '')).toLowerCase();
-    const surfaces = text.replace(/[^a-z0-9_-]/g, ' ').split(/\s+/).filter(t => t.length >= 3);
+    const surfaces = text
+      .replace(/[^a-z0-9_-]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length >= 3);
     const docStems = new Set();
     for (const surface of surfaces) {
       // Stop-word filter at BOTH surface and stem level: PRF_STOP_WORDS lists surface
@@ -201,9 +238,13 @@ export function extractPRFTerms(results, ftsQuery, limit = 3) {
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit)
     .map(([stem]) => {
-      let best = null, bestN = -1;
+      let best = null,
+        bestN = -1;
       for (const [surface, n] of stemSurfaces[stem]) {
-        if (n > bestN) { best = surface; bestN = n; }
+        if (n > bestN) {
+          best = surface;
+          bestN = n;
+        }
       }
       return best;
     });
@@ -224,15 +265,22 @@ export function extractPRFTerms(results, ftsQuery, limit = 3) {
 export function expandQueryByConcepts(db, ftsQuery, project) {
   let rows;
   try {
-    rows = db.prepare(`
+    rows = db
+      .prepare(
+        `
       SELECT o.concepts FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
       WHERE observations_fts MATCH ? AND ${liveObsFilterSql('o')}
         AND (? IS NULL OR o.project = ?)
-      ORDER BY ${OBS_BM25}
+      ORDER BY ${OBS_BM25}, o.id DESC
       LIMIT 20
-    `).all(ftsQuery, project ?? null, project ?? null);
-  } catch (e) { debugCatch(e, 'expandQueryByConcepts-fts'); return []; }
+    `,
+      )
+      .all(ftsQuery, project ?? null, project ?? null);
+  } catch (e) {
+    debugCatch(e, 'expandQueryByConcepts-fts');
+    return [];
+  }
 
   if (rows.length === 0) return [];
 
@@ -247,9 +295,11 @@ export function expandQueryByConcepts(db, ftsQuery, project) {
 
   // Filter out terms already present in the query
   const queryTokens = new Set(
-    ftsQuery.replace(/["()]/g, ' ').split(/\s+/)
-      .map(t => t.toLowerCase())
-      .filter(t => t.length > 1 && t !== 'or' && t !== 'and')
+    ftsQuery
+      .replace(/["()]/g, ' ')
+      .split(/\s+/)
+      .map((t) => t.toLowerCase())
+      .filter((t) => t.length > 1 && t !== 'or' && t !== 'and'),
   );
 
   return Object.entries(freq)
@@ -265,18 +315,77 @@ export function expandQueryByConcepts(db, ftsQuery, project) {
  * Boost importance to 2 for observations that have been accessed multiple times
  * (access_count >= 2) but still have default importance (1).
  * Called after incrementing access_count in mem_get.
+ *
+ * A PROMOTER OUTSIDE THE MAINTENANCE RUN. `lib/maintain-core.mjs`'s DEFAULT_MAINTAIN_OPS
+ * docblock records `boostAccessed` and `demotePinned` as opponents, and names TWO separate
+ * defects it closed — keep them apart: the automatic path promoted and never demoted
+ * because `demote_pinned` was in nobody's default set and hook.mjs did not import it, while
+ * the two faces that DID wire the op ran it in opposite orders. The 148/148 figure quoted
+ * there is rows sitting back at importance>=3 that were BOOST-ELIGIBLE, not rows this op
+ * would have moved — CHANGELOG.md narrows the reachable-by-demotePinned count to 7.
+ *
+ * Both of those fixes act INSIDE a maintenance run. This function fires from
+ * `fetchObsDetail`, so it is a promoter neither a default-set nor an ordering fix can reach:
+ * every `get` / `mem_get` was another chance to hand the row straight back — the same
+ * sentence that docblock uses for the bug it closed.
+ *
+ * Reproduced end-to-end before this clause: `maintain execute --ops demote_pinned` floors a
+ * pinned-but-uncited row 2 -> 1, and ONE subsequent `get` returned it to 2. So an op in the
+ * default maintain set (`lib/maintain-core.mjs` DEFAULT_MAINTAIN_OPS) had an effect any read
+ * reverted, on its own target population.
+ *
+ * Population, stated rather than implied (doctrine rule 3): on the maintainer's DB sampled
+ * 2026-09-14T20:14:16Z, 67 live rows, 3 pinned-but-uncited, and 0 of those had reached
+ * access_count >= 2 — `injection_count` does not bump `access_count`, so the overlap needs
+ * two explicit reads and was unrealised there. The mechanism is deterministic; the observed
+ * incidence on that corpus is zero, and this is a snapshot of one corpus, not a property.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT FIX. `importance = 1` is also what an explicit
+ * `claude-mem-lite update N --importance 1` writes, and that demotion is reverted by the
+ * next read exactly the same way — worse, INSPECTING the row is what pushes access_count to
+ * 2 in the first place. Separating "1 because nobody set it" from "1 because a human said
+ * so" needs a marker this schema does not have, and `demoted_at` is not it — for a reason
+ * the first draft of this paragraph got wrong, so it is stated precisely: nothing keys on
+ * `demoted_at IS NULL` (the sole non-test reader, `mem-cli.mjs`'s decay-queue report, keys
+ * on IS NOT NULL), so a write here would not evict anything — it would ADD the row to that
+ * report, and `applyCitationDecay` CLEARS the column on the row's first citation, silently
+ * discarding a human's demotion. Wrong owner, wrong lifetime. Left as a design decision
+ * rather than patched around.
+ *
+ * THE EXCLUSION IS demotePinned's FLOOR, NOT ITS TRIGGER. `PINNED_FLOOR_SQL` in
+ * lib/maintain-core.mjs is `CASE WHEN <no lesson> THEN 1 ELSE 2 END`, so a LESSON-BEARING
+ * pinned row is floored at 2 and boosting it 1 -> 2 lands it exactly on that floor. The
+ * first cut of this clause copied the trigger (`inj >= N AND cited = 0`) without the floor
+ * and stranded those rows at 1, below the bound maintain-core declares for them — and 16 of
+ * the 17 rows that op would have moved on the maintainer's DB were lesson-bearing. The
+ * predicate below must keep selecting exactly the rows demotePinned would floor to 1.
+ *
+ * The no-lesson clause is COPIED rather than imported: `NO_LESSON_SQL` and `PINNED_FLOOR_SQL`
+ * are module-private in maintain-core by an explicit decision recorded there ("exporting by
+ * habit is how the knip baseline drifts"), and five verbatim copies already live in that
+ * file. The prose stays out here in the docblock rather than inside the SQL string, because
+ * a backtick in a template literal ends it — that cost one parse error on this very edit.
+ *
  * @param {object} db better-sqlite3 database handle
  * @param {number[]} ids Array of observation IDs to check
  */
 export function autoBoostIfNeeded(db, ids) {
   if (!ids || ids.length === 0) return;
   const placeholders = ids.map(() => '?').join(',');
-  db.prepare(`
+  db.prepare(
+    `
     UPDATE observations SET importance = 2
     WHERE id IN (${placeholders})
       AND COALESCE(importance, 1) = 1
       AND COALESCE(access_count, 0) >= 2
-  `).run(...ids);
+      -- Exactly the rows demotePinned would floor to 1 (see the docblock above).
+      AND NOT (
+        COALESCE(injection_count, 0) >= ${PINNED_INJ_THRESHOLD}
+        AND COALESCE(cited_count, 0) = 0
+        AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
+      )
+  `,
+  ).run(...ids);
 }
 
 // ─── Idle Cleanup ────────────────────────────────────────────────────────────
@@ -305,29 +414,56 @@ export function runIdleCleanup(db) {
     for (const { types, days } of staleThresholds) {
       const cutoff = Date.now() - days * DAY_MS;
 
-      const marked = db.prepare(`
+      const marked = db
+        .prepare(
+          `
         UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
         WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
+          -- injection_count=0, the second half of decayAndMarkIdle's engagement guard
+          -- (audit 2026-09-02 P0-4). Since v2.56 an injected-but-never-accessed row counts
+          -- as PROVEN RELEVANT and decay protects it; this MCP sibling carried the lesson
+          -- guard (CHANGELOG "the sixth enforcement site") and not this one, so a row the
+          -- CLI/hook paths preserve was pending-purge'd 5 minutes into an idle server —
+          -- the same guard-on-one-path shape the docblock below claims was consolidated.
+          AND COALESCE(injection_count, 0) = 0
           AND type IN (${types})
-          AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
+          -- liveObsFilterSql, not compressed_into alone (P3-13), and the THIRD clause this
+          -- MCP twin has had to be brought level on (lesson guard, then injection_count in
+          -- audit P0-4, now this). A retired row's superseded_by column is the redirect the
+          -- Stop citation loop follows to credit a #NN naming a corrected memory; purgeStale
+          -- hard-deletes what this marks, and that destroys it. Same predicate, same
+          -- reasoning, as decayAndMarkIdle's mark-idle pass -- the two are twins and drift
+          -- here has cost data twice. The COMPRESSED_AUTO pass below deliberately does NOT
+          -- get it: -1 is not deletable by any path, so a tombstone reaching it loses nothing.
+          -- (No backticks: inside a JS template literal.)
+          AND created_at_epoch < ? AND ${liveObsFilterSql('')}
           -- Never auto-mark a lesson-bearing row for purge. This idle path is the
           -- MCP-server sibling of maintain-core.decayAndMarkIdle and must carry the
           -- SAME "lessons never auto-GC" guard; without it a lesson demoted to imp≤1
           -- by citation-decay gets pending-purge'd here and hard-deleted by purgeStale.
           AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
-      `).run(cutoff);
+      `,
+        )
+        .run(cutoff);
       totalMarked += marked.changes;
 
-      const compressed = db.prepare(`
+      const compressed = db
+        .prepare(
+          `
         UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
         WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
+          -- Same engagement guard as the mark-idle pass above: COMPRESSED_AUTO also hides
+          -- the row from every retrieval surface, so an injected row must not reach it.
+          AND COALESCE(injection_count, 0) = 0
           AND type IN (${types})
           AND created_at_epoch < ?
           -- Same lesson guard: auto-compress (-1) hides the row from all retrieval and
           -- recoverBuriedLessons only re-floors live (compressed_into=0) rows, so a
           -- compressed lesson is unrecoverable. Parity with selectCompressionCandidates.
           AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
-      `).run(cutoff);
+      `,
+        )
+        .run(cutoff);
       totalCompressed += compressed.changes;
     }
   })();

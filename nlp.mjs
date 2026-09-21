@@ -73,7 +73,7 @@ export function cjkBigrams(text) {
 // Extract known CJK words (from SYNONYM_MAP) out of unsegmented CJK text.
 // Greedy longest-match: "数据库的全文搜索" → ["数据库", "搜索"] (skips particles/unknown).
 const _cjkSynonymKeys = [...SYNONYM_MAP.keys()]
-  .filter(k => /[\u4e00-\u9fff\u3400-\u4dbf]/.test(k))
+  .filter((k) => /[\u4e00-\u9fff\u3400-\u4dbf]/.test(k))
   .sort((a, b) => b.length - a.length); // longest first
 
 export function extractCjkSynonymTokens(text) {
@@ -96,8 +96,9 @@ export function extractCjkSynonymTokens(text) {
 
 // Merged CJK dictionary: CJK_COMPOUNDS + CJK keys from SYNONYM_MAP — sorted longest first.
 // Gives broadest coverage: "搜索" from SYNONYM_MAP + "函数" from CJK_COMPOUNDS.
-const _cjkMergedKeys = [...new Set([...CJK_COMPOUNDS, ..._cjkSynonymKeys])]
-  .sort((a, b) => b.length - a.length);
+const _cjkMergedKeys = [...new Set([...CJK_COMPOUNDS, ..._cjkSynonymKeys])].sort(
+  (a, b) => b.length - a.length,
+);
 
 /**
  * Extract CJK keywords using merged dictionary (CJK_COMPOUNDS + SYNONYM_MAP keys).
@@ -110,7 +111,10 @@ export function extractCjkKeywords(text) {
   const found = [];
   let i = 0;
   while (i < text.length) {
-    if (!/[\u4e00-\u9fff\u3400-\u4dbf]/.test(text[i])) { i++; continue; }
+    if (!/[\u4e00-\u9fff\u3400-\u4dbf]/.test(text[i])) {
+      i++;
+      continue;
+    }
     let matched = false;
     for (const word of _cjkMergedKeys) {
       if (text.startsWith(word, i) && !CJK_STOP_WORDS.has(word)) {
@@ -142,7 +146,7 @@ export function extractCjkLikePatterns(query) {
   for (const w of keywords) remainder = remainder.split(w).join(' ');
   const pureCjkOnly = remainder
     .split(/\s+/)
-    .filter(t => /[\u4e00-\u9fff\u3400-\u4dbf]/.test(t) && !/[A-Za-z0-9]/.test(t))
+    .filter((t) => /[\u4e00-\u9fff\u3400-\u4dbf]/.test(t) && !/[A-Za-z0-9]/.test(t))
     .join(' ');
   const bigrams = pureCjkOnly ? cjkBigrams(pureCjkOnly).split(' ').filter(Boolean) : [];
   return [...new Set([...keywords, ...bigrams])];
@@ -196,12 +200,15 @@ export function cjkPrecisionOk(query, text, threshold) {
   if (!query || !text) return true;
   if (!/[一-鿿㐀-䶿]{2,}/.test(query)) return true;
   const keywords = extractCjkKeywords(query);
-  const required = keywords.length > 0
-    ? keywords
-    : cjkBigrams(query).split(' ').filter(b => b && !isCjkNoiseBigram(b));
+  const required =
+    keywords.length > 0
+      ? keywords
+      : cjkBigrams(query)
+          .split(' ')
+          .filter((b) => b && !isCjkNoiseBigram(b));
   if (required.length === 0) return true;
-  const hit = required.filter(w => text.includes(w)).length;
-  return (hit / required.length) >= threshold;
+  const hit = required.filter((w) => text.includes(w)).length;
+  return hit / required.length >= threshold;
 }
 
 // ─── FTS5 Token Formatting ──────────────────────────────────────────────────
@@ -233,9 +240,22 @@ export function expandToken(token) {
 // 're' ("re:"/regarding) — even though that leaves the they're/we're artifact,
 // dropping a real word is the worse failure.
 const CONTRACTION_FRAGMENTS = [
-  've', 'll',
-  'doesn', 'didn', 'isn', 'wasn', 'aren', 'weren',
-  'wouldn', 'couldn', 'shouldn', 'hasn', 'hadn', 'mustn', 'needn', 'mightn',
+  've',
+  'll',
+  'doesn',
+  'didn',
+  'isn',
+  'wasn',
+  'aren',
+  'weren',
+  'wouldn',
+  'couldn',
+  'shouldn',
+  'hasn',
+  'hadn',
+  'mustn',
+  'needn',
+  'mightn',
 ];
 
 export const FTS_STOP_WORDS = new Set([...BASE_STOP_WORDS, ...CONTRACTION_FRAGMENTS]);
@@ -261,8 +281,21 @@ export const FTS_STOP_WORDS = new Set([...BASE_STOP_WORDS, ...CONTRACTION_FRAGME
  *   after stopword filtering and before expansion.
  * @returns {string|null} FTS5-safe query or null if empty
  */
-export function sanitizeFtsQuery(query, opts = {}) {
-  if (!query) return null;
+/**
+ * The tokens an FTS query is actually built from: cleaned, stop-word filtered, capped at
+ * `maxTokens`, and CJK-segmented — everything `sanitizeFtsQuery` does before per-token
+ * synonym expansion. Exported so a caller that must reason about the query's TERMS reads
+ * the same list the query was made of instead of re-deriving one.
+ *
+ * Pre-ship review 2026-09-09: the first cut of the A1 fix shared only `maxChars`. The
+ * coverage denominator therefore still counted every token in a sub-2000-character prompt
+ * while the query itself stopped at `maxTokens` = 64, so the coverage ceiling stayed a
+ * function of prompt length and a 1511-character prompt still zeroed the whole
+ * `<memory-context>` face — measured end to end against a row whose narrative WAS the
+ * prompt. Sharing the cut point was necessary and not sufficient; this is the term source.
+ */
+export function ftsQueryTokens(query, opts = {}) {
+  if (!query) return { tokens: [], cjkExtracted: false };
   const { maxChars = 0, maxTokens = 0 } = opts;
   const cleaned = (maxChars > 0 ? String(query).slice(0, maxChars) : query)
     // Strip ASCII control chars / NUL FIRST. A NUL survives tokenization (it's not
@@ -281,31 +314,36 @@ export function sanitizeFtsQuery(query, opts = {}) {
     .replace(/[{}()[\]^~*:"\\]/g, ' ')
     .replace(/(^|\s)-/g, '$1')
     .trim();
-  if (!cleaned) return null;
-  let tokens = cleaned.split(/\s+/)
+  if (!cleaned) return { tokens: [], cjkExtracted: false };
+  let tokens = cleaned
+    .split(/\s+/)
     // Trim leading/trailing sentence punctuation (. , ? ! ; …) from each token.
     // Natural-language queries end in "?" and clauses in ",": left on, the final
     // (most salient) token rides as "bug?"/"month," which (a) misses the synonym
     // map → no OR-expansion, and (b) gets phrase-quoted as a literal by
     // expandToken. Edges only — internal dots/hyphens (cli.mjs, gardening-related)
     // are preserved so filenames/compounds still phrase-match.
-    .map(t => t.replace(/^[.,;:!?]+|[.,;:!?]+$/g, ''))
-    .filter(t =>
-      t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR(\/\d*)?$/i.test(t)
-      // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
-      && !(t.length === 1 && /^[a-zA-Z]$/.test(t))
-      // Drop tokens with NO index-able character — emoji 💥, symbols ★☆✦, pure
-      // punctuation. unicode61 strips those at index time, so ftsToken would phrase-quote
-      // such a token ("💥") into a REQUIRED AND term that can never match → strict FTS
-      // returns 0 (and a lone-emoji query has no OR recovery). Gate on any Unicode LETTER
-      // or NUMBER (\p{L}/\p{N}), NOT an ASCII+Han allowlist: unicode61 indexes every
-      // script's letters (Cyrillic / Greek / kana / Hangul / Thai / accented Latin …), so
-      // an allowlist silently killed search for all non-Latin/non-Han scripts (round-5
-      // review catch). Letters are kept; only true symbols/emoji/punctuation are dropped.
-      && /[\p{L}\p{N}]/u.test(t)
+    .map((t) => t.replace(/^[.,;:!?]+|[.,;:!?]+$/g, ''))
+    .filter(
+      (t) =>
+        t &&
+        !/^-+$/.test(t) &&
+        !FTS5_KEYWORDS.has(t.toUpperCase()) &&
+        !/^NEAR(\/\d*)?$/i.test(t) &&
+        // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
+        !(t.length === 1 && /^[a-zA-Z]$/.test(t)) &&
+        // Drop tokens with NO index-able character — emoji 💥, symbols ★☆✦, pure
+        // punctuation. unicode61 strips those at index time, so ftsToken would phrase-quote
+        // such a token ("💥") into a REQUIRED AND term that can never match → strict FTS
+        // returns 0 (and a lone-emoji query has no OR recovery). Gate on any Unicode LETTER
+        // or NUMBER (\p{L}/\p{N}), NOT an ASCII+Han allowlist: unicode61 indexes every
+        // script's letters (Cyrillic / Greek / kana / Hangul / Thai / accented Latin …), so
+        // an allowlist silently killed search for all non-Latin/non-Han scripts (round-5
+        // review catch). Letters are kept; only true symbols/emoji/punctuation are dropped.
+        /[\p{L}\p{N}]/u.test(t),
     );
   // Filter stop words (but keep all if filtering would empty the query)
-  const filtered = tokens.filter(t => !FTS_STOP_WORDS.has(t.toLowerCase()));
+  const filtered = tokens.filter((t) => !FTS_STOP_WORDS.has(t.toLowerCase()));
   if (filtered.length > 0) tokens = filtered;
   // Cap AFTER stopword filtering and BEFORE expansion: the terms kept are meaningful
   // ones, and everything downstream (CJK segmentation, synonym expansion, bigrams) is
@@ -336,9 +374,9 @@ export function sanitizeFtsQuery(query, opts = {}) {
         // "redis" in "redis缓存问题". extractCjkKeywords + cjkBigrams only see CJK runs, so
         // without this the Latin anchor (often the single most precise term — a proper noun
         // like redis/grafana/oauth with no CJK synonym) was dropped, zeroing recall on
-        // whitespace-free mixed-script prompts. Mirrors registry-retriever.mjs's embedded-
+        // whitespace-free mixed-script prompts. Mirrors the embedded-
         // English extraction. Lowercased for parity with the write-path unicode61 folding.
-        for (const en of (remainder.match(/[a-zA-Z]{2,}/g) || [])) {
+        for (const en of remainder.match(/[a-zA-Z]{2,}/g) || []) {
           const low = en.toLowerCase();
           if (!FTS_STOP_WORDS.has(low) && !expandedTokens.includes(low)) expandedTokens.push(low);
         }
@@ -357,7 +395,7 @@ export function sanitizeFtsQuery(query, opts = {}) {
       if (!/[A-Za-z0-9]/.test(t)) {
         const fallbackBigrams = cjkBigrams(t)
           .split(' ')
-          .filter(bg => bg && !isCjkNoiseBigram(bg));
+          .filter((bg) => bg && !isCjkNoiseBigram(bg));
         if (fallbackBigrams.length > 0) {
           expandedTokens.push(...fallbackBigrams);
           continue;
@@ -367,7 +405,13 @@ export function sanitizeFtsQuery(query, opts = {}) {
     expandedTokens.push(t);
   }
   tokens = expandedTokens;
-  if (tokens.length === 0) return null;
+  return { tokens, cjkExtracted };
+}
+
+export function sanitizeFtsQuery(query, opts = {}) {
+  const { tokens: baseTokens, cjkExtracted } = ftsQueryTokens(query, opts);
+  if (baseTokens.length === 0) return null;
+  const tokens = baseTokens;
   // Replace single CJK character tokens with bigrams for better phrase matching.
   // Individual CJK chars ("系","统") are too noisy; bigrams ("系统") capture compound words.
   // Skip bigrams when CJK synonym extraction already produced meaningful tokens —
@@ -377,12 +421,10 @@ export function sanitizeFtsQuery(query, opts = {}) {
   // like "存在" match alone after AND→OR fallback, exploding recall onto unrelated docs.
   let bigrams = null;
   if (!cjkExtracted) {
-    const pureCjkTokens = tokens.filter(t =>
-      /[一-鿿㐀-䶿]/.test(t) && !/[A-Za-z0-9]/.test(t)
-    );
+    const pureCjkTokens = tokens.filter((t) => /[一-鿿㐀-䶿]/.test(t) && !/[A-Za-z0-9]/.test(t));
     if (pureCjkTokens.length > 0) bigrams = cjkBigrams(pureCjkTokens.join(' '));
   }
-  const bigramSet = new Set(bigrams ? bigrams.split(' ').filter(b => b && !isCjkNoiseBigram(b)) : []);
+  const bigramSet = new Set(bigrams ? bigrams.split(' ').filter((b) => b && !isCjkNoiseBigram(b)) : []);
   const hasBigrams = bigramSet.size > 0;
   const finalTokens = [];
   const seen = new Set();
@@ -391,14 +433,21 @@ export function sanitizeFtsQuery(query, opts = {}) {
     // Skip single CJK characters when we have bigrams — they're subsumed by bigram tokens
     if (hasBigrams && /^[\u4e00-\u9fff\u3400-\u4dbf]$/.test(t)) continue;
     const expanded = expandToken(t);
-    if (!seen.has(expanded)) { seen.add(expanded); rawTokensSeen.add(t); finalTokens.push(expanded); }
+    if (!seen.has(expanded)) {
+      seen.add(expanded);
+      rawTokensSeen.add(t);
+      finalTokens.push(expanded);
+    }
   }
   for (const bg of bigramSet) {
-    if (!seen.has(bg) && !rawTokensSeen.has(bg)) { seen.add(bg); finalTokens.push(bg); }
+    if (!seen.has(bg) && !rawTokensSeen.has(bg)) {
+      seen.add(bg);
+      finalTokens.push(bg);
+    }
   }
   if (finalTokens.length === 0) return null;
   // FTS5 requires explicit AND after parenthesized OR groups
-  const hasGroup = finalTokens.some(e => e.startsWith('('));
+  const hasGroup = finalTokens.some((e) => e.startsWith('('));
   return finalTokens.join(hasGroup ? ' AND ' : ' ');
 }
 

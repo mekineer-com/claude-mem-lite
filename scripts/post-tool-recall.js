@@ -10,48 +10,69 @@
 // presentIdents excluded it); that class is carried by the pre-edit
 // BIND_DIRECTIVE, not here. See the spec's component-2 limits.
 //
-// Safety: readonly, no DB, exit 0 always. cooldownPathFor mirrors
-// pre-tool-recall.js (inlined per the #8447 fast-path convention).
+// Safety: readonly, no DB, exit 0 always. The cooldown path rule comes from
+// lib/cooldown-path.mjs — it used to be inlined here "per the #8447 fast-path
+// convention", but that exemption stopped applying to THIS script the moment it grew
+// the four lib imports below (audit 2026-09-02 P1-1: the fourth copy; the previous
+// round collapsed only three of four). A writer/reader disagreement on this name does
+// not error — it reads a file nobody wrote, silently zeroing the bind-mode
+// dropped-identifier check.
 
 import { existsSync, readFileSync } from 'fs';
 import { basename, join } from 'path';
-import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
+import { resolveDataDir, resolveRuntimeDir } from '../lib/resolve-data-dir.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 // D#154: every envelope on this stdout goes through the one writer. This script has a
 // single emit today, so the change buys nothing on its own — it buys that a SECOND
 // emit added later merges instead of producing two JSON documents, which the host
 // parses as neither (lib/hook-stdout.mjs). Import-free module over no runtime deps.
 import { queueHookContext, flushHookStdout } from '../lib/hook-stdout.mjs';
+// P1-9: one bounded stdin reader. Import-free, like hook-stdout.mjs beside it.
+import { readHookStdin, TOOL_INPUT_FILE_MAX_BYTES } from '../lib/hook-stdin.mjs';
+import { cooldownPathFor as sharedCooldownPathFor } from '../lib/cooldown-path.mjs';
+import { toolEditPath } from '../lib/file-edge-match.mjs';
 
 const SALIENCE_BIND = process.env.CLAUDE_MEM_SALIENCE === 'bind';
 
 const DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
-const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
+const RUNTIME_DIR = resolveRuntimeDir(DATA_DIR);
 const LEGACY_COOLDOWN_PATH = join(RUNTIME_DIR, 'pre-recall-cooldown.json');
 
+// The no-session legacy fallback stays local: it is this script's own back-compat with
+// pre-session-id cooldown files, not part of the shared naming rule. Same split as
+// scripts/pre-tool-recall.js, which is the writer.
 function cooldownPathFor(sessionId) {
   if (!sessionId) return LEGACY_COOLDOWN_PATH;
-  const safe = String(sessionId).replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
-  return join(RUNTIME_DIR, `pre-recall-cooldown-${safe}.json`);
+  return sharedCooldownPathFor(RUNTIME_DIR, sessionId);
 }
 
 async function main() {
   if (!SALIENCE_BIND) return;
   if (process.env.CLAUDE_MEM_HOOK_RUNNING) return;
-  let input = '';
-  for await (const chunk of process.stdin) input += chunk;
+  // Bounded stdin (P1-9) — was an unbounded `for await` accumulate with no cap or timeout.
+  // Same payload class as pre-tool-recall: a PostToolUse on `Write` carries the whole file.
+  const { text: input } = await readHookStdin({ maxBytes: TOOL_INPUT_FILE_MAX_BYTES });
   let filePath, sessionId;
   try {
     const e = JSON.parse(input);
-    filePath = e.tool_input?.file_path;
+    // Both spellings — this file's PostToolUse matcher includes NotebookEdit, whose
+    // schema has `notebook_path` and no `file_path`. The PreToolUse twin got this in
+    // v6.7.0 and this leg did not, which is the repo's most repeated failure shape:
+    // a fix that closes ONE of the inputs reaching the same line. Caught in pre-ship
+    // review of that very round.
+    filePath = toolEditPath(e.tool_input);
     sessionId = e.session_id || null;
-  } catch { return; }
+  } catch {
+    return;
+  }
   if (!filePath) return;
 
   const cdPath = cooldownPathFor(sessionId);
   if (!existsSync(cdPath)) return;
   let entry;
-  try { entry = JSON.parse(readFileSync(cdPath, 'utf8'))[filePath]; } catch (e) {
+  try {
+    entry = JSON.parse(readFileSync(cdPath, 'utf8'))[filePath];
+  } catch (e) {
     // A corrupt cooldown file (torn concurrent write — audit 2026-08-14 M-6) turns
     // the bind-salience check into a zero-trace no-op; record it so `stats` can see
     // the surface die instead of silently reading zero errors (M-5).
@@ -62,7 +83,11 @@ async function main() {
   if (!idents || typeof idents !== 'object') return;
 
   let post;
-  try { post = readFileSync(filePath, 'utf8'); } catch { return; }
+  try {
+    post = readFileSync(filePath, 'utf8');
+  } catch {
+    return;
+  }
 
   const dropped = [];
   for (const [obsId, tokens] of Object.entries(idents)) {
@@ -72,7 +97,9 @@ async function main() {
 
   const lines = ['[mem] PostToolUse recall — system-injected context, continue your planned action:'];
   for (const d of dropped.slice(0, 3)) {
-    lines.push(`[mem] ⚠ your edit to ${basename(filePath)} dropped \`${d.token}\` flagged by #${d.obsId} — if intentional say so, else re-check before moving on.`);
+    lines.push(
+      `[mem] ⚠ your edit to ${basename(filePath)} dropped \`${d.token}\` flagged by #${d.obsId} — if intentional say so, else re-check before moving on.`,
+    );
   }
   queueHookContext('PostToolUse', lines.join('\n'));
   flushHookStdout();
@@ -90,4 +117,10 @@ process.stdout.on('error', () => {});
 // Record what slips past main()'s early returns before the mandatory swallow —
 // this script had zero telemetry (audit 2026-08-14 M-5). Recorder never throws;
 // the outer catch keeps the exit code 0 regardless.
-main().catch((e) => { try { recordHookError('post-recall:main', e, RUNTIME_DIR); } catch { /* never */ } });
+main().catch((e) => {
+  try {
+    recordHookError('post-recall:main', e, RUNTIME_DIR);
+  } catch {
+    /* never */
+  }
+});

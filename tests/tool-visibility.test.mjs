@@ -1,6 +1,5 @@
-// Tool visibility split: only 10 core tools appear in tools/list (the original
-// retrieval/save tools + search feedback + defer trio); the
-// 11 hidden maintenance/admin tools stay callable by exact name. This test
+// Tool visibility split: only 10 core tools appear in tools/list; the
+// 9 hidden maintenance/admin tools stay callable by exact name. This test
 // spawns the real server over stdio and drives the MCP handshake so it
 // catches regressions in both the filter and the registration wiring.
 
@@ -14,8 +13,16 @@ import { SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 const SERVER_PATH = resolve(new URL('..', import.meta.url).pathname, 'server.mjs');
 
 const EXPECTED_CORE = [
-  'mem_defer', 'mem_defer_drop', 'mem_defer_list',
-  'mem_get', 'mem_recall', 'mem_recent', 'mem_save', 'mem_search', 'mem_search_feedback', 'mem_timeline',
+  'mem_defer',
+  'mem_defer_drop',
+  'mem_defer_list',
+  'mem_get',
+  'mem_recall',
+  'mem_recent',
+  'mem_save',
+  'mem_search',
+  'mem_search_feedback',
+  'mem_timeline',
 ];
 
 function startServer(memDir, extraEnv = {}) {
@@ -67,11 +74,23 @@ describe('MCP tools/list filter (v2.34.0 hidden-but-callable)', () => {
   });
 
   afterEach(async () => {
-    try { proc.stdin.end(); } catch { /* already closed */ }
-    try { proc.kill('SIGTERM'); } catch { /* already exited */ }
+    try {
+      proc.stdin.end();
+    } catch {
+      /* already closed */
+    }
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      /* already exited */
+    }
     // Best-effort wait for process to settle before cleaning the tmp DB.
     await new Promise((r) => setTimeout(r, 50));
-    try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+    try {
+      rmSync(tmp, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   });
 
   it('tools/list returns exactly the 10 core names', async () => {
@@ -86,10 +105,15 @@ describe('MCP tools/list filter (v2.34.0 hidden-but-callable)', () => {
     expect(names).toEqual(EXPECTED_CORE);
   });
 
-  it('CLAUDE_MEM_ALL_TOOLS=1 restores all 21 tools in tools/list (opt-out)', async () => {
+  it('CLAUDE_MEM_ALL_TOOLS=1 restores all 19 tools in tools/list (opt-out)', async () => {
     // Spin up a dedicated server with the env var set — the default fixture
     // runs without it, so we need a separate process for this case.
-    try { proc.stdin.end(); proc.kill('SIGTERM'); } catch { /* ignore */ }
+    try {
+      proc.stdin.end();
+      proc.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
     proc = startServer(tmp, { CLAUDE_MEM_ALL_TOOLS: '1' });
     await rpc(proc, 1, 'initialize', {
       protocolVersion: '2024-11-05',
@@ -99,7 +123,7 @@ describe('MCP tools/list filter (v2.34.0 hidden-but-callable)', () => {
     const resp = await rpc(proc, 2, 'tools/list', {});
     expect(resp.error, 'tools/list error').toBeUndefined();
     const names = resp.result.tools.map((t) => t.name);
-    expect(names).toHaveLength(21);
+    expect(names).toHaveLength(19);
     // Spot-check hidden names are present
     expect(names).toContain('mem_stats');
     expect(names).toContain('mem_browse');

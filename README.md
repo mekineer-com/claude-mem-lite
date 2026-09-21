@@ -2,12 +2,12 @@
 
 # claude-mem-lite
 
-`claude-mem-lite` is a **persistent memory** (also called *long-term memory* or *cross-session context*) system for **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — Anthropic's CLI coding agent. It runs as an **[MCP](https://modelcontextprotocol.io/) server** plus a set of Claude Code hooks, automatically capturing coding observations, decisions, and bug fixes during sessions, then providing hybrid full-text + semantic search to recall them later.
+`claude-mem-lite` is a **persistent memory** (also called *long-term memory* or *cross-session context*) system for **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — Anthropic's CLI coding agent. It runs as an **[MCP](https://modelcontextprotocol.io/) server** plus a set of Claude Code hooks, automatically capturing coding observations, decisions, and bug fixes during sessions, then providing full-text search with query expansion to recall them later.
 
-Compared to general-purpose LLM memory frameworks like [`mem0`](https://github.com/mem0ai/mem0) or the MCP reference [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) server, claude-mem-lite is purpose-built for Claude Code's hook lifecycle: episode batching cuts LLM calls 7–10× vs the original [claude-mem](https://github.com/thedotmack/claude-mem) (an estimated ~600× lower total cost — see the cost model below; this is an architecture estimate, not a measured benchmark), while the hybrid FTS5 + TF-IDF retriever benchmarks at 0.90 Recall@10 / 0.85 Precision@10
+Compared to general-purpose LLM memory frameworks like [`mem0`](https://github.com/mem0ai/mem0) or the MCP reference [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) server, claude-mem-lite is purpose-built for Claude Code's hook lifecycle: episode batching cuts LLM calls 7–10× vs the original [claude-mem](https://github.com/thedotmack/claude-mem) (an estimated ~600× lower total cost — see the cost model below; this is an architecture estimate, not a measured benchmark), while the FTS5 retriever benchmarks at 0.90 Recall@10 / 0.85 Precision@10
 (see [Search Quality](#search-quality) for the reproduction command).
 
-> 中文简介：claude-mem-lite 是 Claude Code 的轻量级**持久化记忆 / 长期记忆 / 跨会话上下文**插件，基于 MCP 协议 + 钩子机制，自动捕获编码会话中的决策、修复和上下文，并通过 FTS5 + TF-IDF 混合检索召回。详见 [中文 README](README.zh-CN.md)。
+> 中文简介：claude-mem-lite 是 Claude Code 的轻量级**持久化记忆 / 长期记忆 / 跨会话上下文**插件，基于 MCP 协议 + 钩子机制，自动捕获编码会话中的决策、修复和上下文，并通过 FTS5 全文检索召回。详见 [中文 README](README.zh-CN.md)。
 
 Zero external services. Single SQLite database. Minimal overhead.
 
@@ -66,7 +66,7 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 | **Target client** | Claude Code only | Any LLM app via SDK | Any MCP client | Claude Code only |
 | **Capture model** | Auto via hooks | Manual `memory.add()` | Manual tool calls (`create_entities`, `add_observations`) | Auto via hooks |
 | **Code-aware retrieval** | FTS5 + 100+ synonym pairs (incl. CJK↔EN) | General-purpose | Generic graph nodes | Code-aware |
-| **Search** | Hybrid: FTS5 BM25 + TF-IDF cosine via RRF | Hybrid: semantic + BM25 + entity linking | Knowledge-graph traversal | FTS5 + Chroma vector |
+| **Search** | FTS5 BM25 + query expansion (PRF, concept co-occurrence) | Hybrid: semantic + BM25 + entity linking | Knowledge-graph traversal | FTS5 + Chroma vector |
 | **Storage** | Single local SQLite | Pluggable; Qdrant or configurable vector store | Single JSONL file (knowledge graph) | SQLite + Chroma |
 | **LLM dependency** | Haiku per episode (5–10 ops batched) | LLM per add/search op | None (graph CRUD only) | Sonnet per tool call |
 | **Setup** | One command (`/plugin install` or `npx`) | SDK integration + vector store config | MCP install (per-client) | Bun + Python + Chroma |
@@ -75,8 +75,8 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 
 ## Features
 
-- **Automatic capture** -- Hooks into Claude Code lifecycle (PostToolUse, SessionStart, Stop, UserPromptSubmit) to record observations without manual effort
-- **Hybrid search** -- FTS5 BM25 + TF-IDF vector cosine similarity, merged via Reciprocal Rank Fusion (RRF). FTS5 handles keyword matching; 512-dim TF-IDF vectors capture semantic similarity for recall beyond exact terms
+- **Automatic capture** -- Hooks into the Claude Code lifecycle (SessionStart, PreCompact, PreToolUse, PostToolUse, PostToolUseFailure, Stop, UserPromptSubmit — the seven events in `hooks/hooks.json`) to record observations without manual effort
+- **Lexical search with query expansion** -- FTS5 BM25 scoring, an AND->OR rescue pass, pseudo-relevance feedback and concept co-occurrence. A TF-IDF vector arm shipped alongside it until it was measured net-negative and removed; `--deep` still fuses multiple LLM-rewritten queries with Reciprocal Rank Fusion
 - **Timeline browsing** -- Navigate observations chronologically with anchor-based context windows
 - **Episode batching** -- Groups related file operations into coherent episodes before LLM encoding
 - **Error-triggered recall** -- Automatically searches memory when Bash errors occur, surfacing relevant past fixes
@@ -92,8 +92,7 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 - **Two-tier dedup** -- Jaccard similarity (5-minute window) + MinHash signatures (7-day cross-session window) prevent duplicates
 - **Synonym expansion** -- Abbreviations like `K8s`, `DB`, `auth` automatically expand to full forms in FTS5 search (100+ pairs including CJK↔EN cross-language mappings)
 - **CJK synonym extraction** -- Unsegmented Chinese text is scanned for known vocabulary words (数据库→database, 搜索→search, etc.) enabling cross-language memory recall
-- **Stop-word filtering** -- English stop words filtered from both TF-IDF vocabulary (reclaiming ~18% of vector dimensions) and FTS queries (preventing false negatives from noise terms like "how", "the", "does")
-- **Persisted vocabulary** -- TF-IDF vocabulary persisted to `vocab_state` table, preventing vector staleness when document frequencies shift. Vectors stay valid until explicit rebuild
+- **Stop-word filtering** -- English stop words filtered from FTS queries, preventing false negatives from noise terms like "how", "the", "does"
 - **Pseudo-relevance feedback (PRF)** -- Top results seed expansion queries for broader recall
 - **Concept co-occurrence** -- Shared concepts across observations expand search to related topics
 - **Context-aware re-ranking** -- Active file overlap boosts relevance (exact match + directory-level half-weight)
@@ -105,15 +104,12 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 - **Atomic writes** -- All file writes (episodes, CLAUDE.md) use write-to-tmp + rename to prevent corruption on crash
 - **Robust locking** -- PID-aware lock files with automatic stale/orphan cleanup (>30s timeout or dead PID)
 - **Stale session cleanup** -- Sessions active for >24h are automatically marked as abandoned on next start
-- **Resource registry** -- Indexes installed skills and agents with FTS5 search, composite scoring, and invocation tracking; searchable via `mem_registry` MCP tool
-- **Unified resource discovery** -- Shared filesystem traversal layer (`resource-discovery.mjs`) used by both runtime scanner and offline indexer, supporting flat directories, plugin nesting, and loose `.md` files
-- **Domain synonym expansion** -- Registry search queries expand to domain synonyms (e.g., "fix" → debug, bugfix, troubleshoot, diagnose, repair)
+- **Domain synonym expansion** -- Search queries expand to domain synonyms (e.g., "fix" → debug, bugfix, troubleshoot, diagnose, repair)
 - **Multi-provider LLM mode** -- Provider priority `ANTHROPIC_API_KEY` (direct Anthropic API) → `OPENROUTER_API_KEY` (OpenRouter, OpenAI-compatible — point it at any model via `OPENROUTER_MODEL`) → `claude -p` CLI fallback when no key is set
 - **Lesson-learned indexing** -- `lesson_learned` field indexed in FTS5 with weight 8, making past debugging insights directly searchable
 - **Cross-source normalization** -- `mem_search` normalizes scores across observations, sessions, and prompts before merging, preventing any source from dominating results
 - **Exponential recency decay** -- Type-differentiated half-lives (decisions: 90d, discoveries: 60d, bugfixes: 14d, changes: 7d) consistently applied in all ranking paths
 - **Prompt-time memory injection** -- UserPromptSubmit hook automatically searches and injects relevant past observations with recency and importance weighting
-- **Smart skill invocation** -- Auto-loaded and searched managed skills/agents include portable `~` paths with `Read()` guidance; native plugin skills recommend `Skill("full:name")`; prevents `Skill()` misuse for managed resources that aren't registered with Claude Code's native handler
 - **Dual injection dedup** -- `user-prompt-search.js` and `handleUserPrompt` coordinate via temp file to prevent duplicate memory injection
 - **Plugin cache hook self-heal** -- Claude Code runtime reads plugin hooks from `~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json`, not from the marketplace source. When `install.mjs`-managed `settings.json` hooks coexist with a stale cache `hooks.json` (e.g. from a previous marketplace install or a plugin auto-update), the runtime registers hooks twice → every session start / user prompt fires twice. `install.mjs` and `hook-update.mjs` now clear cache `hooks.json` in every version dir, and `hook.mjs session-start` self-heals on every session (gated by `hasInstallManagedHooks` so plugin-only users are not affected). `install.mjs status` reports cache pollution state (since v2.31.1/2.31.2).
 - **Result-dedup cooldown** -- User-prompt memory injection uses result-overlap detection (>80% ID overlap → skip) instead of time-based cooldown, allowing topic switches within seconds while preventing redundant injections
@@ -121,34 +117,40 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 - **Configurable LLM model** -- Switch between Haiku (fast/cheap) and Sonnet (deeper analysis) via `CLAUDE_MEM_MODEL` env var
 - **DB auto-recovery** -- Detects and cleans corrupted WAL/SHM files on startup; periodic WAL checkpoints prevent unbounded growth
 - **Schema auto-migration** -- Idempotent `ALTER TABLE` migrations run on every startup, safely adding new columns and indexes without data loss
-- **Exploration bonus** -- New resources in the registry get a fair chance in composite ranking; zombie resources (high recommend, zero adopt) are penalized in scoring
 - **LLM concurrency control** -- File-based semaphore limits background workers to 2 concurrent LLM calls, preventing resource contention
 - **stdin overflow protection** -- Hook input truncated at 256KB with regex-based action salvage for oversized tool outputs
-- **Cross-session handoff** -- Captures session state (request, completed work, next steps, key files) on `/clear` or `/exit`, then injects context when the next session detects continuation intent via explicit keywords or FTS5 term overlap
+- **Cross-session handoff** -- Captures session state (request, completed work, next steps, key files) on `/exit`, then injects context when the next session detects continuation intent via explicit keywords or FTS5 term overlap. **The `/clear` and `/compact` arm fires since v5.4.0** (R10-P1-1); before that it had never once written a row — `session_handoffs` on the maintainer's install held 4 `exit` rows and **0** `clear` rows. Two host facts settled it, both measured rather than assumed. (1) `Stop` runs at the end of every assistant *turn*, not once per session, and it deleted the session file that SessionStart reads to learn which session just ended — so the branch was unreachable, and mem sessions were minted per turn (58 prompts over 16 host sessions produced 56 mem sessions and 56 summary rows, 2026-09-07). (2) Claude Code **rotates its session id across `/clear`**: of 21 real transcripts, 12 carry a `/clear` command record, and in 12/12 that record's timestamp precedes its own file's first record by ~0.1s — the command is issued in the old session and replayed into a new file under a new id. So `Stop` no longer deletes the file, SessionStart asks the host's `source` (`startup`/`clear`/`compact`/`resume`) instead of guessing from the file, and the handoff's prompt lookup falls back to the unscoped set when the new session's id matches none. Revert path: `CLAUDE_MEM_LEGACY_STOP_UNLINK=1`
 - **Git-SHA continuation anchor** (v2.31.0) -- Handoff rows include `git_sha_at_handoff`; any handoff matching the current `HEAD` counts as continuation regardless of TTL. Code state is a stronger continuation signal than wall-clock time
 - **Startup dashboard** (v2.31.0) -- SessionStart hook aggregates `git status` + `~/.claude/tasks/*.json` + `~/.claude/plans/*.md` + most-recent exit handoff + recent event count into a single structured block injected via `hookSpecificOutput.additionalContext`
 - **Activity namespace** (v2.31.0) -- Dedicated `events` table + FTS5 for non-memdir types (`bugfix`, `lesson`, `bug`, `discovery`, `refactor`, `feature`, `observation`, `decision`) that don't compete with `WHAT_NOT_TO_SAVE` semantics on the observations table. CLI: `claude-mem-lite activity save|search|recent|show`. `hook-llm` routes non-memdir summary types through `persistHaikuSummary` so upgrades from observations→events are atomic. (v3.39: the `/lesson` and `/bug` slash commands were redirected from this events table to searchable **observations** — `mem_search` never read the events table, so explicit saves were unfindable; the events table remains the auto-capture activity log.)
-- **In-place observation updates** -- `mem_update` tool modifies existing observations atomically (field update + FTS text rebuild + vector re-computation in one transaction), preserving original IDs and references
+- **In-place observation updates** -- `mem_update` tool modifies existing observations atomically (field update + FTS text rebuild in one transaction), preserving original IDs and references
 - **Bulk export** -- `mem_export` tool exports observations as JSON or JSONL, with project/type/date filtering and 1000-row pagination cap with batch guidance
 - **FTS integrity management** -- `mem_fts_check` tool verifies FTS5 index health or rebuilds indexes on demand, useful after database recovery or when search results seem wrong
-- **Atomic multi-table writes** -- `saveObservation` wraps observations + observation_files + observation_vectors INSERTs in a single `db.transaction()`, preventing orphaned rows on crash
+- **Atomic multi-table writes** -- `saveObservation` wraps the observations + observation_files INSERTs in a single `db.transaction()`, preventing orphaned rows on crash
 - **Modular NLP pipeline** -- Synonym maps, stop words, scoring constants, and query building extracted into focused modules (`synonyms.mjs`, `stop-words.mjs`, `scoring-sql.mjs`, `nlp.mjs`) for independent testing and maintenance
-- **Porter-aligned PRF** -- Pseudo-relevance feedback terms are now stemmed with the same Porter algorithm used by FTS5, ensuring PRF expansion terms match the search index
+- **Surface-form PRF expansion** -- `observations_fts` is built on FTS5's default `unicode61` tokenizer, so the index is **not stemmed**: a query term matches the word forms actually stored, and `crash` does not match a row that only contains `crashes`. Pseudo-relevance feedback therefore uses the Porter stemmer only to *bucket* morphological variants when judging which candidate terms are discriminative, and emits the most frequent **surface** form of each — emitting a bare stem (`cach`) would match nothing and kill expansion recall
 
 ## Platform Support
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| **Linux** | Supported | Primary development and testing platform |
+| **Linux** | Supported | Primary development and testing platform; the whole CI matrix runs here |
 | **macOS** | Supported | Fully compatible (Intel and Apple Silicon) |
-| **Windows** | Not supported | Uses POSIX shell scripts (`post-tool-use.sh`, `setup.sh`) and Unix file locking; WSL2 may work but is untested |
+| **Windows** | Installs, not CI-covered | The MCP server, the CLI and the `node` hooks work (`better-sqlite3` ships `win32-x64` and `win32-arm64` prebuilds, so nothing is compiled). **Three hook commands run under `bash`** — `setup.sh`, `post-tool-use.sh`, `pre-agent-inject.sh` — and need Git for Windows or WSL on `PATH`; `claude-mem-lite doctor` reports it when `bash` cannot be found. No GitHub Actions runner exercises Windows, so this rests on user reports ([#28](https://github.com/sdsrss/claude-mem-lite/issues/28)), not on a green pipeline |
+| **WSL2** | Untested | Linux under the hood, so it should behave as the Linux row; nobody has reported either way |
+
+From v5.1.0 through v6.1.0, `package.json` declared `os: ["darwin", "linux"]`. That is an npm *install*
+gate, not a runtime check: on Windows it made `npm install` exit `EBADPLATFORM`, which the
+plugin launcher runs on the first MCP start after every plugin update — so the server never
+came up and `/mcp` reported `CONNECTION_CLOSED`. `win32` is now in the list. A platform that
+is still outside it gets a message naming both sides of the mismatch instead of a guess.
 
 ## Requirements
 
-- **Node.js** >= 20
+- **Node.js** >= 22
 - **Claude Code** CLI installed and configured (`claude` command available)
-- **SQLite3** support (provided by `better-sqlite3`, compiled on install)
-- **Platform**: Linux or macOS (see [Platform Support](#platform-support))
+- **SQLite3** support (provided by `better-sqlite3` 13, which ships prebuilt binaries for 8 platforms — no compiler needed on any of them; a platform it has no prebuild for falls back to building from source)
+- **Platform**: Linux or macOS; Windows installs and runs but is not CI-covered and needs Git Bash or WSL for three hooks (see [Platform Support](#platform-support))
 
 ## Installation
 
@@ -190,8 +192,8 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 ### What happens during installation
 
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
-2. **Register MCP server** -- `mem-lite` server with 21 tools (10 core exposed via `tools/list` + 11 hidden-but-callable; see the Usage section for the full table). The pre-v2.78 generic server name `mem` is renamed to `mem-lite` for namespace hygiene; the tool names themselves (`mem_search`, `mem_recall`, ...) are unchanged.
-3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
+2. **Register MCP server** -- `mem-lite` server with 19 tools (10 core exposed via `tools/list` + 9 hidden-but-callable; see the Usage section for the full table). The pre-v2.78 generic server name `mem` is renamed to `mem-lite` for namespace hygiene; the tool names themselves (`mem_search`, `mem_recall`, ...) are unchanged.
+3. **Configure hooks** -- all seven lifecycle events: `SessionStart`, `PreCompact`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `UserPromptSubmit`
 4. **Create data directory** -- `~/.claude-mem-lite/` (hidden) for database, runtime, and managed resource files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) or `~/claude-mem-lite/` (pre-v0.5 unhidden) exists, migrates database and runtime files to `~/.claude-mem-lite/`, preserving the original untouched
 6. **Initialize database** -- SQLite with WAL mode, FTS5 indexes created on first server start
@@ -224,27 +226,121 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 ```
 ~/.claude-mem-lite/
   claude-mem-lite.db       # SQLite database — memory (WAL mode)
-  resource-registry.db     # SQLite database — skill/agent registry
   runtime/
     session-<project>    # Active session state
     ep-<project>.json    # Episode buffer
     ep-flush-*.json      # Flushed episodes awaiting processing
     reads-<project>.txt  # Read file paths (collected on flush)
   managed/
-    skills/              # Standalone skills: {name}/SKILL.md
-    agents/              # Agent plugins: {group}/agents/{name}.md + skills/*/SKILL.md
     repos/               # Shallow-cloned source repos
 ```
+
+<!-- normalize-per-project-note:start -->
+## Upgrading to 6.8.0
+
+**Two things change on upgrade. Neither needs an action from you, and neither is a schema
+change — an older build can still open the database.**
+
+*The first open backfills the file-lookup table, once.* Observations imported from a
+transcript before 6.7.2 carry their modified-files list but no row in the junction table the
+file-recall paths join, so asking about a file never found them. The repair was gated on that
+table being completely empty, which one ordinary `mem_save` falsifies forever. It now runs
+once per database, keyed on its own marker, and retries on a later open if it fails. A store
+that never ran `import-jsonl` matches no rows and pays nothing.
+
+Those rows become reachable through `recall` / `mem_recall` and the prompt-submit path. Two
+limits, both measured:
+
+- Not through the pre-tool recall hook, which admits only `importance >= 2` while every
+  imported row carries `1`.
+- Not for `NotebookEdit` rows imported before 6.7.2. Those were stored with an empty
+  modified-files list, because the importer of the day read `file_path` and `NotebookEdit`
+  sets `notebook_path` instead — so the backfill, which selects on that column being
+  non-empty, passes over them. Re-importing the transcript is what recovers those, and 6.7.2
+  made that work by putting the path into the title the dedup key is built from.
+
+*`doctor --json` changes shape.* Checks that print a repair command now carry it in a
+`details` array — previously the human screen got the command and the JSON got only the
+diagnosis. And four checks (dev drift, managed files, and both hook-script branches) now
+report `"level": "fail"` where they used to report `"warn"`, with a new `"glyph": "warn"`
+recording that they still render as ⚠ rather than ✗. They always counted toward the issue
+total and the exit code; the level now says so. If you filter on `level === "fail"` you will
+see four findings you were missing. The `issues` count, the summary line and the exit code
+are unchanged.
+
+## Upgrading to 6.1.0
+
+**One default changes, and only for the daily background pass.** Until 6.1.0 the unattended
+`normalize` task read the concept vocabulary of EVERY project at once, sent it to the model as
+one list, and wrote the answer back across every project — so one project's stored content
+could steer the synonym groups applied to an unrelated project's rows. It now runs one scoped
+pass per project.
+
+| | Before 6.1.0 | 6.1.0 |
+|---|---|---|
+| Unattended `normalize` | one pass over every project's vocabulary | one pass per project, at most 8 per run, rotating |
+| Cross-project synonym unification | automatic | does not happen |
+| `optimize --run --task normalize` with no `--project` | one cross-project pass | fans out the same way |
+
+**What you may notice:** `k8s` in one project and `kubernetes` in another are no longer folded
+together by the daily pass. Nothing is deleted, no row moves project, and search behaviour is
+unchanged — only which terms the background pass will unify.
+
+**It is forward-only.** Terms that earlier cross-project runs already unified stay unified.
+The replaced term is kept on the row as a search alias, so those rows are still findable under
+the old wording, but there is no record of which unification came from another project.
+
+**To keep the old behaviour:** set `CLAUDE_MEM_NORMALIZE_CROSS_PROJECT=1`. It restores the
+cross-project scope — and that scope is exactly the guard it gives up. The other two checks
+added in this release (a shape gate on concept tokens, and a check that the model's answer only
+uses terms the corpus already had) do still run on that path, but the second one is then judged
+against the union of every project's vocabulary, so it no longer keeps one project's term out
+of another project's rows. Set it only if you want cross-project unification and trust the
+contents of every project in the store. A foreground `optimize` run prints a warning when the
+flag is set, and `claude-mem-lite doctor` reports it as ⚠ — the daily pass runs in a worker
+with stderr closed, so it cannot warn you itself.
+<!-- normalize-per-project-note:end -->
+
+<!-- vector-arm-removal-note:start -->
+## Upgrading to 6.0.0 (breaking)
+
+**The default search path does not change.** 6.0.0 removes the TF-IDF vector arm, which has
+been disabled by default since 3.17.0 — if you never set CLAUDE_MEM_VECTORS, upgrading is
+behaviour-identical and there is nothing to do.
+
+Three surfaces are gone:
+
+| Removed | What happens now |
+|---|---|
+| `CLAUDE_MEM_VECTORS=1` | Inert. Setting it has no effect. |
+| `maintain execute --ops rebuild_vectors` | Exits 1: `Unknown operation(s): rebuild_vectors`. |
+| Tables `observation_vectors`, `vocab_state` | Dropped by schema migration v49 on first open. |
+
+**The migration is one-way.** Once a 6.0.0 build has opened your database, older versions
+refuse it — `schema.mjs`'s forward-incompat guard throws *"DB schema is v49 but this
+claude-mem-lite binary supports up to v48"*. If you want to stay on the vector arm, pin
+`claude-mem-lite@5.6.0` **before** upgrading. If you have already upgraded and need to go
+back, either re-upgrade, point `CLAUDE_MEM_DIR` at a fresh directory, or restore a
+pre-upgrade backup (`claude-mem-lite export` / the snapshots under your data dir).
+
+Why it was removed: measured directly against the shipped path, the arm was negative on both
+benchmark fixtures — including the vocabulary-mismatch suite that is the only reason a vector
+arm would exist (Recall@10 0.3407 → 0.3018, and roughly +88% P95 latency). No observations
+are lost; only the derived vector index is.
+<!-- vector-arm-removal-note:end -->
 
 ## Usage
 
 ### MCP Tools (used automatically by Claude)
 
-The server registers 21 tools in total but only the 10 **core**
-tools appear in `tools/list`. The 11 **hidden** tools remain callable at the
+The server registers 19 tools in total but only the 10 **core**
+tools appear in `tools/list`. The 9 **hidden** tools remain callable at the
 protocol layer (`tools/call` by exact name still routes normally); they're
-omitted from the list response so Claude Code sessions don't load 11 extra
-tool schemas at startup. Hidden tools are the maintenance / admin / browser
+omitted from the list response so Claude Code sessions don't load 9 extra
+tool schemas at startup. (It read 20 / 11 until v5.0.0 removed the two skill-registry
+tools — `tool-schemas.mjs` is the source of truth, and
+`tests/tool-count-docs.test.mjs` now holds this paragraph, both README tool tables,
+`README.zh-CN.md`, `llms.txt` and `docs/ARCHITECTURE.md` to it.) Hidden tools are the maintenance / admin / browser
 surface — reach them through the CLI column in the second table.
 
 **Core (10, exposed to Claude Code)**
@@ -262,7 +358,7 @@ surface — reach them through the CLI column in the second table.
 | `mem_defer_list` | List open deferred items for the current project. |
 | `mem_defer_drop` | Drop a deferred item without fixing it; requires a `reason` for the audit trail. |
 
-**Hidden-but-callable (11, CLI-routed)**
+**Hidden-but-callable (9, CLI-routed)**
 
 | Tool | CLI equivalent | Notes |
 |------|----------------|-------|
@@ -270,13 +366,11 @@ surface — reach them through the CLI column in the second table.
 | `mem_stats` | `claude-mem-lite stats` | Counts, type distribution, daily activity. |
 | `mem_delete` | `claude-mem-lite delete <id>` | Preview / confirm workflow, FTS5 cleanup. |
 | `mem_compress` | `claude-mem-lite compress` | Roll up old low-value observations (preview default; `--execute` to apply). |
-| `mem_maintain` | `claude-mem-lite maintain scan --ops dedup,decay` | dedup / decay / cleanup / rebuild_vectors (`scan` previews, `execute` applies). |
+| `mem_maintain` | `claude-mem-lite maintain scan --ops dedup,decay` | dedup / decay / cleanup / vacuum (`scan` previews, `execute` applies). |
 | `mem_optimize` | `claude-mem-lite optimize` | LLM-powered re-enrich / normalize / cluster-merge (preview default; `--run` to apply). |
 | `mem_export` | `claude-mem-lite export` | JSON / JSONL dump, filters by project, type, date. |
 | `mem_fts_check` | `claude-mem-lite fts-check <check\|rebuild>` | FTS5 integrity + rebuild. |
 | `mem_browse` | `claude-mem-lite browse` | Tier-grouped dashboard (working / active / archive). |
-| `mem_registry` | `claude-mem-lite registry <action>` | List / search / import / remove skills + agents. |
-| `mem_use` | _MCP only_ | Load a skill / agent from the registry by name. |
 
 ### Skill Commands (in Claude Code chat)
 
@@ -371,8 +465,12 @@ Slash commands `/adopt` and `/unadopt` wrap the same CLI.
   runtime-gated on sentinel presence, so projects without adoption get the
   full verbose output.
 
-See `docs/plans/2026-04-16-invited-memory-pattern.md` for the full design
-(including the reusable template other plugins can follow).
+See [the invited-memory design][invited-memory] for the full design (including the
+reusable template other plugins can follow). It is a development-time document and
+is no longer in the repository at HEAD, so that link is pinned to `v3.95.0`, the
+last release that carried it.
+
+[invited-memory]: https://github.com/sdsrss/claude-mem-lite/blob/v3.95.0/docs/plans/2026-04-16-invited-memory-pattern.md
 
 ## Database Schema
 
@@ -416,16 +514,6 @@ key_files, key_decisions, match_keywords, created_at_epoch
 obs_id, filename
 ```
 
-**observation_vectors** -- TF-IDF vector embeddings for hybrid search
-```
-observation_id, vector (BLOB Float32Array), vocab_version, created_at_epoch
-```
-
-**vocab_state** -- Persisted TF-IDF vocabulary for stable vector indexing
-```
-term, term_index, idf, version, created_at_epoch
-```
-
 FTS5 indexes: `observations_fts` (title, subtitle, narrative, text, facts, concepts, lesson_learned), `session_summaries_fts`, `user_prompts_fts`
 
 ## How It Works
@@ -434,7 +522,10 @@ FTS5 indexes: `observations_fts` (title, subtitle, narrative, text, facts, conce
 
 ```
 SessionStart
-  -> Generate session ID (or save handoff snapshot on /clear)
+  -> Read the host's `source` (startup | clear | compact | resume) from stdin
+  -> On clear/compact: read the outgoing session from the session file, save its
+     'clear' handoff, emit the Working State block  (R10-P1-1, fixed v5.4.0)
+  -> Generate session ID (overwrites the session file)
   -> Mark stale sessions (>24h active) as abandoned
   -> Clean orphaned/stale lock files
   -> Query recent observations (24h)
@@ -454,9 +545,6 @@ UserPromptSubmit (two parallel paths)
   -> [user-prompt-search.js] Auto-search memory via FTS5 + active file context
   -> [user-prompt-search.js] Inject relevant past observations with recency/importance weighting
   -> [user-prompt-search.js] Write injected IDs to temp file for dedup
-  -> [user-prompt-search.js] L1 skill auto-load: match managed skill names in prompt
-     -> Load content with portable ~ path + Read() guidance
-     -> source="managed-skill|managed-agent", path="~/.claude-mem-lite/managed/..."
   -> [hook.mjs handleUserPrompt] Capture user prompt text to user_prompts table
   -> [hook.mjs handleUserPrompt] Increment session prompt counter
   -> [hook.mjs handleUserPrompt] Handoff: detect continuation intent → inject previous session context
@@ -464,34 +552,13 @@ UserPromptSubmit (two parallel paths)
 
 Stop
   -> Flush final episode buffer
-  -> Save handoff snapshot (on /exit)
+  -> Save handoff snapshot (type 'exit')
   -> Mark session completed
   -> Spawn LLM summary worker (poll-based wait)
+  -> Keep the session file  <- Stop fires per TURN; deleting it here re-minted a mem
+     session every turn and left the SessionStart /clear branch unreachable (v5.4.0)
 ```
 
-### Resource Registry
-
-The resource registry (`registry.mjs`, `registry-retriever.mjs`) indexes installed skills and agents into a searchable FTS5 database. Unlike the previous proactive dispatch system, the registry is now on-demand — it's reachable via the `claude-mem-lite registry` CLI (primary path for Claude Code since v2.34.0 hides the `mem_registry` MCP tool from `tools/list`) or by direct `tools/call mem_registry` for MCP clients that know the name.
-
-```
-Registry pipeline:
-  -> registry-scanner.mjs discovers skills/agents on filesystem
-  -> resource-discovery.mjs handles flat dirs, plugin nesting, loose .md files
-  -> registry-indexer.mjs indexes content into FTS5 with metadata
-  -> registry-retriever.mjs provides BM25-ranked search with synonym expansion
-  -> mem_registry MCP tool exposes search/list/stats/import/remove/reindex actions
-
-Smart invocation (three layers):
-  L1 auto-load: UserPromptSubmit matches managed skill name in prompt
-     -> Loads content with path="~/.claude-mem-lite/managed/.../SKILL.md"
-     -> Guides: Read("path") or mem_use(name="..."), never Skill()
-  L2 bridge: PreToolUse hook intercepts Skill("name") for managed resources
-     -> Outputs content, prevents native handler failure
-  L3 explicit: mem_use(name="...") loads full content with reload path
-  Search: managed resources → Read(path), native plugins → Skill("full:name")
-```
-
-Composite scoring for search results: BM25 relevance (40%) + repo stars (15%) + success rate (15%) + adoption rate (10%) + freshness (10%) + exploration bonus (10%). Domain filtering ensures platform-specific resources (iOS, Go, Rust) only surface for matching projects.
 
 ### Episode Encoding
 
@@ -515,7 +582,8 @@ node install.mjs install              # Install and configure
 node install.mjs uninstall            # Remove (keep data)
 node install.mjs uninstall --purge    # Remove and delete all data
 node install.mjs status               # Show current status
-node install.mjs doctor               # Diagnose issues
+node cli.mjs doctor                   # Diagnose issues  (cli.mjs, not install.mjs — see note)
+node cli.mjs repair                   # Recover a broken install from the latest signed release
 node install.mjs cleanup-hooks        # Remove only stale claude-mem-lite hooks from settings.json
 node install.mjs update               # Force-check for updates and install them (direct install / npx mode)
 
@@ -524,6 +592,13 @@ npx claude-mem-lite                   # Install / reinstall
 npx claude-mem-lite uninstall         # Remove (keep data)
 npx claude-mem-lite doctor            # Diagnose issues
 ```
+
+> `doctor` and `repair` are spelled `cli.mjs`, not `install.mjs`, on purpose. Those two are
+> the commands you reach for when the install is already broken, and `install.mjs` resolves
+> around a dozen static imports before its first line runs — one missing file and it exits
+> with a Node stack instead of telling you which file. `cli.mjs` has no static local imports
+> and catches that, naming the file and a repair command. Everything else in the list is
+> unaffected either way.
 
 Notes:
 - Plugin mode only reports available updates; it does not self-update plugin files.
@@ -560,11 +635,16 @@ git fetch --tags && git checkout v3.62.0
 # 4. To leave the pin later: git checkout main, then the normal update flow.
 ```
 
-Your data directory (`~/.claude-mem-lite/`) is untouched by install/rollback; schema migrations are forward-only, so after rolling back more than one minor version check `node install.mjs doctor` before trusting search results.
+Your data directory (`~/.claude-mem-lite/`) is untouched by install/rollback; schema migrations are forward-only, so after rolling back more than one minor version check `node cli.mjs doctor` before trusting search results.
 
 ### doctor
 
-Checks Node.js version, dependencies, server/hook files, database integrity, FTS5 indexes, and stale processes.
+Checks Node.js version, dependencies, server/hook files, database integrity, FTS5 indexes,
+stale processes, MCP registration, and whether the marketplace clone can still be updated.
+
+It runs `claude mcp list` to answer the registration question, and that **health-checks every
+MCP server you have configured** — i.e. briefly launches each one, including remote endpoints.
+`status` deliberately does not: on a plugin install it answers from the manifest instead.
 
 ### status
 
@@ -572,7 +652,7 @@ Shows MCP registration, hook configuration, plugin disabled state, and database 
 
 ### Recovery (stuck install / hook errors)
 
-If you see `ERR_MODULE_NOT_FOUND` on PreToolUse:Read/Edit/Skill hooks, or `claude-mem-lite` commands crash with import errors, you're likely hit by a partial auto-update — the updater copied new scripts but missed a sibling `lib/*` file, breaking the hook chain (and the next auto-update that would have healed it).
+If you see `ERR_MODULE_NOT_FOUND` on PreToolUse:Read/Edit hooks, or `claude-mem-lite` commands crash with import errors, you're likely hit by a partial auto-update — the updater copied new scripts but missed a sibling `lib/*` file, breaking the hook chain (and the next auto-update that would have healed it).
 
 **v2.84.0+** ships a `repair` subcommand that re-syncs from the latest GitHub release:
 
@@ -583,8 +663,10 @@ claude-mem-lite repair
 **If `repair` itself fails** (the bin is older than v2.84.0, or the bin is also broken), run this one-liner — it pulls a fresh tarball into a temp dir and runs *that* tarball's `install.mjs`, bypassing every file on your disk:
 
 ```bash
-T=$(mktemp -d) && curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/tarball | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install
+T=$(mktemp -d) && U=$(curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/releases/latest | grep -o '"tarball_url"[^,]*' | cut -d'"' -f4) && curl -sL "$U" | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install
 ```
+
+It resolves the latest **release** tag first. A shell one-liner cannot verify the release signature the way `repair` does, so running it is a trust decision you are making explicitly — that is why it is the last resort and not the first suggestion.
 
 After it finishes, `~/.claude-mem-lite/` is back in sync with the latest release and `claude-mem-lite repair` is available for next time.
 
@@ -607,6 +689,19 @@ npx claude-mem-lite uninstall --purge
 Data in `~/.claude-mem-lite/` is preserved by default. Delete manually if needed:
 ```bash
 rm -rf ~/.claude-mem-lite/
+```
+
+**`/plugin uninstall` does not delete the plugin cache.** Claude Code materializes each
+version under `~/.claude/plugins/cache/`, with its own `node_modules`. While the plugin is
+installed these get pruned to the newest three (SessionStart does it, and so does the update
+path), so the directory is bounded — measured at 241 MB — not unbounded. But `/plugin
+uninstall` removes the manifest and there is no uninstall hook a plugin can attach to, so the
+hooks stop firing and whatever is left is never reclaimed. `claude-mem-lite uninstall` does
+reclaim it, but after `/plugin uninstall` that command may no longer be on your PATH. Either
+run it **first**, or delete the directory yourself:
+
+```bash
+rm -rf ~/.claude/plugins/cache/sdsrss/claude-mem-lite
 ```
 
 ### Mixed-install residue (read this if you've used multiple install methods)
@@ -641,7 +736,7 @@ claude-mem-lite/
   hook-semaphore.mjs   # LLM concurrency control: file-based semaphore for background workers
   schema.mjs           # Database schema: single source of truth for tables, migrations, FTS5
   tool-schemas.mjs     # Shared Zod schemas for MCP tool validation
-  tfidf.mjs            # TF-IDF vector engine: tokenization, vocabulary building, vector computation, cosine similarity, RRF merge
+  tfidf.mjs            # the Porter stemmer (name is historical: the TF-IDF vector engine it held was removed)
   tier.mjs             # Temporal tier system: activity-based time window classification
   utils.mjs            # Re-export hub: backward-compatible surface for all utility modules
   nlp.mjs              # FTS5 query building: synonym expansion, CJK bigrams, sanitization
@@ -653,12 +748,6 @@ claude-mem-lite/
   format-utils.mjs     # String formatting: truncate, typeIcon, date/time/week formatting
   hash-utils.mjs       # MinHash signatures, Jaccard similarity for dedup
   bash-utils.mjs       # Bash output significance detection: errors, tests, builds, deploys
-  # Resource registry
-  registry.mjs         # Resource registry DB: schema, CRUD, FTS5, invocation tracking
-  registry-retriever.mjs # FTS5 retrieval with synonym expansion and composite scoring
-  registry-indexer.mjs # Resource indexing pipeline
-  registry-scanner.mjs # Filesystem scanner: reads content + hashes, delegates discovery
-  resource-discovery.mjs # Shared discovery layer: flat dirs, plugin nesting, loose .md files
   haiku-client.mjs     # Unified Haiku LLM wrapper: direct API or CLI fallback
   # Install & config
   install.mjs          # CLI installer: setup, uninstall, status, doctor (npx/git clone mode)
@@ -667,12 +756,11 @@ claude-mem-lite/
   scripts/
     setup.sh           # Setup hook: npm install + migration (hidden dir + old dir)
     post-tool-use.sh   # Bash pre-filter: skips noise in ~5ms, tracks Read paths
-    user-prompt-search.js # UserPromptSubmit hook: auto-search memory + L1 skill auto-load
-    pre-skill-bridge.js  # PreToolUse hook: L2 skill bridge for managed resources
+    user-prompt-search.js # UserPromptSubmit hook: auto-search memory on user prompts
     pre-tool-recall.js   # PreToolUse hook: file lesson recall before Edit/Write
+    post-tool-recall.js  # PostToolUse hook: error recall after a failed tool call
+    pre-agent-inject.sh  # PreToolUse hook: context for spawned agents
     prompt-search-utils.mjs # Shared logic: skip patterns, intent detection, name matching
-    convert-commands.mjs # Converts command .md → SKILL.md in managed plugins
-    index-managed.mjs  # Offline indexer for managed resources
   # Test & benchmark (dev only)
   tests/               # Unit, property, integration, contract, E2E, pipeline tests
   benchmark/           # BM25 search quality benchmarks + CI gate
@@ -681,7 +769,7 @@ claude-mem-lite/
 ## Search Quality
 
 Benchmarked on 200 observations across 30 queries (standard + hard-negative categories),
-measuring the **production-hybrid** retriever (FTS5 BM25 + TF-IDF vector + RRF) — the path
+measuring the **production-hybrid** retriever (the real `searchObservationsHybrid`) — the path
 `mem_search` / `recall` actually use. The CI gate (`npm run benchmark:gate`) runs this same
 path and fails on regression.
 
@@ -699,12 +787,14 @@ path and fails on regression.
 > `npm run benchmark:gate` fails the build when a run drifts more than 5% from it. This is
 > the single source for every retrieval figure quoted in this README.
 
-> **Note on the path measured.** Earlier versions of this table reported the *lexical*
-> FTS-only path (Precision@10 0.96, P95 0.15ms). The hybrid vector arm trades raw
-> precision@10 for higher recall / nDCG / MRR by surfacing semantically-related candidates
-> beyond exact lexical matches; the gate now measures the hybrid path so these numbers
-> reflect real `mem_search` behavior. For field-comparable recall, see the LongMemEval
-> section below.
+> **Note on the path measured.** This table measures whatever `mem_search` actually runs,
+> which is why the figures have moved twice. An older revision reported a narrower FTS-only
+> harness (Precision@10 0.96, P95 0.15ms); a later one attributed the lower precision to a
+> TF-IDF vector arm "trading precision for recall". **That attribution was wrong and the
+> claim is withdrawn** — the gate's `hybrid_over_bm25` delta never executed a vector path at
+> all, so it could not have measured that trade. The arm was later A/B'd directly, came out
+> negative on both fixtures, and was removed; these numbers are the shipped path with no
+> vector arm in it. For field-comparable recall, see the LongMemEval section below.
 
 ### Recall on LongMemEval (standard benchmark)
 
@@ -723,7 +813,7 @@ and `benchmark/longmemeval-rerank.mjs` (rerank).
 
 | Retriever (zero embeddings) | @1 | @5 | @10 |
 |---|---|---|---|
-| Lexical hybrid — FTS5 + TF-IDF + RRF | **83.4%** | **95.2%** | **96.0%** |
+| Lexical — FTS5 BM25 + query expansion | **83.4%** | **95.2%** | **96.0%** |
 | + one top-20 LLM rerank pass † | 92.8% | 96.8% | 97.4% |
 
 *n = 500 questions.* The lexical row was re-measured 2026-07-18: the v3.39–v3.45
@@ -796,7 +886,7 @@ claude-mem-lite.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CLAUDE_MEM_ALL_TOOLS` | `1` exposes all 21 MCP tools in `tools/list` instead of the 10 core ones. The 11 hidden tools stay callable by exact name either way. | _(10 core)_ |
+| `CLAUDE_MEM_ALL_TOOLS` | `1` exposes all 19 MCP tools in `tools/list` instead of the 10 core ones (pre-v2.34.0 behavior). The 9 hidden tools stay callable by exact name either way. | _(10 core)_ |
 | `CLAUDE_MEM_FILE_INTEL` | `0` disables the file-intel block injected before `Read` (past observations about the file you are about to open). | _(on)_ |
 | `CLAUDE_MEM_FILE_INTEL_MIN_TOKENS` | Files smaller than this stay silent — file-intel only pays for itself on large files. | `800` |
 | `CLAUDE_MEM_REREAD_GUARD` | `0` disables the warning when the same file is read twice in a session. Never fires on `offset`/`limit` paging. | _(on)_ |
@@ -805,6 +895,7 @@ claude-mem-lite.
 | `CLAUDE_MEM_KEEP_LOW_SIGNAL` | `1` keeps low-signal observations that the deterministic filter would otherwise drop before dedup/vector work. | _(filtered)_ |
 | `CLAUDE_MEM_NO_TEMPLATE_REFRESH` | `1` stops SessionStart from refreshing the adopted `CLAUDE.md` managed block when the shipped template changes. | _(refreshes)_ |
 | `MEM_QUIET_HOOKS` | See Core above — the broadest injection-volume switch. | _(disabled)_ |
+
 
 ### Retrieval tuning
 
@@ -831,8 +922,10 @@ benchmark and A/B harness are calibrated against — changing them invalidates t
 | `MEM_OR_FALLBACK_MAX_TOKENS` | Max query tokens allowed into the OR fallback (∈ [0,50]). | `8` |
 | `CLAUDE_MEM_CJK_PREC_MIN` | Precision floor for CJK segmentation candidates. | `0.2` |
 | `CLAUDE_MEM_AUTO_DEEP` | `0` disables automatic deep-search escalation (one Haiku call rewriting a weak query into keyword/concept/HyDE variants). Explicit `deep: true` still works. | _(auto)_ |
+| `CLAUDE_MEM_DEEP_DISCLOSURE` | `off` suppresses the one-line caveat appended to a multi-variant deep result. The caveat exists because deep search fills the page even when the corpus cannot answer — measured at 10 of 10 slots on queries whose answers had been removed (`benchmark/deep-search-holdout.mjs`) — and `deep` is AUTO by default on the MCP surface, i.e. it escalates precisely when the honest answer is "nothing". It does not change retrieval, ranking, or which rows are returned. | _(on)_ |
+| `CLAUDE_MEM_REACH_DISCLOSURE` | `off` suppresses the one-line note that fires when a search's reported `total` exceeds what its pagination can hand back. The candidate pool is sized from `limit` alone and deliberately does not grow with `offset` (D#30 — an offset-scaled pool re-ranks its own prefix under RRF, so pages overlapped and gapped), while `total` is the full match count. Measured on a 128-row corpus: at the default limit of 20 the last non-empty offset is 59, so 60 of 128 rows are unreachable at any offset. The note reports that; it does not change retrieval, ranking, or which rows are returned. It stays **silent** when a filter you asked for (`tier`, or the CJK precision gate on prompts) removed rows after the count was taken — that gap is your filter, not the pool, and raising the limit would not recover it. | _(on)_ |
+| `CLAUDE_MEM_NORMALIZE_CROSS_PROJECT` | `1` restores the pre-fix behaviour where the daily unattended `normalize` runs ONCE over every project's concepts at the same time. That is how one project's stored content could steer synonym groups applied to another project's rows, so the default is now one scoped pass per project (bounded to 8 per run). The cost of the default is that `k8s` in one project and `kubernetes` in another are no longer unified automatically. Note that EVERY unscoped run fans out, including an explicit `optimize --run --task normalize` with no `--project` — this variable is the only route back to the single cross-project pass. A foreground `optimize` run prints a warning when it is set; the daily unattended pass cannot (its worker is spawned with stderr closed), so `claude-mem-lite doctor` reports it as a ⚠ instead. | _(off)_ |
 | `CLAUDE_MEM_AUTO_DEEP_CLI` | `0` disables the same auto-escalation on the CLI path only. | _(auto)_ |
-| `CLAUDE_MEM_VECTORS` | `1` re-enables the persisted TF-IDF vector arm (off by default; also needs a vector rebuild via `maintain`). | _(off)_ |
 | `CLAUDE_MEM_SCOPE_FILTER` | `1` stops environment-scoped observations from firing on file-triggered recall. They stay reachable via search. **Leave it off**: on the face it gates, `environment` is not the low-relevance class its premise assumes — it cites at least as well as `project` (47.5% vs 44.3%, intervals overlapping), and an earlier measurement left 173 recall groups empty with it on. | _(off)_ |
 | `CLAUDE_MEM_READS_CARRY` | An episode flush collects `reads-<project>.txt` only when it will actually save an observation, so a flush that records nothing no longer discards the Read paths it swept up (42.2% of the paths a flush consumed, measured over 1122 transcripts). `0` restores the pre-v3.83.0 behaviour. | _(on)_ |
 
@@ -842,9 +935,10 @@ benchmark and A/B harness are calibrated against — changing them invalidates t
 |----------|-------------|---------|
 | `CLAUDE_MEM_NO_CITATION_TRACK` | `1` disables both the access-count bump and the decay loop — no citation bookkeeping at all. | _(enabled)_ |
 | `MEM_DISABLE_CITATION_DECAY` | `1` disables only the decay writes, keeping access-count bumps. | _(enabled)_ |
-| `CLAUDE_MEM_CITATION_ADOPTION_THRESHOLD` | Session cite-rate below which demotion is suppressed (promotion always proceeds). | `0.02` |
+| `CLAUDE_MEM_CITATION_ADOPTION_THRESHOLD` | **Removed — inert.** Tuned the per-project adoption gate, which is gone (D#204). Setting it warns on stderr and changes nothing. | _(n/a)_ |
 | `CLAUDE_MEM_NO_CITE_NUDGE` | `1` fully silences the cite-back nudge. | _(enabled)_ |
-| `CLAUDE_MEM_CITE_NUDGE_THRESHOLD` | Cite-rate below which the nudge fires. | `0.6` |
+| `CLAUDE_MEM_CITE_NUDGE_THRESHOLD` | Cite-rate below which the nudge fires. | `0.4` |
+| `CLAUDE_MEM_CITE_NUDGE_WIDE_DENOMINATOR` | `1` judges the wide cite-recall ratio (every `#NN`-shaped token the model saw) instead of the lessons the hooks injected. **Half of the revert**: the threshold moved too, so pre-v6.6.0 gating needs this **and** `CLAUDE_MEM_CITE_NUDGE_THRESHOLD=0.6`. This switch alone gives you the wide ratio judged at 0.4, which is neither release's behaviour. | unset |
 | `CLAUDE_MEM_CITE_NUDGE_MIN_INJECTED` | Minimum injection volume before the ratio gate is judged at all. | `5` |
 | `CLAUDE_MEM_CITE_NUDGE_SILENCE_AFTER` | Consecutive low-cite sessions before the nudge goes quiet; `0` = never silence. | `3` |
 | `CLAUDE_MEM_CITATION_RELEVANCE_GATE` | Stop credits an `access_count` to a memory the session cited only when something made that memory relevant to the session — it was injected, or you typed its `#NN` yourself. `off` restores the pre-v3.84.0 behaviour of crediting every `#NN` the assistant wrote, which over-counts sessions that discuss memories in prose (release notes, audit reports): measured on real transcripts, 267 of 859 credited (id, session) pairs — 31.1% — were mentions nothing had put in front of the model. Superseded citations are redirected to their keeper on both settings. | _(on)_ |
@@ -858,17 +952,17 @@ what is already stored — only whether new work runs.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CLAUDE_MEM_SKIP_SUMMARY` | Skip the LLM session summary at Stop. | _(runs)_ |
+| `CLAUDE_MEM_SKIP_SUMMARY` | Skip the background LLM session summary at **both** of its spawn sites — `Stop`, and the SessionStart `/clear`-handoff path. Until v5.3.0 only the `Stop` one honoured it. | _(runs)_ |
+| `CLAUDE_MEM_LEGACY_STOP_UNLINK` | Restore the pre-v5.4.0 behaviour where `Stop` deletes the session file. Documented revert path for the session-lifecycle change, not a supported configuration: it re-mints a mem session per turn and makes the `/clear` handoff unreachable again. Only reach for it on a host that fires `Stop` once per session rather than once per turn. | _(file kept)_ |
 | `CLAUDE_MEM_SKIP_EPISODE_LLM` | Skip LLM extraction on episode flush — observations are still batched, just not summarized. | _(runs)_ |
 | `CLAUDE_MEM_SKIP_SAVE_ENRICH` | Skip the background Haiku call that backfills `lesson_learned` / search aliases after a save. | _(runs)_ |
 | `CLAUDE_MEM_SKIP_COMPRESS` | Skip auto-compression of old observations. | _(runs)_ |
 | `CLAUDE_MEM_SKIP_MAINTAIN` | Skip the 24h auto-maintain pass (decay, purge, backup). | _(runs)_ |
 | `CLAUDE_MEM_SKIP_OPTIMIZE` | Skip the LLM optimization pass (re-enrich, normalize, cluster-merge). | _(runs)_ |
 | `CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY` | Skip the MinHash near-duplicate pass, keeping exact dedup. | _(runs)_ |
-| `CLAUDE_MEM_SKIP_MARKER_GC` | Skip the runtime-marker sweep. | _(runs)_ |
+| `CLAUDE_MEM_SKIP_MARKER_GC` | Skip the runtime-marker sweep. **Must be exactly `1`** — unlike the other `CLAUDE_MEM_SKIP_*` flags, which accept any truthy value, this one compares against the string `1`. That is deliberate: a truthy check makes `=0` mean "skip", which is the opposite of what anyone typing it intends. | _(runs)_ |
 | `CLAUDE_MEM_SKIP_UPDATE` | Skip the 24h auto-update check against GitHub Releases. | _(runs)_ |
 | `CLAUDE_MEM_SKIP_SIG_VERIFY` | Skip Ed25519 signature verification of a downloaded update. **Escape hatch — leaves updates unauthenticated.** | _(verifies)_ |
-| `CLAUDE_MEM_SKIP_REPOS` | Skip skill/agent registry seeding during install. | _(seeds)_ |
 | `CLAUDE_MEM_NO_LESSON_RETRY` | `1` disables the one-shot retry that re-asks for a missing `lesson_learned`. | _(retries)_ |
 | `CLAUDE_MEM_FLUSH_TIMEOUT` | Seconds the Stop hook waits for pending episode flushes. | `15` |
 | `CLAUDE_MEM_BACKUP_BUDGET_MB` | Disk budget for backup snapshots; the next maintain/save evicts oldest snapshots past the 7-day undo grace. | `256` |
@@ -880,7 +974,6 @@ and names can change between releases.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CLAUDE_MEM_RECOMMEND_MODE` | Skill-recommendation engine: `shadow` (log would-be recommendations, inject nothing) or `off`. **`live` is parsed but not implemented** — live injection is Phase 2. Setting it runs shadow and prints one warning to stderr per process; `claude-mem-lite doctor` also reports it as an inert flag. | `shadow` |
 | `CLAUDE_MEM_TASK_IMPERATIVE` | `on`/`1` injects the single most relevant lesson at prompt position under an imperative template. | _(off)_ |
 | `CLAUDE_MEM_SUBAGENT_INJECT` | Dispatch-time memory injection for subagents. | _(off)_ |
 | `CLAUDE_MEM_SALIENCE` | Selects a comprehension-bridge arm (`bridge`, `bind`); unset = current default behavior. | _(unset)_ |
@@ -894,6 +987,20 @@ Set by the tool or by the test harness. Setting these by hand is not supported:
 `CLAUDE_MEM_NO_DELAY`, `CLAUDE_MEM_CATCH_SAMPLE`, `CLAUDE_MEM_QUIET_TRACE`,
 `CLAUDE_MEM_DB_PATH`, `CLAUDE_MEM_RUNTIME_DIR`, `MEM_DISABLE_SPAWN_LOG`.
 `CLAUDE_PLUGIN_ROOT` is set by Claude Code itself.
+
+The last two are worth one more sentence each, because they are the ones a harness reaches
+for. `CLAUDE_MEM_RUNTIME_DIR` relocates the runtime directory for hook-written state — markers,
+cooldowns, hook-error telemetry, the native-binding breakage marker, episode buffers.
+(`metrics/` is NOT in that set: it is a sibling of `runtime/` under the data dir and moves
+with `CLAUDE_MEM_DIR` only.) Before v3.93.0 it was honoured by some readers and ignored by others, so setting it
+split the runtime rather than moving it. Installation-identity state (`install.lock`,
+`update-state.json`, update residue) deliberately stays under `CLAUDE_MEM_DIR`: two
+installers pointed at different override directories would otherwise each take their own
+lock and both proceed. **`CLAUDE_MEM_DB_PATH` still has the split shape**, and more narrowly
+than it looks: exactly ONE component reads it — `scripts/pre-tool-recall.js` — so setting it
+aims that single hook at one database and leaves the other four hook faces, the CLI and the
+MCP server on the default. Use `CLAUDE_MEM_DIR` — the only override
+every component respects, including the bash pre-filter — to isolate state.
 
 Three more are set by `vitest.config.mjs` / `tests/global-setup.mjs` and exist only to
 keep a test run off the live database: `CLAUDE_MEM_TEST_GUARD` (`1` arms the guard, `off`

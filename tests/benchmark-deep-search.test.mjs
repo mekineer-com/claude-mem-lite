@@ -8,8 +8,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { createTestDb } from './test-helpers.mjs';
-import { _resetVocabCache } from '../tfidf.mjs';
-import { seedDatabase, seedVectors, runDeepSearch } from '../benchmark/benchmark.mjs';
+import { seedDatabase, runDeepSearch } from '../benchmark/benchmark.mjs';
 
 const fixtures = new URL('../benchmark/fixtures/', import.meta.url);
 const corpus = JSON.parse(readFileSync(new URL('seed-data.json', fixtures), 'utf8'));
@@ -22,22 +21,20 @@ describe('deep-search benchmark suite', () => {
     const missing = [];
     for (const q of suite.queries) {
       const v = rewritesByQuery[q.query];
-      if (!Array.isArray(v) || v.length < 1 || v.some(s => typeof s !== 'string' || !s.trim())) {
+      if (!Array.isArray(v) || v.length < 1 || v.some((s) => typeof s !== 'string' || !s.trim())) {
         missing.push(q.id);
       }
     }
     expect(missing).toEqual([]);
     // No stray rewrite keys that don't map to a suite query (drift guard).
-    const suiteQueries = new Set(suite.queries.map(q => q.query));
-    const orphan = Object.keys(rewritesByQuery).filter(k => !suiteQueries.has(k));
+    const suiteQueries = new Set(suite.queries.map((q) => q.query));
+    const orphan = Object.keys(rewritesByQuery).filter((k) => !suiteQueries.has(k));
     expect(orphan).toEqual([]);
   });
 
   it('deep search lifts recall well above the single-query baseline', async () => {
-    _resetVocabCache();
     const db = createTestDb();
     seedDatabase(db, corpus);
-    seedVectors(db);
 
     const res = await runDeepSearch(db, suite.queries, rewritesByQuery);
 
@@ -62,18 +59,16 @@ describe('deep-search benchmark suite', () => {
     // (the only hard never-worse guarantee is the rewrite-failure floor, locked
     // in the next test). So we assert direction, not universal monotonicity:
     // far more queries improve than regress, and regressions are isolated.
-    const improved = res.perQuery.filter(q => q.recall_delta > 0).length;
-    const regressed = res.perQuery.filter(q => q.recall_delta < 0).length;
+    const improved = res.perQuery.filter((q) => q.recall_delta > 0).length;
+    const regressed = res.perQuery.filter((q) => q.recall_delta < 0).length;
     expect(improved).toBeGreaterThanOrEqual(8);
     expect(improved).toBeGreaterThan(regressed * 4);
     db.close();
   });
 
   it('falls back to baseline (never worse) when rewrites are missing', async () => {
-    _resetVocabCache();
     const db = createTestDb();
     seedDatabase(db, corpus);
-    seedVectors(db);
 
     // Empty rewrites map → fake llm returns null for every query → variants
     // collapse to [original] → deep must equal the single-query baseline.

@@ -20,21 +20,21 @@ const parse = (def, data) => z.object(def).safeParse(data);
 // paths in mem-cli.mjs (renderObsRows / renderSessionRows / renderPromptRows)
 // and server.mjs (mem_search / mem_get / mem_timeline content templates).
 const SCALAR_FORMS = [
-  { label: 'bare int',       value: 42 },
-  { label: 'bare string',    value: '42' },
-  { label: '#N string',      value: '#42' },
-  { label: 'P#N string',     value: 'P#42' },
-  { label: 'S#N string',     value: 'S#42' },
-  { label: 'lowercase p#N',  value: 'p#42' },
-  { label: 'lowercase s#N',  value: 's#42' },
+  { label: 'bare int', value: 42 },
+  { label: 'bare string', value: '42' },
+  { label: '#N string', value: '#42' },
+  { label: 'P#N string', value: 'P#42' },
+  { label: 'S#N string', value: 'S#42' },
+  { label: 'lowercase p#N', value: 'p#42' },
+  { label: 'lowercase s#N', value: 's#42' },
 ];
 
 const ARRAY_FORMS = [
-  { label: 'array mixed',        value: [1, '#2', 'P#3', 'S#4'] },
+  { label: 'array mixed', value: [1, '#2', 'P#3', 'S#4'] },
   { label: 'comma-string mixed', value: '1,#2,P#3,S#4' },
-  { label: 'JSON-array string',  value: '[1,"P#2","S#3"]' },
-  { label: 'single bare int',    value: 1 },
-  { label: 'single P#N string',  value: 'P#1' },
+  { label: 'JSON-array string', value: '[1,"P#2","S#3"]' },
+  { label: 'single bare int', value: 1 },
+  { label: 'single P#N string', value: 'P#1' },
 ];
 
 describe('schema round-trip parity (#8127)', () => {
@@ -80,8 +80,11 @@ describe('schema round-trip parity (#8127)', () => {
       expect(parse(memDeleteSchema, { ids: '1,2,3', confirm: false }).success).toBe(true);
     });
     it('rejects P# prefix (by design — CLI cmdDelete test line ~1795 locks this)', () => {
-      // memDeleteSchema uses coerceIntArray which drops non-numeric tokens during split.
-      // "P#1" → NaN → filtered → empty array → min(1) fails.
+      // memDeleteSchema routes through boundedIntArray, whose `wholeIntOrRaw` LEAVES a
+      // non-numeric token as a STRING so zod rejects it by type (the documented discipline
+      // in tool-schemas.mjs: "left as a string, rejected by zod"). It is not parseInt'd to
+      // NaN, not filtered out, and the failing constraint is the element type, not min(1) —
+      // the previous version of this comment said all four of those and was wrong in each.
       expect(parse(memDeleteSchema, { ids: 'P#1', confirm: false }).success).toBe(false);
     });
   });

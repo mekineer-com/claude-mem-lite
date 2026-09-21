@@ -42,6 +42,13 @@ import { extractTechIdentifiers } from '../scripts/user-prompt-search.js';
 // deadline, not a behaviour change: nothing here got slower, there is just more
 // competing for two cores. Raising the budget keeps every assertion intact; capping it
 // at 20s would only convert contention into a red release.
+//
+// D#203 — the budget was blown again at 60s (run 33605998984), and the number is NOT
+// being raised a third time. The discriminator was the matrix: one commit, three legs,
+// this file at 3792ms on Node 20, 30173ms on Node 24 and 67527ms on Node 22. Identical
+// code cannot get 18x slower on one leg, so the stall is the runner and no fixed budget
+// is safe against a multiplier — the base cost is the only term under our control. It is
+// now ~2.4x smaller (see `seedCorpus`), which is what buys the headroom; 60s stays.
 vi.setConfig({ testTimeout: 60_000 });
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
@@ -49,13 +56,22 @@ const PROJECT = 'x--coldstart';
 const PROMPT = '登录页面的中文错误提示又乱码了，之前是怎么修的';
 const OFF_TOPIC = '请帮我生成本季度的集群入口拓扑示意图并导出为矢量文件';
 
-const TARGET_TEXT = '登录页面的中文错误提示乱码，根因是手写 res.end 时响应头缺少 charset，浏览器按 latin1 解码';
+const TARGET_TEXT =
+  '登录页面的中文错误提示乱码，根因是手写 res.end 时响应头缺少 charset，浏览器按 latin1 解码';
 const TARGET_LESSON = '手写 res.end 时必须显式设置 Content-Type charset';
 // Topically clustered filler: a real first-week corpus shares vocabulary with the
 // target (same project, same feature area), which RAISES df and so LOWERS the IDF the
 // floors are compared against. Distinct filler would understate the problem.
-const FILLER = ['登录表单校验微调', '会话标记审计', '环境变量加载顺序修复', '错误页文案调整',
-  '令牌刷新窗口调整', '密钥轮换手册草稿', '中间件顺序问题', '配置默认值不一致'];
+const FILLER = [
+  '登录表单校验微调',
+  '会话标记审计',
+  '环境变量加载顺序修复',
+  '错误页文案调整',
+  '令牌刷新窗口调整',
+  '密钥轮换手册草稿',
+  '中间件顺序问题',
+  '配置默认值不一致',
+];
 
 const dirs = [];
 
@@ -65,23 +81,41 @@ function seedCorpus(n) {
   dirs.push(dir);
   const db = new Database(join(dir, 'claude-mem-lite.db'));
   initSchema(db);
-  db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch)
-              VALUES ('cc-seed', 'mem-seed', ?, datetime('now'), ?)`).run(PROJECT, Date.now());
+  db.prepare(
+    `INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch)
+              VALUES ('cc-seed', 'mem-seed', ?, datetime('now'), ?)`,
+  ).run(PROJECT, Date.now());
   const base = Date.now();
   // Production pipeline, not a raw INSERT: CJK bigram expansion happens here, and a
   // corpus seeded without it cannot be searched the way a real one can.
   // `now` is stepped 10 min apart so the 5-minute near-duplicate window doesn't
   // collapse the filler rows into one.
-  const target = saveObservation(db, {
-    content: TARGET_TEXT, type: 'bugfix', importance: 3, project: PROJECT,
-    lesson_learned: TARGET_LESSON, now: new Date(base),
-  });
-  for (let i = 1; i < n; i++) {
-    saveObservation(db, {
-      content: `第 ${i} 次会话处理了${FILLER[i % FILLER.length]}，顺带调整了一些配置`,
-      type: 'change', importance: 1, project: PROJECT, now: new Date(base - i * 10 * 60_000),
+  // One transaction, not n. `saveObservation` commits per call, so a 600-row seed paid
+  // 600 fsyncs: measured 2026-09-02 on this corpus shape, 2019ms unwrapped vs 270ms
+  // wrapped (7.5x). The rows written are byte-identical — still the production write
+  // path, still CJK bigram expansion, still the stepped `now` — this changes the seed's
+  // COST, not its shape, which is why the floors it feeds are unaffected. It matters
+  // because the CI stall this file's timeout absorbs is multiplicative (D#203).
+  let target;
+  db.transaction(() => {
+    target = saveObservation(db, {
+      content: TARGET_TEXT,
+      type: 'bugfix',
+      importance: 3,
+      project: PROJECT,
+      lesson_learned: TARGET_LESSON,
+      now: new Date(base),
     });
-  }
+    for (let i = 1; i < n; i++) {
+      saveObservation(db, {
+        content: `第 ${i} 次会话处理了${FILLER[i % FILLER.length]}，顺带调整了一些配置`,
+        type: 'change',
+        importance: 1,
+        project: PROJECT,
+        now: new Date(base - i * 10 * 60_000),
+      });
+    }
+  })();
   const count = db.prepare('SELECT count(*) AS c FROM observations').get().c;
   db.close();
   return { dir, targetId: target.id, count };
@@ -106,10 +140,21 @@ function runHook(dir, prompt, sessionId) {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
-    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
     proc.stderr.on('data', () => {});
-    const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* already gone */ } }, 15_000);
-    proc.on('close', () => { clearTimeout(killer); done(stdout); });
+    const killer = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }, 15_000);
+    proc.on('close', () => {
+      clearTimeout(killer);
+      done(stdout);
+    });
     proc.stdin.write(JSON.stringify({ session_id: sessionId, prompt, cwd: '/x/coldstart' }));
     proc.stdin.end();
   });
@@ -117,7 +162,13 @@ function runHook(dir, prompt, sessionId) {
 
 describe('cold-start UPS injection — the floors must not silence a first-week corpus', () => {
   afterEach(() => {
-    for (const d of dirs.splice(0)) { try { rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
+    for (const d of dirs.splice(0)) {
+      try {
+        rmSync(d, { recursive: true, force: true });
+      } catch {
+        /* gone */
+      }
+    }
   });
 
   it('the probe prompt carries no identifier the bypass could rescue', () => {

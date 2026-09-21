@@ -38,7 +38,9 @@ export function seedEventsPipelineCorpus(db) {
 
   // ① reachability: 'zirconium' lives ONLY in an event body.
   saveEvent(db, {
-    project: PROJECT, event_type: 'bugfix', importance: 2,
+    project: PROJECT,
+    event_type: 'bugfix',
+    importance: 2,
     title: 'Fixed zirconium coupling regression',
     body: 'Root cause: the zirconium coupling flag was inverted in the parser. Fix: restore the guard.',
   });
@@ -47,22 +49,34 @@ export function seedEventsPipelineCorpus(db) {
   // doc (high BM25 magnitude) and once each buried in two LONG obs docs.
   const padding = 'unrelated scaffolding vocabulary '.repeat(30);
   saveEvent(db, {
-    project: PROJECT, event_type: 'decision', importance: 2,
+    project: PROJECT,
+    event_type: 'decision',
+    importance: 2,
     title: 'chronograph scheduler decision',
     body: 'Adopt the chronograph scheduler for retry pacing.',
   });
   insertObs(db, {
-    sessionId: 'probe-sess', project: PROJECT, type: 'discovery', importance: 2,
-    title: 'Session notes A', text: `${padding} chronograph ${padding}`,
+    sessionId: 'probe-sess',
+    project: PROJECT,
+    type: 'discovery',
+    importance: 2,
+    title: 'Session notes A',
+    text: `${padding} chronograph ${padding}`,
   });
   insertObs(db, {
-    sessionId: 'probe-sess', project: PROJECT, type: 'discovery', importance: 2,
-    title: 'Session notes B', text: `${padding} chronograph mention ${padding}`,
+    sessionId: 'probe-sess',
+    project: PROJECT,
+    type: 'discovery',
+    importance: 2,
+    title: 'Session notes B',
+    text: `${padding} chronograph mention ${padding}`,
   });
 
   // ③ supersession: 'palladium' lives only in a TOMBSTONED event.
   saveEvent(db, {
-    project: PROJECT, event_type: 'bugfix', importance: 2,
+    project: PROJECT,
+    event_type: 'bugfix',
+    importance: 2,
     title: 'Old palladium fix (superseded)',
     body: 'The palladium handler leak, first attempt.',
   });
@@ -70,18 +84,27 @@ export function seedEventsPipelineCorpus(db) {
 
   // ④ type filter: 'vanadium' in one bugfix event and one decision event.
   saveEvent(db, {
-    project: PROJECT, event_type: 'bugfix', importance: 2,
-    title: 'vanadium bugfix event', body: 'vanadium fix detail.',
+    project: PROJECT,
+    event_type: 'bugfix',
+    importance: 2,
+    title: 'vanadium bugfix event',
+    body: 'vanadium fix detail.',
   });
   saveEvent(db, {
-    project: PROJECT, event_type: 'decision', importance: 2,
-    title: 'vanadium decision event', body: 'vanadium tradeoff detail.',
+    project: PROJECT,
+    event_type: 'decision',
+    importance: 2,
+    title: 'vanadium decision event',
+    body: 'vanadium tradeoff detail.',
   });
 
   // ⑥ project scoping: 'osmium' only in a FOREIGN-project event.
   saveEvent(db, {
-    project: 'parent--otherproj', event_type: 'bugfix', importance: 2,
-    title: 'osmium fix elsewhere', body: 'osmium detail in another project.',
+    project: 'parent--otherproj',
+    event_type: 'bugfix',
+    importance: 2,
+    title: 'osmium fix elsewhere',
+    body: 'osmium detail in another project.',
   });
 }
 
@@ -90,7 +113,9 @@ async function runPipeline(db, query, { obsType = null, obsTypeScoped = false } 
   const ftsQuery = buildSearchFtsQuery(query);
   const res = await coreRunSearchPipeline(
     {
-      db, currentProject: PROJECT, env: {},
+      db,
+      currentProject: PROJECT,
+      env: {},
       searchObservationsHybrid,
       deepSearch: async () => ({ rows: [] }),
       shouldEscalateToDeep: () => false,
@@ -99,16 +124,26 @@ async function runPipeline(db, query, { obsType = null, obsTypeScoped = false } 
       llm: null,
     },
     {
-      query, ftsQuery, effectiveSource: null, deepMode: 'normal', rerank: false,
-      limit: 10, offset: 0, project: PROJECT, obsType, sort: 'relevance',
+      query,
+      ftsQuery,
+      effectiveSource: null,
+      deepMode: 'normal',
+      rerank: false,
+      limit: 10,
+      offset: 0,
+      project: PROJECT,
+      obsType,
+      sort: 'relevance',
       obsTypeScoped,
       obsTypeFallback: false,
       crossSourceEpochSortNoFts: false,
-      rerankPolicy: 'mcp', rerankProject: PROJECT,
+      rerankPolicy: 'mcp',
+      rerankProject: PROJECT,
       recentListingNoFts: false,
       tolerateMissingFts: false, // MCP policy: a broken events FTS face THROWS → probe red
-      tierPosition: 'late', tierProject: PROJECT,
-    }
+      tierPosition: 'late',
+      tierProject: PROJECT,
+    },
   );
   return res.page;
 }
@@ -124,9 +159,13 @@ export async function runEventsPipelineProbes(dbIn = null) {
   if (!dbIn) seedEventsPipelineCorpus(db);
   const probes = [];
   const probe = async (name, fn) => {
-    let pass = false, detail = '';
-    try { ({ pass, detail } = await fn()); }
-    catch (e) { detail = `threw: ${e.message}`; }
+    let pass = false,
+      detail = '';
+    try {
+      ({ pass, detail } = await fn());
+    } catch (e) {
+      detail = `threw: ${e.message}`;
+    }
     probes.push({ name, pass, detail });
   };
 
@@ -161,9 +200,15 @@ export async function runEventsPipelineProbes(dbIn = null) {
     const page = await runPipeline(db, 'zirconium');
     const evt = page.find((r) => r.source === 'event');
     if (!evt) return { pass: false, detail: 'no event row' };
-    const pass = Boolean(evt.lesson_learned) && evt.lesson_learned === evt.text
-      && typeof evt.created_at === 'string' && evt.type === 'bugfix';
-    return { pass, detail: `lesson=${Boolean(evt.lesson_learned)} text-parity=${evt.lesson_learned === evt.text} iso=${typeof evt.created_at}` };
+    const pass =
+      Boolean(evt.lesson_learned) &&
+      evt.lesson_learned === evt.text &&
+      typeof evt.created_at === 'string' &&
+      evt.type === 'bugfix';
+    return {
+      pass,
+      detail: `lesson=${Boolean(evt.lesson_learned)} text-parity=${evt.lesson_learned === evt.text} iso=${typeof evt.created_at}`,
+    };
   });
 
   await probe('project-scope-excludes-foreign', async () => {
@@ -188,25 +233,65 @@ export async function runEventsPipelineProbes(dbIn = null) {
     const mdb = createTestDb();
     seedEventsPipelineCorpus(mdb);
     if (mutateSql) mdb.prepare(mutateSql).run();
-    try { return await fn(mdb); } finally { mdb.close(); }
+    try {
+      return await fn(mdb);
+    } finally {
+      mdb.close();
+    }
   };
 
   await probe('cite-widening-bounded-3x-real-sql', async () => {
     // The same obs row's raw FULL_SCORE at cited_count=10 must be exactly the
     // 3.0× cap of its baseline — pins that the cite clause reaches the real SQL
     // AND that the widening the banding faces is bounded by CITE_FACTOR_MAX.
+    //
+    // D#200 — why the clock is frozen, and why the tolerance is 1e-12 and not
+    // wider. FULL_SCORE (search-engine.mjs) is a pure left-associative product
+    // and citeFactor is its last multiplicand, so base = P × 1.0 and
+    // cited = P × 3.0 over the SAME P: the ratio is 3.0 up to the float
+    // rounding of (P×3.0)/P, i.e. ≤1 ULP. But P is only the same if the
+    // recency-decay factor is, and each arm below seeds a FRESH corpus and then
+    // queries it, so each computes its own integer-millisecond
+    // `age = Date.now() − created_at_epoch`. The arms' seed→query elapsed times
+    // differ by whatever the machine gives, and MEASURED, each 1 ms of that
+    // difference moves the ratio by exactly 2.0052e-10
+    // (= 3.0 × 0.693 / (2 × 60d), the discovery half-life at age ≈ 0, since
+    //  recencyDecaySql is 1 + EXP(−0.693·age/hl)). The old 1e-9 absolute
+    // tolerance therefore admitted only ±4 ms of scheduling skew, and CI run
+    // 33602196907 went red at ratio=3.0000000010026033 — exactly 5 × 2.0052e-10,
+    // i.e. 5 ms. Freezing Date.now across both arms deletes the term rather than
+    // widening the tolerance to hide it. Note an equal-step clock stub cannot
+    // reproduce the flake (it shifts both arms alike and the difference
+    // cancels); the regression test uses an ACCELERATING one.
     const rawScores = (mdb) => {
-      const ctx = { ftsQuery: buildSearchFtsQuery('chronograph'), args: { project: PROJECT },
-        epochFrom: null, epochTo: null, perSourceLimit: 10, perSourceOffset: 0,
-        currentProject: PROJECT, limit: 10 };
+      const ctx = {
+        ftsQuery: buildSearchFtsQuery('chronograph'),
+        args: { project: PROJECT },
+        epochFrom: null,
+        epochTo: null,
+        perSourceLimit: 10,
+        perSourceOffset: 0,
+        currentProject: PROJECT,
+        limit: 10,
+      };
       return new Map(searchObservationsHybrid(mdb, ctx).map((r) => [r.id, r.score]));
     };
-    const base = await withMutatedCorpus(null, async (mdb) => rawScores(mdb));
-    const cited = await withMutatedCorpus('UPDATE observations SET cited_count = 10', async (mdb) => rawScores(mdb));
+    const realNow = Date.now;
+    const frozen = realNow.call(Date);
+    let base, cited;
+    try {
+      Date.now = () => frozen;
+      base = await withMutatedCorpus(null, async (mdb) => rawScores(mdb));
+      cited = await withMutatedCorpus('UPDATE observations SET cited_count = 10', async (mdb) =>
+        rawScores(mdb),
+      );
+    } finally {
+      Date.now = realNow;
+    }
     if (base.size === 0) return { pass: false, detail: 'no baseline obs rows' };
     for (const [id, s] of base) {
       const ratio = cited.get(id) / s;
-      if (!(Math.abs(ratio - 3.0) < 1e-9)) return { pass: false, detail: `obs#${id} ratio=${ratio}` };
+      if (!(Math.abs(ratio - 3.0) < 1e-12)) return { pass: false, detail: `obs#${id} ratio=${ratio}` };
     }
     return { pass: true, detail: `${base.size} rows widened exactly 3.0×` };
   });
@@ -237,11 +322,16 @@ export async function runEventsPipelineProbes(dbIn = null) {
   return probes;
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url).includes(process.argv[1].replace(/\.mjs$/, ''));
+const isMain =
+  process.argv[1] && fileURLToPath(import.meta.url).includes(process.argv[1].replace(/\.mjs$/, ''));
 if (isMain) {
   const results = await runEventsPipelineProbes();
-  for (const p of results) console.error(`  ${p.pass ? '✓' : '✗'} ${p.name}${p.pass ? '' : ` — ${p.detail}`}`);
+  for (const p of results)
+    console.error(`  ${p.pass ? '✓' : '✗'} ${p.name}${p.pass ? '' : ` — ${p.detail}`}`);
   const failed = results.filter((p) => !p.pass);
-  if (failed.length) { console.error(`\n${failed.length} probe(s) FAILED`); process.exit(1); }
+  if (failed.length) {
+    console.error(`\n${failed.length} probe(s) FAILED`);
+    process.exit(1);
+  }
   console.error(`\nall ${results.length} probes pass`);
 }

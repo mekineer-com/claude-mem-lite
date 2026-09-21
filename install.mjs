@@ -2,12 +2,26 @@
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
 import { execSync, execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, mkdtempSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync, lstatSync } from 'fs';
-import { join, resolve, dirname, isAbsolute, basename } from 'path';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  rmSync,
+  mkdirSync,
+  mkdtempSync,
+  copyFileSync,
+  renameSync,
+  symlinkSync,
+  unlinkSync,
+  readdirSync,
+  statSync,
+  lstatSync,
+} from 'fs';
+import { join, resolve, dirname, basename, sep } from 'path';
 import { homedir, tmpdir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createRequire } from 'node:module';
-import { resolveDataDir } from './lib/resolve-data-dir.mjs';
+import { resolveDataDir, resolveRuntimeDir } from './lib/resolve-data-dir.mjs';
 
 const PROJECT_DIR = resolve(import.meta.dirname ?? dirname(fileURLToPath(import.meta.url)));
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
@@ -22,30 +36,58 @@ const DATA_DIR = join(homedir(), '.claude-mem-lite');
 // the relocated dir → preinstalled skills silently vanished, doctor read the wrong
 // DB). Equals DATA_DIR when CLAUDE_MEM_DIR is unset (the common case).
 const MEM_DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
+// Hook-WRITTEN runtime state (breakage markers, ep-flush/pending buffers) lives here.
+// Installation-identity state — install.lock, update-state.json, update residue — stays
+// under MEM_DATA_DIR on purpose: those are about the one real installation, and moving
+// them with a per-harness override would let two concurrent installs take separate locks.
+const MEM_RUNTIME_DIR = resolveRuntimeDir(MEM_DATA_DIR);
 const DB_PATH = join(MEM_DATA_DIR, 'claude-mem-lite.db');
 const OLD_DATA_DIR = join(homedir(), '.claude-mem');
 
+// The two directories `createCliSymlink` can land the `claude-mem-lite` command in, in the
+// order it tries them. Uninstall already swept exactly this pair as an inline literal, and
+// `status` now has to ask the same question ("is the command installed somewhere, just not
+// on PATH?"), so the list is named once rather than typed a third time. `createCliSymlink`
+// itself is deliberately NOT rewritten to iterate it: its shape is primary-then-fallback
+// with different remedies per branch, and flattening that into a loop is a refactor wearing
+// a constant's clothes.
+const CLI_BIN_DIRS = [join(homedir(), '.local', 'bin'), '/usr/local/bin'];
+
 // Detect ephemeral context (npx) — files won't persist after exit
-const IS_NPX = process.env.npm_command === 'exec' ||
-  PROJECT_DIR.includes('_npx') || PROJECT_DIR.includes('.npm/_');
+const IS_NPX =
+  process.env.npm_command === 'exec' || PROJECT_DIR.includes('_npx') || PROJECT_DIR.includes('.npm/_');
 
 // Both modes install to ~/.claude-mem-lite/ (copies or symlinks)
 const INSTALL_DIR = DATA_DIR;
 const SERVER_PATH = join(INSTALL_DIR, 'server.mjs');
 const HOOK_PATH = join(INSTALL_DIR, 'hook.mjs');
-const MARKETPLACE_KEY = 'sdsrss';
-const PLUGIN_KEY = `claude-mem-lite@${MARKETPLACE_KEY}`;
+// P2-7: both constants and the predicate come from lib/plugin-key.mjs, which hook.mjs also
+// imports — this pair used to be typed out in each.
+import { MARKETPLACE_KEY, PLUGIN_KEY, PLUGIN_NAME, isPluginExplicitlyDisabled } from './lib/plugin-key.mjs';
+import { doctorDbModeHint } from './lib/doctor-modes.mjs';
 const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
-import { RESOURCE_METADATA } from './install-metadata.mjs';
-import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
+import {
+  scanPluginCacheHookPollution,
+  hasInstallManagedHooks,
+  pluginCacheHookEvents,
+  settingsHookCommands,
+} from './plugin-cache-guard.mjs';
 import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
-import { probeBetterSqlite3Binding, ensureBetterSqlite3Working, NATIVE_BINDING_REBUILD_CMD } from './lib/binding-probe.mjs';
-import { detectInstallShape, probeRuntimeRoots } from './lib/install-shape.mjs';
+import {
+  probeBetterSqlite3Binding,
+  ensureBetterSqlite3Working,
+  nativeBindingRepairHint,
+  isNativeBindingError,
+} from './lib/binding-probe.mjs';
+import { detectInstallShape, probeRuntimeRoots, hasAnyManagedCode } from './lib/install-shape.mjs';
+import { probeSchemaCompat, schemaSkewRemedy } from './lib/schema-skew.mjs';
 import { clearNativeBindingBreakage, readNativeBindingBreakage } from './lib/native-binding-hint.mjs';
 import { sweepStaleTestFixtures } from './lib/tmp-fixture-sweep.mjs';
+import { ORPHAN_EPISODE_AGE_MS } from './lib/time-constants.mjs';
 import { acquireLock } from './lib/proc-lock.mjs';
 import { atomicWriteFileSync } from './lib/atomic-write.mjs';
+import { isMemHook, launcherEntryPath } from './lib/hook-prune.mjs';
 
 // Re-export for backward compatibility — tests/install-hook-scripts.test.mjs
 // and any external consumers still import HOOK_SCRIPT_FILES from install.mjs.
@@ -97,202 +139,22 @@ export function migrateLegacyClaudeMemData(oldDir, newDir, opts = {}) {
   return { action: 'backed-up', backupPath };
 }
 
-/**
- * Derive invocation_name from resource name when metadata doesn't provide one.
- * Rules:
- *   "parent/child" → "parent:child"  (plugin:resource format)
- *   "simple-name"  → "simple-name"   (standalone resource)
- * @param {string} name Resource name
- * @returns {string} Derived invocation name
- */
-function deriveInvocationName(name) {
-  if (name.includes('/')) return name.replace('/', ':');
-  return name;
-}
-
-/**
- * Apply curated metadata to existing resource DB entries.
- * Fixes existing installs that have generic name-echo metadata.
- * Also syncs keywords, tech_stack, use_cases and auto-derives invocation_name.
- * @param {Database} rdb Registry database handle
- */
-function reindexKnownResources(rdb) {
-  const update = rdb.prepare(`
-    UPDATE resources SET
-      intent_tags = ?, domain_tags = ?,
-      capability_summary = ?, trigger_patterns = ?,
-      invocation_name = CASE WHEN ? != '' THEN ? ELSE invocation_name END,
-      recommendation_mode = CASE WHEN ? != '' THEN ? ELSE recommendation_mode END,
-      keywords = CASE WHEN ? != '' THEN ? ELSE keywords END,
-      tech_stack = CASE WHEN ? != '' THEN ? ELSE tech_stack END,
-      use_cases = CASE WHEN ? != '' THEN ? ELSE use_cases END,
-      updated_at = datetime('now')
-    WHERE type = ? AND name = ?
-  `);
-
-  rdb.transaction(() => {
-    for (const [key, meta] of Object.entries(RESOURCE_METADATA)) {
-      const sep = key.indexOf(':');
-      if (sep < 0) continue; // skip malformed keys without type:name separator
-      const type = key.slice(0, sep);
-      const name = key.slice(sep + 1);
-      const invName = meta.invocation_name || deriveInvocationName(name);
-      const recMode = meta.recommendation_mode || '';
-      const kw = meta.keywords || '';
-      const ts = meta.tech_stack || '';
-      const uc = meta.use_cases || '';
-      update.run(
-        meta.intent_tags, meta.domain_tags,
-        meta.capability_summary, meta.trigger_patterns,
-        invName, invName,
-        recMode, recMode,
-        kw, kw,
-        ts, ts,
-        uc, uc,
-        type, name
-      );
-    }
-  })();
-}
-
-/**
- * Register plugin resources that have no local files (virtual resources).
- * These are skills/agents from other installed plugins that the dispatch
- * system should know about for intelligent recommendation.
- * Only inserts entries that don't already exist in the resources table.
- * @param {Database} rdb Registry database handle
- */
-function registerVirtualResources(rdb) {
-  const insert = rdb.prepare(`
-    INSERT OR IGNORE INTO resources (name, type, status, source, local_path, invocation_name,
-      intent_tags, domain_tags, capability_summary, trigger_patterns,
-      keywords, tech_stack, use_cases, recommendation_mode,
-      created_at, updated_at)
-    VALUES (?, ?, 'active', 'preinstalled', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-  `);
-
-  // Backfill FTS5 fields for existing resources that have empty keywords/tech_stack/use_cases
-  const updateFts = rdb.prepare(`
-    UPDATE resources SET
-      keywords = CASE WHEN (keywords IS NULL OR keywords = '') AND ?1 != '' THEN ?1 ELSE keywords END,
-      tech_stack = CASE WHEN (tech_stack IS NULL OR tech_stack = '') AND ?2 != '' THEN ?2 ELSE tech_stack END,
-      use_cases = CASE WHEN (use_cases IS NULL OR use_cases = '') AND ?3 != '' THEN ?3 ELSE use_cases END,
-      updated_at = datetime('now')
-    WHERE type = ?4 AND name = ?5
-      AND ((keywords IS NULL OR keywords = '') OR (tech_stack IS NULL OR tech_stack = '') OR (use_cases IS NULL OR use_cases = ''))
-  `);
-
-  let count = 0;
-  rdb.transaction(() => {
-    for (const [key, meta] of Object.entries(RESOURCE_METADATA)) {
-      const sep = key.indexOf(':');
-      if (sep < 0) continue;
-      const type = key.slice(0, sep);
-      const name = key.slice(sep + 1);
-      const { changes } = insert.run(
-        name, type,
-        meta.invocation_name || deriveInvocationName(name),
-        meta.intent_tags || name.replace(/-/g, ' '),
-        meta.domain_tags || '',
-        meta.capability_summary || `${type}: ${name.replace(/-/g, ' ')}`,
-        meta.trigger_patterns || `when user needs ${name.replace(/-/g, ' ')}`,
-        meta.keywords || '',
-        meta.tech_stack || '',
-        meta.use_cases || '',
-        meta.recommendation_mode || 'proactive',
-      );
-      count += changes;
-
-      // Backfill FTS5 fields for existing resources.
-      // ?N numbered placeholders REQUIRE object-form binding in better-sqlite3 —
-      // positional .run(v1, v2, …) always throws "Too many parameter values"
-      // regardless of arg count. Pre-fix this swallow-warned on every install
-      // (masked by install.mjs:785 import failure before the v2.84.2 path fix).
-      if (changes === 0) {
-        updateFts.run({
-          1: meta.keywords || '',
-          2: meta.tech_stack || '',
-          3: meta.use_cases || '',
-          4: type,
-          5: name,
-        });
-      }
-    }
-
-    // Backfill keywords from preinstalled tags for resources still missing keywords
-    try {
-      const backfill = rdb.prepare(`
-        UPDATE resources SET keywords = (
-          SELECT GROUP_CONCAT(json_each.value, ',')
-          FROM preinstalled p, json_each(p.tags)
-          WHERE p.type = resources.type AND p.name = resources.name
-        )
-        WHERE (keywords IS NULL OR keywords = '')
-          AND EXISTS (
-            SELECT 1 FROM preinstalled p
-            WHERE p.type = resources.type AND p.name = resources.name
-              AND p.tags != '[]' AND p.tags IS NOT NULL
-          )
-      `);
-      backfill.run();
-    } catch {}
-
-    // Backfill invocation_name for resources that still have it empty
-    // Derive from name: "parent/child" → "parent:child", otherwise use name as-is
-    try {
-      const emptyInvoc = rdb.prepare(`
-        SELECT id, name FROM resources
-        WHERE status = 'active' AND (invocation_name IS NULL OR invocation_name = '')
-      `).all();
-      if (emptyInvoc.length > 0) {
-        const setInvoc = rdb.prepare('UPDATE resources SET invocation_name = ? WHERE id = ?');
-        for (const r of emptyInvoc) {
-          setInvoc.run(deriveInvocationName(r.name), r.id);
-        }
-      }
-    } catch {}
-  })();
-  return count;
-}
-
 let cmd = process.argv[2];
 let flags = new Set(process.argv.slice(3));
 
-function log(msg) { console.log(`  ${msg}`); }
-function ok(msg) { console.log(`  ✓ ${msg}`); }
-
-/**
- * Recursive on-disk size of `dir`, in bytes. Bounded by `maxEntries` so a
- * surprise-large tree can never turn a progress line into a long stat storm —
- * returns `{ bytes, truncated }` and callers render truncated sums as "≥ N MB".
- *
- * @param {string} dir Directory to measure (missing dir → 0 bytes).
- * @param {number} [maxEntries=50000] Stat budget.
- * @returns {{bytes: number, truncated: boolean}}
- */
-function dirSizeBytes(dir, maxEntries = 50000) {
-  let bytes = 0, seen = 0, truncated = false;
-  const stack = [dir];
-  while (stack.length > 0) {
-    const cur = stack.pop();
-    let entries;
-    try { entries = readdirSync(cur, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
-      if (++seen > maxEntries) { truncated = true; return { bytes, truncated }; }
-      const p = join(cur, e.name);
-      if (e.isDirectory()) stack.push(p);
-      else if (e.isFile()) { try { bytes += statSync(p).size; } catch { /* raced away */ } }
-    }
-  }
-  return { bytes, truncated };
+function log(msg) {
+  console.log(`  ${msg}`);
+}
+function ok(msg) {
+  console.log(`  ✓ ${msg}`);
 }
 
-/** Render a byte count as a short human string ("148 MB"). */
-function fmtMB(bytes, truncated = false) {
-  return `${truncated ? '≥' : ''}${Math.round(bytes / 1048576)} MB`;
+function warn(msg) {
+  console.log(`  ⚠ ${msg}`);
 }
-function warn(msg) { console.log(`  ⚠ ${msg}`); }
-function fail(msg) { console.log(`  ✗ ${msg}`); }
+function fail(msg) {
+  console.log(`  ✗ ${msg}`);
+}
 
 // Pure JSON-version field bumper for the release pipeline. Reads `filePath`,
 // walks `keyPath` (e.g. `['version']` or `['plugins', 0, 'version']`), and
@@ -313,6 +175,97 @@ export function bumpJsonField(filePath, keyPath, newVal) {
   return { changed: true, prev };
 }
 
+// CLAUDE.md's `- **Version**: x.y.z` line, patched to a new version.
+//
+// Replaces the version TOKEN, not the whole line. The line carries a trailing
+// annotation ("— **this exact string is a release guard.**") and the previous
+// whole-line form deleted it on the first release after that annotation was
+// written. Every gate stayed green through the deletion — publish.yml greps the
+// `^- **Version**: <semver>` prefix and install-e2e asserts the same substring,
+// so neither can see a truncated tail. Pure + exported for the same reason
+// bumpJsonField is: syncVersions gets one testable point of truth per file shape.
+//
+// @returns patched text, or null when the line is absent (caller warns + skips).
+export function patchClaudeMdVersion(text, version) {
+  const versionLine = /^(- \*\*Version\*\*: )\d+\.\d+\.\d+(.*)$/m;
+  if (!versionLine.test(text)) return null;
+  return text.replace(versionLine, (_m, head, tail) => `${head}${version}${tail}`);
+}
+
+// Repair instruction for an unregistered hook manifest.
+//
+// The obvious advice — copy the marketplace clone over the cache copy — is a SILENT
+// NO-OP in one real sequence (pre-ship review, finding 3): `install` empties the
+// marketplace manifest too, so after `install` + `cleanup-hooks` BOTH files are
+// `{"hooks":{}}` and the cp exits 0 having changed nothing, leaving the user staring
+// at the same red line. Claude Code also seeds a NEW cache version from that same
+// emptied clone. So check the source before prescribing it, and fall back to a
+// reinstall — which re-clones the manifest from the repo — when it is empty too.
+/**
+ * Clear whatever occupies `p` — file, directory, or symlink INCLUDING a dangling one —
+ * before a symlink is written over it. Returns true when something was removed.
+ *
+ * A20260906-R8-P2-3: every call site used to gate on `existsSync(p)`, which FOLLOWS the
+ * link, so a dangling symlink reads as absent. Two consequences, and the second is the
+ * one that bites: `uninstall` leaves a dead `claude-mem-lite` on PATH, and
+ * `createCliSymlink` skips the removal, `symlinkSync` throws EEXIST, the catch falls back
+ * to an unwritable /usr/local/bin, and the user is told "CLI symlink failed — run
+ * manually". Re-running `install` — the documented repair — cannot repair it. The same
+ * file already knew the idiom: isDevInstall() pairs existsSync with lstatSync.
+ *
+ * rmSync rather than unlinkSync because the dev-mode sites link DIRECTORIES; verified it
+ * removes the link and leaves the target intact (a link to a populated dir, target still
+ * readable afterwards) — following it would delete the developer's own scripts/.
+ *
+ * It is `recursive`, so it also removes a REAL directory at `p`, not only a link to one.
+ * That is deliberate and pre-existing (the dev-mode sites already did this): running
+ * `install --dev` after a normal install finds a real `DATA_DIR/node_modules` where a link
+ * belongs. Named here because the one-line summary above says "before a symlink is written
+ * over it", which undersells what the call can delete.
+ *
+ * @param {string} p
+ * @returns {boolean}
+ */
+export function clearLinkPath(p) {
+  try {
+    lstatSync(p);
+  } catch {
+    return false; // genuinely absent — nothing to clear
+  }
+  try {
+    rmSync(p, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false; // permissions; callers fall back or report their own failure
+  }
+}
+
+/**
+ * Minimum supported Node MAJOR, parsed out of a `package.json#engines.node` range.
+ *
+ * A20260906-R8-P2-1: doctor carried its own `>= 18` literal, so v4.0.0 raised the real
+ * floor to 22 (npm refuses to install below it, and better-sqlite3 13 ships no prebuild
+ * for those Nodes) while doctor kept printing `✓ Node.js: v20.x` — greenlighting the
+ * runtime that WAS the fault, in the one tool a broken user is told to run. One source,
+ * so the two cannot drift again; the fallback only covers an unreadable manifest.
+ *
+ * @param {unknown} enginesNode e.g. '>=22' or '^22.12.0 || ^24.0.0 || >=26.0.0'
+ * @param {number} [fallback]
+ * @returns {number}
+ */
+export function requiredNodeMajor(enginesNode, fallback = 22) {
+  const m = /(\d+)/.exec(String(enginesNode ?? ''));
+  return m ? Number(m[1]) : fallback;
+}
+
+export function hookManifestRepairHint(cacheRoot, marketplaceRoot) {
+  const src = join(marketplaceRoot, 'hooks', 'hooks.json');
+  const dst = join(cacheRoot, 'hooks', 'hooks.json');
+  return pluginCacheHookEvents(marketplaceRoot).ok
+    ? `cp "${src}" "${dst}" && restart Claude Code`
+    : `no usable marketplace copy to restore from — reinstall the plugin (/plugin uninstall then /plugin install), then restart Claude Code`;
+}
+
 // Doctor's final summary line. Pure function so the 4-way contract
 // (clean / warnings-only / issues / mixed) is unit-testable without spinning
 // up the full doctor pipeline. `issues` are ✗-level (action required);
@@ -324,6 +277,59 @@ export function buildDoctorSummary(issues, warnings) {
   if (issues === 0) return `All critical checks passed (${warnings} warning${wPlural}).`;
   const warnSuffix = warnings > 0 ? ` (+${warnings} warning${wPlural})` : '';
   return `${issues} issue(s) found.${warnSuffix}`;
+}
+
+/**
+ * How many LIVE hook commands invoke `bash`, and which scripts they are.
+ *
+ * There are two hook registrations and only one is live per install shape, which is what
+ * the first cut of doctor's interpreter check got wrong (pre-ship review P1-1). The plugin
+ * shape reads `hooks/hooks.json` out of the plugin cache. The npm / npx / `git clone` shape
+ * has no such file — `hooks/hooks.json` is in RELEASE_SIGNED_FILES but NOT in SOURCE_FILES,
+ * so nothing deploys it to ~/.claude-mem-lite/ — and registers its hooks in settings.json
+ * instead. Reading only the manifest therefore answered "zero bash hooks" on the one shape
+ * where two of them are live.
+ *
+ * Returns THREE outcomes, never two. `count: null` means no registration could be read, and
+ * that is deliberately distinct from a count of zero: zero is an answer, null is the absence
+ * of one, and a diagnostic that reports them identically tells the reader to stop looking.
+ *
+ * @param {{manifestPath: string, settingsCommands?: string[], installDir: string}} opts
+ * @returns {{count: number|null, source: 'manifest'|'settings'|null, scripts: string[]}}
+ */
+export function resolveBashHookCount({ manifestPath, settingsCommands = [], installDir }) {
+  const basenames = (commands) =>
+    commands
+      .map((c) => {
+        const m = c.match(/([^/"\s]+\.sh)/);
+        return m ? m[1] : c;
+      })
+      .sort();
+
+  if (existsSync(manifestPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      const commands = [];
+      for (const matchers of Object.values(parsed?.hooks || {})) {
+        for (const m of matchers || []) {
+          for (const h of m?.hooks || []) commands.push(String(h?.command || ''));
+        }
+      }
+      const bash = commands.filter((c) => c.startsWith('bash '));
+      return { count: bash.length, source: 'manifest', scripts: basenames(bash) };
+    } catch {
+      // A torn manifest is not evidence of zero bash hooks. Fall through to settings.json,
+      // and if that says nothing about us either, the caller gets null.
+    }
+  }
+  // Only OUR entries: settings.json is shared with every other tool the user installs, so a
+  // foreign `bash "…"` line is not ours to report on, and — the discriminating half — a
+  // settings.json that names nothing of ours is not evidence that no hook needs bash. It is
+  // evidence we are reading the wrong registration.
+  const ours = settingsCommands.filter((c) => c.includes(installDir));
+  if (ours.length === 0) return { count: null, source: null, scripts: [] };
+  const bash = ours.filter((c) => c.startsWith('bash '));
+  return { count: bash.length, source: 'settings', scripts: basenames(bash) };
 }
 
 // Dev installs symlink server.mjs → the project's source file. Used to suppress
@@ -338,45 +344,147 @@ function isDevInstall() {
   }
 }
 
-// Decide what to check out of a registry repo. We only ever copy the manifest's
-// `entry.path` subdirs into managed/skills|agents, so the working tree never
-// needs the rest of the repo — a partial+sparse clone fetches just those subtrees
-// (e.g. davila7/claude-code-templates: 197MB whole repo → a few MB of 3 paths).
-// Returns { full, paths }: `full` forces a normal checkout when any entry maps to
-// the repo root ('.') — sparse buys nothing there. Unsafe paths ('..'/absolute)
-// are dropped here exactly as the copy loop drops them, so they never reach
-// `sparse-checkout set`. Pure + exported for unit testing.
-export function planRepoSparsePaths(entries) {
-  let needsFull = false;
-  const paths = [];
-  for (const e of entries || []) {
-    const p = e && e.path;
-    if (!p || p === '.' || p === './') { needsFull = true; continue; }
-    if (isAbsolute(p) || String(p).includes('..')) continue; // unsafe — skipped at copy too
-    const norm = String(p).replace(/^\.\//, '').replace(/\/+$/, '');
-    if (norm && !paths.includes(norm)) paths.push(norm);
+// Last-resort recovery command, printed when the signature-verified repair path itself
+// fails. It resolves the latest RELEASE tarball via the GitHub API rather than fetching
+// `/tarball`, which serves the DEFAULT BRANCH — unreleased WIP. That mattered: repair()
+// exists because the old auto-path ran main HEAD unverified, and until 2026-09-08 the
+// fallback it printed on failure handed the user exactly that behaviour back. A shell
+// one-liner cannot check an Ed25519 signature, so this remains a trust decision the user
+// makes explicitly; pinning it to a release at least removes the unreleased-WIP half.
+//
+// FOUR surfaces carry this string — here, scripts/hook-launcher.mjs (pure-`node:` charter,
+// cannot import lib/), README.md and README.zh-CN.md. Exported so
+// tests/manual-fallback-sync.test.mjs can pin the other three to this one and fail if a
+// fifth appears; a string kept in sync by a comment is a string that drifts.
+export const MANUAL_TARBALL_FALLBACK =
+  'T=$(mktemp -d) && U=$(curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/releases/latest | grep -o \'"tarball_url"[^,]*\' | cut -d\'"\' -f4) && curl -sL "$U" | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install';
+
+/**
+ * Whether the local marketplace clone can still be fast-forwarded.
+ *
+ * This is the near cause of the failure v6.3.0 shipped a detector for. Claude Code updates a
+ * git-source marketplace by pulling that clone; a DIRTY working tree blocks the pull, the
+ * plugin silently stops updating, and eventually the database is written by a newer
+ * claude-mem-lite than the code that has to open it. On this machine the clone was pinned 22
+ * commits behind while everything reported green.
+ *
+ * It gets dirty on its own: with a DIRECTORY-source marketplace, `${CLAUDE_PLUGIN_ROOT}`
+ * resolves inside the clone, and `scripts/launch.mjs` runs `npm install` there whenever
+ * `node_modules/better-sqlite3` is missing — which is every materialization of a new version.
+ * That install rewrites **`package-lock.json`**, which IS tracked, and that is what blocks the
+ * pull. So the plugin's own launcher can create the state that stops the plugin updating.
+ *
+ * **Do not add a `node_modules` special case here.** A first cut did, and pre-ship review
+ * measured it dead: the clone is a clone of THIS repo, whose `.gitignore` carries
+ * `/node_modules`, so `git status --porcelain` never sees it — the branch was reachable only
+ * from a fixture that omitted the `.gitignore` the real clone always has. An ignored
+ * `node_modules` also does not block a fast-forward, so reporting it would have been noise
+ * even if it were visible. The tracked-file dirt is the whole signal.
+ *
+ * Five outcomes, and `unknown` is one of them on purpose: "I could not run git" must not be
+ * reported in the same voice as "the tree is clean".
+ *
+ * Exported for tests/marketplace-clone-health.test.mjs.
+ */
+export function marketplaceCloneHealth(
+  dir,
+  run = (args) => execFileSync('git', args, { encoding: 'utf8', timeout: 20000 }),
+) {
+  if (!existsSync(dir)) return { kind: 'absent' };
+  if (!existsSync(join(dir, '.git'))) return { kind: 'not-git' };
+  let porcelain;
+  try {
+    porcelain = run(['-C', dir, 'status', '--porcelain']);
+  } catch (e) {
+    return { kind: 'unknown', reason: e?.code || e?.message || 'git failed' };
   }
-  // No usable sparse paths (all root or all unsafe) → a full checkout is the only
-  // thing that can produce content; sparse would be an empty, pointless tree.
-  return { full: needsFull || paths.length === 0, paths };
+  const entries = String(porcelain)
+    .split('\n')
+    .filter((l) => l.trim());
+  if (entries.length === 0) return { kind: 'clean' };
+  return { kind: 'dirty', count: entries.length };
 }
 
-// True only for a clone this code produced (partial-clone promisor + sparse-checkout
-// both on). A legacy full clone returns false → caller re-clones it slim. Detection
-// erring false only costs a one-time re-clone (the dir is a rebuildable cache), so
-// over-eager migration is safe; under-eager just keeps a fat clone one more cycle.
-function isPartialSparseClone(clonePath) {
-  const cfg = (key) => {
-    try {
-      return execFileSync('git', ['-C', clonePath, 'config', '--get', key],
-        { encoding: 'utf8', stdio: 'pipe' }).trim();
-    } catch { return ''; } // missing key → git exits non-zero → treat as unset
-  };
-  return cfg('remote.origin.promisor') === 'true' && cfg('core.sparseCheckout') === 'true';
+/**
+ * The `mem-lite` / `mem` registrations in `claude mcp list` output that are NOT provided by
+ * a plugin manifest.
+ *
+ * `claude mcp list` prints one `<name>: <command>` line per server, and a plugin-provided
+ * one is named `plugin:<plugin>:<server>`. The old test — `list.includes('mem-lite:')` —
+ * matched inside `plugin:claude-mem-lite:mem-lite:`, so it could not tell the two apart and
+ * always answered "registered" for a plugin user.
+ *
+ * Deliberately named for what it MEASURES: a bare-name registration, whatever its scope.
+ * `mcp list` does not label user vs project scope on the line itself, so calling this
+ * "user-scope" would claim more than the output supports.
+ *
+ * Exported for tests/mcp-registration-parse.test.mjs.
+ */
+export function nonPluginMemRegistrations(listOutput) {
+  const names = [];
+  for (const line of String(listOutput ?? '').split('\n')) {
+    // Anchored, no leading whitespace: the diagnostics block below the list is indented, and
+    // its `└ [Warning] [mem-lite] mcpServers.mem-lite: …` lines are not registrations.
+    const m = /^(\S+):\s+\S/.exec(line);
+    if (!m) continue;
+    const name = m[1];
+    if (name.startsWith('plugin:')) continue;
+    if (name === 'mem-lite' || name === 'mem') names.push(name);
+  }
+  return names;
+}
+
+/**
+ * The remedy line for a `doctor` database check that threw — or null when the failure is
+ * one this cannot classify.
+ *
+ * Returning null is deliberate and is the case worth defending: a diagnostic that always
+ * prints a fix eventually prints the wrong one, and the bare error message is a better
+ * answer than a confident irrelevance. The three CLASSIFIED outcomes are kept apart for the
+ * same reason — "restore this snapshot", "there is no snapshot", and "I could not read the
+ * directory to find out" are three different situations, and collapsing the last two ends
+ * the reader's search with a fact nobody checked.
+ *
+ * Shell commands only, no `claude-mem-lite <cmd>`: the remedy for a broken store must not
+ * itself depend on which install shape the user has (the plugin cache has no CLI on PATH).
+ *
+ * Exported for tests/doctor-db-remedy.test.mjs, which also drives the shipped doctor over a
+ * corrupt file — a pure function nothing calls is the wiring gap this repo keeps finding.
+ */
+export async function dbCheckRemedy(dbPath, err) {
+  if (isNativeBindingError(err)) return `Repair: ${nativeBindingRepairHint(PROJECT_DIR)}`;
+  // Classification and remedy both live in lib/db-unusable.mjs since v6.5.0, because the hook
+  // path now has to answer the same question in-session and two copies of a SQLite-message
+  // regex is this repo's named twin-drift class. Doctor keeps its own SENTENCE (one line, no
+  // leading banner); only the decision is shared.
+  //
+  // Audit 2026-09-08 P1-1: loaded HERE, not at the top of the file. `lib/db-unusable.mjs`
+  // reaches utils.mjs through db-backup, and utils.mjs pulls the whole retrieval/NLP
+  // subtree (nlp / synonyms / stop-words / scoring-sql / secret-scrub / …). As a static
+  // import that made every one of those files a prerequisite for doctor STARTING, on a
+  // command whose whole job is to tell a user which file is missing — so a copy install
+  // short one of them answered with a bare ERR_MODULE_NOT_FOUND stack. This function runs
+  // only inside the Database check's catch, so the cost of loading it lazily is paid by
+  // the rare failure rather than by every invocation. Same shape as the six dynamic
+  // imports doctor already uses.
+  const { isDbUnusableError, dbUnusableRemedy } = await import('./lib/db-unusable.mjs');
+  if (!isDbUnusableError(err)) return null;
+  const remedy = dbUnusableRemedy(dbPath);
+  if (remedy.kind === 'unknown') return remedy.note;
+  if (remedy.kind === 'set-aside') {
+    return (
+      `No backup snapshot exists beside the database. Set the broken file aside so a fresh ` +
+      `store is created on the next session: ${remedy.command} ` +
+      `— memories in that file are not recoverable without a backup.`
+    );
+  }
+  return (
+    `Restore the newest of ${remedy.snapshotCount} backup snapshot(s): ${remedy.command} ` +
+    `— move the broken file aside first if you want to keep it for inspection.`
+  );
 }
 
 // ─── Install ────────────────────────────────────────────────────────────────
-
 
 // Dynamic-import helpers, resolved against the installed copy at INSTALL_DIR
 // (lets install.mjs run from a /tmp staging dir whose node_modules is at
@@ -386,826 +494,744 @@ const requireFromInstall = createRequire(pathToFileURL(join(INSTALL_DIR, 'packag
 
 // ─── install() step helpers (audit P1-9) ──────────────────────────────────────
 function installSourceFiles(IS_DEV) {
-// Auto-migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
-const oldUnhidden = join(homedir(), 'claude-mem-lite');
-if (!existsSync(DATA_DIR) && existsSync(oldUnhidden)) {
-  log('Migrating ~/claude-mem-lite/ → ~/.claude-mem-lite/...');
-  renameSync(oldUnhidden, DATA_DIR);
-  ok('Directory migrated');
-}
+  // Auto-migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
+  const oldUnhidden = join(homedir(), 'claude-mem-lite');
+  if (!existsSync(DATA_DIR) && existsSync(oldUnhidden)) {
+    log('Migrating ~/claude-mem-lite/ → ~/.claude-mem-lite/...');
+    renameSync(oldUnhidden, DATA_DIR);
+    ok('Directory migrated');
+  }
 
-if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-// Under relocation the DB/managed/runtime live here, not in the code dir — create it too.
-if (!existsSync(MEM_DATA_DIR)) mkdirSync(MEM_DATA_DIR, { recursive: true });
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  // Under relocation the DB/managed/runtime live here, not in the code dir — create it too.
+  if (!existsSync(MEM_DATA_DIR)) mkdirSync(MEM_DATA_DIR, { recursive: true });
 
-if (IS_DEV) {
-  log('Dev mode — creating symlinks in ~/.claude-mem-lite/...');
-  // Symlink individual source files
-  for (const f of SOURCE_FILES) {
-    const target = join(PROJECT_DIR, f);
-    const link = join(DATA_DIR, f);
-    if (existsSync(target)) {
-      // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
-      const linkParent = dirname(link);
-      if (!existsSync(linkParent)) mkdirSync(linkParent, { recursive: true });
-      // Remove existing file/symlink before creating
-      if (existsSync(link)) try { unlinkSync(link); } catch {}
-      symlinkSync(target, link);
+  if (IS_DEV) {
+    log('Dev mode — creating symlinks in ~/.claude-mem-lite/...');
+    // Symlink individual source files
+    for (const f of SOURCE_FILES) {
+      const target = join(PROJECT_DIR, f);
+      const link = join(DATA_DIR, f);
+      if (existsSync(target)) {
+        // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
+        const linkParent = dirname(link);
+        if (!existsSync(linkParent)) mkdirSync(linkParent, { recursive: true });
+        // Remove existing file/symlink (including a dangling one) before creating.
+        clearLinkPath(link);
+        symlinkSync(target, link);
+      }
+    }
+    // Symlink scripts/ directory
+    const scriptsLink = join(DATA_DIR, 'scripts');
+    clearLinkPath(scriptsLink);
+    symlinkSync(join(PROJECT_DIR, 'scripts'), scriptsLink);
+    // Symlink node_modules/
+    const nmLink = join(DATA_DIR, 'node_modules');
+    clearLinkPath(nmLink);
+    symlinkSync(join(PROJECT_DIR, 'node_modules'), nmLink);
+    // R10 P3-28: the registry/ symlink is gone. The directory left with the skill registry
+    // in v5.0.0, so the existsSync guard was permanently false and the branch was dead —
+    // clearLinkPath still ran, silently removing a stale ~/.claude-mem-lite/registry link
+    // on the first dev install after upgrading, which is the one useful thing it did.
+    // Do that unconditionally instead of pretending the source directory might return.
+    clearLinkPath(join(DATA_DIR, 'registry'));
+    // commands/ is intentionally NOT linked: Claude Code reads slash commands
+    // from the plugin cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/commands/)
+    // or user-level ~/.claude/commands/, never from ~/.claude-mem-lite/commands/.
+    // Pre-v2.55 maintained a symlink/copy here that had no consumers.
+    ok('Symlinks created in ~/.claude-mem-lite/ → dev dir');
+  } else {
+    log('Installing to ~/.claude-mem-lite/...');
+    const scriptsDir = join(DATA_DIR, 'scripts');
+    if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
+    for (const f of SOURCE_FILES) {
+      const src = join(PROJECT_DIR, f);
+      const dst = join(DATA_DIR, f);
+      if (existsSync(src)) {
+        // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
+        const dstParent = dirname(dst);
+        if (!existsSync(dstParent)) mkdirSync(dstParent, { recursive: true });
+        copyFileSync(src, dst);
+      }
+    }
+    // Copy hook scripts (settings.json hook commands point at these — must
+    // stay in sync with HOOK_SCRIPT_FILES manifest)
+    copyHookScripts(join(PROJECT_DIR, 'scripts'), scriptsDir);
+    // Ensure bash script is executable
+    try {
+      execFileSync('chmod', ['+x', join(scriptsDir, 'post-tool-use.sh')], { stdio: 'pipe' });
+    } catch {}
+    // commands/ is intentionally NOT copied — see dev-mode branch above.
+    ok('Source files copied to ~/.claude-mem-lite/');
+
+    // v2.48 P1-4: prune stale top-level .mjs + 0-byte .db files left behind by
+    // prior upgrades (e.g. dispatch.mjs removed in v2.20.0, zero-byte mem.db /
+    // memory.db / registry.db from pre-consolidation installs). Subdirs +
+    // symlinks + non-empty DBs are always preserved.
+    try {
+      const pruned = pruneStaleInstallFiles(DATA_DIR, SOURCE_FILES);
+      if (pruned.length > 0) {
+        ok(`Pruned ${pruned.length} stale file(s): ${pruned.map((p) => basename(p)).join(', ')}`);
+      }
+    } catch (e) {
+      /* prune is best-effort — never block install */ void e;
     }
   }
-  // Symlink scripts/ directory
-  const scriptsLink = join(DATA_DIR, 'scripts');
-  if (existsSync(scriptsLink)) try { rmSync(scriptsLink, { recursive: true, force: true }); } catch {}
-  symlinkSync(join(PROJECT_DIR, 'scripts'), scriptsLink);
-  // Symlink node_modules/
-  const nmLink = join(DATA_DIR, 'node_modules');
-  if (existsSync(nmLink)) try { rmSync(nmLink, { recursive: true, force: true }); } catch {}
-  symlinkSync(join(PROJECT_DIR, 'node_modules'), nmLink);
-  // Symlink registry/ directory
-  const regLink = join(DATA_DIR, 'registry');
-  if (existsSync(regLink)) try { rmSync(regLink, { recursive: true, force: true }); } catch {}
-  if (existsSync(join(PROJECT_DIR, 'registry'))) {
-    symlinkSync(join(PROJECT_DIR, 'registry'), regLink);
-  }
-  // commands/ is intentionally NOT linked: Claude Code reads slash commands
-  // from the plugin cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/commands/)
-  // or user-level ~/.claude/commands/, never from ~/.claude-mem-lite/commands/.
-  // Pre-v2.55 maintained a symlink/copy here that had no consumers.
-  ok('Symlinks created in ~/.claude-mem-lite/ → dev dir');
-} else {
-  log('Installing to ~/.claude-mem-lite/...');
-  const scriptsDir = join(DATA_DIR, 'scripts');
-  if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
-  for (const f of SOURCE_FILES) {
-    const src = join(PROJECT_DIR, f);
-    const dst = join(DATA_DIR, f);
-    if (existsSync(src)) {
-      // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
-      const dstParent = dirname(dst);
-      if (!existsSync(dstParent)) mkdirSync(dstParent, { recursive: true });
-      copyFileSync(src, dst);
-    }
-  }
-  // Copy hook scripts (settings.json hook commands point at these — must
-  // stay in sync with HOOK_SCRIPT_FILES manifest)
-  copyHookScripts(join(PROJECT_DIR, 'scripts'), scriptsDir);
-  // Ensure bash script is executable
-  try { execFileSync('chmod', ['+x', join(scriptsDir, 'post-tool-use.sh')], { stdio: 'pipe' }); } catch {}
-  // commands/ is intentionally NOT copied — see dev-mode branch above.
-  // Copy registry manifest
-  const registryDir = join(DATA_DIR, 'registry');
-  if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
-  const manifestSrc = join(PROJECT_DIR, 'registry', 'preinstalled.json');
-  if (existsSync(manifestSrc)) copyFileSync(manifestSrc, join(registryDir, 'preinstalled.json'));
-  ok('Source files copied to ~/.claude-mem-lite/');
-
-  // v2.48 P1-4: prune stale top-level .mjs + 0-byte .db files left behind by
-  // prior upgrades (e.g. dispatch.mjs removed in v2.20.0, zero-byte mem.db /
-  // memory.db / registry.db from pre-consolidation installs). Subdirs +
-  // symlinks + non-empty DBs are always preserved.
-  try {
-    const pruned = pruneStaleInstallFiles(DATA_DIR, SOURCE_FILES);
-    if (pruned.length > 0) {
-      ok(`Pruned ${pruned.length} stale file(s): ${pruned.map(p => basename(p)).join(', ')}`);
-    }
-  } catch (e) { /* prune is best-effort — never block install */ void e; }
-}
 }
 
 async function installDependencies(IS_DEV) {
-// 2. npm install (skip for --dev: node_modules is symlinked)
-if (IS_DEV) {
-  ok('Dependencies: using dev dir (symlinked)');
-} else {
-  log('Ensuring dependencies installed...');
-  try {
-    // stderr inherited so users see real-time progress (network slowness,
-    // node-gyp compile spinner, prebuild-install fallback messages). With
-    // `stdio: 'pipe'` the install appeared to hang under the 5-min Bash
-    // timeout when better-sqlite3 had no Node v24 prebuild and had to
-    // compile from source — see bug audit 2026-05.
-    execSync(NPM_INSTALL_CMD, { cwd: INSTALL_DIR, stdio: ['ignore', 'pipe', 'inherit'] });
-    ok('Dependencies installed');
-  } catch (e) {
-    fail('npm install failed: ' + e.message);
-    process.exit(1);
-  }
-  // npm install exits 0 even when the better-sqlite3 prebuilt .node binary
-  // mismatches the running Node ABI (e.g. NODE_MODULE_VERSION 137 on Node v24).
-  // Probe and auto-rebuild before declaring success — otherwise the next
-  // launch FATALs with "Could not locate the bindings file".
-  const verify = await ensureBetterSqlite3Working(INSTALL_DIR);
-  if (verify.ok) {
-    ok(`better-sqlite3: ${verify.action}`);
+  // 2. npm install (skip for --dev: node_modules is symlinked)
+  if (IS_DEV) {
+    ok('Dependencies: using dev dir (symlinked)');
   } else {
-    fail(`better-sqlite3 binding unusable after rebuild: ${verify.error}`);
-    log('Try manually: cd ' + INSTALL_DIR + ' && npm rebuild better-sqlite3 --dangerously-allow-all-scripts');
-    process.exit(1);
-  }
-
-  // The package this installer is RUNNING from owns a second tree, and after
-  // `npm i -g claude-mem-lite` npm >= 12 has left its better-sqlite3 install
-  // scripts blocked — so the binding is present-but-uncompiled and nothing
-  // above touches it. The shell CLI heals it on first DB use, but only after
-  // the user has already seen `doctor` report `2 issue(s) found` on a
-  // correct install. Close the window here instead. Never fatal: this tree is
-  // not what hooks or the MCP server load.
-  if (PROJECT_DIR !== INSTALL_DIR && existsSync(join(PROJECT_DIR, 'node_modules', 'better-sqlite3'))) {
-    const selfVerify = await ensureBetterSqlite3Working(PROJECT_DIR);
-    if (selfVerify.ok) {
-      if (selfVerify.action === 'rebuilt') ok(`better-sqlite3: rebuilt for the running package too (${PROJECT_DIR})`);
+    log('Ensuring dependencies installed...');
+    try {
+      // stderr inherited so users see real-time progress (network slowness,
+      // node-gyp compile spinner, prebuild-install fallback messages). With
+      // `stdio: 'pipe'` the install appeared to hang under the 5-min Bash
+      // timeout when better-sqlite3 had no Node v24 prebuild and had to
+      // compile from source — see bug audit 2026-05.
+      execSync(NPM_INSTALL_CMD, { cwd: INSTALL_DIR, stdio: ['ignore', 'pipe', 'inherit'] });
+      ok('Dependencies installed');
+    } catch (e) {
+      fail('npm install failed: ' + e.message);
+      process.exit(1);
+    }
+    // npm install exits 0 even when the better-sqlite3 prebuilt .node binary
+    // mismatches the running Node ABI (e.g. NODE_MODULE_VERSION 137 on Node v24).
+    // Probe and auto-rebuild before declaring success — otherwise the next
+    // launch FATALs with "Could not locate the bindings file".
+    const verify = await ensureBetterSqlite3Working(INSTALL_DIR);
+    if (verify.ok) {
+      ok(`better-sqlite3: ${verify.action}`);
     } else {
-      warn(`better-sqlite3 unusable in the package this installer runs from (${PROJECT_DIR}): ${selfVerify.error}`);
-      log(`  The install itself is fine; the \`claude-mem-lite\` shell command will self-heal on first use, or run: cd ${PROJECT_DIR} && ${NATIVE_BINDING_REBUILD_CMD}`);
+      fail(`better-sqlite3 binding unusable after rebuild: ${verify.error}`);
+      log(`Try manually: ${nativeBindingRepairHint(INSTALL_DIR)}`);
+      process.exit(1);
+    }
+
+    // The package this installer is RUNNING from owns a second tree, and after
+    // `npm i -g claude-mem-lite` npm >= 12 has left its better-sqlite3 install
+    // scripts blocked — so the binding is present-but-uncompiled and nothing
+    // above touches it. The shell CLI heals it on first DB use, but only after
+    // the user has already seen `doctor` report `2 issue(s) found` on a
+    // correct install. Close the window here instead. Never fatal: this tree is
+    // not what hooks or the MCP server load.
+    if (PROJECT_DIR !== INSTALL_DIR && existsSync(join(PROJECT_DIR, 'node_modules', 'better-sqlite3'))) {
+      const selfVerify = await ensureBetterSqlite3Working(PROJECT_DIR);
+      if (selfVerify.ok) {
+        if (selfVerify.action === 'rebuilt')
+          ok(`better-sqlite3: rebuilt for the running package too (${PROJECT_DIR})`);
+      } else {
+        warn(
+          `better-sqlite3 unusable in the package this installer runs from (${PROJECT_DIR}): ${selfVerify.error}`,
+        );
+        log(
+          `  The install itself is fine; the \`claude-mem-lite\` shell command will self-heal on first use, or run: ${nativeBindingRepairHint(PROJECT_DIR)}`,
+        );
+      }
     }
   }
-}
 }
 
 function createCliSymlink() {
-// 2b. Create global CLI symlink (claude-mem-lite command)
-const cliSource = join(INSTALL_DIR, 'cli.mjs');
-if (existsSync(cliSource)) {
-  try { execFileSync('chmod', ['+x', cliSource], { stdio: 'pipe' }); } catch {}
-  // Try ~/.local/bin first (user-writable, commonly on PATH)
-  const localBin = join(homedir(), '.local', 'bin');
-  const cliLink = join(localBin, 'claude-mem-lite');
-  try {
-    if (!existsSync(localBin)) mkdirSync(localBin, { recursive: true });
-    if (existsSync(cliLink)) unlinkSync(cliLink);
-    symlinkSync(cliSource, cliLink);
-    ok(`CLI: ${cliLink} → ${cliSource}`);
-  } catch {
-    // Fallback: try /usr/local/bin (may need sudo)
+  // 2b. Create global CLI symlink (claude-mem-lite command)
+  const cliSource = join(INSTALL_DIR, 'cli.mjs');
+  if (existsSync(cliSource)) {
     try {
-      const globalLink = '/usr/local/bin/claude-mem-lite';
-      if (existsSync(globalLink)) unlinkSync(globalLink);
-      symlinkSync(cliSource, globalLink);
-      ok(`CLI: ${globalLink} → ${cliSource}`);
+      execFileSync('chmod', ['+x', cliSource], { stdio: 'pipe' });
+    } catch {}
+    // Try ~/.local/bin first (user-writable, commonly on PATH)
+    const localBin = join(homedir(), '.local', 'bin');
+    const cliLink = join(localBin, 'claude-mem-lite');
+    try {
+      if (!existsSync(localBin)) mkdirSync(localBin, { recursive: true });
+      clearLinkPath(cliLink);
+      symlinkSync(cliSource, cliLink);
+      ok(`CLI: ${cliLink} → ${cliSource}`);
     } catch {
-      warn('CLI symlink failed — run manually: ln -sf ' + cliSource + ' ~/.local/bin/claude-mem-lite');
+      // Fallback: try /usr/local/bin (may need sudo)
+      try {
+        const globalLink = '/usr/local/bin/claude-mem-lite';
+        clearLinkPath(globalLink);
+        symlinkSync(cliSource, globalLink);
+        ok(`CLI: ${globalLink} → ${cliSource}`);
+      } catch {
+        warn('CLI symlink failed — run manually: ln -sf ' + cliSource + ' ~/.local/bin/claude-mem-lite');
+      }
     }
   }
 }
+
+/**
+ * Which of our MCP names a PROJECT-scoped `.mcp.json` in `cwd` registers.
+ *
+ * This exists because the installer used to run `claude mcp remove -s project <name>` as
+ * part of "purge any pre-existing registration before re-registering". That command edits
+ * `<cwd>/.mcp.json` — a file that belongs to whatever repository the user happens to be
+ * standing in, not to this installer's state. Measured 2026-09-08: running the installer
+ * from a clone of this repo emptied the tracked root `.mcp.json` (the plugin's own MCP
+ * manifest, and a RELEASE_SIGNED_FILES entry), and nothing said so; only a test noticed.
+ * For anyone else it is a silent edit to a checked-in file that breaks the registration
+ * for every teammate who pulls it.
+ *
+ * `uninstall` has always removed `-s user` only, so the scope discipline already existed
+ * on the other half of the lifecycle; this brings install into line with it and reports
+ * the duplicate instead — same doctrine as the README's mixed-install residue section,
+ * where the tool diagnoses and the user decides.
+ *
+ * @param {string} cwd directory to inspect
+ * @returns {{file: string, names: string[]}} names present, empty when there is nothing to say
+ */
+export function projectScopedMemRegistrations(cwd) {
+  const file = join(cwd, '.mcp.json');
+  try {
+    const servers = JSON.parse(readFileSync(file, 'utf8'))?.mcpServers;
+    // Array.isArray is load-bearing: `typeof [] === 'object'`, so without it an array
+    // falls through to the membership filter and the guard cannot fire on its own
+    // named input — which is how the test case for it was passing.
+    if (!servers || typeof servers !== 'object' || Array.isArray(servers)) return { file, names: [] };
+    return { file, names: ['mem', 'mem-lite'].filter((n) => n in servers) };
+  } catch {
+    // Absent, unreadable, or not JSON — nothing we can honestly report.
+    return { file, names: [] };
+  }
+}
+
+/**
+ * Say so when the directory we are standing in registers our server at PROJECT scope.
+ *
+ * Reporting rather than removing is the whole point — see projectScopedMemRegistrations.
+ */
+function warnProjectScopedMcpDuplicate() {
+  const projectScoped = projectScopedMemRegistrations(process.cwd());
+  if (projectScoped.names.length === 0) return;
+  warn(
+    `${projectScoped.file} also registers ${projectScoped.names.map((n) => `"${n}"`).join(' and ')} ` +
+      `at PROJECT scope — that duplicate wins inside this directory. Left untouched: it is your ` +
+      `repo's file. Remove it with \`claude mcp remove -s project <name>\` if you want the ` +
+      `user-scope registration to apply here.`,
+  );
 }
 
 function registerMcpServer() {
-// 3. Register MCP server (skip if plugin system already handles it)
-// Plugin MCP must stay at root .mcp.json so Claude Code registers plugin:*:mem-lite.
-// Duplicate registrations in practice come from old global install.mjs state
-// (claude mcp add) or stale marketplace copies, not from the cache root itself.
-// Global registration via `claude mcp add` creates a DUPLICATE mcp__mem-lite__* server.
-// The legacy generic name "mem" (pre-v2.78) is also purged so a user who installed in
-// either era ends up with a single canonical "mem-lite" registration.
-// Detect plugin mode: installed_plugins.json has our entry → plugin handles MCP.
-const installedPluginsPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
-let pluginHandlesMcp = false;
-try {
-  const installed = JSON.parse(readFileSync(installedPluginsPath, 'utf8'));
-  pluginHandlesMcp = !!installed?.plugins?.[PLUGIN_KEY]?.length;
-} catch { /* not installed via plugin system */ }
-
-if (pluginHandlesMcp) {
-  log('MCP server: plugin system handles registration (skipping global)');
-  // Clean up stale global registrations (both legacy "mem" and current "mem-lite")
-  for (const name of ['mem', 'mem-lite']) {
-    try {
-      execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' });
-      ok(`Removed stale global MCP "${name}"`);
-    } catch {}
-  }
-} else {
-  log('Registering MCP server...');
+  // 3. Register MCP server (skip if plugin system already handles it)
+  // Plugin MCP must stay at root .mcp.json so Claude Code registers plugin:*:mem-lite.
+  // Duplicate registrations in practice come from old global install.mjs state
+  // (claude mcp add) or stale marketplace copies, not from the cache root itself.
+  // Global registration via `claude mcp add` creates a DUPLICATE mcp__mem-lite__* server.
+  // The legacy generic name "mem" (pre-v2.78) is also purged so a user who installed in
+  // either era ends up with a single canonical "mem-lite" registration.
+  // Detect plugin mode: installed_plugins.json has our entry → plugin handles MCP.
+  const installedPluginsPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
+  let pluginHandlesMcp = false;
   try {
-    // Purge legacy "mem" and any pre-existing "mem-lite" before re-registering
+    const installed = JSON.parse(readFileSync(installedPluginsPath, 'utf8'));
+    pluginHandlesMcp = !!installed?.plugins?.[PLUGIN_KEY]?.length;
+  } catch {
+    /* not installed via plugin system */
+  }
+
+  // The DISCLOSURE is unconditional even though the removal it replaced was not: a
+  // project-scoped `mem`/`mem-lite` entry shadows the user-scope one inside that directory
+  // whichever way this install provides the server, so a plugin-mode user standing in such a
+  // repo has the same problem and used to get the same silence.
+  warnProjectScopedMcpDuplicate();
+
+  if (pluginHandlesMcp) {
+    log('MCP server: plugin system handles registration (skipping global)');
+    // Clean up stale global registrations (both legacy "mem" and current "mem-lite")
     for (const name of ['mem', 'mem-lite']) {
-      try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' }); } catch {}
-      try { execFileSync('claude', ['mcp', 'remove', '-s', 'project', name], { stdio: 'pipe' }); } catch {}
+      try {
+        execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' });
+        ok(`Removed stale global MCP "${name}"`);
+      } catch {}
     }
-    execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem-lite', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
-    ok('MCP server registered: mem-lite');
-  } catch (e) {
-    fail('MCP registration failed: ' + e.message);
-    warn('Try manually: claude mcp add -s user -t stdio mem-lite -- node ' + SERVER_PATH);
+  } else {
+    log('Registering MCP server...');
+    try {
+      // Purge legacy "mem" and any pre-existing "mem-lite" from OUR scope before
+      // re-registering. User scope only — see projectScopedMemRegistrations for why the
+      // project-scope removal that used to sit here was a bug, not a cleanup.
+      for (const name of ['mem', 'mem-lite']) {
+        try {
+          execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' });
+        } catch {}
+      }
+      execFileSync(
+        'claude',
+        ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem-lite', '--', 'node', SERVER_PATH],
+        { stdio: 'pipe' },
+      );
+      ok('MCP server registered: mem-lite');
+    } catch (e) {
+      fail('MCP registration failed: ' + e.message);
+      warn('Try manually: claude mcp add -s user -t stdio mem-lite -- node ' + SERVER_PATH);
+    }
   }
 }
-}
 
-function dedupePluginCacheAndHooks() {
-// 3b. Deduplicate: if marketplace plugin also registers MCP + hooks,
-// clear them to prevent double execution. install.mjs hooks (in settings.json)
-// point to ~/.claude-mem-lite/ (latest code in dev mode via symlinks),
-// while plugin hooks use ${CLAUDE_PLUGIN_ROOT} (potentially stale marketplace copy).
-//
-// MCP dedup: Claude Code copies .mcp.json from marketplace clone → plugin cache.
-// Do NOT modify marketplace .mcp.json — it breaks the MCP server registration chain.
-// Dedup is handled by skipping global `claude mcp add` when plugin system is active.
-const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
-const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
+export function dedupePluginCacheAndHooks({ managedHooks, isDev = false } = {}) {
+  // 3b. Deduplicate: if marketplace plugin also registers MCP + hooks,
+  // clear them to prevent double execution. install.mjs hooks (in settings.json)
+  // point to ~/.claude-mem-lite/ (latest code in dev mode via symlinks),
+  // while plugin hooks use ${CLAUDE_PLUGIN_ROOT} (potentially stale marketplace copy).
+  //
+  // MCP dedup: Claude Code copies .mcp.json from marketplace clone → plugin cache.
+  // Do NOT modify marketplace .mcp.json — it breaks the MCP server registration chain.
+  // Dedup is handled by skipping global `claude mcp add` when plugin system is active.
+  const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
+  const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
 
-if (existsSync(pluginDir)) {
-  // NOTE: Do NOT clear marketplace .mcp.json — Claude Code copies from
-  // marketplace clone → plugin cache on updates. Clearing it causes the
-  // cache .mcp.json to lose the MCP server definition, breaking plugin MCP.
-  // Dedup is already handled by skipping global `claude mcp add` above.
+  // Clearing is a DEDUP, and a dedup with only one registration left is a delete.
+  // Both clearers below empty a file Claude Code reads hooks from; that is correct
+  // only while settings.json ALSO registers them. On a plugin-only install (no
+  // install.mjs-managed entries) the cache manifest is the sole registration, so
+  // clearing it silently unregisters all seven events — and status/doctor then read
+  // "settings.json holds none" as the healthy plugin shape. plugin-cache-guard.mjs
+  // has documented this precondition since it was written and hook.mjs's self-heal
+  // honours it; these two sites did not.
+  //
+  // `managedHooks` comes from the caller rather than a bare hasInstallManagedHooks()
+  // call, and that is the whole point: install() runs configureHooks() first, so a
+  // self-read here is ALWAYS true and the guard would be decorative — the real
+  // protection would be the call ORDER, which nothing pins and a future reorder
+  // would silently revert (pre-ship review, finding 1). Passing the value makes the
+  // dependency data, not sequence. Explicit `false` is honoured; omitted → self-read,
+  // for any caller that has not just written settings.json.
+  const settingsOwnsHooks = managedHooks ?? hasInstallManagedHooks();
 
-  // Clear plugin hooks to prevent double hook execution
-  try {
-    if (existsSync(pluginHooksPath)) {
-      const pluginHooks = JSON.parse(readFileSync(pluginHooksPath, 'utf8'));
-      if (pluginHooks.hooks && Object.keys(pluginHooks.hooks).length > 0) {
-        writeFileSync(pluginHooksPath, JSON.stringify({
-          description: pluginHooks.description || 'claude-mem-lite hooks',
-          _note: 'Hooks managed by install.mjs in settings.json — this file cleared to prevent duplicates',
-          hooks: {}
-        }, null, 2) + '\n');
-        ok('Marketplace plugin: hooks cleared (prevents duplicate)');
+  // Scope note (pre-ship review, finding 2): the gate covers the two hook-CLEARING
+  // blocks only. The launch.mjs / launch-preflight.mjs sync below it is not dedup —
+  // it is issue #15's dev-mode MCP routing fix — and an early return out of the whole
+  // function would silently stop shipping it to plugin-cache users.
+  if (!settingsOwnsHooks) {
+    log(
+      'Plugin cache: hooks left in place (plugin-only install — the cache manifest is the only registration)',
+    );
+  }
+
+  if (existsSync(pluginDir)) {
+    // NOTE: Do NOT clear marketplace .mcp.json — Claude Code copies from
+    // marketplace clone → plugin cache on updates. Clearing it causes the
+    // cache .mcp.json to lose the MCP server definition, breaking plugin MCP.
+    // Dedup is already handled by skipping global `claude mcp add` above.
+
+    // Clear plugin hooks to prevent double hook execution
+    try {
+      if (settingsOwnsHooks && existsSync(pluginHooksPath)) {
+        const pluginHooks = JSON.parse(readFileSync(pluginHooksPath, 'utf8'));
+        if (pluginHooks.hooks && Object.keys(pluginHooks.hooks).length > 0) {
+          // Atomic (audit 2026-09-02 P1-10): a torn hooks.json is not a fail-open marker —
+          // Claude Code parses it at plugin load, so half a file disables the plugin's hooks
+          // for that install until the next successful write. Same writer settings.json
+          // already uses 1600 lines down.
+          atomicWriteFileSync(
+            pluginHooksPath,
+            JSON.stringify(
+              {
+                description: pluginHooks.description || 'claude-mem-lite hooks',
+                _note:
+                  'Hooks managed by install.mjs in settings.json — this file cleared to prevent duplicates',
+                hooks: {},
+              },
+              null,
+              2,
+            ) + '\n',
+          );
+          ok('Marketplace plugin: hooks cleared (prevents duplicate)');
+        }
       }
+    } catch (e) {
+      warn(`Marketplace hooks dedup: ${e.message}`);
     }
-  } catch (e) { warn(`Marketplace hooks dedup: ${e.message}`); }
 
-  // Sync launch.mjs to plugin cache — ensures MCP server loads dev code via symlink detection.
-  // ALSO clear cached hooks.json in every version dir — Claude Code runtime reads hooks from
-  // ~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json, NOT from the marketplace source.
-  // Clearing only the marketplace source (above) leaves stale cache copies that double-register
-  // hooks alongside install.mjs-written settings.json entries.
-  try {
-    const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
-    if (existsSync(cacheBase)) {
-      const launchSyncFiles = ['launch.mjs', 'launch-preflight.mjs'];
-      let clearedHooks = 0;
-      for (const ver of readdirSync(cacheBase)) {
-        const verDir = join(cacheBase, ver);
+    // Sync launch.mjs to plugin cache — ensures MCP server loads dev code via symlink detection.
+    // ALSO clear cached hooks.json in every version dir — Claude Code runtime reads hooks from
+    // ~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json, NOT from the marketplace source.
+    // Clearing only the marketplace source (above) leaves stale cache copies that double-register
+    // hooks alongside install.mjs-written settings.json entries.
+    try {
+      const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
+      if (existsSync(cacheBase)) {
+        const launchSyncFiles = ['launch.mjs', 'launch-preflight.mjs'];
+        // Read, not remembered: the cache dir names ARE versions, so the comparison has to
+        // be against what this installer actually is. A stale constant here would re-open
+        // R10-P2-11 on the next release without changing a line of this block.
+        let selfVersion = null;
+        try {
+          selfVersion = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8')).version;
+        } catch {
+          /* no readable package.json — treat every version as non-matching (sync nothing) */
+        }
+        let clearedHooks = 0;
+        for (const ver of readdirSync(cacheBase)) {
+          const verDir = join(cacheBase, ver);
 
-        // Sync launch.mjs + its preflight companion (issue #15)
-        if (existsSync(join(verDir, 'scripts'))) {
-          for (const f of launchSyncFiles) {
-            const src = join(PROJECT_DIR, 'scripts', f);
-            if (existsSync(src)) {
-              try { copyFileSync(src, join(verDir, 'scripts', f)); } catch { /* keep going */ }
+          // Sync launch.mjs + its preflight companion (issue #15).
+          //
+          // R10-P2-11: this used to run for EVERY cached version. Issue #15 is a dev-mode
+          // routing fix — the point is that a dev tree's launch.mjs reaches the cache the
+          // MCP server starts from — but nothing gated it, so a plain `install` (and the
+          // repair that SessionStart spawns in the background) pushed the installer's entry
+          // point into every OLD version dir, where it runs against that version's own
+          // `lib/`. Entry point and library are versioned together: HEAD's launch.mjs:72-73
+          // destructures `nativeBindingRepairHint` from ../lib/binding-probe.mjs, which
+          // v3.95.0 does not export, so :110 throws inside a catch and the user's repair
+          // hint disappears — a silent downgrade of the one message that tells them how to
+          // fix a dead binding. Reproduced in tests/sandbox/phaseB-npm.mjs §B9 (the old
+          // dir came back 9802B with `nativeBindingRepairHint` in it), which is the
+          // reproduction R10 §8 required before touching install().
+          //
+          // Dev mode still syncs everything: that is the fix's whole purpose, and a dev
+          // tree has no old versions to protect. Otherwise only the version dir that
+          // matches this installer — same release, so same expectations of `lib/`.
+          const versionMatches = isDev || ver === selfVersion;
+          if (versionMatches && existsSync(join(verDir, 'scripts'))) {
+            for (const f of launchSyncFiles) {
+              const src = join(PROJECT_DIR, 'scripts', f);
+              if (existsSync(src)) {
+                try {
+                  // Atomic for the same reason the two hooks.json writes above are: a
+                  // torn launch.mjs is the MCP server's entry point, and the reader is
+                  // Claude Code starting it, not us.
+                  atomicWriteFileSync(join(verDir, 'scripts', f), readFileSync(src));
+                } catch {
+                  /* keep going */
+                }
+              }
+            }
+          }
+
+          // Clear cached hooks.json (runtime reads here, not marketplace source)
+          const cachedHooksPath = join(verDir, 'hooks', 'hooks.json');
+          if (settingsOwnsHooks && existsSync(cachedHooksPath)) {
+            try {
+              const h = JSON.parse(readFileSync(cachedHooksPath, 'utf8'));
+              if (h.hooks && Object.keys(h.hooks).length > 0) {
+                // Atomic, same reason as the marketplace-source copy above (P1-10). This one
+                // is the higher-cost of the two: it runs once PER CACHED VERSION, so a tear
+                // here disables hooks for whichever version Claude Code happens to load.
+                atomicWriteFileSync(
+                  cachedHooksPath,
+                  JSON.stringify(
+                    {
+                      description: h.description || 'claude-mem-lite hooks',
+                      _note: `Hooks managed by install.mjs in settings.json — cache hooks.json cleared to prevent duplicate registration (cache ver: ${ver})`,
+                      hooks: {},
+                    },
+                    null,
+                    2,
+                  ) + '\n',
+                );
+                clearedHooks++;
+              }
+            } catch {
+              /* silent — never block install on one bad cache entry */
             }
           }
         }
-
-        // Clear cached hooks.json (runtime reads here, not marketplace source)
-        const cachedHooksPath = join(verDir, 'hooks', 'hooks.json');
-        if (existsSync(cachedHooksPath)) {
-          try {
-            const h = JSON.parse(readFileSync(cachedHooksPath, 'utf8'));
-            if (h.hooks && Object.keys(h.hooks).length > 0) {
-              writeFileSync(cachedHooksPath, JSON.stringify({
-                description: h.description || 'claude-mem-lite hooks',
-                _note: `Hooks managed by install.mjs in settings.json — cache hooks.json cleared to prevent duplicate registration (cache ver: ${ver})`,
-                hooks: {}
-              }, null, 2) + '\n');
-              clearedHooks++;
-            }
-          } catch { /* silent — never block install on one bad cache entry */ }
-        }
+        const parts = ['launch.mjs synced (dev mode MCP routing)'];
+        if (clearedHooks > 0) parts.push(`${clearedHooks} stale hooks.json cleared`);
+        ok(`Plugin cache: ${parts.join('; ')}`);
       }
-      const parts = ['launch.mjs synced (dev mode MCP routing)'];
-      if (clearedHooks > 0) parts.push(`${clearedHooks} stale hooks.json cleared`);
-      ok(`Plugin cache: ${parts.join('; ')}`);
+    } catch (e) {
+      warn(`Plugin cache sync: ${e.message}`);
     }
-  } catch (e) { warn(`Plugin cache sync: ${e.message}`); }
-}
+  }
 }
 
 function configureHooks() {
-// 4. Configure hooks (merge: preserve user's existing hooks, replace ours)
-log('Configuring hooks...');
-const settings = readSettings();
-if (clearPluginDisabledMarkerForDirectInstall(settings)) {
-  ok('Cleared stale disabled plugin flag so install.mjs-managed hooks can run');
-}
-settings.hooks = settings.hooks || {};
+  // 4. Configure hooks (merge: preserve user's existing hooks, replace ours)
+  log('Configuring hooks...');
+  const settings = readSettings();
+  if (clearPluginDisabledMarkerForDirectInstall(settings)) {
+    ok('Cleared stale disabled plugin flag so install.mjs-managed hooks can run');
+  }
+  settings.hooks = settings.hooks || {};
 
-const SCRIPTS_PATH = join(INSTALL_DIR, 'scripts');
-const PREFILTER_PATH = join(SCRIPTS_PATH, 'post-tool-use.sh');
-// Second bash prefilter, same idea one event over: skip the Node start for a
-// default-off feature (audit 2026-08-22 P2-5, see the script's header).
-const AGENT_PREFILTER_PATH = join(SCRIPTS_PATH, 'pre-agent-inject.sh');
-// v2.84: every Node hook invocation routes through hook-launcher.mjs so an
-// ERR_MODULE_NOT_FOUND from a partial-install drift auto-heals via
-// install.mjs repair instead of permanently bricking the hook chain.
-const LAUNCHER_PATH = join(SCRIPTS_PATH, 'hook-launcher.mjs');
-const nodeHook = (entry, ...args) => `node "${LAUNCHER_PATH}" ${entry} ${args.join(' ')}`.trim();
+  const SCRIPTS_PATH = join(INSTALL_DIR, 'scripts');
+  const PREFILTER_PATH = join(SCRIPTS_PATH, 'post-tool-use.sh');
+  // Second bash prefilter, same idea one event over: skip the Node start for a
+  // default-off feature (audit 2026-08-22 P2-5, see the script's header).
+  const AGENT_PREFILTER_PATH = join(SCRIPTS_PATH, 'pre-agent-inject.sh');
+  // v2.84: every Node hook invocation routes through hook-launcher.mjs so an
+  // ERR_MODULE_NOT_FOUND from a partial-install drift auto-heals via
+  // install.mjs repair instead of permanently bricking the hook chain.
+  const LAUNCHER_PATH = join(SCRIPTS_PATH, 'hook-launcher.mjs');
+  const nodeHook = (entry, ...args) => `node "${LAUNCHER_PATH}" ${entry} ${args.join(' ')}`.trim();
 
-const memPostToolUse = {
-  matcher: '*',
-  hooks: [{
-    type: 'command',
-    command: `bash "${PREFILTER_PATH}"`,
-    timeout: 5
-  }]
-};
+  const memPostToolUse = {
+    matcher: '*',
+    hooks: [
+      {
+        type: 'command',
+        command: `bash "${PREFILTER_PATH}"`,
+        timeout: 5,
+      },
+    ],
+  };
 
-// Component 2 of the bind-salience forcing function: after an Edit/Write, flag an
-// identifier the file's own lesson named that the edit just removed (component 1 is the
-// pre-edit directive from scripts/pre-tool-recall.js, which also records the identifiers
-// this one checks). Shipped, signed and tested since it was written, but registered in
-// NEITHER registry — so `CLAUDE_MEM_SALIENCE=bind` delivered half the mechanism and
-// nothing said so (audit B6, 2026-08-14). Matched on the edit tools only, NOT Read: there
-// is no post-edit state to compare after a read. Inert (returns before touching stdin)
-// unless CLAUDE_MEM_SALIENCE=bind, so the default chain pays one short-circuit spawn per
-// edit and emits nothing.
-const memPostToolRecall = {
-  matcher: 'Edit|Write|NotebookEdit',
-  hooks: [{
-    type: 'command',
-    command: nodeHook('scripts/post-tool-recall.js'),
-    timeout: 3
-  }]
-};
+  // Component 2 of the bind-salience forcing function: after an Edit/Write, flag an
+  // identifier the file's own lesson named that the edit just removed (component 1 is the
+  // pre-edit directive from scripts/pre-tool-recall.js, which also records the identifiers
+  // this one checks). Shipped, signed and tested since it was written, but registered in
+  // NEITHER registry — so `CLAUDE_MEM_SALIENCE=bind` delivered half the mechanism and
+  // nothing said so (audit B6, 2026-08-14). Matched on the edit tools only, NOT Read: there
+  // is no post-edit state to compare after a read. Inert (returns before touching stdin)
+  // unless CLAUDE_MEM_SALIENCE=bind, so the default chain pays one short-circuit spawn per
+  // edit and emits nothing.
+  const memPostToolRecall = {
+    matcher: 'Edit|Write|NotebookEdit',
+    hooks: [
+      {
+        type: 'command',
+        command: nodeHook('scripts/post-tool-recall.js'),
+        timeout: 3,
+      },
+    ],
+  };
 
-// D#170. A SEPARATE event from PostToolUse, not a variant of it: Claude Code does not
-// fire PostToolUse for a tool call it judged failed, so without this registration the
-// plugin never sees a single host-flagged failure. Matched on Bash alone — the surface
-// it feeds queries on a command plus its output, and no other tool has that shape.
-const memPostToolFailure = {
-  matcher: 'Bash',
-  hooks: [{
-    type: 'command',
-    command: nodeHook('hook.mjs', 'post-tool-failure'),
-    timeout: 5
-  }]
-};
+  // D#170. A SEPARATE event from PostToolUse, not a variant of it: Claude Code does not
+  // fire PostToolUse for a tool call it judged failed, so without this registration the
+  // plugin never sees a single host-flagged failure. Matched on Bash alone — the surface
+  // it feeds queries on a command plus its output, and no other tool has that shape.
+  const memPostToolFailure = {
+    matcher: 'Bash',
+    hooks: [
+      {
+        type: 'command',
+        command: nodeHook('hook.mjs', 'post-tool-failure'),
+        timeout: 5,
+      },
+    ],
+  };
 
-const memSessionStart = {
-  matcher: 'startup|clear|compact',
-  hooks: [{
-    type: 'command',
-    command: nodeHook('hook.mjs', 'session-start'),
-    timeout: 10
-  }]
-};
+  const memSessionStart = {
+    matcher: 'startup|clear|compact',
+    hooks: [
+      {
+        type: 'command',
+        command: nodeHook('hook.mjs', 'session-start'),
+        // R10 P2-16: 15, matching hooks/hooks.json. SessionStart is the heaviest hook
+        // (stdin read + leftover episode flush + auto-adopt + dashboard + context build +
+        // possibly a synchronous self-heal) and hook-launcher.mjs's own comments reason
+        // about its budget as 15 s. There is no reason for the settings.json install shape
+        // to get 5 seconds less than the plugin shape for the same work.
+        timeout: 15,
+      },
+    ],
+  };
 
-const memStop = {
-  matcher: '*',
-  hooks: [{
-    type: 'command',
-    command: nodeHook('hook.mjs', 'stop'),
-    timeout: 5
-  }]
-};
+  const memStop = {
+    matcher: '*',
+    hooks: [
+      {
+        type: 'command',
+        command: nodeHook('hook.mjs', 'stop'),
+        timeout: 5,
+      },
+    ],
+  };
 
-// Fires immediately BEFORE auto-compaction, re-emitting <claude-mem-context> so the
-// summarizer that rewrites the transcript still has memory in scope (SessionStart's
-// compact matcher fires AFTER, when the context is already gone). Parity with
-// hooks/hooks.json: omitting it here made every settings.json install lose exactly the
-// block that exists to survive compaction, invisibly — doctor only ever asked "are ANY
-// mem hooks present", never "which events" (audit B3, 2026-08-14).
-const memPreCompact = {
-  matcher: '*',
-  hooks: [{
-    type: 'command',
-    command: nodeHook('hook.mjs', 'pre-compact'),
-    timeout: 5
-  }]
-};
+  // Fires immediately BEFORE auto-compaction, re-emitting <claude-mem-context> so the
+  // summarizer that rewrites the transcript still has memory in scope (SessionStart's
+  // compact matcher fires AFTER, when the context is already gone). Parity with
+  // hooks/hooks.json: omitting it here made every settings.json install lose exactly the
+  // block that exists to survive compaction, invisibly — doctor only ever asked "are ANY
+  // mem hooks present", never "which events" (audit B3, 2026-08-14).
+  const memPreCompact = {
+    matcher: '*',
+    hooks: [
+      {
+        type: 'command',
+        command: nodeHook('hook.mjs', 'pre-compact'),
+        timeout: 5,
+      },
+    ],
+  };
 
-const memUserPrompt = {
-  matcher: '*',
-  hooks: [
-    {
-      type: 'command',
-      command: nodeHook('scripts/user-prompt-search.js'),
-      timeout: 2
-    },
-    {
-      type: 'command',
-      command: nodeHook('hook.mjs', 'user-prompt'),
-      timeout: 5
-    }
-  ]
-};
+  const memUserPrompt = {
+    matcher: '*',
+    hooks: [
+      {
+        type: 'command',
+        command: nodeHook('scripts/user-prompt-search.js'),
+        timeout: 2,
+      },
+      {
+        type: 'command',
+        command: nodeHook('hook.mjs', 'user-prompt'),
+        timeout: 5,
+      },
+    ],
+  };
 
-const memPreToolRecall = {
-  // v2.34.6: Read added to cover planning-Read (pre-Edit exploration).
-  // Read-path uses a tighter filter (lesson_learned required, top-1,
-  // 120-char truncation, silent-on-empty) — see scripts/pre-tool-recall.js.
-  matcher: 'Edit|Write|NotebookEdit|Read',
-  hooks: [
-    {
-      type: 'command',
-      command: nodeHook('scripts/pre-tool-recall.js'),
-      timeout: 3
-    }
-  ]
-};
+  const memPreToolRecall = {
+    // v2.34.6: Read added to cover planning-Read (pre-Edit exploration).
+    // Read-path uses a tighter filter (lesson_learned required, top-1,
+    // 120-char truncation, silent-on-empty) — see scripts/pre-tool-recall.js.
+    matcher: 'Edit|Write|NotebookEdit|Read',
+    hooks: [
+      {
+        type: 'command',
+        command: nodeHook('scripts/pre-tool-recall.js'),
+        timeout: 3,
+      },
+    ],
+  };
 
-const memPreSkillBridge = {
-  matcher: 'Skill',
-  hooks: [
-    {
-      type: 'command',
-      command: nodeHook('scripts/pre-skill-bridge.js'),
-      timeout: 3
-    }
-  ]
-};
+  // P0 subagent dispatch-time injection (default off — CLAUDE_MEM_SUBAGENT_INJECT).
+  // Fires on the Agent/Task dispatch so a subagent (otherwise memory-blind — #8848)
+  // can receive one relevant lesson via updatedInput. Parity with hooks/hooks.json.
+  // Behind the bash prefilter since 2026-08-22 (audit P2-5): the flag is off by
+  // default, and a disabled feature was starting a Node interpreter on every single
+  // Agent dispatch (22.6ms → 2.4ms; see scripts/pre-agent-inject.sh). The prefilter
+  // execs the same launcher when the flag is on.
+  const memPreAgentInject = {
+    matcher: 'Agent|Task',
+    hooks: [
+      {
+        type: 'command',
+        command: `bash "${AGENT_PREFILTER_PATH}"`,
+        timeout: 5,
+      },
+    ],
+  };
 
-// P0 subagent dispatch-time injection (default off — CLAUDE_MEM_SUBAGENT_INJECT).
-// Fires on the Agent/Task dispatch so a subagent (otherwise memory-blind — #8848)
-// can receive one relevant lesson via updatedInput. Parity with hooks/hooks.json.
-// Behind the bash prefilter since 2026-08-22 (audit P2-5): the flag is off by
-// default, and a disabled feature was starting a Node interpreter on every single
-// Agent dispatch (22.6ms → 2.4ms; see scripts/pre-agent-inject.sh). The prefilter
-// execs the same launcher when the flag is on.
-const memPreAgentInject = {
-  matcher: 'Agent|Task',
-  hooks: [
-    {
-      type: 'command',
-      command: `bash "${AGENT_PREFILTER_PATH}"`,
-      timeout: 5
-    }
-  ]
-};
+  // Filter out existing mem hooks, then append fresh ones
+  // PreToolUse has two separate matchers, so we register both
+  // Event set MUST stay equal to hooks/hooks.json's (minus scripts/setup.sh, which
+  // bootstraps the plugin cache and has no settings.json counterpart) —
+  // tests/audit-silent-20260814.test.mjs diffs a real `install --dev` run's
+  // settings.json against the shipped manifest and reds on any new divergence.
+  const hookConfigs = {
+    PreToolUse: [memPreToolRecall, memPreAgentInject],
+    PostToolUse: [memPostToolUse, memPostToolRecall],
+    PostToolUseFailure: [memPostToolFailure],
+    PreCompact: [memPreCompact],
+    SessionStart: [memSessionStart],
+    Stop: [memStop],
+    UserPromptSubmit: [memUserPrompt],
+  };
 
-// Filter out existing mem hooks, then append fresh ones
-// PreToolUse has three separate matchers, so we register all three
-// Event set MUST stay equal to hooks/hooks.json's (minus scripts/setup.sh, which
-// bootstraps the plugin cache and has no settings.json counterpart) —
-// tests/audit-silent-20260814.test.mjs diffs a real `install --dev` run's
-// settings.json against the shipped manifest and reds on any new divergence.
-const hookConfigs = {
-  PreToolUse: [memPreToolRecall, memPreSkillBridge, memPreAgentInject],
-  PostToolUse: [memPostToolUse, memPostToolRecall],
-  PostToolUseFailure: [memPostToolFailure],
-  PreCompact: [memPreCompact],
-  SessionStart: [memSessionStart],
-  Stop: [memStop],
-  UserPromptSubmit: [memUserPrompt],
-};
+  for (const [event, configs] of Object.entries(hookConfigs)) {
+    const existing = Array.isArray(settings.hooks[event])
+      ? settings.hooks[event].filter((cfg) => !isMemHook(cfg))
+      : [];
+    settings.hooks[event] = [...existing, ...configs];
+  }
 
-for (const [event, configs] of Object.entries(hookConfigs)) {
-  const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
-  settings.hooks[event] = [...existing, ...configs];
-}
-
-writeSettings(settings);
-// Derived from the map, not a parallel literal: the pre-B3 line said five events and
-// kept saying five after the map changed, which is how a missing registration reads as
-// a successful one.
-ok(`Hooks configured (${Object.keys(hookConfigs).join(', ')})`);
+  writeSettings(settings);
+  // Derived from the map, not a parallel literal: the pre-B3 line said five events and
+  // kept saying five after the map changed, which is how a missing registration reads as
+  // a successful one.
+  ok(`Hooks configured (${Object.keys(hookConfigs).join(', ')})`);
+  // Returned so dedupePluginCacheAndHooks gates on a VALUE this function produced
+  // rather than re-reading settings.json — see the `managedHooks` note there. This
+  // function writes all seven events unconditionally, so the answer is always true;
+  // returning it keeps that fact in the caller's dataflow instead of in call order.
+  return true;
 }
 
 function backupLegacyClaudeMemData() {
-// 5. Legacy ~/.claude-mem/ → ~/.claude-mem-lite/ — back up, don't reuse.
-// The legacy DB is schema v16 (schema_versions plural) and there's no
-// bridge in MIGRATIONS[] to v28. Reusing it FATALs on first launch with
-// "no such column: memory_session_id". Rename to a timestamped backup
-// so the new install creates a fresh v28 DB.
-try {
-  const r = migrateLegacyClaudeMemData(OLD_DATA_DIR, MEM_DATA_DIR);
-  if (r.action === 'backed-up') {
-    ok(`Legacy ~/.claude-mem/ DB backed up to ${r.backupPath}`);
-    log('New v28 DB will be created on first launch (legacy schema is incompatible).');
-  }
-} catch (e) {
-  warn('Legacy DB backup failed: ' + e.message);
-}
-
-// 5b. Rename claude-mem.db → claude-mem-lite.db in same directory
-const oldDbInDir = join(MEM_DATA_DIR, 'claude-mem.db');
-if (existsSync(oldDbInDir) && !existsSync(DB_PATH)) {
-  renameSync(oldDbInDir, DB_PATH);
-  for (const ext of ['-wal', '-shm']) {
-    if (existsSync(oldDbInDir + ext)) try { renameSync(oldDbInDir + ext, DB_PATH + ext); } catch {}
-  }
-  ok('Database renamed: claude-mem.db → claude-mem-lite.db');
-}
-}
-
-async function installPreinstalledResources() {
-// 6. Install pre-installed resources (skills + agents)
-if (process.env.CLAUDE_MEM_SKIP_REPOS) {
-  ok('Skill/agent registry: skipped (CLAUDE_MEM_SKIP_REPOS)');
-} else try {
-  const manifestPath = join(INSTALL_DIR, 'registry', 'preinstalled.json');
-  if (!existsSync(manifestPath)) {
-    // For git-clone mode, check PROJECT_DIR
-    const altPath = join(PROJECT_DIR, 'registry', 'preinstalled.json');
-    if (existsSync(altPath)) {
-      const registryDir = join(INSTALL_DIR, 'registry');
-      if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
-      copyFileSync(altPath, manifestPath);
+  // 5. Legacy ~/.claude-mem/ → ~/.claude-mem-lite/ — back up, don't reuse.
+  // The legacy DB is schema v16 (schema_versions plural) and there's no
+  // bridge in MIGRATIONS[] to v28. Reusing it FATALs on first launch with
+  // "no such column: memory_session_id". Rename to a timestamped backup
+  // so the new install creates a fresh v28 DB.
+  try {
+    const r = migrateLegacyClaudeMemData(OLD_DATA_DIR, MEM_DATA_DIR);
+    if (r.action === 'backed-up') {
+      ok(`Legacy ~/.claude-mem/ DB backed up to ${r.backupPath}`);
+      log('New v28 DB will be created on first launch (legacy schema is incompatible).');
     }
+  } catch (e) {
+    warn('Legacy DB backup failed: ' + e.message);
   }
 
-  if (existsSync(manifestPath)) {
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-    const resources = manifest.resources || [];
-
-    if (resources.length > 0) {
-      const managedDir = join(MEM_DATA_DIR, 'managed');
-
-      // 6a. Git shallow clone unique repos
-      const repos = new Map();
-      for (const r of resources) {
-        if (!repos.has(r.repo)) repos.set(r.repo, []);
-        repos.get(r.repo).push(r);
-      }
-
-      // Disclose the cost BEFORE spending it. This step is the single largest
-      // thing `install` does — N shallow git clones over the network, ~150 MB on
-      // disk for the default manifest — and it used to announce itself only after
-      // the fact ("Repos: 15 cloned"). A first-time user on a metered link or a
-      // small disk had no warning and no visible way out; the opt-out existed but
-      // lived only in an env var no output ever mentioned.
-      // Count only repos not already on disk — a re-run/update clones nothing, and
-      // announcing "cloning 15 repos" every time would be false.
-      const repoDirName = (repoUrl) =>
-        repoUrl.split('/').slice(-2).join('-').replace(/[^a-zA-Z0-9._-]/g, '_');
-      const pendingClones = [...repos.keys()]
-        .filter(repoUrl => !existsSync(join(managedDir, 'repos', repoDirName(repoUrl)))).length;
-      if (pendingClones > 0) {
-        log(`Skill/agent registry: cloning ${pendingClones} repo(s) — network + ~150 MB on disk.`);
-        log('  Skip with CLAUDE_MEM_SKIP_REPOS=1 (memory features work without it).');
-      }
-
-      let cloned = 0, updated = 0;
-      const deadRepos = new Set(); // repos that no longer exist (404)
-
-      const isRepoNotFound = (err) => {
-        const msg = (err?.stderr ? err.stderr.toString() : '') + (err?.message || '');
-        return /repository.*not found|404/i.test(msg);
-      };
-
-      for (const [repoUrl, entries] of repos) {
-        const repoName = repoUrl.split('/').slice(-2).join('-').replace(/[^a-zA-Z0-9._-]/g, '_');
-        const clonePath = join(managedDir, 'repos', repoName);
-        let repoReady = false;
-
-        const plan = planRepoSparsePaths(entries);
-        const cloneUrl = `${repoUrl.replace(/\.git$/, '')}.git`;
-        // Clone only what we extract: a partial (blob:none) + sparse clone fetches
-        // just the manifest subpaths' subtrees instead of the whole repo. Falls
-        // back to a plain shallow clone if partial-clone/sparse-checkout is
-        // unsupported (old git/server) — identical to the prior behavior.
-        const cloneSlim = () => {
-          if (plan.full) {
-            execFileSync('git', ['clone', '--depth', '1', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
-            return;
-          }
-          try {
-            execFileSync('git', ['clone', '--depth', '1', '--filter=blob:none', '--no-checkout', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
-            execFileSync('git', ['-C', clonePath, 'sparse-checkout', 'set', '--no-cone', ...plan.paths], { stdio: 'pipe', timeout: 30000 });
-            execFileSync('git', ['-C', clonePath, 'checkout'], { stdio: 'pipe', timeout: 30000 });
-          } catch {
-            try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
-            execFileSync('git', ['clone', '--depth', '1', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
-          }
-        };
-
-        // Migrate a legacy full clone: drop it so the fresh-clone path below
-        // rebuilds it slim. managed/repos is a rebuildable cache, so this loses
-        // nothing and reclaims the bulk of its footprint on the next install run.
-        if (!plan.full && existsSync(clonePath) && !isPartialSparseClone(clonePath)) {
-          try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
-        }
-
-        if (!existsSync(clonePath)) {
-          // Fresh clone (also the rebuild path for a just-migrated legacy clone)
-          try {
-            mkdirSync(join(managedDir, 'repos'), { recursive: true });
-            cloneSlim();
-            cloned++;
-            repoReady = true;
-          } catch (err) {
-            if (isRepoNotFound(err)) {
-              deadRepos.add(repoUrl);
-              warn(`  Repo not found (removed?): ${repoUrl}`);
-            } else {
-              warn(`  Clone failed: ${repoUrl}`);
-            }
-            continue;
-          }
-        } else {
-          // Update existing: fetch latest and fast-forward
-          try {
-            // Re-assert the sparse set so a newer manifest that adds a subpath to
-            // an already-slim clone checks it out (idempotent; no-op for full clones).
-            if (!plan.full && isPartialSparseClone(clonePath)) {
-              try { execFileSync('git', ['-C', clonePath, 'sparse-checkout', 'set', '--no-cone', ...plan.paths], { stdio: 'pipe', timeout: 30000 }); } catch {}
-            }
-            const localHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
-            execFileSync('git', ['-C', clonePath, 'fetch', '--depth', '1', 'origin'], { stdio: 'pipe', timeout: 30000 });
-            const remoteHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'FETCH_HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
-            if (localHash !== remoteHash) {
-              execFileSync('git', ['-C', clonePath, 'reset', '--hard', 'FETCH_HEAD'], { stdio: 'pipe' });
-              updated++;
-              repoReady = true; // needs re-copy
-            }
-          } catch (err) {
-            if (isRepoNotFound(err)) {
-              deadRepos.add(repoUrl);
-              warn(`  Repo not found (removed?): ${repoUrl} — cleaning up`);
-              // Remove local clone
-              try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
-              // Remove extracted resources
-              for (const entry of entries) {
-                const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
-                const destPath = join(destDir, entry.name);
-                try { if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true }); } catch {}
-              }
-              continue;
-            }
-            // Transient failure — use existing clone as-is
-          }
-        }
-
-        // Copy resources to managed/skills/ or managed/agents/
-        // Re-copy if repo was freshly cloned or updated
-        mkdirSync(join(managedDir, 'skills'), { recursive: true });
-        mkdirSync(join(managedDir, 'agents'), { recursive: true });
-        for (const entry of entries) {
-          // Path traversal guard: reject entries with '..' or absolute paths
-          if (entry.path.includes('..') || entry.name.includes('..') ||
-              isAbsolute(entry.path) || isAbsolute(entry.name)) continue;
-          const srcPath = entry.path === '.' ? clonePath : join(clonePath, entry.path);
-          const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
-          const destPath = join(destDir, entry.name);
-          if (existsSync(srcPath) && (repoReady || !existsSync(destPath))) {
-            try {
-              if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true });
-              cpSync(srcPath, destPath, { recursive: true });
-            } catch {}
-          }
-        }
-      }
-      const managedSize = dirSizeBytes(managedDir);
-      ok(`Repos: ${cloned} cloned, ${updated} updated, ${repos.size - deadRepos.size} active` +
-         (deadRepos.size > 0 ? `, ${deadRepos.size} dead removed` : '') +
-         ` (${fmtMB(managedSize.bytes, managedSize.truncated)} in ${managedDir})`);
-
-      // 6b. Init registry DB and record preinstalled entries
-      const { ensureRegistryDb } = await importFromInstall('registry.mjs');
-      const regDbPath = join(MEM_DATA_DIR, 'resource-registry.db');
-      const rdb = ensureRegistryDb(regDbPath);
-
-      const insertPre = rdb.prepare(`
-        INSERT OR REPLACE INTO preinstalled (name, type, repo_url, repo_path, tags, enabled)
-        VALUES (?, ?, ?, ?, ?, 1)
-      `);
-      const activeResources = deadRepos.size > 0
-        ? resources.filter(r => !deadRepos.has(r.repo))
-        : resources;
-      for (const r of activeResources) {
-        insertPre.run(r.name, r.type, r.repo, r.path, JSON.stringify(r.tags || []));
-      }
-
-      // Clean up DB entries for dead repos
-      if (deadRepos.size > 0) {
-        const delPre = rdb.prepare('DELETE FROM preinstalled WHERE repo_url = ?');
-        const delRes = rdb.prepare('DELETE FROM resources WHERE repo_url = ?');
-        for (const deadUrl of deadRepos) {
-          try { delPre.run(deadUrl); } catch {}
-          try { delRes.run(deadUrl); } catch {}
-        }
-      }
-      ok(`Registry DB initialized (${activeResources.length} preinstalled entries` +
-         (deadRepos.size > 0 ? `, ${deadRepos.size} dead repos purged` : '') + ')');
-
-      // 6c. Fetch GitHub stars (best-effort, unauthenticated)
-      log('  Fetching GitHub stars...');
-      const starCache = new Map();
-      for (const [repoUrl] of repos) {
-        if (deadRepos.has(repoUrl)) continue;
-        const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
-        if (match) {
-          try {
-            const apiUrl = `https://api.github.com/repos/${match[1]}/${match[2]}`;
-            const res = execFileSync('curl', ['-sf', apiUrl], { encoding: 'utf8', timeout: 10000 });
-            const data = JSON.parse(res);
-            if (typeof data.stargazers_count === 'number') {
-              starCache.set(repoUrl, data.stargazers_count);
-            }
-          } catch {}
-        }
-      }
-      if (starCache.size > 0) ok(`Stars fetched (${starCache.size}/${repos.size} repos)`);
-
-      // 6d. Scan and index resources (fallback-only, Haiku indexing deferred to first run)
-      log('  Scanning resources...');
-      const { scanAllResources, diffResources } = await importFromInstall('registry-scanner.mjs');
-      const scanned = scanAllResources({ dataDir: MEM_DATA_DIR });
-
-      // Attach star counts and repo URLs
-      for (const s of scanned) {
-        const entry = resources.find(r => r.name === s.name && r.type === s.type);
-        if (entry) {
-          s.repoUrl = entry.repo;
-          s.repoStars = starCache.get(entry.repo) || 0;
-        }
-      }
-
-      const { toIndex } = diffResources(rdb, scanned);
-      if (toIndex.length > 0) {
-        // Use fallback indexing at install time (no Haiku calls)
-        // Full Haiku indexing happens on first SessionStart
-        const { upsertResource } = await importFromInstall('registry.mjs');
-        for (const res of toIndex) {
-          try {
-            const metaKey = `${res.type}:${res.name}`;
-            const meta = RESOURCE_METADATA[metaKey];
-            upsertResource(rdb, {
-              name: res.name,
-              type: res.type,
-              status: 'active',
-              source: res.source,
-              repo_url: res.repoUrl || null,
-              repo_stars: res.repoStars || 0,
-              local_path: res.localPath,
-              file_hash: res.fileHash,
-              invocation_name: meta?.invocation_name || deriveInvocationName(res.name),
-              intent_tags: meta?.intent_tags || res.name.replace(/-/g, ' '),
-              domain_tags: meta?.domain_tags || '',
-              trigger_patterns: meta?.trigger_patterns || `when user needs ${res.name.replace(/-/g, ' ')}`,
-              capability_summary: meta?.capability_summary || `${res.type}: ${res.name.replace(/-/g, ' ')}`,
-            });
-          } catch {}
-        }
-        ok(`Resources registered: ${toIndex.length} indexed`);
-      }
-
-      // Apply curated metadata to all known resources (fixes existing installs)
-      reindexKnownResources(rdb);
-      ok('Resource metadata curated (FTS5 reindexed)');
-
-      // Register plugin resources (skills/agents from other plugins, no local files)
-      const virtualCount = registerVirtualResources(rdb);
-      if (virtualCount > 0) ok(`Plugin resources registered: ${virtualCount} virtual entries`);
-
-      rdb.close();
+  // 5b. Rename claude-mem.db → claude-mem-lite.db in same directory
+  const oldDbInDir = join(MEM_DATA_DIR, 'claude-mem.db');
+  if (existsSync(oldDbInDir) && !existsSync(DB_PATH)) {
+    renameSync(oldDbInDir, DB_PATH);
+    for (const ext of ['-wal', '-shm']) {
+      if (existsSync(oldDbInDir + ext))
+        try {
+          renameSync(oldDbInDir + ext, DB_PATH + ext);
+        } catch {}
     }
-  } else {
-    log('  No preinstalled manifest found, skipping');
+    ok('Database renamed: claude-mem.db → claude-mem-lite.db');
   }
-} catch (e) {
-  warn('Resource setup: ' + e.message);
-  log('  Skills/agents will be indexed on first use');
-}
 }
 
 function verifyDatabase() {
-// 7. Verify database
-if (existsSync(DB_PATH)) {
-  try {
-    const Database = requireFromInstall('better-sqlite3');
-    const db = new Database(DB_PATH, { readonly: true });
-    const count = db.prepare('SELECT COUNT(*) as c FROM observations').get();
-    db.close();
-    ok(`Database accessible: ${count.c} observations`);
-  } catch (e) {
-    warn('Database check failed: ' + e.message);
+  // 7. Verify database
+  if (existsSync(DB_PATH)) {
+    try {
+      const Database = requireFromInstall('better-sqlite3');
+      const db = new Database(DB_PATH, { readonly: true });
+      const count = db.prepare('SELECT COUNT(*) as c FROM observations').get();
+      db.close();
+      ok(`Database accessible: ${count.c} observations`);
+    } catch (e) {
+      warn('Database check failed: ' + e.message);
+    }
+  } else {
+    log('No existing database — will be created on first use');
   }
-} else {
-  log('No existing database — will be created on first use');
-}
 }
 
 async function dogfoodAutoAdopt() {
-// 7b. Dogfood auto-adopt (invited-memory, Phase C T13).
-// Only fires when install.mjs is running from the claude-mem-lite source repo
-// itself (detected via git remote match). In npm/npx flows PROJECT_DIR is a
-// cache dir with no git metadata, so this is a no-op for end users.
-// --no-adopt override respected.
-if (!flags.has('--no-adopt')) {
-  try {
-    const remote = execFileSync('git', ['-C', PROJECT_DIR, 'config', '--get', 'remote.origin.url'], { encoding: 'utf8', stdio: 'pipe' }).trim();
-    const isDogfood = /github\.com[:/]sdsrss\/claude-mem-lite(\.git)?$/i.test(remote);
-    if (isDogfood) {
-      const { cmdAdopt } = await importFromInstall('adopt-cli.mjs');
-      cmdAdopt([]);
-      ok('Invited-memory: auto-adopt for claude-mem-lite dogfood repo');
+  // 7b. Dogfood auto-adopt (invited-memory, Phase C T13).
+  // Only fires when install.mjs is running from the claude-mem-lite source repo
+  // itself (detected via git remote match). In npm/npx flows PROJECT_DIR is a
+  // cache dir with no git metadata, so this is a no-op for end users.
+  // Two overrides are respected, and they are NOT interchangeable:
+  //   --no-adopt            per-invocation opt-out
+  //   MEM_NO_AUTO_ADOPT=1   the GLOBAL escape hatch. adopt-content.mjs advertises it in
+  //                         the managed block itself ("全局禁用自动 adopt") and hook.mjs:2299
+  //                         gates SessionStart auto-adopt on it — this call site ignored it,
+  //                         so `install` adopted users who had opted out globally, and the
+  //                         unit suite (tests/install-e2e.test.mjs, inheriting PWD = repo
+  //                         root) rewrote this repository's own CLAUDE.md managed block and
+  //                         .claude/ sidecar on every run. R10 P2-17.
+  if (!flags.has('--no-adopt') && process.env.MEM_NO_AUTO_ADOPT !== '1') {
+    try {
+      const remote = execFileSync('git', ['-C', PROJECT_DIR, 'config', '--get', 'remote.origin.url'], {
+        encoding: 'utf8',
+        stdio: 'pipe',
+      }).trim();
+      const isDogfood = /github\.com[:/]sdsrss\/claude-mem-lite(\.git)?$/i.test(remote);
+      if (isDogfood) {
+        const { cmdAdopt } = await importFromInstall('adopt-cli.mjs');
+        cmdAdopt([]);
+        ok('Invited-memory: auto-adopt for claude-mem-lite dogfood repo');
+      }
+    } catch {
+      // Not a git repo, or git missing — silent skip (this is the normal npm path).
     }
-  } catch {
-    // Not a git repo, or git missing — silent skip (this is the normal npm path).
   }
-}
 }
 
 function disableOldClaudeMemPlugin() {
   const settings = readSettings();
-// 8. Disable old claude-mem plugin
-if (settings.enabledPlugins?.['claude-mem@thedotmack'] !== undefined) {
-  settings.enabledPlugins['claude-mem@thedotmack'] = false;
-  writeSettings(settings);
-  ok('Old claude-mem plugin disabled');
-}
+  // 8. Disable old claude-mem plugin
+  if (settings.enabledPlugins?.['claude-mem@thedotmack'] !== undefined) {
+    settings.enabledPlugins['claude-mem@thedotmack'] = false;
+    writeSettings(settings);
+    ok('Old claude-mem plugin disabled');
+  }
 }
 
 function offerCleanOldVectorDb() {
-// 9. Offer to clean old vector-db
-const vectorDbPath = join(OLD_DATA_DIR, 'vector-db');
-if (existsSync(vectorDbPath)) {
-  try {
-    const size = execFileSync('du', ['-sh', vectorDbPath], { encoding: 'utf8' }).trim().split('\t')[0];
-    warn(`Old vector-db exists (${size}). Run: rm -rf ~/.claude-mem/vector-db/`);
-  } catch {}
-}
+  // 9. Offer to clean old vector-db
+  const vectorDbPath = join(OLD_DATA_DIR, 'vector-db');
+  if (existsSync(vectorDbPath)) {
+    try {
+      const size = execFileSync('du', ['-sh', vectorDbPath], { encoding: 'utf8' }).trim().split('\t')[0];
+      warn(`Old vector-db exists (${size}). Run: rm -rf ~/.claude-mem/vector-db/`);
+    } catch {}
+  }
 }
 
 async function install() {
@@ -1218,10 +1244,15 @@ async function install() {
   await installDependencies(IS_DEV);
   createCliSymlink();
   registerMcpServer();
-  dedupePluginCacheAndHooks();
-  configureHooks();
+  // configureHooks BEFORE dedupe, and its result feeds the dedup gate: dedupe now
+  // refuses to clear a hooks manifest unless install.mjs-managed hooks exist in
+  // settings.json, and on a first install those entries do not exist until
+  // configureHooks writes them. Passing the value (rather than letting dedupe
+  // re-read settings.json) is what keeps a future reorder from silently turning the
+  // dedup off — the dependency is data, not sequence.
+  const managedHooks = configureHooks();
+  dedupePluginCacheAndHooks({ managedHooks, isDev: IS_DEV });
   backupLegacyClaudeMemData();
-  await installPreinstalledResources();
   verifyDatabase();
   await dogfoodAutoAdopt();
   disableOldClaudeMemPlugin();
@@ -1229,7 +1260,6 @@ async function install() {
 
   console.log('\n  Done! Restart Claude Code to activate.\n');
 }
-
 
 // ─── Uninstall ──────────────────────────────────────────────────────────────
 
@@ -1250,11 +1280,11 @@ async function uninstall() {
   if (!removedAny) warn('MCP server not found or already removed');
 
   // 1b. Remove CLI symlink
-  for (const binDir of [join(homedir(), '.local', 'bin'), '/usr/local/bin']) {
+  for (const binDir of CLI_BIN_DIRS) {
     const cliLink = join(binDir, 'claude-mem-lite');
-    try {
-      if (existsSync(cliLink)) { unlinkSync(cliLink); ok(`CLI symlink removed: ${cliLink}`); }
-    } catch { /* may not have permissions */ }
+    // No try/catch: clearLinkPath swallows a permissions failure and returns false, so the
+    // wrapper this used to have was unreachable once the existsSync gate moved inside it.
+    if (clearLinkPath(cliLink)) ok(`CLI symlink removed: ${cliLink}`);
   }
 
   // 2. Remove hooks from settings.json (match both npx and git-clone install paths)
@@ -1313,11 +1343,23 @@ async function uninstall() {
     ok('Marketplace directory removed');
   }
 
-  // 5b. Remove cache directory
+  // 5b. Remove cache directories — OURS unconditionally, the marketplace-wide one gated.
+  //
+  // The gate exists so uninstalling this plugin does not delete a sibling plugin published
+  // under the same marketplace. That reasoning covers `cache/<marketplace>/`; it does not
+  // cover `cache/<marketplace>/claude-mem-lite/`, which is ours alone. Because only the
+  // gated branch existed, a user with any other sdsrss plugin installed kept every cached
+  // version of THIS one — measured at 241 MB on a machine where `/plugin uninstall` had
+  // already removed the manifest, i.e. bytes belonging to a plugin that was gone.
+  const ownCacheDir = join(pluginsDir, 'cache', marketplaceKey, PLUGIN_NAME);
+  if (existsSync(ownCacheDir)) {
+    rmSync(ownCacheDir, { recursive: true, force: true });
+    ok('Plugin cache removed');
+  }
   const cacheDir = join(pluginsDir, 'cache', marketplaceKey);
   if (canRemoveMarketplaceArtifacts && existsSync(cacheDir)) {
     rmSync(cacheDir, { recursive: true, force: true });
-    ok('Plugin cache removed');
+    ok('Marketplace cache directory removed');
   }
 
   // 5c. Clean known_marketplaces.json
@@ -1329,7 +1371,9 @@ async function uninstall() {
       writeFileSync(knownPath, JSON.stringify(known, null, 2) + '\n');
       ok('Removed from known_marketplaces.json');
     }
-  } catch { /* file may not exist */ }
+  } catch {
+    /* file may not exist */
+  }
 
   if (!canRemoveMarketplaceArtifacts && (existsSync(marketplaceDir) || existsSync(cacheDir))) {
     log('Marketplace cache preserved (other plugins may still depend on sdsrss marketplace)');
@@ -1352,14 +1396,94 @@ async function uninstall() {
         rmSync(MEM_DATA_DIR, { recursive: true, force: true });
         ok(`Relocated data purged (${MEM_DATA_DIR})`);
       } else if (existsSync(MEM_DATA_DIR)) {
-        warn(`CLAUDE_MEM_DIR (${MEM_DATA_DIR}) has no claude-mem-lite.db — left untouched. Remove manually if intended.`);
+        warn(
+          `CLAUDE_MEM_DIR (${MEM_DATA_DIR}) has no claude-mem-lite.db — left untouched. Remove manually if intended.`,
+        );
       }
     }
   } else {
-    log('Data preserved (use --purge to remove)');
+    // "Data preserved" was true and incomplete, and the gap is what a user notices on
+    // disk: the DB here is fractions of a megabyte while the installed code and its
+    // node_modules — which uninstall has just made unreachable (symlink gone, hooks gone,
+    // MCP registration gone) — are tens of megabytes and were never named. Measured on a
+    // sandbox install right after uninstall: 56 MB total, 53 MB of it node_modules,
+    // against a 0.2 MB DB. Report both halves so nothing large is left unnamed.
+    //
+    // These are APPARENT bytes (`statSync().size`), which is what `du --apparent-size`
+    // reports and NOT what a bare `du -sh` does: block rounding over thousands of small
+    // node_modules files put the same tree at 44.4 MB apparent against 54.3 MB of blocks,
+    // a 22% gap. Do not "reconcile" this line against a plain `du` — they are two rulers.
+    const kept = preservedFootprint();
+    const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+    log(`Data preserved: memories in ${MEM_DATA_DIR} (${mb(kept.memoryBytes)}MB)`);
+    if (kept.restBytes > 0) {
+      log(
+        `  Also kept: the installed code + node_modules under ${DATA_DIR} (${mb(kept.restBytes)}MB) — ` +
+          `a later \`install\` reuses them; nothing runs them now.`,
+      );
+    }
+    log('  `uninstall --purge` removes the directory, memories included');
   }
 
   console.log('\n  Done!\n');
+}
+
+/**
+ * Split what a non-purge uninstall leaves behind into the two halves a user cares about:
+ * the memories, and everything else.
+ *
+ * "Memories" is every file whose name starts with `claude-mem-lite.db` in the data dir —
+ * the DB, its WAL/SHM, and the `.db.<tag>.bak` snapshots. That is DELIBERATELY WIDER than
+ * lib/db-backup.mjs::readSnapshots, which additionally requires the trailing dot and a
+ * `.bak` suffix: this wants everything that is the user's data, that wants snapshots only. "Rest" is the whole install directory minus that,
+ * so it covers the source files, node_modules, runtime/ and metrics/ in one number. The
+ * point of the split is the node_modules order-of-magnitude (53 MB against a 0.2 MB DB on
+ * a fresh sandbox install), not a per-subdirectory audit.
+ *
+ * Never throws: a missing dir, a permission error or a symlink loop all degrade to 0, and
+ * the caller prints the shorter sentence. An uninstall must not fail on a size probe.
+ *
+ * @returns {{memoryBytes: number, restBytes: number}} bytes, 0 when unmeasurable
+ */
+function preservedFootprint() {
+  const DB_PREFIX = 'claude-mem-lite.db';
+  const walk = (dir, onFile) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      try {
+        if (e.isDirectory()) walk(p, onFile);
+        else if (e.isFile()) onFile(p, e.name, statSync(p).size);
+      } catch {
+        /* raced deletion / unreadable entry — skip */
+      }
+    }
+  };
+
+  let memoryBytes = 0;
+  let restBytes = 0;
+  // The memories may live outside the install dir (CLAUDE_MEM_DIR), so measure each dir
+  // for what it actually holds rather than assuming the two are the same tree.
+  walk(MEM_DATA_DIR, (_p, name, size) => {
+    if (name.startsWith(DB_PREFIX)) memoryBytes += size;
+    else if (MEM_DATA_DIR === DATA_DIR) restBytes += size;
+  });
+  if (MEM_DATA_DIR !== DATA_DIR) {
+    // A relocated CLAUDE_MEM_DIR may still sit INSIDE the install dir, in which case walking
+    // DATA_DIR would count the DB and its snapshots a second time — reported 9.0MB against a
+    // true 6.0MB on a nested fixture. Skip the memory tree explicitly rather than assume the
+    // two are disjoint; `+ sep` so a sibling named `<dir>-old` is not swallowed too.
+    const memPrefix = MEM_DATA_DIR.endsWith(sep) ? MEM_DATA_DIR : MEM_DATA_DIR + sep;
+    walk(DATA_DIR, (p, _name, size) => {
+      if (p !== MEM_DATA_DIR && !p.startsWith(memPrefix)) restBytes += size;
+    });
+  }
+  return { memoryBytes, restBytes };
 }
 
 // ─── Cleanup Hooks ───────────────────────────────────────────────────────────
@@ -1397,30 +1521,52 @@ async function status() {
   // configured` at a correctly-installed plugin user — two red marks describing
   // the intended state.
   const shape = detectInstallShape({ home: homedir(), projectDir: PROJECT_DIR, installDir: INSTALL_DIR });
-  const pluginProvides = !!shape.activePluginVersion;
+  // A cache DIRECTORY is not an installed plugin — `/plugin uninstall` leaves version dirs
+  // behind (this project's own README documents that), and `activePluginVersion` falls back to
+  // "newest cache dir" when nothing recorded an install. Both branches below credit the
+  // manifest with providing something, so both need the registration, not the directory.
+  const pluginProvides =
+    !!shape.activePluginVersion && pluginIsRegistered({ home: homedir(), settings: readSettings() });
 
-  // MCP
-  try {
-    const list = execFileSync('claude', ['mcp', 'list'], { encoding: 'utf8' });
-    // Accept either the current "mem-lite" registration or the legacy "mem"
-    // name (pre-v2.78) so a user mid-upgrade still sees a green status until
-    // setup.sh / install.mjs purges the legacy entry on next run.
-    // v2.79.1: dropped a `/\bmem\b\s/` fallback regex — the `\b` word boundary
-    // also matched "mem-lite" (because `-` is a non-word char), so the regex
-    // was always-true noise (benign only because the mem-lite checks short-
-    // circuited first). `claude mcp list` formats as `<name>: <command>`, so
-    // the two colon-form checks below cover every shape.
-    const registered = list.includes('mem-lite:') || list.includes('mem:');
-    if (registered) {
-      push('ok', 'mcp', 'MCP server: registered', { registered });
-    } else if (pluginProvides) {
-      push('ok', 'mcp', `MCP server: provided by the plugin manifest (v${shape.activePluginVersion.version} .mcp.json) — no user-scope registration expected`, { registered: false, via: 'plugin' });
-    } else {
-      push('fail', 'mcp', 'MCP server: not registered', { registered });
+  // MCP. A plugin install answers this from the manifest and does NOT shell out.
+  //
+  // Two reasons, and the first is correctness rather than speed. `claude mcp list` prints a
+  // plugin server as `plugin:claude-mem-lite:mem-lite: …`, and the old substring test
+  // `list.includes('mem-lite:')` matched INSIDE that name — so a plugin user was reported as
+  // having a user-scope registration they do not have, and the branch written for them below
+  // was unreachable. That is the same accidental-match class as the `\bmem\b` regex this
+  // comment block used to describe. Second: the official help says approved servers are
+  // "health-checked", i.e. the call STARTS every MCP server configured on the machine —
+  // measured 2026-09-08 at 2.546s wall for three servers, one of them a remote HTTP endpoint.
+  // A status command should not pay that, and a plugin user gains nothing from it.
+  //
+  // `doctor` GAINS the exec instead (it had none before this change) and runs it
+  // unconditionally: it is the deep check, and it is where the duplicate/legacy registration
+  // the README's "Mixed-install residue" section describes now gets detected — nothing
+  // detected it before. That means `doctor` now health-checks every MCP server on the
+  // machine; both READMEs say so under their `doctor` sections.
+  if (pluginProvides) {
+    push(
+      'ok',
+      'mcp',
+      `MCP server: provided by the plugin manifest (v${shape.activePluginVersion.version} .mcp.json) — no user-scope registration expected`,
+      { registered: false, via: 'plugin' },
+    );
+  } else
+    try {
+      const list = execFileSync('claude', ['mcp', 'list'], { encoding: 'utf8', timeout: 60000 });
+      // Accept either the current "mem-lite" registration or the legacy "mem" name
+      // (pre-v2.78) so a user mid-upgrade still sees a green status until setup.sh /
+      // install.mjs purges the legacy entry on next run.
+      const registered = nonPluginMemRegistrations(list).length > 0;
+      if (registered) {
+        push('ok', 'mcp', 'MCP server: registered', { registered });
+      } else {
+        push('fail', 'mcp', 'MCP server: not registered', { registered });
+      }
+    } catch {
+      push('warn', 'mcp', 'Could not check MCP status', { registered: null });
     }
-  } catch {
-    push('warn', 'mcp', 'Could not check MCP status', { registered: null });
-  }
 
   // Hooks
   const settings = readSettings();
@@ -1429,17 +1575,44 @@ async function status() {
   const pluginEnabled = settings.enabledPlugins?.[PLUGIN_KEY] === true;
 
   if (pluginEnabled) push('ok', 'plugin', 'Plugin: enabled in settings', { enabled: true, disabled: false });
-  else if (pluginDisabled) push('warn', 'plugin', 'Plugin: disabled in settings', { enabled: false, disabled: true });
+  else if (pluginDisabled)
+    push('warn', 'plugin', 'Plugin: disabled in settings', { enabled: false, disabled: true });
   else push('warn', 'plugin', 'Plugin: not present in enabledPlugins', { enabled: false, disabled: false });
 
   if (hasHooks && pluginDisabled) {
-    push('warn', 'hooks', 'Hooks: still configured in settings.json while plugin is disabled (runtime ignores them; run cleanup-hooks or uninstall to clean up)', { configured: true });
+    push(
+      'warn',
+      'hooks',
+      'Hooks: still configured in settings.json while plugin is disabled (runtime ignores them; run cleanup-hooks or uninstall to clean up)',
+      { configured: true },
+    );
   } else if (hasHooks) {
     push('ok', 'hooks', 'Hooks: configured', { configured: true });
   } else if (pluginDisabled) {
     push('ok', 'hooks', 'Hooks: not configured', { configured: false });
   } else if (pluginProvides) {
-    push('ok', 'hooks', `Hooks: provided by the plugin manifest (v${shape.activePluginVersion.version} hooks/hooks.json) — settings.json correctly holds none`, { configured: false, via: 'plugin' });
+    // Open the manifest being credited. Trusting `settings.json holds none` alone
+    // reported all-green over an emptied cache manifest — zero hooks registered.
+    const manifest = pluginCacheHookEvents(shape.activePluginVersion.root);
+    if (manifest.ok) {
+      push(
+        'ok',
+        'hooks',
+        `Hooks: provided by the plugin manifest (v${shape.activePluginVersion.version} hooks/hooks.json, ${manifest.events.length} events) — settings.json correctly holds none`,
+        { configured: false, via: 'plugin', events: manifest.events },
+      );
+    } else {
+      const repair = hookManifestRepairHint(
+        shape.activePluginVersion.root,
+        join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY),
+      );
+      push(
+        'fail',
+        'hooks',
+        `Hooks: plugin manifest v${shape.activePluginVersion.version} registers NO hooks (${manifest.reason}) and settings.json holds none — every hook is unregistered. Repair: ${repair}`,
+        { configured: false, via: 'plugin', events: [], manifest_reason: manifest.reason },
+      );
+    }
   } else {
     push('fail', 'hooks', 'Hooks: not configured', { configured: false });
   }
@@ -1448,11 +1621,23 @@ async function status() {
   // settings.json hooks → runtime registers both → duplicate firing.
   const polluted = scanPluginCacheHookPollution();
   if (polluted.length > 0 && hasHooks) {
-    push('fail', 'plugin_cache', `Plugin cache: stale hooks.json in version(s) ${polluted.join(', ')} — duplicate firing alongside settings.json (run 'install' to auto-clear)`, { polluted_versions: polluted });
+    push(
+      'fail',
+      'plugin_cache',
+      `Plugin cache: stale hooks.json in version(s) ${polluted.join(', ')} — duplicate firing alongside settings.json (run 'install' to auto-clear)`,
+      { polluted_versions: polluted },
+    );
   } else if (polluted.length > 0) {
-    push('ok', 'plugin_cache', `Plugin cache: ${polluted.length} version(s) with hooks.json (plugin-only mode)`, { polluted_versions: polluted });
+    push(
+      'ok',
+      'plugin_cache',
+      `Plugin cache: ${polluted.length} version(s) with hooks.json (plugin-only mode)`,
+      { polluted_versions: polluted },
+    );
   } else if (pluginEnabled || hasHooks) {
-    push('ok', 'plugin_cache', 'Plugin cache: no stale hooks.json (no duplicate firing)', { polluted_versions: [] });
+    push('ok', 'plugin_cache', 'Plugin cache: no stale hooks.json (no duplicate firing)', {
+      polluted_versions: [],
+    });
   }
 
   // Database
@@ -1463,20 +1648,85 @@ async function status() {
       const obs = db.prepare('SELECT COUNT(*) as c FROM observations').get();
       const sess = db.prepare('SELECT COUNT(*) as c FROM session_summaries').get();
       db.close();
-      push('ok', 'database', `Database: ${obs.c} observations, ${sess.c} sessions`, { exists: true, observations: obs.c, sessions: sess.c });
+      push('ok', 'database', `Database: ${obs.c} observations, ${sess.c} sessions`, {
+        exists: true,
+        observations: obs.c,
+        sessions: sess.c,
+      });
     } catch (e) {
-      push('warn', 'database', 'Database: exists but check failed — ' + e.message, { exists: true, error: e.message });
+      push('warn', 'database', 'Database: exists but check failed — ' + e.message, {
+        exists: true,
+        error: e.message,
+      });
     }
   } else {
     push('warn', 'database', 'Database: not found', { exists: false });
   }
 
-  // CLI
+  // CLI.
+  //
+  // The probe resolves a BARE name, so a failure conflates three different worlds and the
+  // old single remedy ("run install again to create symlink") was correct in only one of
+  // them. On the common one — `createCliSymlink` put a working link in ~/.local/bin, a
+  // directory a non-login shell frequently does not have on PATH — the advice sends the
+  // user to re-run an installer that will create the very symlink that already exists,
+  // report ✓, and leave `status` saying the same thing. Advice that cannot converge is
+  // worse than the silence it replaced.
+  //
+  // Split on `err.code`: ENOENT is "the name did not resolve" and is the only world the
+  // symlink question applies to. Anything else means the command WAS found and then failed
+  // or timed out (a broken native binding is the live example), where naming PATH is a
+  // second wrong answer — report what actually happened instead.
+  // `linked` is a NEW field on this check, and `--json` republishes every extra key
+  // (`const { level, key, message, ...extra }` below), so it is part of that face's output,
+  // not an internal detail. Nothing in this repo reads it; external consumers of
+  // `status --json` now see `linked: <path>|null`.
   try {
     execFileSync('claude-mem-lite', ['--help'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' });
     push('ok', 'cli', 'CLI: claude-mem-lite command available', { available: true });
-  } catch {
-    push('warn', 'cli', 'CLI: command not on PATH — run install again to create symlink', { available: false });
+  } catch (e) {
+    if (e && e.code !== 'ENOENT') {
+      // `e.message` already CARRIES the child's stderr — with stdio:'pipe' Node formats it
+      // as "Command failed: <cmd>\n<stderr>", so the live example (a broken native binding,
+      // whose `nativeBindingRepairHint` line is on stderr) reaches the user unaided.
+      // Measured, because pre-ship review asserted the opposite and a redundant `e.stderr`
+      // suffix was written and then withdrawn: printing both duplicates the text.
+      // Note `e.code` is UNDEFINED for a non-zero exit — only a spawn failure sets ENOENT —
+      // so `!== 'ENOENT'` is what routes this branch, not a truthiness check on the code.
+      push('warn', 'cli', `CLI: on PATH but "claude-mem-lite --help" failed — ${e.message}`, {
+        available: false,
+        linked: null,
+      });
+    } else {
+      // Two properties of `existsSync` matter here and they pull in opposite directions:
+      //   - it FOLLOWS the link, so a DANGLING one reads as absent. That is the answer we
+      //     want: a link pointing at a deleted install is the installer's problem, not
+      //     PATH's, and falls through to the reinstall remedy.
+      //   - it is also true for a DIRECTORY of that name, which would make us print
+      //     "installed at … add it to PATH" about something that can never be executed —
+      //     the exact non-converging advice this block exists to stop. Hence isFile().
+      const isLinkedCli = (d) => {
+        try {
+          return statSync(join(d, 'claude-mem-lite')).isFile();
+        } catch {
+          return false; // ENOENT (absent or dangling), EACCES on the dir, anything else
+        }
+      };
+      const binDir = CLI_BIN_DIRS.find(isLinkedCli);
+      if (binDir) {
+        push(
+          'warn',
+          'cli',
+          `CLI: installed at ${join(binDir, 'claude-mem-lite')} but ${binDir} is not on PATH — add it: export PATH="${binDir}:$PATH"`,
+          { available: false, linked: join(binDir, 'claude-mem-lite') },
+        );
+      } else {
+        push('warn', 'cli', 'CLI: command not on PATH — run install again to create symlink', {
+          available: false,
+          linked: null,
+        });
+      }
+    }
   }
 
   // Old system
@@ -1519,10 +1769,39 @@ async function doctor() {
   if (!json) console.log('\nclaude-mem-lite doctor\n');
 
   // Shadow file-level helpers so every call site auto-records.
-  const ok   = (msg) => { checks.push({ level: 'ok',   message: msg }); if (!json) console.log(`  ✓ ${msg}`); };
-  const warn = (msg) => { checks.push({ level: 'warn', message: msg }); if (!json) console.log(`  ⚠ ${msg}`); };
-  const fail = (msg) => { checks.push({ level: 'fail', message: msg }); if (!json) console.log(`  ✗ ${msg}`); };
-  const log  = (msg) => { if (!json) console.log(`  ${msg}`); };
+  const ok = (msg) => {
+    checks.push({ level: 'ok', message: msg });
+    if (!json) console.log(`  ✓ ${msg}`);
+  };
+  const warn = (msg) => {
+    checks.push({ level: 'warn', message: msg });
+    if (!json) console.log(`  ⚠ ${msg}`);
+  };
+  const fail = (msg) => {
+    checks.push({ level: 'fail', message: msg });
+    if (!json) console.log(`  ✗ ${msg}`);
+  };
+  // Detail / remedy lines. These were `--json`'s blind spot: `log()` was a no-op under
+  // --json and EVERY repair instruction doctor gives goes through it, so the machine face
+  // received the diagnosis and none of the treatment (R12 audit P2-3). 7 of its 16 call
+  // sites carry a runnable command; the other 9 are paths, notes and prose. They attach to
+  // the check they follow, not to a report-level bucket, because the stated purpose of
+  // --json is acting on an individual check.
+  //
+  // The count was first written here as "12 of 14" and both halves were wrong — pre-ship
+  // review recounted. 16 is also the count at the previous release, so no edit of this
+  // round moved it.
+  const log = (msg) => {
+    if (!json) {
+      console.log(`  ${msg}`);
+      return;
+    }
+    const last = checks[checks.length - 1];
+    // A detail before any check has nothing to attach to — same as today's drop, but the
+    // human face would show it, so this is the one line the two faces cannot share.
+    if (!last) return;
+    (last.details ??= []).push(msg.trim());
+  };
 
   let issues = 0;
   let warnings = 0;
@@ -1531,14 +1810,49 @@ async function doctor() {
   // "warnings present". Used for informational ⚠ checks; the two ⚠ paths
   // that ALSO bump `issues` (stale procs, dev drift) keep using the file-level
   // `warn` directly to avoid double-counting.
-  const dwarn = (msg) => { warnings++; warn(msg); };
+  const dwarn = (msg) => {
+    warnings++;
+    warn(msg);
+  };
+  // The fourth cell of the matrix, and the one that had no home: findings rendered at ⚠
+  // severity that nevertheless REQUIRE action. Four checks used to spell it `warn(...)`
+  // followed by `issues++`, which made `issues` count rows reporting `level:'warn'` — so
+  // `checks.filter(c => c.level === 'fail')`, the exact use --json documents, under-reported
+  // by four (R12 audit P2-4). Severity and glyph are separate facts: `level` is what the
+  // counter and the exit code are derived from, `glyph` is how loud the screen is.
+  //
+  // The first draft of this comment justified the split by claiming that promoting these
+  // four to `fail()` would break `doctor-missing-files-severity` and
+  // `doctor-hook-script-manifest`. Pre-ship review measured it: rendering them as ✗ with
+  // `level:'fail'` and no glyph leaves both files 13/13 GREEN, because each asserts
+  // `level === 'warn' || level === 'fail'` — a disjunction over the only two values those
+  // checks can carry, so it cannot say NO about a severity change in either direction.
+  // The real reason is their stated INTENT (an unlinked-but-reachable module must not read
+  // as an error), which nothing enforced until this round's `doctor-failure-branches` pin.
+  // Self-counting like `dwarn`, so neither source scan in doctor-summary.test.mjs needs to
+  // reach inside it; the end-to-end counter check in doctor-json-face-parity.test.mjs does.
+  const issueWarn = (msg) => {
+    issues++;
+    checks.push({ level: 'fail', glyph: 'warn', message: msg });
+    if (!json) console.log(`  ⚠ ${msg}`);
+  };
 
-  // Node version
+  // Node version. The floor is read from package.json#engines rather than restated here —
+  // see requiredNodeMajor. It is PRINTED on the ok line too, so the guard test has something
+  // to compare against the manifest; a floor nobody can observe is a floor nobody notices
+  // has gone stale, which is exactly how the `>= 18` literal outlived the v4.0.0 bump.
   const nodeVer = process.version;
-  if (parseInt(nodeVer.slice(1)) >= 18) {
-    ok(`Node.js: ${nodeVer}`);
+  let enginesNode = null;
+  try {
+    enginesNode = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8')).engines?.node;
+  } catch {
+    /* unreadable manifest → requiredNodeMajor's fallback */
+  }
+  const nodeFloor = requiredNodeMajor(enginesNode);
+  if (parseInt(nodeVer.slice(1)) >= nodeFloor) {
+    ok(`Node.js: ${nodeVer} (>=${nodeFloor} required)`);
   } else {
-    fail(`Node.js ${nodeVer} too old (need >=18)`);
+    fail(`Node.js ${nodeVer} too old (need >=${nodeFloor})`);
     issues++;
   }
 
@@ -1562,7 +1876,9 @@ async function doctor() {
     fail('better-sqlite3: no install on this machine owns a native binding — nothing here can open the DB');
     issues++;
   } else if (brokenRoots.length === 0) {
-    ok(`better-sqlite3: verified in ${rootProbes.length} install${rootProbes.length === 1 ? '' : 's'} (${rootProbes.map((r) => r.label).join('; ')})`);
+    ok(
+      `better-sqlite3: verified in ${rootProbes.length} install${rootProbes.length === 1 ? '' : 's'} (${rootProbes.map((r) => r.label).join('; ')})`,
+    );
   } else {
     // Name the ROOT, not just the fault: the repair is per-tree, and pointing a
     // user at the wrong `cd` is how `rebuild-binding` used to report success
@@ -1571,6 +1887,109 @@ async function doctor() {
       fail(`better-sqlite3 unusable in ${b.label}: ${b.error}`);
       log(`    repair: ${b.repair}`);
       issues++;
+    }
+  }
+
+  // Can each code home actually OPEN this database? A binding that loads is not the same
+  // question: better-sqlite3 can be perfect and the store still unreadable, because
+  // schema.mjs refuses a DB written by a newer claude-mem-lite (correctly — replaying old
+  // migrations over a newer layout would corrupt it). That is a one-way ratchet, and on a
+  // plugin install it is REACHED ROUTINELY: the cache only advances when Claude Code's
+  // marketplace updater advances it, so anything else that opens the DB — an npm-global
+  // CLI, a dev checkout — can leave the cache locked out. Measured 2026-09-08: DB v49 vs a
+  // live 5.6.0 cache supporting v48, >=648 identical hook errors in one day, and the only
+  // user-visible signal was `-32000 Connection closed` from the MCP host.
+  //
+  // Probed per root, out of process, exactly like the binding check above and for the same
+  // reason: this is the check that has to survive answering the question, and importing
+  // another tree's schema.mjs would poison the process that must report the answer. It is
+  // also why this check is USEFUL TODAY rather than only after the next upgrade — doctor
+  // runs from whichever tree the user invoked, so new code here can diagnose an old cache.
+  // Hoisted out of the branch below because two LATER checks have to honour it. The
+  // verdict is "this install cannot safely touch that file"; a verdict nothing
+  // downstream reads is a sentence, not a gate (R12 audit, partition C P2-5).
+  //
+  // Two variables, because the two consumers ask different questions. `dbWriteBlocked`
+  // is about SAFETY — may this process open the file read-write — and carries its own
+  // reason so the line it gates is true. `dbUnusableHere` is about HONESTY — may this
+  // screen put a ✓ on a store this install cannot use. A read that succeeds on a
+  // too-new file is still a real number; a checkmark on it is not.
+  let dbWriteBlocked = null;
+  let dbUnusableHere = false;
+  if (!existsSync(DB_PATH)) {
+    ok('DB schema: no database yet — nothing to compare');
+  } else if (rootProbes.length === 0) {
+    // The fourth outcome the first cut had and did not print. The `fail` above already tells
+    // the reader no install owns a binding, but a block whose stated design point is "three
+    // outcomes, never two" must not answer a fourth case with silence.
+    dwarn('DB schema: not checked — no install on this machine owns a native binding to read it with');
+  } else {
+    const compat = probeSchemaCompat(shape.runtimeRoots, DB_PATH);
+    const behind = compat.filter((c) => c.status === 'skew');
+    const unknown = compat.filter((c) => c.status === 'unknown');
+    // Ask about the tree THIS process runs from, not about the machine.
+    // probeSchemaCompat probes every code home on purpose — its docblock says so:
+    // "so a report can NAME the one that is behind instead of asserting something
+    // global about 'the install'". The first cut of this gate read `behind.length > 0`
+    // and then printed "this install", which is the assertion that docblock exists to
+    // prevent. On the shape this whole check was built for — a current npm-global CLI
+    // beside a stale plugin cache, reached routinely per the rationale above — the
+    // running process can read and write the store perfectly well, and gating on any
+    // home withheld checkFTSIntegrity + rebuildFTS, doctor's ONLY non-destructive DB
+    // repair, from the machine most likely to need it. Found in pre-ship review.
+    //
+    // `unknown` blocks the write too, and says so in its own words: the probe could
+    // not get both numbers, and "I could not tell" is not "safe to write". The three
+    // outcomes stay three, the way the schema check above already keeps them.
+    const self = compat.find((c) => c.root === PROJECT_DIR);
+    if (!self) {
+      dbWriteBlocked = 'could not identify the install this command is running from';
+    } else if (self.status === 'skew') {
+      dbWriteBlocked =
+        `this database (v${self.dbVersion}) is newer than the install you are running, ` +
+        `which supports up to v${self.supported}`;
+      dbUnusableHere = true;
+    } else if (self.status === 'unknown') {
+      dbWriteBlocked = 'could not determine whether the install you are running can read this database';
+    }
+    if (behind.length === 0 && unknown.length === 0) {
+      ok(`DB schema: v${compat[0]?.dbVersion} — readable by all ${compat.length} install(s)`);
+    }
+    if (behind.length > 0) {
+      // Dynamic: only a skewed machine pays for it, and it reuses hook-update's isDevMode
+      // rather than re-deriving "is this a checkout", which that file has already had to
+      // correct twice (whole-dir symlink, then per-file drift).
+      let dev = false;
+      try {
+        const { isDevMode } = await import('./hook-update.mjs');
+        dev = isDevMode();
+      } catch {
+        /* unreadable → the initialiser stands: a non-dev install gets the common remedy */
+      }
+      for (const b of behind) {
+        // PER ROOT, inside the loop. Computing one remedy for every skewed tree printed the
+        // machine's global answer beneath a label naming a different tree — on a mixed
+        // managed+plugin install that meant `self-update` under "plugin cache v5.6.0",
+        // which advances nothing. b.root is the tree that is actually behind.
+        const remedy = schemaSkewRemedy({
+          managed: shape.managed,
+          activePluginVersion: shape.activePluginVersion,
+          dev,
+          root: b.root,
+        });
+        // fail, not warn: every write path is dead in this state and only the user can fix it.
+        fail(`DB schema v${b.dbVersion} is newer than ${b.label}, which supports up to v${b.supported}`);
+        for (const c of remedy.commands) log(`    ${c}`);
+        if (remedy.note) log(`    ${remedy.note}`);
+        issues++;
+      }
+    }
+    for (const u of unknown) {
+      // Deliberately its own outcome. "I could not determine what this install supports"
+      // printed as a green line is the defect the v6.2.0 round wrote and its pre-ship review
+      // caught before the tag — a check that says "nothing to check" and "I could not look"
+      // in the same voice ends the reader's search instead of directing it.
+      dwarn(`DB schema: could not determine compatibility for ${u.label} (${u.error})`);
     }
   }
 
@@ -1592,10 +2011,14 @@ async function doctor() {
     ok(`hook.mjs: ${HOOK_PATH}`);
   } else if (shape.activePluginVersion) {
     const v = shape.activePluginVersion;
-    ok(`Entry points: served from plugin cache v${v.version} (plugin-only install — the ~/.claude-mem-lite code layout is not used)`);
+    ok(
+      `Entry points: served from plugin cache v${v.version} (plugin-only install — the ~/.claude-mem-lite code layout is not used)`,
+    );
     for (const entry of ['server.mjs', 'hook.mjs', 'cli.mjs']) {
       if (!existsSync(join(v.root, entry))) {
-        fail(`Plugin cache v${v.version}: ${entry} missing — reinstall with \`/plugin install claude-mem-lite@sdsrss\``);
+        fail(
+          `Plugin cache v${v.version}: ${entry} missing — reinstall with \`/plugin install claude-mem-lite@sdsrss\``,
+        );
         issues++;
       }
     }
@@ -1609,15 +2032,23 @@ async function doctor() {
   // broken install to exit 0 so it never spams a Node stack trace on every hook
   // fire. That silence is intentional but hides failure — it drops a breakage
   // marker so this check can surface the otherwise-invisible degraded state.
-  const brokenMarker = join(MEM_DATA_DIR, 'runtime', 'hook-launcher-broken');
+  const brokenMarker = join(MEM_RUNTIME_DIR, 'hook-launcher-broken');
   if (existsSync(brokenMarker)) {
     let detail = '';
     try {
       const b = JSON.parse(readFileSync(brokenMarker, 'utf8'));
       const ageH = Math.round((Date.now() - (b.ts || 0)) / 3600000);
       detail = ` (last: ${b.reason || 'unknown'}, ~${ageH}h ago)`;
-    } catch { /* unreadable marker → bare warning */ }
-    dwarn(`Hook self-heal: a recent hook fire degraded to exit-0${detail} — run \`node ${join(PROJECT_DIR, 'install.mjs')} repair\``);
+    } catch {
+      /* unreadable marker → bare warning */
+    }
+    // cli.mjs, matching hook-launcher.mjs's CLI_REPAIR and the two remedies further
+    // down: this check FIRES because something about the install is already
+    // misbehaving, which is the worst moment to hand out the one entry that cannot
+    // survive a missing module. Pre-ship review of v6.7.0 caught this one left behind.
+    dwarn(
+      `Hook self-heal: a recent hook fire degraded to exit-0${detail} — run \`node ${join(PROJECT_DIR, 'cli.mjs')} repair\``,
+    );
   } else {
     ok('Hook self-heal: no recent silent hook breakage');
   }
@@ -1627,15 +2058,19 @@ async function doctor() {
   // is 6h-rate-limited stderr nobody reads), the live probe says "is it broken
   // right now". A Node upgrade breaks every DB-touching path at once, so this is
   // the single highest-value line in doctor when it fires.
-  const breakage = readNativeBindingBreakage(join(MEM_DATA_DIR, 'runtime'));
+  const breakage = readNativeBindingBreakage(MEM_RUNTIME_DIR);
   // Reuses the per-root probes above — same trees, same question, and doctor
   // should not pay for another round of child spawns to ask it twice.
   if (brokenRoots.length > 0) {
-    fail(`Native DB binding: unusable in ${brokenRoots.map((b) => b.label).join(', ')} — run \`node ${join(PROJECT_DIR, 'cli.mjs')} rebuild-binding\` (repairs every broken install, not just this one)`);
+    fail(
+      `Native DB binding: unusable in ${brokenRoots.map((b) => b.label).join(', ')} — run \`node ${join(PROJECT_DIR, 'cli.mjs')} rebuild-binding\` (repairs every broken install, not just this one)`,
+    );
     issues++;
   } else if (breakage) {
     const ageH = Math.round((Date.now() - (breakage.ts || 0)) / 3600000);
-    dwarn(`Native DB binding: healthy now, but a fire failed ~${ageH}h ago (${breakage.reason || 'unknown'}) — stale marker clears on the next successful rebuild-binding`);
+    dwarn(
+      `Native DB binding: healthy now, but a fire failed ~${ageH}h ago (${breakage.reason || 'unknown'}) — stale marker clears on the next successful rebuild-binding`,
+    );
   } else {
     ok(`Native DB binding: loadable on Node ${process.version}`);
   }
@@ -1655,17 +2090,49 @@ async function doctor() {
     // Warn threshold = the REAL eviction budget (pre-release review 2026-08-16) —
     // warning below it promised an eviction enforceBackupBudget would never do.
     if (backupBytes > backupBudgetBytes()) {
-      dwarn(`Disk footprint: ${snaps.length} backup snapshot(s) hold ${mb(backupBytes)}MB, over the ${mb(backupBudgetBytes())}MB budget (CLAUDE_MEM_BACKUP_BUDGET_MB) — the next maintain/save snapshot evicts oldest snapshots past the 7d undo grace`);
+      dwarn(
+        `Disk footprint: ${snaps.length} backup snapshot(s) hold ${mb(backupBytes)}MB, over the ${mb(backupBudgetBytes())}MB budget (CLAUDE_MEM_BACKUP_BUDGET_MB) — the next maintain/save snapshot evicts oldest snapshots past the 7d undo grace`,
+      );
     } else {
-      ok(`Disk footprint: DB ${mb(dbBytes)}MB, ${snaps.length} backup snapshot(s) ${mb(backupBytes)}MB (budget ${mb(backupBudgetBytes())}MB)`);
+      ok(
+        `Disk footprint: DB ${mb(dbBytes)}MB, ${snaps.length} backup snapshot(s) ${mb(backupBytes)}MB (budget ${mb(backupBudgetBytes())}MB)`,
+      );
     }
-  } catch { /* footprint check is informational — never block doctor */ }
+  } catch (e) {
+    // "Informational" was the reason this was silent, and silence is the one thing it must
+    // not be: the import above is of a sibling module, so the run where it fails is a broken
+    // install — doctor's entire audience. The line vanished with no trace, which reads
+    // identically to a check that was never written (R12 audit P3-7). Every other "I could
+    // not look" in this file has its own sentence; this is the same shape as the four.
+    dwarn('Disk footprint: check failed — ' + e.message);
+  }
 
   // Plugin/hook lifecycle state
-  const settings = readSettings();
-  const hasHooks = hasMemHooksConfigured(settings);
-  const pluginDisabled = isPluginExplicitlyDisabled(settings);
-  if (pluginDisabled && hasHooks) {
+  //
+  // Audit 2026-09-08 P1-2: readSettings() THROWS on a settings.json that exists and does
+  // not parse. That is the right answer for install / uninstall — every write path merges
+  // into its return value, so refusing to act is the only safe move (R10 P1-8) — and the
+  // wrong one to inherit here. doctor never writes settings.json, and a hand-edited
+  // trailing comma is one of the most common self-inflicted "Claude Code is broken"
+  // states, i.e. precisely when someone runs doctor. Inheriting the throw aborted the run
+  // at this check: nine later checks never ran and `--json` emitted zero bytes.
+  //
+  // `null` means NOT READ, and each consumer says "not checked" rather than treating an
+  // empty object as "nothing is configured". "I could not look" is not "there is nothing
+  // there" — the same three-outcome rule the bash-hook and marketplace checks follow.
+  let settings = null;
+  try {
+    settings = readSettings();
+  } catch (e) {
+    fail(`settings.json: unreadable — ${e.message}`);
+    log('    The three checks that read it are skipped below; every other check still runs.');
+    issues++;
+  }
+  const hasHooks = settings !== null && hasMemHooksConfigured(settings);
+  const pluginDisabled = settings !== null && isPluginExplicitlyDisabled(settings);
+  if (settings === null) {
+    dwarn('Plugin lifecycle: not checked (settings.json unreadable)');
+  } else if (pluginDisabled && hasHooks) {
     fail('Plugin lifecycle: plugin is disabled but claude-mem-lite hooks still remain in settings.json');
     issues++;
   } else if (pluginDisabled) {
@@ -1675,8 +2142,23 @@ async function doctor() {
   } else if (shape.activePluginVersion) {
     // Plugin-only: hooks come from the cache's hooks/hooks.json, and an EMPTY
     // settings.json hooks block is the correct state — warning about it told a
-    // correctly-installed user their hooks were missing.
-    ok(`Plugin lifecycle: hooks served by the plugin manifest (v${shape.activePluginVersion.version}); settings.json correctly holds none`);
+    // correctly-installed user their hooks were missing. But "correct state" is
+    // only half the question: read the manifest too, or an emptied one passes as
+    // the healthy shape (same false green as status).
+    const manifest = pluginCacheHookEvents(shape.activePluginVersion.root);
+    if (manifest.ok) {
+      ok(
+        `Plugin lifecycle: hooks served by the plugin manifest (v${shape.activePluginVersion.version}, ${manifest.events.length} events); settings.json correctly holds none`,
+      );
+    } else {
+      fail(
+        `Plugin lifecycle: plugin manifest v${shape.activePluginVersion.version} registers NO hooks (${manifest.reason}) and settings.json holds none — every hook is unregistered`,
+      );
+      log(
+        `    Repair: ${hookManifestRepairHint(shape.activePluginVersion.root, join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY))}`,
+      );
+      issues++;
+    }
   } else {
     dwarn('Plugin lifecycle: hooks not configured');
   }
@@ -1688,9 +2170,13 @@ async function doctor() {
   // with require-error noise every session. README's Uninstall section warns
   // about the right ordering; this check flags the broken state so it surfaces
   // even when the user skipped the README.
-  const orphanPaths = collectOrphanHookPaths(settings);
-  if (orphanPaths.length > 0) {
-    fail(`Orphan hooks: ${orphanPaths.length} settings.json entr${orphanPaths.length === 1 ? 'y references a missing file' : 'ies reference missing files'}`);
+  const orphanPaths = settings === null ? null : collectOrphanHookPaths(settings);
+  if (orphanPaths === null) {
+    dwarn('Orphan hooks: not checked (settings.json unreadable)');
+  } else if (orphanPaths.length > 0) {
+    fail(
+      `Orphan hooks: ${orphanPaths.length} settings.json entr${orphanPaths.length === 1 ? 'y references a missing file' : 'ies reference missing files'}`,
+    );
     for (const p of orphanPaths.slice(0, 5)) log(`    missing: ${p}`);
     if (orphanPaths.length > 5) log(`    ... +${orphanPaths.length - 5} more`);
     log(`    Repair: node ${join(PROJECT_DIR, 'install.mjs')} uninstall    # removes the dead hook entries`);
@@ -1699,44 +2185,144 @@ async function doctor() {
     ok('Orphan hooks: none (all hook targets present)');
   }
 
+  // MCP registration. This lives in doctor, not status: `claude mcp list` health-checks —
+  // i.e. STARTS — every MCP server configured on the machine (2.546s wall for three servers,
+  // measured 2026-09-08), which is a cost the deep check can carry and a status line cannot.
+  //
+  // What it buys beyond status: the DUPLICATE. The README's "Mixed-install residue" section
+  // has warned since v3 that a plugin user who once ran the npx/git-clone installer keeps a
+  // bare-name registration that double-registers the server — and nothing in the tool
+  // detected it. Orphan hooks had a check; its MCP twin did not.
+  try {
+    const list = execFileSync('claude', ['mcp', 'list'], { encoding: 'utf8', timeout: 60000 });
+    const bare = nonPluginMemRegistrations(list);
+    // Registration, not directory — see pluginIsRegistered. Crediting a leftover cache dir
+    // here told a working npm-channel install to delete its ONLY MCP registration.
+    // Reuses the `settings` read above rather than calling readSettings() a second time:
+    // the second call carried the same throw, so guarding only the first would have moved
+    // the abort eleven checks later instead of removing it (P1-2).
+    const viaPlugin =
+      !!shape?.activePluginVersion && settings !== null && pluginIsRegistered({ home: homedir(), settings });
+    if (settings === null) {
+      dwarn(
+        `MCP registration: found ${bare.length} bare registration(s); whether the plugin also provides one is not checked (settings.json unreadable)`,
+      );
+    } else if (viaPlugin && bare.length > 0) {
+      dwarn(
+        `MCP registration: the plugin manifest provides the server AND a bare "${bare.join('", "')}" registration exists — the server is registered twice`,
+      );
+      // No `-s` flag, deliberately: `nonPluginMemRegistrations`'s own docblock says `mcp list`
+      // does not label scope, and this repo's tracked `.mcp.json` registers a bare `mem-lite`
+      // at PROJECT scope, which `-s user` cannot remove. `claude mcp remove` without the flag
+      // removes from whichever scope the entry is in. Every name, not just the first.
+      for (const name of bare) log(`    Fix: claude mcp remove ${name}`);
+    } else if (viaPlugin) {
+      ok('MCP registration: provided by the plugin manifest only (no duplicate)');
+    } else if (bare.length > 0) {
+      ok(`MCP registration: "${bare.join('", "')}" registered`);
+    } else {
+      dwarn('MCP registration: no claude-mem-lite MCP server is registered and no plugin provides one');
+    }
+  } catch (e) {
+    // Third outcome, kept apart from "none found" on purpose: the `claude` CLI may not be on
+    // PATH at all, and a green "no duplicate" would end the reader's search on a check that
+    // never ran.
+    dwarn(`MCP registration: could not run \`claude mcp list\` (${e.code || e.message}) — not checked`);
+  }
+
+  // Marketplace clone updatability — see marketplaceCloneHealth for why this is the
+  // precondition behind the schema-skew lock-in v6.3.0 shipped a detector for.
+  const marketplaceClone = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
+  const clone = marketplaceCloneHealth(marketplaceClone);
+  if (clone.kind === 'dirty') {
+    dwarn(`Marketplace clone: ${clone.count} uncommitted change(s) in ${marketplaceClone}`);
+    log(
+      '    Claude Code updates a git-source marketplace by pulling this clone, and a dirty tree blocks the pull —',
+    );
+    log(
+      '    the plugin then stops updating silently, which is how a machine ends up running code older than its DB.',
+    );
+    log(`    Inspect: git -C ${marketplaceClone} status`);
+  } else if (clone.kind === 'unknown') {
+    dwarn(`Marketplace clone: could not check ${marketplaceClone} (${clone.reason}) — not checked`);
+  } else if (clone.kind === 'clean') {
+    ok('Marketplace clone: clean (the marketplace updater can fast-forward it)');
+  }
+  // 'absent' / 'not-git' are silent: an npm-channel or npx user has no marketplace clone,
+  // and a check that reports on a thing you do not have is noise.
+
   // Database
   if (existsSync(DB_PATH)) {
     try {
       const Database = (await import('better-sqlite3')).default;
       const db = new Database(DB_PATH, { readonly: true });
       // Check FTS
-      const fts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations_fts'").get();
+      const fts = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations_fts'")
+        .get();
       db.close();
       if (fts) {
         ok('FTS5 index: present');
         // FTS5 integrity check (requires read-write access for INSERT INTO fts VALUES('integrity-check'))
-        try {
-          const { checkFTSIntegrity, rebuildFTS } = await import('./schema.mjs');
-          const rwDb = new Database(DB_PATH);
-          rwDb.pragma('busy_timeout = 3000');
+        if (dbWriteBlocked) {
+          // Everything past this point wants a WRITE handle on a file this install
+          // has just been told it is too old to write — which is the exact way a
+          // store gets locked out for good. The rebuild below is gated by sitting
+          // inside this else, not by a second condition that could drift from it.
+          //
+          // dwarn rather than silence, and the REASON is interpolated rather than
+          // assumed: "I could not look" and "I looked and it is fine" have to stay
+          // distinguishable, and so does "I did not look, and here is which of the
+          // three reasons applies" — a line that names the wrong reason ends the
+          // reader's search just as a false green does.
+          dwarn(`FTS5 integrity: not checked — ${dbWriteBlocked}`);
+        } else {
           try {
-            const { healthy, details } = checkFTSIntegrity(rwDb);
-            if (healthy) {
-              ok('FTS5 integrity: all indexes healthy');
-            } else {
-              dwarn('FTS5 integrity issues detected:');
-              for (const d of details) log(`    ${d}`);
-              log('  Attempting FTS5 rebuild...');
-              const { rebuilt, errors } = rebuildFTS(rwDb);
-              if (rebuilt.length > 0) ok(`FTS5 rebuilt: ${rebuilt.join(', ')}`);
-              if (errors.length > 0) { fail(`FTS5 rebuild errors: ${errors.join(', ')}`); issues++; }
+            const { checkFTSIntegrity, rebuildFTS } = await import('./schema.mjs');
+            const rwDb = new Database(DB_PATH);
+            rwDb.pragma('busy_timeout = 3000');
+            try {
+              const { healthy, details } = checkFTSIntegrity(rwDb);
+              if (healthy) {
+                ok('FTS5 integrity: all indexes healthy');
+              } else {
+                dwarn('FTS5 integrity issues detected:');
+                for (const d of details) log(`    ${d}`);
+                log('  Attempting FTS5 rebuild...');
+                const { rebuilt, errors } = rebuildFTS(rwDb);
+                if (rebuilt.length > 0) ok(`FTS5 rebuilt: ${rebuilt.join(', ')}`);
+                if (errors.length > 0) {
+                  fail(`FTS5 rebuild errors: ${errors.join(', ')}`);
+                  issues++;
+                }
+              }
+            } finally {
+              rwDb.close();
             }
-          } finally {
-            rwDb.close();
+          } catch (e) {
+            dwarn('FTS5 integrity check failed: ' + e.message);
           }
-        } catch (e) {
-          dwarn('FTS5 integrity check failed: ' + e.message);
         }
       } else {
         dwarn('FTS5 index: missing (will be created on server start)');
       }
     } catch (e) {
       fail('Database: ' + e.message);
+      // Every other ✗ on this screen carries a remedy; this one used to be the exception,
+      // and a corrupt store is the failure a user is least able to diagnose unaided.
+      // dbCheckRemedy returns null rather than invent one for an error it cannot classify.
+      // Pre-ship review 2026-09-09: dbCheckRemedy became async and lazy (P1-1), which moved
+      // its failure mode from load time into THIS catch — and an unhandled rejection here
+      // aborts doctor exactly as the static import did, so `--json` still emitted zero bytes
+      // on the compound shape "a file is missing AND the database will not open". A remedy
+      // is an extra sentence on a check that has already failed; never let it take the run.
+      let remedy = null;
+      try {
+        remedy = await dbCheckRemedy(DB_PATH, e);
+      } catch (remedyErr) {
+        log(`    (could not build a repair hint: ${remedyErr.message})`);
+      }
+      if (remedy) log(`    ${remedy}`);
       issues++;
     }
   } else {
@@ -1752,11 +2338,19 @@ async function doctor() {
   // when their version segment ≠ current package.json version; dev-install
   // paths (no version segment) are never flagged.
   try {
-    const procs = execFileSync('pgrep', ['-af', 'chroma|claude-mem-lite.*(scripts/launch|server)\\.mjs|\\.claude-mem/.*worker'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' }).trim();
-    const lines = procs.split('\n').filter(l => l && !l.includes('pgrep'));
+    const procs = execFileSync(
+      'pgrep',
+      ['-af', 'chroma|claude-mem-lite.*(scripts/launch|server)\\.mjs|\\.claude-mem/.*worker'],
+      { encoding: 'utf8', timeout: 5000, stdio: 'pipe' },
+    ).trim();
+    const lines = procs.split('\n').filter((l) => l && !l.includes('pgrep'));
     let currentVersion = '';
-    try { currentVersion = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8')).version; } catch { /* fall through with empty version */ }
-    const stale = lines.filter(l => isStaleMemProcess(l, currentVersion));
+    try {
+      currentVersion = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8')).version;
+    } catch {
+      /* fall through with empty version */
+    }
+    const stale = lines.filter((l) => isStaleMemProcess(l, currentVersion));
     if (stale.length > 0) {
       // ⚠-level ONLY, deliberately not `issues++`. buildDoctorSummary's contract is
       // "issues are ✗-level (action required); warnings are ⚠-level (informational)",
@@ -1768,7 +2362,19 @@ async function doctor() {
       // `validate` job (where the "old processes" were vitest's own workers) and it
       // reddens doctor-install-shape-e2e's "instead of going red forever" case on any
       // dev box with a previous-version session still open.
-      warn(`Old processes running${currentVersion ? ` (current: v${currentVersion})` : ''}:\n    ` + stale.join('\n    '));
+      //
+      // `dwarn`, not the bare `warn`: the first cut called the bare one, which prints the
+      // ⚠ line but never touches the `warnings` counter — so a doctor run whose ONLY
+      // finding was a stale launcher printed the ⚠ and then closed with
+      // "All checks passed!". That is the exact sentence buildDoctorSummary's docblock
+      // says must not lie, and the exact case tests/doctor-summary.test.mjs pins at the
+      // pure-function level; the counter simply never reached it from here. `dwarn`
+      // increments `warnings` only — `issues` stays 0, so the paragraph above still
+      // holds and `doctor` still exits 0.
+      dwarn(
+        `Old processes running${currentVersion ? ` (current: v${currentVersion})` : ''}:\n    ` +
+          stale.join('\n    '),
+      );
     } else {
       ok('No stale processes');
     }
@@ -1778,7 +2384,7 @@ async function doctor() {
 
   // Update state
   try {
-    const stateFile = join(MEM_DATA_DIR, 'runtime', 'update-state.json');
+    const stateFile = join(MEM_DATA_DIR, 'runtime', 'update-state.json'); // runtime-dir:stays-put — installation identity
     if (existsSync(stateFile)) {
       const state = JSON.parse(readFileSync(stateFile, 'utf8'));
       const parts = [];
@@ -1826,6 +2432,24 @@ async function doctor() {
   // was ever deployed there, so every entry reads as "missing" and this reported
   // `⚠ Managed files: 121 missing` + an issue on a correct install — prescribing
   // a repair against a path that does not exist.
+  // ...and a THIRD state under the same `!shape.managed`: nothing was ever deployed here.
+  // Both checks below otherwise prescribe `repair`, which re-syncs an install from the signed
+  // release and runs from `<INSTALL_DIR>/cli.mjs` — one of the very entry points whose absence
+  // produced the verdict, so on this shape it hands the reader a command that cannot start.
+  // Damaged (some of the managed files survive) and never-deployed (none do) are different
+  // populations with opposite commands, the same conflation the plugin-only branch above fixed
+  // once already. Declared out here because the hook-script check needs it too and a `const`
+  // inside the try below is not in scope there.
+  //
+  // The population is SOURCE_FILES, not the two entry points. Asking about the entry points
+  // alone made this verdict a claim about two files while the message it gates says "none
+  // present" about all of them: an install holding cli.mjs and every lib/ module, with only
+  // server.mjs and hook.mjs gone, was reported as a data directory with no install behind it
+  // — and sent to re-`install` instead of `repair`, which was runnable from the cli.mjs
+  // already there.
+  const noCodeInstall =
+    !shape.managed && !shape.activePluginVersion && !hasAnyManagedCode(INSTALL_DIR, SOURCE_FILES);
+  const installRemedy = `node ${join(PROJECT_DIR, 'install.mjs')} install`;
   try {
     const skipDrift = !shape.managed && !!shape.activePluginVersion;
     const { checkDevDrift } = await import('./lib/doctor-drift.mjs');
@@ -1836,14 +2460,18 @@ async function doctor() {
       return `${files.join(', ')}${suffix}`;
     };
     if (skipDrift) {
-      ok('Managed files: n/a (plugin-only install — code is served from the plugin cache, so ~/.claude-mem-lite holds data only)');
+      ok(
+        'Managed files: n/a (plugin-only install — code is served from the plugin cache, so ~/.claude-mem-lite holds data only)',
+      );
     } else if (r.devMode) {
       const parts = [];
       if (r.plainCount > 0) {
         parts.push(`${r.plainCount} non-symlink: ${nameList(r.plainFiles.slice(0, 5), r.plainCount)}`);
       }
       if (r.missingEntryCount > 0) {
-        parts.push(`${r.missingEntryCount} missing ENTRY POINT: ${nameList(r.missingEntryFiles, r.missingEntryCount)}`);
+        parts.push(
+          `${r.missingEntryCount} missing ENTRY POINT: ${nameList(r.missingEntryFiles, r.missingEntryCount)}`,
+        );
       }
       if (parts.length > 0) {
         // Hard: a non-symlink means repo edits stop propagating, and a missing entry point
@@ -1851,10 +2479,11 @@ async function doctor() {
         // install also loses the realpath argument below — a COPIED entry point resolves
         // its imports against the install dir, so absent modules can throw there.
         if (r.missingModuleCount > 0) {
-          parts.push(`${r.missingModuleCount} missing module: ${nameList(r.missingModuleFiles, r.missingModuleCount)}`);
+          parts.push(
+            `${r.missingModuleCount} missing module: ${nameList(r.missingModuleFiles, r.missingModuleCount)}`,
+          );
         }
-        warn(`Dev drift: ${parts.join('; ')} (${devRemedy})`);
-        issues++;
+        issueWarn(`Dev drift: ${parts.join('; ')} (${devRemedy})`);
       } else if (r.missingModuleCount > 0) {
         // Informational, NOT an issue: in a pure-symlink install every entry point resolves
         // to the repo, and Node resolves each module's imports against that REALPATH — so an
@@ -1862,10 +2491,12 @@ async function doctor() {
         // it as drift prescribed `install --dev` for a demonstrably healthy install (the
         // maintainer's own machine ran every one of those modules fine while doctor called
         // them missing).
-        dwarn(`Dev drift: ${r.symlinkCount} symlinks, 0 plain, all entry points present — `
-          + `${r.missingModuleCount} import-only file(s) not linked into the install dir `
-          + `(${nameList(r.missingModuleFiles, r.missingModuleCount)}). Harmless: Node resolves `
-          + `imports against each entry point's realpath, i.e. the repo. ${devRemedy} to link them.`);
+        dwarn(
+          `Dev drift: ${r.symlinkCount} symlinks, 0 plain, all entry points present — ` +
+            `${r.missingModuleCount} import-only file(s) not linked into the install dir ` +
+            `(${nameList(r.missingModuleFiles, r.missingModuleCount)}). Harmless: Node resolves ` +
+            `imports against each entry point's realpath, i.e. the repo. ${devRemedy} to link them.`,
+        );
       } else {
         ok(`Dev drift: clean (${r.symlinkCount} symlinks, 0 plain, 0 missing)`);
       }
@@ -1878,7 +2509,9 @@ async function doctor() {
       // are FATAL was the silent one (#8268's rule failing in the other direction).
       const parts = [];
       if (r.missingEntryCount > 0) {
-        parts.push(`${r.missingEntryCount} entry point: ${nameList(r.missingEntryFiles, r.missingEntryCount)}`);
+        parts.push(
+          `${r.missingEntryCount} entry point: ${nameList(r.missingEntryFiles, r.missingEntryCount)}`,
+        );
       }
       if (r.missingModuleCount > 0) {
         parts.push(`${r.missingModuleCount} module: ${nameList(r.missingModuleFiles, r.missingModuleCount)}`);
@@ -1886,10 +2519,15 @@ async function doctor() {
       // `claude-mem-lite update` is the observation editor (`update <id>`); the
       // self-updater is `self-update`. Naming the wrong one sent the user to a
       // usage error at the exact moment their install was incomplete.
-      warn(`Managed files: ${r.missingCount} missing (${parts.join('; ')}) — a copy install resolves `
-        + `imports against the install dir, so these throw at hook time. Fix: claude-mem-lite self-update `
-        + `(or: node ${join(INSTALL_DIR, 'install.mjs')} repair)`);
-      issues++;
+      issueWarn(
+        noCodeInstall
+          ? `Managed files: no claude-mem-lite code is deployed in ${INSTALL_DIR} (${r.missingCount} ` +
+              `file(s) absent, none present) — this is a data directory with no install behind it, not ` +
+              `a damaged one. Fix: ${installRemedy}`
+          : `Managed files: ${r.missingCount} missing (${parts.join('; ')}) — a copy install resolves ` +
+              `imports against the install dir, so these throw at hook time. Fix: claude-mem-lite self-update ` +
+              `(or: node ${join(INSTALL_DIR, 'cli.mjs')} repair)`,
+      );
     }
     // Complete copy install: no message — drift is a dev-install concern.
   } catch (e) {
@@ -1908,43 +2546,123 @@ async function doctor() {
     const skipScripts = !shape.managed && !!shape.activePluginVersion;
     const { checkHookScriptDrift, HOOK_SCRIPT_ENTRY_POINTS } = await import('./lib/doctor-drift.mjs');
     const h = skipScripts ? null : checkHookScriptDrift(INSTALL_DIR, HOOK_SCRIPT_FILES);
-    const scriptRemedy = `claude-mem-lite self-update (or: node ${join(INSTALL_DIR, 'install.mjs')} repair)`;
+    // cli.mjs, not install.mjs: the reader of this line has an install that is
+    // missing files, and install.mjs is the one entry that cannot survive that —
+    // its static imports resolve before its first statement. cli.mjs has no static
+    // local imports and catches the failure (D#26). Same route, same command.
+    // Never-deployed gets the install command instead, for the reason spelled out at
+    // `noCodeInstall` above: the `repair` route runs from an entry point that is itself absent.
+    const scriptRemedy = noCodeInstall
+      ? installRemedy
+      : `claude-mem-lite self-update (or: node ${join(INSTALL_DIR, 'cli.mjs')} repair)`;
     if (skipScripts) {
       ok('Hook scripts: n/a (plugin-only install — hooks run from the plugin cache)');
     } else if (!h.present) {
-      warn(`Hook scripts: ${join(INSTALL_DIR, 'scripts')} `
-        + `${h.dirSymlink ? 'is a dangling symlink' : 'is absent'} — all ${HOOK_SCRIPT_ENTRY_POINTS.size} hook `
-        + `commands name absolute paths under it, so no hook can fire. Fix: ${scriptRemedy}`);
-      issues++;
+      issueWarn(
+        `Hook scripts: ${join(INSTALL_DIR, 'scripts')} ` +
+          `${h.dirSymlink ? 'is a dangling symlink' : 'is absent'} — all ${HOOK_SCRIPT_ENTRY_POINTS.size} hook ` +
+          `commands name absolute paths under it, so no hook can fire. Fix: ${scriptRemedy}`,
+      );
     } else if (h.missingCount > 0) {
       const parts = [];
       if (h.missingEntryFiles.length > 0) {
-        parts.push(`${h.missingEntryFiles.length} hook entry (${h.missingEntryFiles.join(', ')}) — the command cannot start`);
+        parts.push(
+          `${h.missingEntryFiles.length} hook entry (${h.missingEntryFiles.join(', ')}) — the command cannot start`,
+        );
       }
       if (h.missingModuleFiles.length > 0) {
-        parts.push(`${h.missingModuleFiles.length} imported helper (${h.missingModuleFiles.join(', ')}) — ERR_MODULE_NOT_FOUND at hook time`);
+        parts.push(
+          `${h.missingModuleFiles.length} imported helper (${h.missingModuleFiles.join(', ')}) — ERR_MODULE_NOT_FOUND at hook time`,
+        );
       }
-      warn(`Hook scripts: ${h.missingCount} missing — ${parts.join('; ')}. Fix: ${scriptRemedy}`);
-      issues++;
+      issueWarn(`Hook scripts: ${h.missingCount} missing — ${parts.join('; ')}. Fix: ${scriptRemedy}`);
     } else {
-      ok(`Hook scripts: ${HOOK_SCRIPT_FILES.length} present `
-        + `(${h.dirSymlink ? 'dev — scripts/ symlinked to the repo' : 'copy install'})`);
+      ok(
+        `Hook scripts: ${HOOK_SCRIPT_FILES.length} present ` +
+          `(${h.dirSymlink ? 'dev — scripts/ symlinked to the repo' : 'copy install'})`,
+      );
     }
   } catch (e) {
     dwarn('Hook scripts: check failed — ' + e.message);
+  }
+
+  // Hook interpreter. Some hook commands are `bash "<script>"` (the PostToolUse and
+  // Agent prefilters, plus setup.sh in the plugin manifest) — the rest are `node`. If bash
+  // cannot run, those commands fail and nothing says so; the check above grades whether the
+  // FILES are present, which they are.
+  //
+  // Keyed on whether bash runs, not on process.platform === 'win32'. A Windows user with
+  // Git for Windows on PATH — the normal case, since Claude Code shells out to bash for its
+  // own Bash tool — has a working configuration and must not be warned; a stripped
+  // container with no bash has a broken one and must be, whatever its platform. This is
+  // also what issue #28's P3-19 intent asked for: `os: [darwin, linux]` was added so a
+  // Windows user "should be told rather than handed a string of silent catch blocks", and
+  // blocking the install told them nothing. This is the telling.
+  try {
+    const {
+      count: bashCommands,
+      source: countSource,
+      scripts: bashScripts,
+    } = resolveBashHookCount({
+      manifestPath: join(PROJECT_DIR, 'hooks', 'hooks.json'),
+      settingsCommands: settingsHookCommands(homedir()),
+      installDir: INSTALL_DIR,
+    });
+    if (bashCommands === null) {
+      // NOT `ok`. Pre-ship review (P1-1) found the first cut printing "no hook command needs
+      // bash" here, on a shape where two of them are registered — a green line that ends the
+      // reader's search is worse than the silence this check exists to remove.
+      dwarn(
+        'Hook interpreter: could not read either hook registration — neither ' +
+          `${join(PROJECT_DIR, 'hooks', 'hooks.json')} nor a claude-mem-lite entry in ` +
+          `${join(homedir(), '.claude', 'settings.json')} — so whether any hook needs bash is unknown.`,
+      );
+    } else if (bashCommands === 0) {
+      ok(`Hook interpreter: no hook command needs bash (per the ${countSource})`);
+    } else {
+      let bashOk = false;
+      try {
+        execFileSync('bash', ['-c', 'exit 0'], { stdio: 'ignore', timeout: 5000 });
+        bashOk = true;
+      } catch {
+        /* not resolvable, or not runnable — either way the hooks that need it cannot fire */
+      }
+      if (bashOk) {
+        ok(`Hook interpreter: bash present (${bashCommands} hook command(s) need it)`);
+      } else {
+        // dwarn, not an issue: everything else works. Saying "broken" about an install
+        // whose MCP server and node hooks are fine would be the mirror of the defect that
+        // sent this round's reporter looking at their disk and their network.
+        // The scripts are NAMED from the live registration rather than described from
+        // memory — the first cut wrote "(episode Read-tracking and the subagent prefilter)",
+        // a two-item gloss on a count of three (P3-1).
+        dwarn(
+          `Hook interpreter: bash not found on PATH — the ${bashCommands} hook command(s) that ` +
+            `invoke it cannot fire (${bashScripts.join(', ')}). The MCP server and the node ` +
+            'hooks are unaffected. On Windows, install Git for Windows or use WSL; elsewhere ' +
+            'this means a stripped PATH.',
+        );
+      }
+    }
+  } catch (e) {
+    dwarn('Hook interpreter: check failed — ' + e.message);
   }
 
   // Stale temp files
   try {
     // hook-update + the episode workers write runtime/ + staging under DB_DIR
     // (= MEM_DATA_DIR, env-aware), NOT the homedir code dir — scan there so doctor
-    // sees the real residue under relocation.
-    const runtimeDir = join(MEM_DATA_DIR, 'runtime');
+    // sees the real residue under relocation. MEM_RUNTIME_DIR rather than
+    // join(MEM_DATA_DIR,'runtime'): `pending-*` / `ep-flush-*` are written through
+    // hook-shared.mjs's override-aware RUNTIME_DIR, and `cleanup()` below deletes them from
+    // MEM_RUNTIME_DIR — v3.93.0 moved the deleter and left this scanner behind, so under the
+    // override doctor reported "none" while the cleanup it recommends removed files.
+    const runtimeDir = MEM_RUNTIME_DIR;
     let staleCount = 0;
     const stalePatterns = ['.update-staging-', '.update-backup-'];
     if (existsSync(MEM_DATA_DIR)) {
       for (const f of readdirSync(MEM_DATA_DIR)) {
-        if (stalePatterns.some(p => f.startsWith(p))) staleCount++;
+        if (stalePatterns.some((p) => f.startsWith(p))) staleCount++;
       }
     }
     if (existsSync(runtimeDir)) {
@@ -1972,58 +2690,90 @@ async function doctor() {
       // Align with stats / MCP mem_stats: session_summaries, not sdk_sessions
       const sessCount = db.prepare('SELECT COUNT(*) as cnt FROM session_summaries').get()?.cnt || 0;
       db.close();
-      ok(`DB stats: ${sizeMB}MB, ${obsCount} observations, ${sessCount} sessions`);
+      const stats = `DB stats: ${sizeMB}MB, ${obsCount} observations, ${sessCount} sessions`;
+      // The read succeeds on a too-new file — the tables are still there — so this
+      // line printed a ✓ about a store the screen had already called unusable two
+      // checks up. The numbers are real and worth showing; the checkmark is not.
+      // Keyed on dbUnusableHere, not on dbWriteBlocked: "I could not confirm this
+      // install can read the DB" is not grounds to tell the user it cannot.
+      if (dbUnusableHere)
+        dwarn(`${stats} — but the install you are running cannot use this database (see DB schema above)`);
+      else ok(stats);
     } catch (e) {
       dwarn('DB stats: ' + e.message);
     }
   }
 
-  // Env flags that are ACCEPTED but do nothing. A flag a user set and believes is
-  // in effect is a silent lie the rest of doctor cannot see: every other check here
-  // asks whether the install is healthy, and this install is perfectly healthy while
-  // behaving as though the flag were unset (audit 2026-08-22 P2-5).
-  // Dynamically imported, and the mode table is read from the module that owns it:
-  // a static import would drag the registry retriever's dependency chain into a tool
-  // whose whole job is to run when the tree is broken, and a local copy of the list
-  // is the drift shape this repo keeps paying for.
-  try {
-    const { getRequestedRecommendMode, RECOMMEND_MODE_UNIMPLEMENTED } = await import('./registry-recommend.mjs');
-    const requested = getRequestedRecommendMode();
-    if (RECOMMEND_MODE_UNIMPLEMENTED.has(requested)) {
-      dwarn(`CLAUDE_MEM_RECOMMEND_MODE=${requested}: accepted but NOT implemented — `
-        + 'live skill-recommendation injection is Phase 2 and does not exist. The engine '
-        + 'is running in shadow (logs only, injects nothing). Set shadow or off.');
-    }
-  } catch (e) {
-    dwarn('Env flags: check failed — ' + e.message);
+  // Protections the operator has switched off. `doctor` is the channel because the surface
+  // that would otherwise carry it cannot: the daily normalize runs in a worker spawned by
+  // hook-shared.mjs::spawnBackground with `stdio: 'ignore'`, so its `console.error` warning
+  // reaches /dev/null. That warning is still correct for the foreground CLI path; this is
+  // the unattended one. Same shape as the CLAUDE_MEM_SKIP_SIG_VERIFY notice.
+  // dwarn, not fail: the flag is set deliberately, so it must be VISIBLE without pushing
+  // doctor to exit 1 — a diagnostic that fails on a supported configuration stops being run.
+  // `=== '1'` mirrors executeNormalize exactly; warning on `true` would describe a machine
+  // that is in fact still fanning out.
+  if (String(process.env.CLAUDE_MEM_NORMALIZE_CROSS_PROJECT || '') === '1') {
+    dwarn(
+      'CLAUDE_MEM_NORMALIZE_CROSS_PROJECT=1: the daily normalize runs over every project at ' +
+        "once, so one project's stored content can steer the synonym groups applied to all of " +
+        'them (R10-P3-21). Unset it for the per-project default.',
+    );
   }
 
   // Plugin cache versions
   const pluginCacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
   if (existsSync(pluginCacheBase)) {
     try {
-      const versions = readdirSync(pluginCacheBase).filter(n => /^\d+\./.test(n));
+      const versions = readdirSync(pluginCacheBase).filter((n) => /^\d+\./.test(n));
       let sizeStr;
       try {
-        sizeStr = execFileSync('du', ['-sh', pluginCacheBase], { encoding: 'utf8', timeout: 5000 }).trim().split('\t')[0];
-      } catch { sizeStr = '?'; }
+        sizeStr = execFileSync('du', ['-sh', pluginCacheBase], { encoding: 'utf8', timeout: 5000 })
+          .trim()
+          .split('\t')[0];
+      } catch {
+        sizeStr = '?';
+      }
       if (versions.length > 3) {
-        dwarn(`Plugin cache: ${versions.length} versions (${sizeStr}) — run setup.sh or update to auto-prune to 3`);
+        dwarn(
+          `Plugin cache: ${versions.length} versions (${sizeStr}) — run setup.sh or update to auto-prune to 3`,
+        );
       } else {
         ok(`Plugin cache: ${versions.length} version(s) (${sizeStr})`);
       }
-    } catch {}
+    } catch (e) {
+      // Was empty to the point of carrying no comment. `existsSync` already said the path is
+      // there, so reaching here means it is unreadable or not a directory — a fact about the
+      // plugin install worth one line (R12 audit P3-7).
+      dwarn(`Plugin cache: could not read ${pluginCacheBase} — ${e.message}`);
+    }
   }
 
   if (json) {
-    console.log(JSON.stringify({
-      issues,
-      warnings,
-      summary: buildDoctorSummary(issues, warnings),
-      checks,
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          issues,
+          warnings,
+          summary: buildDoctorSummary(issues, warnings),
+          checks,
+        },
+        null,
+        2,
+      ),
+    );
   } else {
-    console.log(`\n  ${buildDoctorSummary(issues, warnings)}\n`);
+    console.log(`\n  ${buildDoctorSummary(issues, warnings)}`);
+    // This run checked the INSTALL. The DB-layer modes are a different implementation reached
+    // through the same command name, and nothing else told the user they exist -- a healthy
+    // install with bad retrieval read "All checks passed!" and ended there. Derived from
+    // DOCTOR_DB_MODES so it cannot become a second list to forget. Text only: the exit-code
+    // contract `claude-mem-lite doctor || alert` depends on is untouched.
+    // Phrased as prose, not as `doctor a | b | c`: a line that looks like a command gets
+    // copy-pasted, and `|` is a shell pipe. See doctorDbModeHint()'s note.
+    console.log(
+      `  Deeper checks (database layer): run \`claude-mem-lite doctor\` with ${doctorDbModeHint()}\n`,
+    );
   }
   // Diagnostic-tool exit-code contract: any ✗-level finding must propagate non-zero
   // so CI / wrapper scripts (`claude-mem-lite doctor || alert`) actually trip. Keeps
@@ -2034,32 +2784,10 @@ async function doctor() {
 
 // ─── Settings helpers ───────────────────────────────────────────────────────
 
-// Identify a settings hook as one of OURS (to replace on install / strip on uninstall).
-// Must be tight: the old `hook.mjs` + event-word test matched a user's OWN generic hook
-// (`node ~/.config/hook.mjs session-start`) and install/uninstall silently deleted it.
-// The launcher marker (`hook-launcher.mjs`, which every Node hook routes through since v2.84)
-// replaces that clause; the product-name substring (our install-dir / legacy-direct hooks)
-// and the bash prefilter round out the real markers.
-export function isMemHook(cfg) {
-  if (!cfg.hooks) return false;
-  return cfg.hooks.some(h => {
-    const cmd = h.command || '';
-    return cmd.includes('claude-mem-lite') ||
-      cmd.includes('hook-launcher.mjs') ||
-      cmd.includes('scripts/post-tool-use.sh') ||
-      // Same reason post-tool-use.sh is named here: a bash prefilter routes through
-      // NO launcher, and the product-name clause only fires when the install dir
-      // happens to contain it — which CLAUDE_MEM_DIR can relocate. Without this line
-      // an Agent|Task hook in a relocated install survives uninstall and duplicates
-      // on reinstall (audit 2026-08-22 P2-5 added the second prefilter).
-      cmd.includes('scripts/pre-agent-inject.sh');
-  });
-}
-
 function hasMemHooksConfigured(settings) {
   if (!settings?.hooks) return false;
-  return Object.values(settings.hooks).some(configs =>
-    Array.isArray(configs) && configs.some(cfg => isMemHook(cfg))
+  return Object.values(settings.hooks).some(
+    (configs) => Array.isArray(configs) && configs.some((cfg) => isMemHook(cfg)),
   );
 }
 
@@ -2094,10 +2822,10 @@ const HOOK_PATH_EXTS = ['.mjs', '.js', '.cjs', '.sh'];
 
 function looksLikeHookPath(p) {
   if (!p || !p.startsWith('/')) return false;
-  return HOOK_PATH_EXTS.some(ext => p.endsWith(ext));
+  return HOOK_PATH_EXTS.some((ext) => p.endsWith(ext));
 }
 
-export function collectOrphanHookPaths(settings) {
+export function collectOrphanHookPaths(settings, installDir = INSTALL_DIR) {
   if (!settings?.hooks) return [];
   const out = [];
   for (const configs of Object.values(settings.hooks)) {
@@ -2107,6 +2835,14 @@ export function collectOrphanHookPaths(settings) {
       for (const h of cfg.hooks || []) {
         const cmd = h.command || '';
         if (cmd.includes('${CLAUDE_PLUGIN_ROOT}')) continue;
+        // The launcher's entry argument, which is unquoted and so invisible to the
+        // quoted-token scan below. Recorded IN ADDITION to that scan, never instead of
+        // it: a `continue` here shadowed a missing `scripts/hook-launcher.mjs` — the
+        // half-applied-update shape where every hook fire dies with
+        // ERR_MODULE_NOT_FOUND — and doctor went back to printing "Orphan hooks: none".
+        // Both files have to exist for the hook to run, so both are reportable.
+        const entry = launcherEntryPath(cmd, installDir);
+        if (entry && !existsSync(entry) && !out.includes(entry)) out.push(entry);
         // v2.80: scan ALL quoted tokens (was: only the first), prefer ones
         // that look like a hook path. Fixes a footgun where a wrapper command
         // like `bash -c "some inline" "/real/path.sh"` would pick "some inline"
@@ -2115,11 +2851,14 @@ export function collectOrphanHookPaths(settings) {
         // entry — we'd rather under-report than false-flag.
         let path = null;
         for (const m of cmd.matchAll(/"([^"]+)"/g)) {
-          if (looksLikeHookPath(m[1])) { path = m[1]; break; }
+          if (looksLikeHookPath(m[1])) {
+            path = m[1];
+            break;
+          }
         }
         if (!path) {
           const parts = cmd.split(/\s+/);
-          path = parts.find(p => looksLikeHookPath(p)) || null;
+          path = parts.find((p) => looksLikeHookPath(p)) || null;
         }
         if (!path) continue;
         if (!existsSync(path) && !out.includes(path)) out.push(path);
@@ -2139,11 +2878,11 @@ export function collectOrphanHookPaths(settings) {
  *   - 0-byte `.db` files that are NOT in the protected-db allow-list
  *
  * Protections (never touched):
- *   - subdirectories (managed/, runtime/, scripts/, lib/, cli/, commands/, server/, node_modules/, .claude-plugin/, registry/, etc.)
+ *   - subdirectories (runtime/, scripts/, lib/, cli/, commands/, server/, node_modules/, .claude-plugin/, etc.)
  *   - non-empty `.db` files — real data risk, always preserved
  *   - WAL/SHM (`*-wal`, `*-shm`) transients
  *   - files not ending in `.mjs` or `.db`
- *   - the two canonical DBs (`claude-mem-lite.db`, `resource-registry.db`) even when 0-byte (fresh-install transient state)
+ *   - the canonical DB (`claude-mem-lite.db`) even when 0-byte (fresh-install transient state)
  *
  * @param {string} dataDir Absolute path, typically `~/.claude-mem-lite`
  * @param {string[]} sourceFiles SOURCE_FILES manifest
@@ -2154,27 +2893,49 @@ export function pruneStaleInstallFiles(dataDir, sourceFiles) {
   // Flatten manifest to just top-level basenames. SOURCE_FILES contains entries
   // like 'lib/activity.mjs' — those belong to a subdir and prune never touches
   // subdirs anyway. For top-level entries ('server.mjs'), basename === entry.
-  const topLevelAllowed = new Set(
-    sourceFiles
-      .filter(f => !f.includes('/'))
-      .map(f => f)
-  );
-  const PROTECTED_DBS = new Set(['claude-mem-lite.db', 'resource-registry.db']);
+  const topLevelAllowed = new Set(sourceFiles.filter((f) => !f.includes('/')).map((f) => f));
+  // `resource-registry.db` came off this list with the registry itself. My first pass kept
+  // it on a wrong premise — "a user upgrading from <=4.x might lose data" — but the prune
+  // below gates on `st.size === 0`, so a registry DB with anything in it was never
+  // reachable here in the first place. The only file the entry saved was a ZERO-BYTE one,
+  // which holds no user data and is exactly the stale artifact this function exists to
+  // clear. Nothing creates the file any more, so the "fresh-install transient state"
+  // rationale that keeps `claude-mem-lite.db` here does not transfer. (R9 review F8a
+  // corrected the premise; the CHANGELOG still tells users where the real file lives.)
+  const PROTECTED_DBS = new Set(['claude-mem-lite.db']);
   const removed = [];
   let entries;
-  try { entries = readdirSync(dataDir); } catch { return removed; }
+  try {
+    entries = readdirSync(dataDir);
+  } catch {
+    return removed;
+  }
   for (const name of entries) {
     const full = join(dataDir, name);
     let st;
-    try { st = lstatSync(full); } catch { continue; }
+    try {
+      st = lstatSync(full);
+    } catch {
+      continue;
+    }
     // Skip directories and symlinks (dev mode uses symlinks; treat as intentional).
     if (!st.isFile()) continue;
     if (name.endsWith('.mjs') && !topLevelAllowed.has(name)) {
-      try { unlinkSync(full); removed.push(full); } catch { /* best-effort */ }
+      try {
+        unlinkSync(full);
+        removed.push(full);
+      } catch {
+        /* best-effort */
+      }
       continue;
     }
     if (name.endsWith('.db') && !PROTECTED_DBS.has(name) && st.size === 0) {
-      try { unlinkSync(full); removed.push(full); } catch { /* best-effort */ }
+      try {
+        unlinkSync(full);
+        removed.push(full);
+      } catch {
+        /* best-effort */
+      }
     }
   }
   return removed;
@@ -2193,7 +2954,7 @@ function cleanupMemHooksFromSettings(settings) {
   let removed = 0;
   for (const [event, configs] of Object.entries(settings.hooks)) {
     if (!Array.isArray(configs)) continue;
-    const kept = configs.filter(cfg => !isMemHook(cfg));
+    const kept = configs.filter((cfg) => !isMemHook(cfg));
     removed += configs.length - kept.length;
     if (kept.length > 0) settings.hooks[event] = kept;
     else delete settings.hooks[event];
@@ -2203,25 +2964,81 @@ function cleanupMemHooksFromSettings(settings) {
   return removed;
 }
 
-function isPluginExplicitlyDisabled(settings) {
-  return settings?.enabledPlugins?.[PLUGIN_KEY] === false;
-}
-
 function getInstalledPluginEntries(installed) {
   if (installed?.plugins && typeof installed.plugins === 'object') return installed.plugins;
   return installed && typeof installed === 'object' ? installed : {};
 }
 
-export function hasOtherMarketplacePlugins(installed, marketplaceKey = MARKETPLACE_KEY, pluginKey = PLUGIN_KEY) {
+export function hasOtherMarketplacePlugins(
+  installed,
+  marketplaceKey = MARKETPLACE_KEY,
+  pluginKey = PLUGIN_KEY,
+) {
   const plugins = getInstalledPluginEntries(installed);
-  return Object.keys(plugins).some(key => key !== pluginKey && key.endsWith(`@${marketplaceKey}`));
+  return Object.keys(plugins).some((key) => key !== pluginKey && key.endsWith(`@${marketplaceKey}`));
 }
 
-function readSettings() {
+/**
+ * Whether Claude Code actually has this plugin INSTALLED — as opposed to a leftover version
+ * directory sitting in its cache.
+ *
+ * `detectInstallShape`'s `activePluginVersion` is not that question. Its own comment calls its
+ * third tier — the newest cache directory — "a guess, and after a rollback the wrong one", and
+ * a terminal has neither of the first two tiers (`CLAUDE_PLUGIN_ROOT`, `installed_plugins.json`)
+ * after `/plugin uninstall`. `/plugin uninstall` leaves the version dirs behind, which this
+ * project's own README now documents — so "a cache directory exists" is true on machines that
+ * have no plugin at all.
+ *
+ * Using it as "the plugin provides the MCP server" was measured to tell a working npm-channel
+ * install that its server was registered twice, with a remedy that removes its ONLY
+ * registration. Read from the two places that RECORD an installation instead.
+ *
+ * Deliberately NOT `!shape.managed`: a mixed install has both, and that is precisely the state
+ * the duplicate check exists for. Over-narrowing here is safe by construction — the caller
+ * falls back to asking `claude mcp list`, which is the pre-fix behaviour and correct.
+ *
+ * Exported for tests/mcp-registration-parse.test.mjs.
+ */
+export function pluginIsRegistered({ home = homedir(), settings = {} } = {}) {
+  if (isPluginExplicitlyDisabled(settings)) return false;
+  if (settings?.enabledPlugins?.[PLUGIN_KEY] === true) return true;
   try {
-    return JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'));
+    const installed = JSON.parse(
+      readFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), 'utf8'),
+    );
+    return PLUGIN_KEY in getInstalledPluginEntries(installed);
   } catch {
-    return {};
+    // Missing or unparseable registry: not evidence of an installation.
+    return false;
+  }
+}
+
+/** Thrown when settings.json exists but is not parseable. Never a reason to write. */
+class SettingsUnparseableError extends Error {}
+
+function readSettings() {
+  // R10 P1-8: ENOENT and a parse failure are NOT the same answer. Both used to return {},
+  // so a settings.json the user was midway through hand-editing (one trailing comma) was
+  // replaced wholesale on the next install / uninstall: permissions, env, other plugins'
+  // hooks, enabledPlugins — all of it. The .bak is written only on the FIRST overwrite
+  // ever, so on a real machine it is months old and not a recovery path.
+  let raw;
+  try {
+    raw = readFileSync(SETTINGS_PATH, 'utf8');
+  } catch {
+    return {}; // absent — a first install legitimately starts from nothing
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    // `null` and arrays parse fine and would silently drop every key on merge.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('top level is not a JSON object');
+    }
+    return parsed;
+  } catch (e) {
+    throw new SettingsUnparseableError(
+      `${SETTINGS_PATH} is not valid JSON (${e.message}) — fix it first; nothing was written.`,
+    );
   }
 }
 
@@ -2246,10 +3063,20 @@ function cleanup() {
 
   // Clean .update-staging-* / .update-backup-* — hook-update writes these under
   // DB_DIR (= MEM_DATA_DIR, env-aware), so scan the data dir, not the homedir code dir.
+  //
+  // R10 P2-10: take install.lock first. `.update-backup-*` is the ONLY rollback copy of an
+  // in-flight update and it holds the journal hook-update replays; `.update-staging-*` is
+  // the tree being swapped in. Deleting either mid-update leaves the install unrecoverable,
+  // and the window is long — it spans the source-compile fallback, up to five minutes —
+  // while doctor is actively telling the user to run cleanup. Non-blocking: if an installer
+  // holds the lock we skip only these two patterns, not the rest of cleanup.
   const stalePatterns = ['.update-staging-', '.update-backup-'];
-  if (existsSync(MEM_DATA_DIR)) {
+  const updateLock = acquireLock(join(MEM_DATA_DIR, 'runtime', 'install.lock')); // runtime-dir:stays-put — install lock serialises real installers
+  if (!updateLock) {
+    warn('Update residue skipped: install in progress (install.lock held)');
+  } else if (existsSync(MEM_DATA_DIR)) {
     for (const f of readdirSync(MEM_DATA_DIR)) {
-      if (stalePatterns.some(p => f.startsWith(p))) {
+      if (stalePatterns.some((p) => f.startsWith(p))) {
         if (dryRun) {
           ok(`Would remove: ${f}`);
           removed++;
@@ -2265,12 +3092,39 @@ function cleanup() {
       }
     }
   }
+  // Release immediately: the rest of cleanup touches runtime scratch that no installer owns,
+  // and holding install.lock across it would block a self-heal for no reason.
+  if (updateLock) updateLock();
 
-  // Clean pending-* / ep-flush-* in runtime/ (under the env-aware data dir)
-  const runtimeDir = join(MEM_DATA_DIR, 'runtime');
+  // Clean pending-* / ep-flush-* in runtime/ (env-aware, and honouring the runtime override).
+  //
+  // AGE-GATED, same window the automatic sweep uses (ORPHAN_EPISODE_AGE_MS, 1h). An
+  // `ep-flush-<ts>-<id>.json` is the episode handed to the summarizer, not residue: the
+  // round-trip is ~60s, and deleting one mid-flight discards that episode's observations
+  // silently while printing "✓ Removed". This block had no age gate at all, which made a
+  // documented maintenance command — the one `doctor` tells users to run — destructive
+  // against live work. Matches the P2-10 fix above (in-flight update residue) and the
+  // fixture sweep below, whose comment already states the principle: a MANUAL cleanup is
+  // the conservative one.
+  const runtimeDir = MEM_RUNTIME_DIR;
   if (existsSync(runtimeDir)) {
+    const epCutoff = Date.now() - ORPHAN_EPISODE_AGE_MS;
+    let inFlight = 0;
     for (const f of readdirSync(runtimeDir)) {
       if (f.startsWith('pending-') || f.startsWith('ep-flush-')) {
+        // Unreadable mtime → treat as in-flight and skip. Failing safe here costs one
+        // stale file until the next sweep; failing open costs an episode.
+        let mtimeMs;
+        try {
+          mtimeMs = statSync(join(runtimeDir, f)).mtimeMs;
+        } catch {
+          inFlight++;
+          continue;
+        }
+        if (mtimeMs > epCutoff) {
+          inFlight++;
+          continue;
+        }
         if (dryRun) {
           ok(`Would remove: runtime/${f}`);
           removed++;
@@ -2284,6 +3138,11 @@ function cleanup() {
           warn(`Failed to remove runtime/${f}: ${e.message}`);
         }
       }
+    }
+    if (inFlight > 0) {
+      log(
+        `  Kept ${inFlight} episode file(s) newer than 1h — possibly in flight, they sweep automatically once stale.`,
+      );
     }
   }
 
@@ -2348,22 +3207,42 @@ async function repair() {
     // repo/TLS-MITM compromise achieved RCE, bypassing the Ed25519 signed-release control that
     // the manual `update` path enforces. Lazy import so a missing/broken hook-update dependency
     // degrades to the manual fallback (fail-closed) rather than to unverified auto-install.
-    let fetchLatestRelease, verifyReleaseAuthenticity, validateExtractedTarball, isRepairDowngrade, getCurrentVersion;
+    let fetchLatestRelease,
+      verifyReleaseAuthenticity,
+      validateExtractedTarball,
+      isRepairDowngrade,
+      getCurrentVersion;
     try {
-      ({ fetchLatestRelease, verifyReleaseAuthenticity, validateExtractedTarball, isRepairDowngrade, getCurrentVersion } = await import('./hook-update.mjs'));
+      ({
+        fetchLatestRelease,
+        verifyReleaseAuthenticity,
+        validateExtractedTarball,
+        isRepairDowngrade,
+        getCurrentVersion,
+      } = await import('./hook-update.mjs'));
     } catch (e) {
-      throw new Error(`cannot load the verified-update path (${e.message}) — refusing to auto-install unverified code`, { cause: e });
+      throw new Error(
+        `cannot load the verified-update path (${e.message}) — refusing to auto-install unverified code`,
+        { cause: e },
+      );
     }
     const rel = await fetchLatestRelease();
-    if (!rel || !rel.tarballUrl) throw new Error('could not resolve the latest release (network / rate-limit)');
+    if (!rel || !rel.tarballUrl)
+      throw new Error('could not resolve the latest release (network / rate-limit)');
     // Rollback guard: refuse to repair BACKWARD onto an older validly-signed release replayed
     // as "latest" (the only attack signing leaves open). Skipped when the local version is
     // unreadable — a broken install still needs repair; the signature check below still gates
     // authenticity either way.
     let localVersion = null;
-    try { localVersion = getCurrentVersion(); } catch { /* broken install → allow repair */ }
+    try {
+      localVersion = getCurrentVersion();
+    } catch {
+      /* broken install → allow repair */
+    }
     if (isRepairDowngrade(rel.version, localVersion)) {
-      throw new Error(`refusing to repair BACKWARD: resolved release v${rel.version} is older than installed v${localVersion} (possible signed-release rollback)`);
+      throw new Error(
+        `refusing to repair BACKWARD: resolved release v${rel.version} is older than installed v${localVersion} (possible signed-release rollback)`,
+      );
     }
     // URL allow-list mirrors hook-update.downloadAndInstall — only github.com tarball URLs.
     if (!/^https:\/\/(?:api\.)?github\.com\/[a-zA-Z0-9./_-]+$/.test(rel.tarballUrl)) {
@@ -2371,11 +3250,16 @@ async function repair() {
     }
     const tarballPath = join(stagingDir, 'release.tgz');
     log(`Downloading release v${rel.version}...`);
-    execFileSync('curl', ['-sL', '-f', '-H', 'Accept: application/vnd.github+json', rel.tarballUrl, '-o', tarballPath],
-      { timeout: 60000, stdio: ['ignore', 'pipe', 'inherit'] });
+    execFileSync(
+      'curl',
+      ['-sL', '-f', '-H', 'Accept: application/vnd.github+json', rel.tarballUrl, '-o', tarballPath],
+      { timeout: 60000, stdio: ['ignore', 'pipe', 'inherit'] },
+    );
     log('Extracting...');
-    execFileSync('tar', ['xzf', tarballPath, '-C', stagingDir, '--strip-components=1'],
-      { timeout: 30000, stdio: ['ignore', 'pipe', 'inherit'] });
+    execFileSync('tar', ['xzf', tarballPath, '-C', stagingDir, '--strip-components=1'], {
+      timeout: 30000,
+      stdio: ['ignore', 'pipe', 'inherit'],
+    });
     // Defense-in-depth on the extracted tarball (name + version === resolved tag + entry
     // points) BEFORE the signature check — parity with hook-update.downloadAndInstall. Catches
     // a wrong-version / truncated / squatter artifact whose package.json doesn't match the tag.
@@ -2389,8 +3273,7 @@ async function repair() {
     const tarballInstaller = join(stagingDir, 'install.mjs');
     if (!existsSync(tarballInstaller)) throw new Error('verified tarball missing install.mjs');
     log('Re-running install from the verified release sources...');
-    execFileSync(process.execPath, [tarballInstaller, 'install'],
-      { stdio: 'inherit', timeout: 300000 });
+    execFileSync(process.execPath, [tarballInstaller, 'install'], { stdio: 'inherit', timeout: 300000 });
     ok(`Repair complete — resynced from verified release v${rel.version}`);
   } catch (e) {
     fail(`Repair failed: ${e.message}`);
@@ -2398,11 +3281,13 @@ async function repair() {
     console.log('  Automatic repair fails closed rather than run unverified code.');
     console.log('  Manual fallback — run this in any shell (you are choosing to trust it):');
     console.log('');
-    console.log('  T=$(mktemp -d) && curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/tarball | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install');
+    console.log(`  ${MANUAL_TARBALL_FALLBACK}`);
     console.log('');
     process.exit(1);
   } finally {
-    try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(stagingDir, { recursive: true, force: true });
+    } catch {}
   }
 }
 
@@ -2437,9 +3322,8 @@ function syncVersions() {
   const claudeMdPath = join(PROJECT_DIR, 'CLAUDE.md');
   if (existsSync(claudeMdPath)) {
     const orig = readFileSync(claudeMdPath, 'utf8');
-    const versionLine = /^- \*\*Version\*\*: .+$/m;
-    if (versionLine.test(orig)) {
-      const patched = orig.replace(versionLine, `- **Version**: ${version}`);
+    const patched = patchClaudeMdVersion(orig, version);
+    if (patched !== null) {
       if (patched !== orig) {
         writeFileSync(claudeMdPath, patched);
         ok(`CLAUDE.md: → ${version}`);
@@ -2518,7 +3402,10 @@ export function isStaleMemProcess(line, currentVersion) {
   // release: first vitest workers under a checkout named `claude-mem-lite`, then the
   // `git commit -F -` publishing THIS fix, whose message text contains the word
   // "chroma". Anything that takes a program as an argument can quote us.
-  if (/(^|\/)(ba|z|k|da|c|t)?sh$/.test(exe) || /(^|\/)(env|xargs|timeout|nohup|sudo|git|grep|rg|less|vi|vim|nano|code)$/.test(exe)) {
+  if (
+    /(^|\/)(ba|z|k|da|c|t)?sh$/.test(exe) ||
+    /(^|\/)(env|xargs|timeout|nohup|sudo|git|grep|rg|less|vi|vim|nano|code)$/.test(exe)
+  ) {
     return false;
   }
 
@@ -2549,7 +3436,7 @@ function bindingHostDir() {
 // two concurrent rebuilds can clobber the .node mid-compile. A live peer → report
 // and exit 0 (it is doing this very work), never race it.
 async function rebuildBinding() {
-  const release = acquireLock(join(MEM_DATA_DIR, 'runtime', 'install.lock'));
+  const release = acquireLock(join(MEM_DATA_DIR, 'runtime', 'install.lock')); // runtime-dir:stays-put — install lock serialises real installers
   if (!release) {
     // NOT exit 0: skipping is not healing. Callers key their state on the exit
     // code — a false success would let the launcher drop its cooldown and the
@@ -2566,18 +3453,23 @@ async function rebuildBinding() {
     // still had no memory. Falling back to INSTALL_DIR keeps a source-only
     // layout with no deps of its own repairable.
     const shape = detectInstallShape({ home: homedir(), projectDir: PROJECT_DIR, installDir: INSTALL_DIR });
-    const targets = shape.runtimeRoots.length > 0
-      ? shape.runtimeRoots
-      : [{ label: 'install dir', root: bindingHostDir() }];
+    const targets =
+      shape.runtimeRoots.length > 0 ? shape.runtimeRoots : [{ label: 'install dir', root: bindingHostDir() }];
 
     let failed = 0;
     for (const { label, root } of targets) {
       const verify = await ensureBetterSqlite3Working(root);
       if (verify.ok) {
         ok(`better-sqlite3 binding ${verify.action} for Node ${process.version} — ${label} (${root})`);
+        if (verify.quarantined) {
+          // Say it out loud: the heal renamed a file inside the user's node_modules because
+          // the shipped prebuild was present and would not load. A silent move inside a
+          // dependency is the kind of thing that reads as corruption six months later.
+          log(`  the shipped prebuild would not load — moved aside to ${verify.quarantined}.unusable`);
+        }
       } else {
         fail(`better-sqlite3 binding still unusable in ${label}: ${verify.error}`);
-        log(`Try manually: cd ${root} && ${NATIVE_BINDING_REBUILD_CMD}`);
+        log(`Try manually: ${nativeBindingRepairHint(root)}`);
         failed++;
       }
     }
@@ -2585,7 +3477,7 @@ async function rebuildBinding() {
       process.exitCode = 1;
     } else {
       // Every tree is loadable → drop the marker so session-start stops retrying.
-      clearNativeBindingBreakage(join(MEM_DATA_DIR, 'runtime'));
+      clearNativeBindingBreakage(MEM_RUNTIME_DIR);
     }
   } finally {
     release();
@@ -2598,18 +3490,39 @@ async function rebuildBinding() {
 // install/self-heal) holds it → skip rather than race into a torn install. Lock
 // path is shared with hook-update.installExtractedRelease (both env-aware).
 async function runLockedInstall() {
-  const release = acquireLock(join(MEM_DATA_DIR, 'runtime', 'install.lock'));
+  const release = acquireLock(join(MEM_DATA_DIR, 'runtime', 'install.lock')); // runtime-dir:stays-put — install lock serialises real installers
   if (!release) {
     console.log('[install] Another install/repair is in progress — skipping to avoid a torn write.');
     return;
   }
-  try { await install(); } finally { release(); }
+  try {
+    await install();
+  } finally {
+    release();
+  }
 }
 
 export async function main(argv = process.argv.slice(2)) {
   cmd = argv[0];
   flags = new Set(argv.slice(1));
 
+  try {
+    return await dispatch(cmd);
+  } catch (e) {
+    // R10 P1-8: an unparseable settings.json aborts the whole command with a non-zero exit
+    // and a message that names the file. Refusing to act is the only safe answer — every
+    // write path merges into what readSettings returned, so continuing means replacing the
+    // user's Claude Code configuration with whatever this installer happens to know about.
+    if (e instanceof SettingsUnparseableError) {
+      console.error(`\n  ✗ ${e.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    throw e;
+  }
+}
+
+async function dispatch(cmd) {
   switch (cmd) {
     case 'install':
       await runLockedInstall();

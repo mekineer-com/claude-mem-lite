@@ -3,16 +3,38 @@
 // Skips in dev mode (symlinked installs). Silent on network failure.
 
 import { execSync, execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, renameSync, chmodSync } from 'node:fs';
+import {
+  readFileSync,
+  writeFileSync,
+  copyFileSync,
+  readdirSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  renameSync,
+  chmodSync,
+  realpathSync,
+} from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
-import { DB_DIR, CODE_DIR } from './schema.mjs';
+// lib/data-paths.mjs, NOT schema.mjs: this module is what install.mjs::repair() imports to
+// reach the signature-verified release path, and schema.mjs statically imports
+// better-sqlite3 — so importing two path constants from there made the verified repair
+// unreachable on exactly the broken-install state it exists to repair (2026-09-08).
+// tests/repair-path-no-native-dep.test.mjs fails on any package edge reachable from here.
+import { DB_DIR, CODE_DIR } from './lib/data-paths.mjs';
 import { debugCatch, debugLog } from './utils.mjs';
+import { NATIVE_BINDING_SOURCE_BUILD_CMD } from './lib/binding-probe.mjs';
 // Local manifest is fallback only — the active manifest is loaded from the
 // extracted tarball's own source-files.mjs inside installExtractedRelease.
 // See loadReleaseManifest below.
-import { SOURCE_FILES as LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES as LOCAL_HOOK_SCRIPT_FILES } from './source-files.mjs';
+import {
+  SOURCE_FILES as LOCAL_SOURCE_FILES,
+  HOOK_SCRIPT_FILES as LOCAL_HOOK_SCRIPT_FILES,
+} from './source-files.mjs';
 // Native fetch ignores HTTP(S)_PROXY. Without this the whole update path — the
 // version check AND the release download — dies instantly behind a proxy, and
 // because checkForUpdate is silent on network failure the plugin then reports
@@ -21,24 +43,25 @@ import { httpConnectProxyFor, getViaConnectProxy } from './lib/proxy-fetch.mjs';
 import { acquireLock } from './lib/proc-lock.mjs';
 import { atomicWriteFileSync } from './lib/atomic-write.mjs';
 import { verifyReleaseFiles, verifyManifestSignature } from './lib/release-digest.mjs';
+import { detectInstallShape } from './lib/install-shape.mjs';
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/claude-mem-lite';
 // Plugin CODE location (server.mjs / package.json / install target) — always
 // homedir-rooted, NEVER follows CLAUDE_MEM_DIR (see schema.mjs CODE_DIR). Used
 // for dev-mode detection, current-version read, and the install target dir.
-const INSTALL_DIR = CODE_DIR;  // ~/.claude-mem-lite/ (code)
+const INSTALL_DIR = CODE_DIR; // ~/.claude-mem-lite/ (code)
 // DATA/state location — runtime/update-state.json lives with the data (env-aware
 // DB_DIR), matching hook-shared RUNTIME_DIR and install.mjs doctor's read path.
 // Equal to INSTALL_DIR unless CLAUDE_MEM_DIR relocates the data dir.
 const STATE_DIR = DB_DIR;
-const STATE_FILE = join(STATE_DIR, 'runtime', 'update-state.json');
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;       // 24 hours
-const FETCH_TIMEOUT_MS = 3000;                         // 3s network timeout
+const STATE_FILE = join(STATE_DIR, 'runtime', 'update-state.json'); // runtime-dir:stays-put — installation identity
+const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const FETCH_TIMEOUT_MS = 3000; // 3s network timeout
 // When rate-limited we got NO release data, so re-check sooner than the normal 24h
 // cadence (GitHub's unauthenticated rate-limit window resets within the hour). 6h × ≤2
 // requests = 4 polls/day, far under the 60/hr limit, so this is a faster retry, not a hammer.
-const RATE_LIMIT_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6h retry when rate-limited
+const RATE_LIMIT_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h retry when rate-limited
 const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
 // ── Main Entry ─────────────────────────────────────────────
@@ -83,13 +106,15 @@ export async function checkForUpdate(options = {}) {
     if (hasUpdate) {
       debugLog('DEBUG', 'hook-update', `Update available: ${currentVersion} → ${latest.version}`);
       const canInstall = !pluginMode && Boolean(allowInstall);
-      const success = canInstall ? await downloadAndInstall(latest.tarballUrl, latest.version, latest.assets) : false;
+      const success = canInstall
+        ? await downloadAndInstall(latest.tarballUrl, latest.version, latest.assets)
+        : false;
       const newState = {
         lastCheck: new Date().toISOString(),
         installedVersion: success ? latest.version : currentVersion,
         latestVersion: latest.version,
         updateAvailable: !success,
-        lastUpdate: success ? new Date().toISOString() : (state.lastUpdate || null),
+        lastUpdate: success ? new Date().toISOString() : state.lastUpdate || null,
         rateLimited: false,
       };
       saveState(newState);
@@ -144,7 +169,9 @@ export function getCachedUpdateBanner() {
       return `\n📦 claude-mem-lite: v${state.latestVersion} available (current: v${state.installedVersion})${hint}\n`;
     }
     return null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 // True when a network refresh is due (24h throttle) and updates aren't disabled.
@@ -153,15 +180,64 @@ export function isUpdateCheckDue() {
   try {
     if (isDevMode() || process.env.CLAUDE_MEM_SKIP_UPDATE) return false;
     return shouldCheck(readState());
-  } catch { return false; }
+  } catch {
+    return false;
+  }
+}
+
+// D#187. `CLAUDE_PLUGIN_ROOT` is set in every hook and MCP process Claude Code
+// spawns, so inside those the env var answers "am I a plugin install?" perfectly —
+// which is why v3.84.1's fix, which reads it, was enough THERE. It is not set in a
+// plain terminal, and a plugin-only user typing `claude-mem-lite update` therefore
+// fell off both plugin paths at once: getCurrentVersion() returned '0.0.0' (so every
+// release compares as newer, forever), and isPluginMode() was false, so allowInstall
+// defaulted to true and downloadAndInstall laid a full managed tree into
+// ~/.claude-mem-lite — silently converting a plugin-only install into the hybrid
+// whose two trees D#184 documents drifting apart.
+//
+// Same root cause as PR #17: process ENVIRONMENT was the only install-shape
+// evidence consulted. detectInstallShape() reads the FILESYSTEM instead, so it
+// answers the same in a hook, in a terminal, and in a subprocess.
+//
+// Memoised per process. The reason first written here was wrong and the pre-tag review
+// traced it out: it claimed the memo keeps installExtractedRelease()'s post-install
+// isPluginMode() call stable across the managed-tree write. That call cannot depend on
+// this fallback at all — every path reaching installExtractedRelease is a plugin process
+// (checkForUpdate cannot reach downloadAndInstall while pluginMode is true, and
+// syncDataDirFromCache is only called from scripts/launch.mjs and
+// scripts/hook-launcher.mjs), so CLAUDE_PLUGIN_ROOT is set and isPluginMode()
+// short-circuits before pluginOnlyInstall() is consulted, before AND after the write.
+// What the memo actually buys: one readdirSync per process instead of one per call, and
+// a stable answer inside a long-lived MCP server whose plugin cache may be pruned or
+// re-populated underneath it while it runs.
+let shapeMemo;
+function installShape() {
+  if (shapeMemo === undefined) {
+    try {
+      shapeMemo = detectInstallShape({ installDir: INSTALL_DIR });
+    } catch {
+      shapeMemo = null;
+    }
+  }
+  return shapeMemo;
+}
+
+/** True when this machine runs the plugin and has NO managed code install to update. */
+function pluginOnlyInstall() {
+  const shape = installShape();
+  return Boolean(shape && !shape.managed && shape.activePluginVersion);
 }
 
 function isPluginMode() {
-  return Boolean(process.env.CLAUDE_PLUGIN_ROOT);
+  return Boolean(process.env.CLAUDE_PLUGIN_ROOT) || pluginOnlyInstall();
 }
 
 // ── Dev Mode Detection ─────────────────────────────────────
-function isDevMode() {
+// Exported since the schema-skew notice needs it: a dev checkout must be told `git pull`,
+// never a command that would overwrite its working tree. Re-implementing the check at the
+// call site would make it the second copy of a predicate this file has already had to get
+// right twice (whole-dir symlink, then per-file drift) — the twin-drift class.
+export function isDevMode() {
   try {
     // A dev checkout always carries a .git dir. This catches a whole-directory
     // symlink (~/.claude-mem-lite -> /repo): lstat on server.mjs there follows the
@@ -179,7 +255,9 @@ function isDevMode() {
       if (existsSync(p) && lstatSync(p).isSymbolicLink()) return true;
     }
     return false;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 // ── Throttle ───────────────────────────────────────────────
@@ -194,7 +272,7 @@ function shouldCheck(state) {
 // Try releases/latest first, fallback to tags (some repos only use tags)
 export async function fetchLatestRelease() {
   const headers = {
-    'Accept': 'application/vnd.github+json',
+    Accept: 'application/vnd.github+json',
     'User-Agent': 'claude-mem-lite-updater/1.0',
   };
 
@@ -217,10 +295,7 @@ export async function fetchLatestRelease() {
   }
 
   // Attempt 2: Tags API fallback (for repos without formal releases)
-  const tags = await fetchWithTimeout(
-    `https://api.github.com/repos/${GITHUB_REPO}/tags?per_page=1`,
-    headers,
-  );
+  const tags = await fetchWithTimeout(`https://api.github.com/repos/${GITHUB_REPO}/tags?per_page=1`, headers);
   if (tags === 'rate-limited') return null;
   if (Array.isArray(tags) && tags.length > 0 && typeof tags[0]?.name === 'string') {
     const tag = tags[0];
@@ -261,8 +336,11 @@ async function fetchWithTimeout(url, headers) {
     }
     if (!res.ok) return null;
     return await res.json();
-  } catch { return null; }
-  finally { clearTimeout(timeout); }
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ── Version Comparison (semver) ────────────────────────────
@@ -305,23 +383,40 @@ export function getCurrentVersion() {
   try {
     const pkg = JSON.parse(readFileSync(join(INSTALL_DIR, 'package.json'), 'utf8'));
     if (pkg.version) return pkg.version;
-  } catch { /* no code install here → try the running plugin cache */ }
+  } catch {
+    /* no code install here → try the running plugin cache */
+  }
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
   if (pluginRoot) {
     try {
       const pkg = JSON.parse(readFileSync(join(pluginRoot, 'package.json'), 'utf8'));
       if (pkg.version) return pkg.version;
-    } catch { /* fall through to the last resort */ }
+    } catch {
+      /* fall through to the last resort */
+    }
+  }
+  // D#187: no env var in a plain terminal, so ask the filesystem which plugin
+  // version this machine actually runs. Without this a plugin-only user's
+  // `claude-mem-lite update` reads 0.0.0 and every release compares as newer.
+  const active = installShape()?.activePluginVersion;
+  if (active) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(active.root, 'package.json'), 'utf8'));
+      if (pkg.version) return pkg.version;
+    } catch {
+      /* the cache dir name IS the version — use it rather than 0.0.0 */
+    }
+    if (active.version) return active.version;
   }
   return '0.0.0';
 }
 
 // SWITCHABLE_PATHS = everything in SOURCE_FILES plus the recursive dirs that
-// install.mjs copies as whole subtrees (scripts, registry, node_modules). It's
+// install.mjs copies as whole subtrees (scripts, node_modules). It's
 // built per-call from the *tarball's* manifest, not the locally-imported one —
 // see loadReleaseManifest comment for why.
 function buildSwitchablePaths(sourceFiles) {
-  return [...sourceFiles, 'scripts', 'registry', 'node_modules'];
+  return [...sourceFiles, 'scripts', 'node_modules'];
 }
 
 // Load the SOURCE_FILES / HOOK_SCRIPT_FILES manifest from the *extracted
@@ -336,7 +431,11 @@ function buildSwitchablePaths(sourceFiles) {
 async function loadReleaseManifest(sourceDir) {
   const manifestPath = join(sourceDir, 'source-files.mjs');
   if (!existsSync(manifestPath)) {
-    return { SOURCE_FILES: LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES, source: 'fallback-missing' };
+    return {
+      SOURCE_FILES: LOCAL_SOURCE_FILES,
+      HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES,
+      source: 'fallback-missing',
+    };
   }
   try {
     const mod = await import(pathToFileURL(manifestPath).href + `?t=${Date.now()}`);
@@ -349,7 +448,11 @@ async function loadReleaseManifest(sourceDir) {
     return { SOURCE_FILES: mod.SOURCE_FILES, HOOK_SCRIPT_FILES: mod.HOOK_SCRIPT_FILES, source: 'tarball' };
   } catch (e) {
     debugCatch(e, 'loadReleaseManifest');
-    return { SOURCE_FILES: LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES, source: 'fallback-error' };
+    return {
+      SOURCE_FILES: LOCAL_SOURCE_FILES,
+      HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES,
+      source: 'fallback-error',
+    };
   }
 }
 
@@ -369,7 +472,6 @@ export function createUpdateTmpDir() {
 async function downloadAndInstall(tarballUrl, expectedVersion, assets = []) {
   const tmpDir = createUpdateTmpDir();
   try {
-
     // Download tarball via curl (available on all supported platforms)
     // Validate URL to prevent command injection via crafted tarball URLs
     if (!/^https:\/\/(?:api\.)?github\.com\/[a-zA-Z0-9./_-]+$/.test(tarballUrl)) {
@@ -377,10 +479,19 @@ async function downloadAndInstall(tarballUrl, expectedVersion, assets = []) {
       return false;
     }
     const tarballPath = join(tmpDir, 'release.tar.gz');
-    execFileSync('curl', ['-sL', '-H', 'Accept: application/vnd.github+json', tarballUrl, '-o', tarballPath],
-      { timeout: 30000, stdio: 'pipe' });
-    execFileSync('tar', ['xzf', tarballPath, '-C', tmpDir, '--strip-components=1'],
-      { timeout: 30000, stdio: 'pipe' });
+    execFileSync(
+      'curl',
+      // R10 P3-18: `-f` makes curl exit non-zero on an HTTP error instead of writing the
+      // error BODY to the output file. Without it a 404 or a rate-limit page was saved as
+      // release.tar.gz, tar failed on it, and the debug log reported "tarball corrupt" for
+      // what was really a network or auth problem — the wrong thing to go debug.
+      ['-fsL', '-H', 'Accept: application/vnd.github+json', tarballUrl, '-o', tarballPath],
+      { timeout: 30000, stdio: 'pipe' },
+    );
+    execFileSync('tar', ['xzf', tarballPath, '-C', tmpDir, '--strip-components=1'], {
+      timeout: 30000,
+      stdio: 'pipe',
+    });
 
     const validation = validateExtractedTarball(tmpDir, expectedVersion);
     if (!validation.ok) {
@@ -395,7 +506,11 @@ async function downloadAndInstall(tarballUrl, expectedVersion, assets = []) {
     // so this never bricks auto-update for unsigned or pre-key releases.
     const authentic = await verifyReleaseAuthenticity(tmpDir, assets);
     if (!authentic.ok) {
-      debugLog('WARN', 'hook-update', `Release authenticity check failed (${authentic.action}) — aborting update`);
+      debugLog(
+        'WARN',
+        'hook-update',
+        `Release authenticity check failed (${authentic.action}) — aborting update`,
+      );
       return false;
     }
 
@@ -404,7 +519,9 @@ async function downloadAndInstall(tarballUrl, expectedVersion, assets = []) {
     debugCatch(err, 'downloadAndInstall');
     return false;
   } finally {
-    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {}
   }
 }
 
@@ -481,19 +598,29 @@ const SIGNATURE_ASSET_NAME = 'release-manifest.json.sig';
 // Pure verifier (no I/O) — exported for unit testing. ok=true ONLY when the
 // Ed25519 signature over `manifestBytes` is valid for `publicKeyPem` AND every
 // file the manifest lists matches its sha256 under `extractedDir`.
-export function verifyDownloadedRelease(extractedDir, manifestBytes, signatureB64, publicKeyPem = RELEASE_PUBLIC_KEY) {
+export function verifyDownloadedRelease(
+  extractedDir,
+  manifestBytes,
+  signatureB64,
+  publicKeyPem = RELEASE_PUBLIC_KEY,
+) {
   if (!verifyManifestSignature(manifestBytes, signatureB64, publicKeyPem)) {
     return { ok: false, reason: 'signature-invalid' };
   }
   let manifest;
   try {
-    manifest = JSON.parse(Buffer.isBuffer(manifestBytes) ? manifestBytes.toString('utf8') : String(manifestBytes));
+    manifest = JSON.parse(
+      Buffer.isBuffer(manifestBytes) ? manifestBytes.toString('utf8') : String(manifestBytes),
+    );
   } catch {
     return { ok: false, reason: 'manifest-unparseable' };
   }
   const files = verifyReleaseFiles(extractedDir, manifest);
   if (!files.ok) {
-    return { ok: false, reason: `file-mismatch: ${[...files.mismatches, ...files.missing].slice(0, 5).join(', ')}` };
+    return {
+      ok: false,
+      reason: `file-mismatch: ${[...files.mismatches, ...files.missing].slice(0, 5).join(', ')}`,
+    };
   }
   return { ok: true, reason: 'verified' };
 }
@@ -542,17 +669,21 @@ export async function verifyReleaseAuthenticity(extractedDir, assets, publicKey 
     // where silence is exactly wrong. An operator who set the var sees it; an
     // attacker who set it in someone's environment loses the quiet.
     process.stderr.write(
-      '[claude-mem-lite] WARNING: CLAUDE_MEM_SKIP_SIG_VERIFY is set — installing this release WITHOUT signature verification.\n'
+      '[claude-mem-lite] WARNING: CLAUDE_MEM_SKIP_SIG_VERIFY is set — installing this release WITHOUT signature verification.\n',
     );
     return { ok: true, action: 'skipped-env' };
   }
   if (!publicKey) return { ok: true, action: 'skipped-no-pubkey' };
 
   const list = Array.isArray(assets) ? assets : [];
-  const manifestAsset = list.find(a => a && a.name === MANIFEST_ASSET_NAME);
-  const sigAsset = list.find(a => a && a.name === SIGNATURE_ASSET_NAME);
+  const manifestAsset = list.find((a) => a && a.name === MANIFEST_ASSET_NAME);
+  const sigAsset = list.find((a) => a && a.name === SIGNATURE_ASSET_NAME);
   if (!manifestAsset || !sigAsset) {
-    debugLog('WARN', 'hook-update', 'Signed-release mode: release carries no signature assets — refusing to install (possible downgrade/strip)');
+    debugLog(
+      'WARN',
+      'hook-update',
+      'Signed-release mode: release carries no signature assets — refusing to install (possible downgrade/strip)',
+    );
     return { ok: false, action: 'missing-signature' };
   }
 
@@ -562,7 +693,11 @@ export async function verifyReleaseAuthenticity(extractedDir, assets, publicKey 
     signatureB64 = (await fetchAssetBuffer(sigAsset.browser_download_url)).toString('utf8').trim();
   } catch (e) {
     // Can't fetch the signature → can't verify → don't install this cycle (retries next poll).
-    debugLog('WARN', 'hook-update', `Signed-release mode: signature asset fetch failed (${e.message}) — refusing to install this cycle`);
+    debugLog(
+      'WARN',
+      'hook-update',
+      `Signed-release mode: signature asset fetch failed (${e.message}) — refusing to install this cycle`,
+    );
     return { ok: false, action: 'signature-fetch-failed' };
   }
 
@@ -590,7 +725,7 @@ export async function verifyReleaseAuthenticity(extractedDir, assets, publicKey 
 // hooks are best-effort, so losing one fire beats importing a mixed module graph.
 // Carries pid + ts because the launcher must never be muted permanently by an
 // updater that was killed mid-swap (it applies the same staleness bound).
-const SWAP_MARKER = join(STATE_DIR, 'runtime', 'swap-in-progress');
+const SWAP_MARKER = join(STATE_DIR, 'runtime', 'swap-in-progress'); // runtime-dir:stays-put — installation identity
 // Intent journal, written INSIDE the backup dir before each rename. On a hard kill
 // the backup dir survives (every normal exit deletes it) and this file says exactly
 // which paths were in flight, so the next entry can finish the rollback at the right
@@ -602,11 +737,17 @@ function markSwapStart() {
   try {
     mkdirSync(dirname(SWAP_MARKER), { recursive: true });
     writeFileSync(SWAP_MARKER, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-  } catch (e) { debugCatch(e, 'markSwapStart'); }
+  } catch (e) {
+    debugCatch(e, 'markSwapStart');
+  }
 }
 
 function clearSwapMarker() {
-  try { rmSync(SWAP_MARKER, { force: true }); } catch (e) { debugCatch(e, 'clearSwapMarker'); }
+  try {
+    rmSync(SWAP_MARKER, { force: true });
+  } catch (e) {
+    debugCatch(e, 'clearSwapMarker');
+  }
 }
 
 // Write-ahead: journal the INTENT before the rename, never after. Journalling after
@@ -617,7 +758,9 @@ function clearSwapMarker() {
 function journalSwap(backupDir, backedUp, installed) {
   try {
     writeFileSync(join(backupDir, SWAP_JOURNAL), JSON.stringify({ backedUp, installed }));
-  } catch (e) { debugCatch(e, 'journalSwap'); }
+  } catch (e) {
+    debugCatch(e, 'journalSwap');
+  }
 }
 
 /**
@@ -628,7 +771,11 @@ function journalSwap(backupDir, backedUp, installed) {
  */
 export function recoverInterruptedSwaps(targetDir = INSTALL_DIR) {
   let entries;
-  try { entries = readdirSync(targetDir, { withFileTypes: true }); } catch { return 0; }
+  try {
+    entries = readdirSync(targetDir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
 
   let recovered = 0;
   for (const entry of entries) {
@@ -638,27 +785,47 @@ export function recoverInterruptedSwaps(targetDir = INSTALL_DIR) {
     // Staging holds only copies — nothing was switched out of it, so it is residue,
     // not a torn swap.
     if (entry.name.startsWith('.update-staging-')) {
-      try { rmSync(dir, { recursive: true, force: true }); } catch (e) { debugCatch(e, 'recover-staging'); }
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch (e) {
+        debugCatch(e, 'recover-staging');
+      }
       continue;
     }
     if (!entry.name.startsWith('.update-backup-')) continue;
 
     let journal;
-    try { journal = JSON.parse(readFileSync(join(dir, SWAP_JOURNAL), 'utf8')); } catch { journal = null; }
+    try {
+      journal = JSON.parse(readFileSync(join(dir, SWAP_JOURNAL), 'utf8'));
+    } catch {
+      journal = null;
+    }
     const backedUp = Array.isArray(journal?.backedUp) ? journal.backedUp : [];
     const installed = Array.isArray(journal?.installed) ? journal.installed : [];
     // Copies: rollbackInstall reverses the arrays in place.
     rollbackInstall([...installed], [...backedUp], dir, targetDir);
-    try { rmSync(dir, { recursive: true, force: true }); } catch (e) { debugCatch(e, 'recover-backup'); }
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch (e) {
+      debugCatch(e, 'recover-backup');
+    }
     recovered++;
-    debugLog('WARN', 'hook-update', `Recovered an interrupted update swap: restored ${backedUp.length} path(s) from ${entry.name}`);
+    debugLog(
+      'WARN',
+      'hook-update',
+      `Recovered an interrupted update swap: restored ${backedUp.length} path(s) from ${entry.name}`,
+    );
   }
   return recovered;
 }
 
 function rollbackInstall(installed, backedUp, backupDir, targetDir) {
   for (const relPath of installed.reverse()) {
-    try { rmSync(join(targetDir, relPath), { recursive: true, force: true }); } catch { /* best-effort */ }
+    try {
+      rmSync(join(targetDir, relPath), { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
   }
   for (const relPath of backedUp.reverse()) {
     const backupPath = join(backupDir, relPath);
@@ -686,10 +853,14 @@ function rollbackInstall(installed, backedUp, backupDir, targetDir) {
 function smokeInstalledRelease(targetDir) {
   const q = (s) => JSON.stringify(s);
   try {
-    execSync(`${q(process.execPath)} ${q(join(targetDir, 'cli.mjs'))} help`, { timeout: 20000, stdio: 'ignore' });
+    execSync(`${q(process.execPath)} ${q(join(targetDir, 'cli.mjs'))} help`, {
+      timeout: 20000,
+      stdio: 'ignore',
+    });
     for (const entry of ['hook.mjs', 'server.mjs']) {
       const p = join(targetDir, entry);
-      if (existsSync(p)) execSync(`${q(process.execPath)} --check ${q(p)}`, { timeout: 10000, stdio: 'ignore' });
+      if (existsSync(p))
+        execSync(`${q(process.execPath)} --check ${q(p)}`, { timeout: 10000, stdio: 'ignore' });
     }
     // `cli.mjs help` exits without opening the DB, so it cannot see a
     // present-but-unusable better-sqlite3 binding: npm >= 12 blocks
@@ -704,17 +875,42 @@ function smokeInstalledRelease(targetDir) {
     // out of the try, smoke fails, and the caller rolls back to the old
     // (working) install.
     if (existsSync(join(targetDir, 'node_modules', 'better-sqlite3'))) {
-      const probeSrc = 'const{createRequire}=require("node:module");const D=createRequire(process.argv[1])("better-sqlite3");new D(":memory:").close();';
+      const probeSrc =
+        'const{createRequire}=require("node:module");const D=createRequire(process.argv[1])("better-sqlite3");new D(":memory:").close();';
       const probeCmd = `${q(process.execPath)} -e ${q(probeSrc)} ${q(join(targetDir, 'package.json'))}`;
       try {
         execSync(probeCmd, { timeout: 20000, stdio: 'ignore' });
       } catch {
         try {
-          execSync('npm rebuild better-sqlite3 --dangerously-allow-all-scripts', { cwd: targetDir, timeout: 120000, stdio: 'ignore' });
+          execSync('npm rebuild better-sqlite3 --dangerously-allow-all-scripts', {
+            cwd: targetDir,
+            timeout: 120000,
+            stdio: 'ignore',
+          });
         } catch {
           execSync('npm rebuild better-sqlite3', { cwd: targetDir, timeout: 120000, stdio: 'ignore' });
         }
-        execSync(probeCmd, { timeout: 20000, stdio: 'ignore' });
+        try {
+          execSync(probeCmd, { timeout: 20000, stdio: 'ignore' });
+        } catch {
+          // Both npm rebuilds healed nothing — which is what better-sqlite3 13 does on a
+          // platform it ships no prebuild for, because there is no install script for them to
+          // run. Without this step the re-probe threw, smoke failed, and the caller rolled the
+          // whole update back, so auto-update could never land again on those platforms
+          // (A20260906-R8b-P2-1, found by independent review of v4.0.0).
+          //
+          // The source build is `node-gyp clean && node-gyp rebuild`, i.e. it deletes build/
+          // first — which is why the SessionStart probe path must NOT run it. Here it is safe
+          // for two independent reasons: the binding is ALREADY unusable (the probe above just
+          // threw), so clean destroys nothing; and this whole function is a smoke gate whose
+          // failure rolls back to the previous, working install.
+          execSync(NATIVE_BINDING_SOURCE_BUILD_CMD, {
+            cwd: targetDir,
+            timeout: 300000,
+            stdio: 'ignore',
+          });
+          execSync(probeCmd, { timeout: 20000, stdio: 'ignore' });
+        }
       }
     }
     return true;
@@ -730,9 +926,13 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
   // holding the lock means an install is already in flight — skip rather than
   // race. Shared path with install.mjs so direct install + repair + auto-update
   // are mutually exclusive.
-  const release = acquireLock(join(STATE_DIR, 'runtime', 'install.lock'));
+  const release = acquireLock(join(STATE_DIR, 'runtime', 'install.lock')); // runtime-dir:stays-put — install lock serialises real installers
   if (!release) {
-    debugLog('DEBUG', 'hook-update', 'installExtractedRelease: another install/update is in progress — skipping');
+    debugLog(
+      'DEBUG',
+      'hook-update',
+      'installExtractedRelease: another install/update is in progress — skipping',
+    );
     return false;
   }
   const ts = `${Date.now()}-${process.pid}`;
@@ -801,6 +1001,41 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
     rmSync(stagingDir, { recursive: true, force: true });
     rmSync(backupDir, { recursive: true, force: true });
 
+    // Post-update migration: reconcile settings.json against the release we just
+    // swapped in. `configureHooks()` already strips stale mem entries — but its only
+    // caller is `install()`, and this path never runs it, while `buildSwitchablePaths`
+    // replaces `scripts/` wholesale. So an upgrade that REMOVES a hook script deletes
+    // the file and leaves settings.json pointing at it; the launcher then reports a
+    // broken install on every fire, for a file that is not coming back (R9 review P1-1,
+    // first hit by the `PreToolUse:Skill` removal). Plugin-channel installs are
+    // unaffected — hooks/hooks.json is replaced wholesale — so this is npm-channel only.
+    //
+    // The reconciler lives in lib/hook-prune.mjs, not install.mjs: install.mjs already
+    // imports THIS file, so importing it back would close a cycle the repo's import-graph
+    // guard rejects. Failure is non-fatal — a stale entry is noisy, not broken, and must
+    // never roll back an otherwise-good update.
+    try {
+      const settingsPath = join(homedir(), '.claude', 'settings.json');
+      if (existsSync(settingsPath)) {
+        const { pruneDanglingMemHooks } = await import('./lib/hook-prune.mjs');
+        const before = JSON.parse(readFileSync(settingsPath, 'utf8'));
+        const { settings, removed } = pruneDanglingMemHooks(before, targetDir);
+        if (removed.length > 0) {
+          // Through the shared writer: settings.json is user-owned config and may be a
+          // symlink into a dotfiles repo, which a bare temp+rename would sever (P0-5).
+          const { atomicWriteFileSync } = await import('./lib/atomic-write.mjs');
+          atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', { backup: true });
+          debugLog(
+            'INFO',
+            'update',
+            `pruned ${removed.length} dangling hook entr(ies): ${removed.join(', ')}`,
+          );
+        }
+      }
+    } catch (e) {
+      debugCatch(e, 'pruneDanglingMemHooks');
+    }
+
     // Post-update migration: clean stale global MCPs if plugin handles it.
     // Both "mem" (legacy, pre-v2.78) and "mem-lite" (current) are purged so a
     // user who manually ran `claude mcp add` in either era doesn't end up with
@@ -819,27 +1054,46 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
         }
         // Atomic + one-time backup: ~/.claude.json is the user's ENTIRE Claude
         // Code config; a torn write here breaks them outside our control.
-        if (changed) atomicWriteFileSync(claudeJsonPath, JSON.stringify(cfg, null, 2) + '\n', { backup: true });
+        if (changed)
+          atomicWriteFileSync(claudeJsonPath, JSON.stringify(cfg, null, 2) + '\n', { backup: true });
       }
-    } catch (e) { debugCatch(e, 'post-update-mcp-dedup'); }
+    } catch (e) {
+      debugCatch(e, 'post-update-mcp-dedup');
+    }
 
     // Post-update: prune old plugin cache versions (keep latest 3)
-    try { prunePluginCache(); } catch (e) { debugCatch(e, 'prunePluginCache'); }
+    try {
+      prunePluginCache();
+    } catch (e) {
+      debugCatch(e, 'prunePluginCache');
+    }
 
     // Post-update: clear cache hooks.json in every remaining version. Claude Code
     // runtime reads plugin hooks from cache, not marketplace source — leaving populated
     // cache hooks.json alongside install.mjs-written settings.json causes double firing.
     // Inline impl (no import of plugin-cache-guard.mjs — this module must run even when
     // the guard module is absent on disk, e.g. auto-upgrading from pre-2.31.2).
-    try { clearCacheHookResidue(); } catch (e) { debugCatch(e, 'clearCacheHookResidue'); }
+    try {
+      clearCacheHookResidue();
+    } catch (e) {
+      debugCatch(e, 'clearCacheHookResidue');
+    }
 
     debugLog('DEBUG', 'hook-update', `Auto-update: switched ${installed.length} paths`);
     return true;
   } catch (err) {
     debugCatch(err, 'installExtractedRelease');
     rollbackInstall(installed, backedUp, backupDir, targetDir);
-    try { rmSync(stagingDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    try { rmSync(backupDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try {
+      rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+    try {
+      rmSync(backupDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
     return false;
   } finally {
     release();
@@ -882,15 +1136,18 @@ export async function syncDataDirFromCache(opts = {}) {
 
     let sourceDir = opts.sourceDir || null;
     if (!sourceDir) {
-      const cacheBase = opts.cacheBase
-        || join(homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      const cacheBase =
+        opts.cacheBase || join(homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
       if (!existsSync(cacheBase)) return { synced: false, reason: 'no-cache' };
       const versions = readdirSync(cacheBase)
-        .filter(n => /^\d+\.\d+/.test(n))
-        .sort((a, b) => compareVersions(b, a));   // newest first
+        .filter((n) => /^\d+\.\d+/.test(n))
+        .sort((a, b) => compareVersions(b, a)); // newest first
       for (const v of versions) {
         const dir = join(cacheBase, v);
-        if (validateExtractedTarball(dir, null).ok) { sourceDir = dir; break; }
+        if (validateExtractedTarball(dir, null).ok) {
+          sourceDir = dir;
+          break;
+        }
       }
       if (!sourceDir) return { synced: false, reason: 'no-valid-cache-version' };
     }
@@ -909,8 +1166,10 @@ export async function syncDataDirFromCache(opts = {}) {
     // mis-detect it as a complete install. Require proof of a real prior code
     // install: package.json AND a resolvable better-sqlite3 binding (both present
     // on a drifted direct install; absent for a pure-plugin data dir).
-    if (!existsSync(join(targetDir, 'package.json'))
-        || !existsSync(join(targetDir, 'node_modules', 'better-sqlite3'))) {
+    if (
+      !existsSync(join(targetDir, 'package.json')) ||
+      !existsSync(join(targetDir, 'node_modules', 'better-sqlite3'))
+    ) {
       return { synced: false, reason: 'no-existing-code-install' };
     }
 
@@ -920,20 +1179,27 @@ export async function syncDataDirFromCache(opts = {}) {
     let sourceVersion;
     try {
       sourceVersion = JSON.parse(readFileSync(join(sourceDir, 'package.json'), 'utf8')).version;
-    } catch { return { synced: false, reason: 'source-version-unreadable' }; }
+    } catch {
+      return { synced: false, reason: 'source-version-unreadable' };
+    }
 
     let dataVersion = '0.0.0';
     try {
       dataVersion = JSON.parse(readFileSync(join(targetDir, 'package.json'), 'utf8')).version || '0.0.0';
-    } catch { /* missing/corrupt target package.json → treat as 0.0.0, sync */ }
+    } catch {
+      /* missing/corrupt target package.json → treat as 0.0.0, sync */
+    }
 
     // Only ever upgrade. Equal → no-op (cheap version compare runs every session).
     if (compareVersions(sourceVersion, dataVersion) <= 0) {
       return { synced: false, reason: 'data-dir-current', sourceVersion, dataVersion };
     }
 
-    debugLog('DEBUG', 'hook-update',
-      `Syncing data-dir code ${dataVersion} → ${sourceVersion} from plugin cache (${sourceDir})`);
+    debugLog(
+      'DEBUG',
+      'hook-update',
+      `Syncing data-dir code ${dataVersion} → ${sourceVersion} from plugin cache (${sourceDir})`,
+    );
     const ok = await installExtractedRelease(sourceDir, targetDir, { skipNpmInstall: true });
     return ok
       ? { synced: true, from: dataVersion, to: sourceVersion }
@@ -944,7 +1210,11 @@ export async function syncDataDirFromCache(opts = {}) {
   }
 }
 
-function copyReleaseIntoStaging(sourceDir, stagingDir, manifest = { SOURCE_FILES: LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES }) {
+function copyReleaseIntoStaging(
+  sourceDir,
+  stagingDir,
+  manifest = { SOURCE_FILES: LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES },
+) {
   let copied = 0;
 
   for (const f of manifest.SOURCE_FILES) {
@@ -959,7 +1229,7 @@ function copyReleaseIntoStaging(sourceDir, stagingDir, manifest = { SOURCE_FILES
   // scripts/ is curated to HOOK_SCRIPT_FILES — settings.json hook commands
   // resolve only to these 5 files, and plugin mode does not consume this
   // directory at all. Pre-v2.55 used cpSync({recursive:true}) which silently
-  // shipped dev-only files (mock-claude.mjs, extract-repos.mjs, p0-forward-probe.mjs…)
+  // shipped dev-only files (mock-claude.mjs, extract-repos.mjs…)
   // from the GitHub Releases tarball into every user's data dir.
   const stagingScripts = join(stagingDir, 'scripts');
   const sourceScripts = join(sourceDir, 'scripts');
@@ -971,19 +1241,14 @@ function copyReleaseIntoStaging(sourceDir, stagingDir, manifest = { SOURCE_FILES
     }
   }
 
-  // registry/ stays recursive — preinstalled.json is the only current entry
-  // but the directory is consumed wholesale by the registry indexer and may
-  // grow subtrees. Pre-v2.55 readdirSync+copyFileSync would EISDIR-throw on
-  // any subdir and silently roll back the entire update.
-  const sourceRegistry = join(sourceDir, 'registry');
-  if (existsSync(sourceRegistry)) {
-    cpSync(sourceRegistry, join(stagingDir, 'registry'), { recursive: true });
-  }
-
   const stagedScripts = join(stagingDir, 'scripts');
   if (existsSync(stagedScripts)) {
-    for (const sf of readdirSync(stagedScripts).filter(n => n.endsWith('.sh'))) {
-      try { chmodSync(join(stagedScripts, sf), 0o755); } catch (e) { debugCatch(e, 'chmod-script'); }
+    for (const sf of readdirSync(stagedScripts).filter((n) => n.endsWith('.sh'))) {
+      try {
+        chmodSync(join(stagedScripts, sf), 0o755);
+      } catch (e) {
+        debugCatch(e, 'chmod-script');
+      }
     }
   }
 
@@ -993,7 +1258,11 @@ function copyReleaseIntoStaging(sourceDir, stagingDir, manifest = { SOURCE_FILES
   // install.mjs:408 and the next CLI invocation dies with "Permission denied".
   const stagedCli = join(stagingDir, 'cli.mjs');
   if (existsSync(stagedCli)) {
-    try { chmodSync(stagedCli, 0o755); } catch (e) { debugCatch(e, 'chmod-cli'); }
+    try {
+      chmodSync(stagedCli, 0o755);
+    } catch (e) {
+      debugCatch(e, 'chmod-cli');
+    }
   }
 
   debugLog('DEBUG', 'hook-update', `Auto-update staged ${copied} source files`);
@@ -1002,7 +1271,54 @@ function copyReleaseIntoStaging(sourceDir, stagingDir, manifest = { SOURCE_FILES
 // ── Cache hook residue clearing ────────────────────────────
 // Inline (does not import plugin-cache-guard.mjs) so hook-update.mjs keeps working
 // even if plugin-cache-guard.mjs is missing on disk in degraded installs.
+
+// Mirror of plugin-cache-guard.hasInstallManagedHooks, inlined for the reason above.
+// Kept string-identical in its match rule (`.claude-mem-lite/` or `/claude-mem-lite/`
+// appearing in a serialized hooks block) so the two cannot disagree about whether
+// settings.json owns the hooks.
+function hasInstallManagedSettingsHooks() {
+  const settingsPath = join(homedir(), '.claude', 'settings.json');
+  if (!existsSync(settingsPath)) return false;
+  let s;
+  try {
+    s = JSON.parse(readFileSync(settingsPath, 'utf8'));
+  } catch {
+    return false;
+  }
+  const serialized = JSON.stringify(s.hooks || {});
+  if (!(serialized.includes('.claude-mem-lite/') || serialized.includes('/claude-mem-lite/'))) return false;
+  // Liveness, mirroring plugin-cache-guard.hasLiveInstallManagedHooks (see its docblock).
+  // The string test alone says settings.json MENTIONS a path of ours, not that the path
+  // still exists — and a stale entry left by a removed global install fires nothing while
+  // making this function authorise emptying the plugin manifest that does. Narrow by
+  // construction: only a command we parsed a path out of, ALL of whose paths are gone,
+  // flips the answer; an unfamiliar shape yields no path and keeps the old result.
+  let checked = 0;
+  for (const matchers of Object.values(s?.hooks || {})) {
+    if (!Array.isArray(matchers)) continue;
+    for (const m of matchers) {
+      for (const h of Array.isArray(m?.hooks) ? m.hooks : []) {
+        const c = typeof h?.command === 'string' ? h.command : '';
+        if (!(c.includes('.claude-mem-lite/') || c.includes('/claude-mem-lite/'))) continue;
+        let paths = [...c.matchAll(/"([^"]+)"/g)].map((x) => x[1]).filter((p) => p.startsWith('/'));
+        if (paths.length === 0) paths = c.split(/\s+/).filter((t) => t.startsWith('/'));
+        for (const p of paths) {
+          checked++;
+          if (existsSync(p)) return true;
+        }
+      }
+    }
+  }
+  return checked === 0;
+}
 export function clearCacheHookResidue() {
+  // Same precondition plugin-cache-guard.mjs documents and hook.mjs's self-heal
+  // honours: this is a DEDUP against install.mjs-managed settings.json entries.
+  // With no such entries the cache manifest is the ONLY hook registration, and
+  // "clearing residue" unregisters all seven events — invisibly, because
+  // status/doctor then see the shape of a healthy plugin-only install. Inlined
+  // here for the same reason the rest of this function is (see header).
+  if (!hasInstallManagedSettingsHooks()) return 0;
   const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
   if (!existsSync(cacheBase)) return 0;
   let cleared = 0;
@@ -1012,13 +1328,22 @@ export function clearCacheHookResidue() {
     try {
       const h = JSON.parse(readFileSync(p, 'utf8'));
       if (!h.hooks || Object.keys(h.hooks).length === 0) continue;
-      writeFileSync(p, JSON.stringify({
-        description: h.description || 'claude-mem-lite hooks',
-        _note: `Auto-cleared by hook-update.mjs post-install — prevents double hook registration (cache ver: ${ver})`,
-        hooks: {},
-      }, null, 2) + '\n');
+      writeFileSync(
+        p,
+        JSON.stringify(
+          {
+            description: h.description || 'claude-mem-lite hooks',
+            _note: `Auto-cleared by hook-update.mjs post-install — prevents double hook registration (cache ver: ${ver})`,
+            hooks: {},
+          },
+          null,
+          2,
+        ) + '\n',
+      );
       cleared++;
-    } catch { /* ignore single bad entry */ }
+    } catch {
+      /* ignore single bad entry */
+    }
   }
   if (cleared > 0) {
     debugLog('DEBUG', 'hook-update', `Cache hooks residue cleared in ${cleared} version(s)`);
@@ -1029,26 +1354,65 @@ export function clearCacheHookResidue() {
 // ── Plugin Cache Pruning ──────────────────────────────────
 const PLUGIN_CACHE_KEEP = 3;
 
+/**
+ * Same-directory test that survives trailing slashes, `..` segments and symlinks.
+ * realpathSync throws on a path that no longer exists → fall back to lexical resolve.
+ */
+function isSameDir(a, b) {
+  if (!a || !b) return false;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return resolve(a) === resolve(b);
+  }
+}
+
 export function prunePluginCache() {
   const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
   if (!existsSync(cacheBase)) return 0;
 
   const entries = readdirSync(cacheBase)
-    .filter(name => /^\d+\.\d+/.test(name))  // version-like dirs only
-    .sort((a, b) => compareVersions(b, a));   // newest first
+    .filter((name) => /^\d+\.\d+/.test(name)) // version-like dirs only
+    .sort((a, b) => compareVersions(b, a)); // newest first
 
   if (entries.length <= PLUGIN_CACHE_KEEP) return 0;
 
+  // A20260905-R5-Q1: "not in the newest 3" is not the same question as "not in use".
+  // CLAUDE_PLUGIN_ROOT is the version dir THIS process was launched from, and after a
+  // marketplace rollback (a bad release withdrawn while >=3 newer dirs are already cached)
+  // it is not among the newest 3 — so keep-latest-3 rm -rf'd the tree the running hooks and
+  // MCP server import from. scripts/setup.sh step 8 carries the same guard for the same
+  // reason; the two prune the same directory and must agree.
+  //
+  // R10 P2-9: CLAUDE_PLUGIN_ROOT alone is not enough, because prune also runs from a
+  // TERMINAL — `self-update` — where Claude Code never sets it. There the guard was
+  // vacuous and keep-latest-3 deleted the recorded live version outright. detectInstallShape
+  // now consults installed_plugins.json as well, so ask it rather than the env var, and
+  // keep the env var as the first-hand answer inside a hook.
+  const runningRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  let recordedRoot = null;
+  try {
+    recordedRoot = detectInstallShape({ home: homedir() }).activePluginVersion?.root || null;
+  } catch {
+    /* best-effort — a failure here must not stop pruning entirely */
+  }
   const toRemove = entries.slice(PLUGIN_CACHE_KEEP);
   let removed = 0;
   for (const ver of toRemove) {
+    const dir = join(cacheBase, ver);
+    if (isSameDir(dir, runningRoot)) continue;
+    if (isSameDir(dir, recordedRoot)) continue;
     try {
-      rmSync(join(cacheBase, ver), { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
       removed++;
     } catch {}
   }
   if (removed > 0) {
-    debugLog('DEBUG', 'hook-update', `Plugin cache pruned: removed ${removed} old version(s), kept latest ${PLUGIN_CACHE_KEEP}`);
+    debugLog(
+      'DEBUG',
+      'hook-update',
+      `Plugin cache pruned: removed ${removed} old version(s), kept latest ${PLUGIN_CACHE_KEEP}`,
+    );
   }
   return removed;
 }
@@ -1064,7 +1428,7 @@ function readState() {
 
 function saveState(state) {
   try {
-    const dir = join(STATE_DIR, 'runtime');
+    const dir = join(STATE_DIR, 'runtime'); // runtime-dir:stays-put — mkdir for update-state.json above
     mkdirSync(dir, { recursive: true });
     const tmpFile = STATE_FILE + `.tmp-${process.pid}`;
     writeFileSync(tmpFile, JSON.stringify(state, null, 2));

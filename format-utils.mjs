@@ -21,8 +21,38 @@ export function truncate(str, max = 80) {
   // code unit is a high surrogate, drop it so we cut on a code-point boundary.
   let end = max - 1;
   const last = str.charCodeAt(end - 1);
-  if (last >= 0xD800 && last <= 0xDBFF) end--;
+  if (last >= 0xd800 && last <= 0xdbff) end--;
   return str.slice(0, end) + '\u2026';
+}
+
+/**
+ * Longest query echoed back verbatim in a result label. Long enough that no query a human
+ * or an agent actually types is touched — the shapes that exceed it are pasted stack traces,
+ * file dumps and multi-paragraph questions.
+ */
+export const QUERY_LABEL_MAX = 200;
+
+/**
+ * A query as it should appear in output handed back to whoever asked.
+ *
+ * Every search surface labels its answer with the query (`Found N result(s) for "<query>"`),
+ * which is how a caller confirms what was actually searched. Unbounded, that made the size
+ * of the answer track the size of the question: a 50,000-character query produced 50,024
+ * characters of CLI output, and the MCP face — with no argv ceiling — carried the whole
+ * thing back into the model's context. For a tool whose purpose is to spend context
+ * carefully, returning several KB of the caller's own input is the budget it was invoked to
+ * protect.
+ *
+ * Bounded, not silently truncated: the real length travels with the prefix, so the label
+ * still answers the question it exists for. `truncate` handles the surrogate-pair boundary.
+ *
+ * @param {string} query
+ * @returns {string}
+ */
+export function queryLabel(query) {
+  if (typeof query !== 'string') return '';
+  if (query.length <= QUERY_LABEL_MAX) return query;
+  return `${truncate(query, QUERY_LABEL_MAX)} [query truncated; ${query.length} chars]`;
 }
 
 // Two delimiter classes are defanged here:
@@ -47,7 +77,8 @@ export function truncate(str, max = 80) {
 //      (<system-reminder foo="\u2026">). Unrelated tags (<other-tag>) are left intact.
 // Reachable by editing files that contain these tokens \u2014 e.g. developing claude-mem-lite
 // itself, where source/observations carry the delimiter names.
-const CONTEXT_DELIMITER_RE = /<\/?(?:claude-mem-context|memory-context|session-handoff|system-reminder|task-notification|(?:antml:)?function_calls|(?:antml:)?function_results|(?:antml:)?invoke|(?:antml:)?parameter)(?:\s[^>]*)?>/gi;
+const CONTEXT_DELIMITER_RE =
+  /<\/?(?:claude-mem-context|memory-context|session-handoff|system-reminder|task-notification|(?:antml:)?function_calls|(?:antml:)?function_results|(?:antml:)?invoke|(?:antml:)?parameter)(?:\s[^>]*)?>/gi;
 
 // Pass cap for the fixpoint loop below. 32 nested layers of a forged delimiter is far past
 // anything prose produces; the cap exists only to bound the ADVERSARIAL cost (an unbounded
@@ -84,10 +115,10 @@ function defangToFixpoint(s, re) {
   let text = String(s ?? '');
   for (let pass = 0; pass < DEFANG_MAX_PASSES; pass++) {
     const next = text.replace(re, (m) => m.slice(1, -1));
-    if (next === text) return text;   // fixpoint: nothing left to defang
+    if (next === text) return text; // fixpoint: nothing left to defang
     text = next;
   }
-  return text.replace(/[<>]/g, '');   // pathological nesting \u2192 fail closed
+  return text.replace(/[<>]/g, ''); // pathological nesting \u2192 fail closed
 }
 
 /**
@@ -124,27 +155,6 @@ export function neutralizeSkillDelimiters(s) {
   return defangToFixpoint(s, SKILL_BLOCK_RE);
 }
 
-// <skill-bridge> is the wrapper scripts/pre-skill-bridge.js puts around a managed
-// skill body it injects as PreToolUse additionalContext. The body comes from a
-// third-party repo (tools/adopt import) — an untrusted boundary — so a literal
-// `</skill-bridge>` inside it would close the wrapper early and spill the rest of
-// the payload (e.g. a forged <system-reminder>) as undelimited context (audit
-// 2026-08-14 M-4). Not in CONTEXT_DELIMITER_RE for the same reason <skill-loaded>
-// isn't: the bridge's OWN wrapper must stay live, so the defang is applied per
-// call site to the untrusted body only.
-const SKILL_BRIDGE_RE = /<\/?skill-bridge(?:\s[^>]*)?>/gi;
-
-/**
- * Defang a literal `<skill-bridge>` opener/closer in untrusted text that is about
- * to be wrapped in a real skill-bridge block. Same fixpoint treatment as the
- * classes above. Never apply to the wrapper itself.
- * @param {string} s Input string (any type; coerced)
- * @returns {string} Text with skill-bridge delimiters defanged
- */
-export function neutralizeSkillBridgeDelimiters(s) {
-  return defangToFixpoint(s, SKILL_BRIDGE_RE);
-}
-
 /**
  * Render the PostToolUse error-recall hint block (hook.mjs::triggerErrorRecall).
  * The single most-relevant hit (rows[0]) that carries a lesson_learned gets its
@@ -171,7 +181,7 @@ export function formatErrorRecallHints(rows) {
     }
     return head;
   });
-  const ids = rows.map(r => r.id).join(',');
+  const ids = rows.map((r) => r.id).join(',');
   return `[claude-mem-lite] Related memories found for this error:\n${lines.join('\n')}\n  \u2192 Use mem_get(ids=[${ids}]) for details.\n`;
 }
 
@@ -181,13 +191,20 @@ export function formatErrorRecallHints(rows) {
  * @returns {string} Emoji icon for the type
  */
 export function typeIcon(type) {
-  const icons = { decision: '\uD83D\uDFE1', bugfix: '\uD83D\uDD34', feature: '\uD83D\uDFE2', refactor: '\uD83D\uDD35', discovery: '\uD83D\uDD0D', change: '\uD83D\uDCDD' };
+  const icons = {
+    decision: '\uD83D\uDFE1',
+    bugfix: '\uD83D\uDD34',
+    feature: '\uD83D\uDFE2',
+    refactor: '\uD83D\uDD35',
+    discovery: '\uD83D\uDD0D',
+    change: '\uD83D\uDCDD',
+  };
   return icons[type] || '\u26AA';
 }
 
 // ─── Date Formatting ─────────────────────────────────────────────────────────
 
-const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 /**
  * Format an ISO date string as "Mon DD HH:MM" for compact display.

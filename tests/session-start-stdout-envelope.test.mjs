@@ -18,13 +18,18 @@
 // (tests/feature-sweep-hooks.test.mjs::expectHookStdout): one envelope on one
 // line satisfies both models, mixed output only satisfies one.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
+import { disposeFixtureDir, makeFixtureTracker } from './test-helpers.mjs';
+
+// afterEach disposal succeeds; a detached worker recreates the data dir afterwards.
+const fixtures = makeFixtureTracker();
+afterAll(() => fixtures.disposeAll());
 
 const HOOK_PATH = resolve(import.meta.dirname, '../hook.mjs');
 let tmpHome, projDir, dbPath, runtimeDir, env;
@@ -37,7 +42,9 @@ function runSessionStart(sessionId, extraEnv = {}, cwd = projDir) {
   try {
     return execFileSync(process.execPath, [HOOK_PATH, 'session-start'], {
       input: JSON.stringify({ session_id: sessionId, source: 'startup', cwd: projDir }),
-      timeout: 20000, encoding: 'utf8', cwd,
+      timeout: 20000,
+      encoding: 'utf8',
+      cwd,
       env: { ...env, HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir, ...extraEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -55,8 +62,8 @@ function expectSingleEnvelope(stdout) {
     parsed = JSON.parse(trimmed);
   } catch (e) {
     throw new Error(
-      `SessionStart stdout is not one JSON document — the host falls back to plain text `
-      + `and the envelope reaches the model as raw JSON:\n${stdout.slice(0, 600)}`,
+      `SessionStart stdout is not one JSON document — the host falls back to plain text ` +
+        `and the envelope reaches the model as raw JSON:\n${stdout.slice(0, 600)}`,
       { cause: e },
     );
   }
@@ -69,30 +76,35 @@ function expectSingleEnvelope(stdout) {
 function seedObservation(text, title) {
   const db = new Database(dbPath);
   const now = Date.now();
-  db.prepare(`INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-              VALUES ('seed-cc', 'seed-mem', 'work--fresh', ?, ?, 'active')`)
-    .run(new Date(now).toISOString(), now);
-  db.prepare(`
+  db.prepare(
+    `INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+              VALUES ('seed-cc', 'seed-mem', 'work--fresh', ?, ?, 'active')`,
+  ).run(new Date(now).toISOString(), now);
+  db.prepare(
+    `
     INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts,
                               facts, files_read, files_modified, importance, created_at, created_at_epoch)
     VALUES ('seed-mem', 'work--fresh', ?, 'bugfix', ?, '', '', '', '', '[]', '[]', 3, ?, ?)
-  `).run(text, title, new Date(now).toISOString(), now);
+  `,
+  ).run(text, title, new Date(now).toISOString(), now);
   db.close();
 }
 
 /** Give the dashboard a leg of its own that no other stdout contributor can produce. */
 function seedEvent(title) {
   const db = new Database(dbPath);
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO events (project, event_type, title, body, importance, created_at_epoch)
     VALUES ('work--fresh', 'lesson', ?, '', 1, ?)
-  `).run(title, Date.now());
+  `,
+  ).run(title, Date.now());
   db.close();
 }
 
 describe('SessionStart stdout envelope', () => {
   beforeEach(() => {
-    tmpHome = mkdtempSync(join(tmpdir(), 'mem-ssenv-'));
+    tmpHome = fixtures.track(mkdtempSync(join(tmpdir(), 'mem-ssenv-')));
     projDir = join(tmpHome, 'work', 'fresh');
     mkdirSync(projDir, { recursive: true });
     const dbDir = join(tmpHome, '.claude-mem-lite');
@@ -125,12 +137,23 @@ describe('SessionStart stdout envelope', () => {
   });
 
   afterEach(() => {
-    try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+    // D#2. This one still leaks 1 dir per run and that is the designed outcome, not a
+    // gap: removal SUCCEEDS (no report from the helper), then a detached worker of the
+    // hook subprocess — whose HOME is still this now-deleted path — re-runs
+    // resolveDataDir and recreates `.claude-mem-lite/runtime` plus a fresh 274KB DB.
+    // `work/` never comes back, which is how the shape is identified. That is the class
+    // lib/tmp-fixture-sweep.mjs absorbs via its `mem-` prefix (:24) at the next run
+    // past DEFAULT_FIXTURE_AGE_MS (:51).
+    // Using the shared helper anyway so a real removal failure would now be REPORTED
+    // rather than swallowed by the `catch {}` this replaced.
+    disposeFixtureDir(tmpHome);
   });
 
   it('emits one JSON document when the memory block and the dashboard both have content', () => {
-    seedObservation('Retry budget was shared across shards so one hot shard starved the rest',
-      'Retry budget was shared across shards');
+    seedObservation(
+      'Retry budget was shared across shards so one hot shard starved the rest',
+      'Retry budget was shared across shards',
+    );
     const stdout = runSessionStart('cc-env-1');
     const parsed = expectSingleEnvelope(stdout);
     // Both surfaces must survive the merge — this is a delivery-channel change,
@@ -151,7 +174,12 @@ describe('SessionStart stdout envelope', () => {
     // One document ⇒ exactly one line that parses as JSON.
     const jsonLines = stdout.split('\n').filter((l) => {
       if (!l.trim()) return false;
-      try { JSON.parse(l); return true; } catch { return false; }
+      try {
+        JSON.parse(l);
+        return true;
+      } catch {
+        return false;
+      }
     });
     expect(jsonLines).toHaveLength(1);
     // Pin the DASHBOARD leg by content, not by "additionalContext is non-empty":
@@ -174,9 +202,14 @@ describe('SessionStart stdout envelope', () => {
     const listDir = join(tmpHome, '.claude', 'tasks', 'list-a');
     mkdirSync(listDir, { recursive: true });
     writeFileSync(join(listDir, 'meta.json'), JSON.stringify({ projectPath: projDir }));
-    writeFileSync(join(listDir, 't1.json'), JSON.stringify({
-      id: 't1', subject: 'rekey the shard router', status: 'in_progress',
-    }));
+    writeFileSync(
+      join(listDir, 't1.json'),
+      JSON.stringify({
+        id: 't1',
+        subject: 'rekey the shard router',
+        status: 'in_progress',
+      }),
+    );
 
     const repoRoot = resolve(import.meta.dirname, '..');
     const parsed = expectSingleEnvelope(runSessionStart('cc-env-cwd', {}, repoRoot));
@@ -185,9 +218,14 @@ describe('SessionStart stdout envelope', () => {
     const otherDir = join(tmpHome, '.claude', 'tasks', 'list-b');
     mkdirSync(otherDir, { recursive: true });
     writeFileSync(join(otherDir, 'meta.json'), JSON.stringify({ projectPath: repoRoot }));
-    writeFileSync(join(otherDir, 't2.json'), JSON.stringify({
-      id: 't2', subject: 'host-tree decoy task', status: 'in_progress',
-    }));
+    writeFileSync(
+      join(otherDir, 't2.json'),
+      JSON.stringify({
+        id: 't2',
+        subject: 'host-tree decoy task',
+        status: 'in_progress',
+      }),
+    );
     const second = expectSingleEnvelope(runSessionStart('cc-env-cwd2', {}, repoRoot));
     expect(second.hookSpecificOutput.additionalContext).toContain('rekey the shard router');
     expect(second.hookSpecificOutput.additionalContext).not.toContain('host-tree decoy task');
@@ -195,11 +233,14 @@ describe('SessionStart stdout envelope', () => {
 
   it('folds the update banner in too, instead of appending raw text after the envelope', () => {
     seedObservation('Shard rebalance dropped the last write', 'Shard rebalance dropped the last write');
-    writeFileSync(join(runtimeDir, 'update-state.json'), JSON.stringify({
-      lastCheck: new Date().toISOString(),
-      latestVersion: '99.0.0',
-      updateAvailable: true,
-    }));
+    writeFileSync(
+      join(runtimeDir, 'update-state.json'),
+      JSON.stringify({
+        lastCheck: new Date().toISOString(),
+        latestVersion: '99.0.0',
+        updateAvailable: true,
+      }),
+    );
     const stdout = runSessionStart('cc-env-3', { CLAUDE_MEM_SKIP_UPDATE: '' });
     const parsed = expectSingleEnvelope(stdout);
     // Pin the BANNER leg by content. Asserting only single-envelope-ness left the

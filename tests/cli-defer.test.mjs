@@ -81,8 +81,16 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  try { db.close(); } catch { /* ignore */ }
-  try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+  try {
+    db.close();
+  } catch {
+    /* ignore */
+  }
+  try {
+    rmSync(tmpHome, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
 });
 
 describe('claude-mem-lite defer CLI', () => {
@@ -120,7 +128,14 @@ describe('claude-mem-lite defer CLI', () => {
   // mem_defer_drop.id → --id. Flags-only invocations previously fell to a
   // stderr-only usage line (same shape as the save --text incident).
   it('defer add accepts --title as alias for the positional title', () => {
-    const { stdout, exitCode } = runCli(['defer', 'add', '--title', 'alias-shaped item', '--detail', 'came in MCP field shape']);
+    const { stdout, exitCode } = runCli([
+      'defer',
+      'add',
+      '--title',
+      'alias-shaped item',
+      '--detail',
+      'came in MCP field shape',
+    ]);
     expect(exitCode).toBe(0);
     expect(stdout).toMatch(/D#\d+/);
     const list = runCli(['defer', 'list']);
@@ -147,11 +162,16 @@ describe('claude-mem-lite defer CLI', () => {
 
     // Save a real bugfix observation that closes the deferred item via ordinal.
     const save = runCli([
-      'save', 'Fixed FTS leak by holding a connection-scoped statement cache',
-      '--type', 'bugfix',
-      '--lesson', 'better-sqlite3 statements are per-connection; cache by session',
-      '--importance', '2',
-      '--closes-deferred', '1',
+      'save',
+      'Fixed FTS leak by holding a connection-scoped statement cache',
+      '--type',
+      'bugfix',
+      '--lesson',
+      'better-sqlite3 statements are per-connection; cache by session',
+      '--importance',
+      '2',
+      '--closes-deferred',
+      '1',
     ]);
     expect(save.exitCode).toBe(0);
     expect(save.stdout).toMatch(/Saved #\d+/);
@@ -161,6 +181,56 @@ describe('claude-mem-lite defer CLI', () => {
     // List must now be empty — the only deferred item transitioned to 'done'.
     const list = runCli(['defer', 'list']);
     expect(list.stdout).toMatch(/No open deferred items/);
+  });
+
+  // ── D#195: mis-drop recovery, end-to-end through the real CLI ─────────────
+  // `defer drop` used on an item that was in fact FIXED used to be a one-way
+  // gate: the row became indistinguishable from a genuinely rejected one and
+  // lost the closed_by_obs_id link the ledger convention depends on.
+  it('save --closes-deferred D#N re-closes a mis-DROPPED item into done (D#195)', () => {
+    const add = runCli(['defer', 'add', 'fix the FTS leak', '--priority', '2']);
+    const dId = /D#(\d+)/.exec(add.stdout)[1];
+
+    // Drop it "by mistake" — reason worded as a completion, so the advisory
+    // hint must fire on this very call.
+    const drop = runCli(['defer', 'drop', '1', '--reason', 'already fixed in this round']);
+    expect(drop.exitCode).toBe(0);
+    expect(drop.stdout).toMatch(/closes-deferred/);
+
+    // The ordinal is gone with the row — ordinals are defined over OPEN rows
+    // only, so recovery MUST go through the explicit D#N form.
+    const byOrdinal = runCli(['save', 'x', '--type', 'bugfix', '--closes-deferred', '1']);
+    expect(byOrdinal.exitCode).not.toBe(0);
+
+    const save = runCli([
+      'save',
+      'Fixed FTS leak by holding a connection-scoped statement cache',
+      '--type',
+      'bugfix',
+      '--importance',
+      '2',
+      '--closes-deferred',
+      `D#${dId}`,
+    ]);
+    expect(save.exitCode).toBe(0);
+    expect(save.stdout).toMatch(new RegExp(`Closed: D#${dId}`));
+
+    const row = db
+      .prepare(`SELECT status, closed_by_obs_id, drop_reason FROM deferred_work WHERE id=?`)
+      .get(Number(dId));
+    expect(row.status).toBe('done');
+    expect(row.closed_by_obs_id).toBeGreaterThan(0);
+    // The mis-drop stays on the record rather than being erased.
+    expect(row.drop_reason).toBe('already fixed in this round');
+    const detail = runCli(['get', `D#${dId}`]);
+    expect(detail.stdout).toMatch(/previously_dropped: already fixed in this round/);
+  });
+
+  it('defer drop stays quiet when the reason is a genuine rejection (D#195)', () => {
+    runCli(['defer', 'add', 'some item', '--priority', '2']);
+    const drop = runCli(['defer', 'drop', '1', '--reason', 'no longer relevant']);
+    expect(drop.exitCode).toBe(0);
+    expect(drop.stdout).not.toMatch(/closes-deferred/);
   });
 
   // ── Folded from Task 5 review (M-1): duplicate path skips closure ──────────
@@ -202,13 +272,19 @@ describe('claude-mem-lite defer CLI', () => {
   it('duplicate save with --closes-deferred does NOT close the deferred item', () => {
     runCli(['defer', 'add', 'fix dedup leak', '--priority', '2']);
 
-    const content = 'Dedup-path test: this content is sufficiently long to compute a minhash signature for dedup purposes';
+    const content =
+      'Dedup-path test: this content is sufficiently long to compute a minhash signature for dedup purposes';
     const args = [
-      'save', content,
-      '--type', 'bugfix',
-      '--lesson', 'dedup short-circuit must skip deferred closure',
-      '--importance', '2',
-      '--closes-deferred', '1',
+      'save',
+      content,
+      '--type',
+      'bugfix',
+      '--lesson',
+      'dedup short-circuit must skip deferred closure',
+      '--importance',
+      '2',
+      '--closes-deferred',
+      '1',
     ];
 
     // First save: creates obs + closes the deferred item.
@@ -228,9 +304,11 @@ describe('claude-mem-lite defer CLI', () => {
     // Sanity-check via DB: closed_by_obs_id should still equal the FIRST obs id,
     // proving the duplicate path didn't touch the deferred row.
     const firstObsId = parseInt(/Saved #(\d+)/.exec(first.stdout)[1], 10);
-    const row = db.prepare(
-      `SELECT status, closed_by_obs_id FROM deferred_work WHERE project = ? ORDER BY id DESC LIMIT 1`
-    ).get('parent--testproj');
+    const row = db
+      .prepare(
+        `SELECT status, closed_by_obs_id FROM deferred_work WHERE project = ? ORDER BY id DESC LIMIT 1`,
+      )
+      .get('parent--testproj');
     expect(row.status).toBe('done');
     expect(row.closed_by_obs_id).toBe(firstObsId);
   });
@@ -346,8 +424,9 @@ describe('defer list age + stale hint (CLI)', () => {
     runCli(['defer', 'add', 'stale item', '--priority', '2']);
     // Backdate the second row 40 days via direct DB write (subprocess CLI has
     // no backdate flag by design).
-    db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE title = 'stale item'`)
-      .run(Date.now() - 40 * DAY);
+    db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE title = 'stale item'`).run(
+      Date.now() - 40 * DAY,
+    );
     const { stdout, exitCode } = runCli(['defer', 'list']);
     expect(exitCode).toBe(0);
     expect(stdout).toMatch(/fresh item \(D#\d+, 0d\)/);

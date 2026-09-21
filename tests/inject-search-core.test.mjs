@@ -11,9 +11,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import {
-  liveObsFilterSql, recencyDecaySql, injectionRelevanceSql,
-} from '../lib/inject-search-core.mjs';
+import { liveObsFilterSql, recencyDecaySql, injectionRelevanceSql } from '../lib/inject-search-core.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -41,12 +39,14 @@ describe('shared atoms — semantics', () => {
   // `no such column`). Named placeholders must reach only the caller that asks.
   it('nowParam defaults to positional ? and changes nothing unless requested', () => {
     const base = recencyDecaySql({ tsExpr: 'o.created_at_epoch' });
-    expect(base, 'default must stay byte-identical to the pre-option output')
-      .toBe(recencyDecaySql({ tsExpr: 'o.created_at_epoch', nowParam: '?' }));
+    expect(base, 'default must stay byte-identical to the pre-option output').toBe(
+      recencyDecaySql({ tsExpr: 'o.created_at_epoch', nowParam: '?' }),
+    );
     const named = recencyDecaySql({ tsExpr: 'o.created_at_epoch', nowParam: '@now' });
     expect(named).toContain('MAX(0, @now - o.created_at_epoch)');
-    expect(named, 'opting in must remove the positional placeholder, not add to it')
-      .not.toContain('MAX(0, ? -');
+    expect(named, 'opting in must remove the positional placeholder, not add to it').not.toContain(
+      'MAX(0, ? -',
+    );
     expect(named).toBe(base.replace('MAX(0, ? -', 'MAX(0, @now -'));
   });
 
@@ -54,11 +54,11 @@ describe('shared atoms — semantics', () => {
   // M-3 class (behavior signal wired on some surfaces, missing on others) reopens.
   it('injectionRelevanceSql composes decay + type-quality + importance + noise + cite', () => {
     const sql = injectionRelevanceSql('o');
-    expect(sql).toContain('MAX(0, ? - o.created_at_epoch)');   // clamped decay
-    expect(sql).toContain("CASE o.type");                       // type quality/decay cases
+    expect(sql).toContain('MAX(0, ? - o.created_at_epoch)'); // clamped decay
+    expect(sql).toContain('CASE o.type'); // type quality/decay cases
     expect(sql).toContain('0.5 + 0.5 * COALESCE(o.importance, 1)');
-    expect(sql).toContain('injection_count');                   // noise penalty
-    expect(sql).toContain('cited_count');                       // cite factor
+    expect(sql).toContain('injection_count'); // noise penalty
+    expect(sql).toContain('cited_count'); // cite factor
   });
 
   // Functional M-1 pin at the core level: a far-future created_at row must score
@@ -66,16 +66,23 @@ describe('shared atoms — semantics', () => {
   it('a future-epoch row scores finite through injectionRelevanceSql (real SQL)', () => {
     const db = new Database(':memory:');
     initSchema(db);
-    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-                VALUES ('s1', 'm1', 'p', datetime('now'), ?, 'active')`).run(Date.now());
-    db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, text, created_at, created_at_epoch)
-                VALUES ('m1', 'p', 'bugfix', 'quasar flux regression', 'quasar body', datetime('now'), ?)`)
-      .run(Date.now() + 10 * 365 * 86400000);
-    const row = db.prepare(`
+    db.prepare(
+      `INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+                VALUES ('s1', 'm1', 'p', datetime('now'), ?, 'active')`,
+    ).run(Date.now());
+    db.prepare(
+      `INSERT INTO observations (memory_session_id, project, type, title, text, created_at, created_at_epoch)
+                VALUES ('m1', 'p', 'bugfix', 'quasar flux regression', 'quasar body', datetime('now'), ?)`,
+    ).run(Date.now() + 10 * 365 * 86400000);
+    const row = db
+      .prepare(
+        `
       SELECT ${injectionRelevanceSql('o')} AS relevance
       FROM observations_fts JOIN observations o ON o.id = observations_fts.rowid
       WHERE observations_fts MATCH 'quasar'
-    `).get(Date.now());
+    `,
+      )
+      .get(Date.now());
     expect(row, 'seed row must be FTS-reachable').toBeTruthy();
     expect(Number.isFinite(row.relevance), `relevance=${row.relevance}`).toBe(true);
     db.close();
@@ -114,7 +121,6 @@ describe('consumer ledger — no inlined live-filter pairs in the converted file
     'hook-optimize.mjs',
     'mem-cli.mjs',
     'search-scoring.mjs',
-    'tfidf.mjs',
     'deep-search.mjs',
     'lib/recall-core.mjs',
     'lib/recent-core.mjs',
@@ -154,10 +160,53 @@ describe('consumer ledger — no inlined live-filter pairs in the converted file
     });
   }
 
-  it('every consumer imports the shared core', () => {
+  // A file may reach the core THROUGH a named shared module instead of importing it
+  // directly. Each entry names the intermediary, and the intermediary is then checked to
+  // actually import the core — so the exemption cannot rot into "this file no longer uses
+  // the live filter at all", which the per-file pair scan above would happily pass.
+  //
+  // server.mjs joined this list in v3.92.0: audit P2-5 moved `runExport`'s WHERE assembly
+  // into `lib/export-columns.mjs::buildExportWhere`, which is where its live-row predicate
+  // now comes from. Its direct import became unused and eslint removed it. Without this
+  // indirection the ledger goes red on a change that made the sharing STRONGER — the
+  // source-anchor guard failing because its anchor legitimately moved.
+  const VIA = { 'server.mjs': 'lib/export-columns.mjs' };
+
+  it('every consumer reaches the shared core, directly or through a declared module', () => {
     for (const f of FILES) {
+      // Comment-stripped with this file's own helper (the same one the pair-scan above uses),
+      // because raw source lets a COMMENTED-OUT import satisfy the VIA check below while the
+      // real edge is gone. It also stops a commented `inject-search-core.mjs` short-circuiting
+      // the whole case on the line after this one.
+      const src = stripLineComments(readFileSync(join(REPO, f), 'utf8'));
+      if (src.includes('inject-search-core.mjs')) continue;
+      const via = VIA[f];
+      expect(via, `${f} neither imports the core nor declares an intermediary`).toBeTruthy();
+      // Anchored on the import SPECIFIER, not a bare substring: `src.includes('export-columns.mjs')`
+      // is satisfied by a COMMENT naming the module, so the ledger could clear a file whose
+      // real edge had moved away. The specifier narrowed that hole; comment-stripping above
+      // closes it (v3.93.0 post-release review, I2 — a commented-out import still passed).
+      // Full regex escape, not just `.`: today's single entry is inert either way, but an
+      // entry containing `+ ( [ $ ^ * ?` would build a wrong or throwing regex.
+      const viaEsc = via.replace(/^lib\//, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const viaSpecifier = new RegExp(`from\\s+'[^']*${viaEsc}'`);
+      expect(viaSpecifier.test(src), `${f} does not import its declared intermediary ${via}`).toBe(true);
+      expect(
+        stripLineComments(readFileSync(join(REPO, via), 'utf8')).includes('inject-search-core.mjs'),
+        `${via} is declared as ${f}'s route to the core but does not import it`,
+      ).toBe(true);
+    }
+  });
+
+  it('the indirection list has no dead entries', () => {
+    // An intermediary that stopped being needed — because the file went back to importing
+    // the core directly — must be removed rather than left as a standing exemption.
+    for (const [f, via] of Object.entries(VIA)) {
       const src = readFileSync(join(REPO, f), 'utf8');
-      expect(src.includes('inject-search-core.mjs'), `${f} does not import the core`).toBe(true);
+      expect(
+        src.includes('inject-search-core.mjs'),
+        `${f} imports the core directly now; drop its ${via} entry from VIA`,
+      ).toBe(false);
     }
   });
 
@@ -168,7 +217,9 @@ describe('consumer ledger — no inlined live-filter pairs in the converted file
   it('no hand-rolled EXP decay outside the core', () => {
     for (const f of FILES) {
       const src = readFileSync(join(REPO, f), 'utf8');
-      expect(src.includes('EXP(-0.693'), `${f} re-inlines the decay shape — compose recencyDecaySql`).toBe(false);
+      expect(src.includes('EXP(-0.693'), `${f} re-inlines the decay shape — compose recencyDecaySql`).toBe(
+        false,
+      );
     }
   });
 });
@@ -189,16 +240,38 @@ describe('mem_export default excludes retracted AND compressed rows', () => {
     ]);
     const db = createTestDb();
     const P = 'export--live-filter';
-    const live = saveObservation(db, { project: P, type: 'bugfix', content: 'live row about FTS triggers not firing', title: 'LIVEROW marker' }).id;
-    const gone = saveObservation(db, { project: P, type: 'bugfix', content: 'retracted row about proxy CONNECT tunnels', title: 'GONEROW marker' }).id;
-    const zipped = saveObservation(db, { project: P, type: 'bugfix', content: 'compressed row about vector vocabulary gaps', title: 'ZIPROW marker' }).id;
-    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?').run(Date.now(), live, gone);
+    const live = saveObservation(db, {
+      project: P,
+      type: 'bugfix',
+      content: 'live row about FTS triggers not firing',
+      title: 'LIVEROW marker',
+    }).id;
+    const gone = saveObservation(db, {
+      project: P,
+      type: 'bugfix',
+      content: 'retracted row about proxy CONNECT tunnels',
+      title: 'GONEROW marker',
+    }).id;
+    const zipped = saveObservation(db, {
+      project: P,
+      type: 'bugfix',
+      content: 'compressed row about vector vocabulary gaps',
+      title: 'ZIPROW marker',
+    }).id;
+    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?').run(
+      Date.now(),
+      live,
+      gone,
+    );
     db.prepare('UPDATE observations SET compressed_into = 999 WHERE id = ?').run(zipped);
 
     const idsOf = async (args) => {
       const res = await handleExportForTest(db, { project: P, format: 'jsonl', limit: 100, ...args });
       const text = res.content.map((c) => c.text).join('\n');
-      return text.split('\n').filter((l) => l.trim().startsWith('{')).map((l) => JSON.parse(l).id);
+      return text
+        .split('\n')
+        .filter((l) => l.trim().startsWith('{'))
+        .map((l) => JSON.parse(l).id);
     };
 
     const byDefault = await idsOf({});

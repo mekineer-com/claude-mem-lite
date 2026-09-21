@@ -11,6 +11,36 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = process.env.CLAUDE_PLUGIN_ROOT || join(__dirname, '..');
 
 if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
+  // Platform gate BEFORE npm, not after it. package.json's `os` field is an npm install
+  // gate: npm exits EBADPLATFORM without resolving anything, so the catch below sees only
+  // "Command failed" and answers with a fixed cause list that cannot contain this cause.
+  // That is issue #28 — a Windows user got CONNECTION_CLOSED in /mcp plus a wrong reason,
+  // where the field was added (b6a2579, R10 P3-19) precisely so they would be TOLD.
+  // Letting npm fail and then guessing is the shape that failed; asking the manifest first
+  // is the shape that names both sides of the mismatch. Guarded import: lib/ can be absent
+  // in an incomplete install, which launch-preflight.mjs below diagnoses properly, and a
+  // missing diagnostic must never become a new failure mode.
+  try {
+    const { platformGate } = await import('../lib/platform-gate.mjs');
+    const gate = platformGate({ root: ROOT });
+    if (gate.blocked) {
+      process.stderr.write(
+        `[claude-mem-lite] npm install is blocked by this package's own platform list (npm EBADPLATFORM).\n`,
+      );
+      process.stderr.write(
+        `[claude-mem-lite]   package.json declares os: ${gate.declared.join(', ')} — this machine is ${gate.platform}\n`,
+      );
+      process.stderr.write(
+        `[claude-mem-lite] Nothing was installed, so the MCP server cannot start. See "Platform Support" in the README.\n`,
+      );
+      process.stderr.write(
+        `[claude-mem-lite] To install anyway: cd "${ROOT}" && npm install --omit=dev --force\n`,
+      );
+      process.exit(1);
+    }
+  } catch (e) {
+    process.stderr.write(`[claude-mem-lite] platform check skipped: ${e.message}\n`);
+  }
   process.stderr.write('[claude-mem-lite] Installing dependencies...\n');
   try {
     execSync('npm install --omit=dev', {
@@ -49,12 +79,20 @@ if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
     // Coalescing first keeps the original both-nullish semantics exactly, `0`
     // included.
     const status = e?.status ?? null;
-    const detail = e?.message?.split('\n')[0]
-      || (status !== null ? `npm exited ${status}` : '')
-      || (e?.signal ? `npm killed by ${e.signal}` : '')
-      || 'unknown error';
+    const detail =
+      e?.message?.split('\n')[0] ||
+      (status !== null ? `npm exited ${status}` : '') ||
+      (e?.signal ? `npm killed by ${e.signal}` : '') ||
+      'unknown error';
     process.stderr.write(`[claude-mem-lite] npm install failed in ${ROOT} — ${detail}\n`);
-    process.stderr.write(`[claude-mem-lite] Likely cause: read-only directory, disk full, or network blocked.\n`);
+    // "Likely cause: …" until issue #28: it asserted three causes, and the one that was
+    // actually firing (EBADPLATFORM, gated above) was not among them. stderr is inherited,
+    // so npm's own `npm error code <CODE>` line is already on this stream a few lines up —
+    // point at that instead of competing with it. A guess presented as a diagnosis costs
+    // more than no diagnosis: it sends the reader looking at their disk and their network.
+    process.stderr.write(
+      `[claude-mem-lite] npm printed its own error above — read its "npm error code" line first. Common causes: read-only directory, disk full, network blocked.\n`,
+    );
     process.stderr.write(`[claude-mem-lite] Repair: cd "${ROOT}" && npm install --omit=dev\n`);
     process.exit(1);
   }
@@ -66,7 +104,8 @@ if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
 // intact but the .node binary stale → server FATALs with "Could not locate
 // the bindings file" on first DB open. Probe + auto-rebuild before launching.
 try {
-  const { ensureBetterSqlite3Working, probeBindingInFreshProcess } = await import('../lib/binding-probe.mjs');
+  const { ensureBetterSqlite3Working, probeBindingInFreshProcess, nativeBindingRepairHint } =
+    await import('../lib/binding-probe.mjs');
   // The rebuild inside ensureBetterSqlite3Working mutates node_modules — the
   // same write class as install/repair/update, and this was the ONE rebuild
   // path outside the shared install.lock: a second MCP launch or a concurrent
@@ -76,7 +115,7 @@ try {
   // proceeds; a broken one defers to the peer instead of racing it).
   const { acquireLock } = await import('../lib/proc-lock.mjs');
   const { resolveDataDir } = await import('../lib/resolve-data-dir.mjs');
-  const lockPath = join(resolveDataDir(process.env.CLAUDE_MEM_DIR), 'runtime', 'install.lock');
+  const lockPath = join(resolveDataDir(process.env.CLAUDE_MEM_DIR), 'runtime', 'install.lock'); // runtime-dir:stays-put — install lock serialises real installers
   let release = null;
   for (let i = 0; i < 20 && !(release = acquireLock(lockPath)); i++) {
     await new Promise((r) => setTimeout(r, 500));
@@ -93,14 +132,17 @@ try {
       const probe = probeBindingInFreshProcess(ROOT);
       verify = probe.ok
         ? { ok: true, action: 'verified' }
-        : { ok: false, error: `${probe.error} (another install/repair holds the lock — not rebuilding concurrently; reconnect with /mcp once it finishes)` };
+        : {
+            ok: false,
+            error: `${probe.error} (another install/repair holds the lock — not rebuilding concurrently; reconnect with /mcp once it finishes)`,
+          };
     }
   } finally {
     if (release) release();
   }
   if (!verify.ok) {
     process.stderr.write(`[claude-mem-lite] better-sqlite3 binding unusable: ${verify.error}\n`);
-    process.stderr.write(`[claude-mem-lite] Repair: cd "${ROOT}" && npm rebuild better-sqlite3 --dangerously-allow-all-scripts\n`);
+    process.stderr.write(`[claude-mem-lite] Repair: ${nativeBindingRepairHint(ROOT)}\n`);
     process.exit(1);
   }
   if (verify.action === 'rebuilt') {
@@ -118,7 +160,9 @@ try {
 try {
   await import('@modelcontextprotocol/sdk/server/mcp.js');
 } catch (firstErr) {
-  process.stderr.write(`[claude-mem-lite] MCP SDK broken (${firstErr.code || firstErr.message}) — reinstalling...\n`);
+  process.stderr.write(
+    `[claude-mem-lite] MCP SDK broken (${firstErr.code || firstErr.message}) — reinstalling...\n`,
+  );
   try {
     execSync('npm install @modelcontextprotocol/sdk --force --omit=dev --no-audit --no-fund', {
       cwd: ROOT,
@@ -161,28 +205,88 @@ if (process.env.CLAUDE_PLUGIN_ROOT) {
 const dataDir = join(homedir(), '.claude-mem-lite');
 const devServer = join(dataDir, 'server.mjs');
 let useDevServer = false;
-try { useDevServer = existsSync(devServer) && lstatSync(devServer).isSymbolicLink(); } catch {}
+try {
+  useDevServer = existsSync(devServer) && lstatSync(devServer).isSymbolicLink();
+} catch {}
+
+// The MCP server opens the DB while it is being imported, so a forward-incompat store
+// (schema.mjs's "DB schema is vN but this binary supports up to vN-1") throws right here
+// and kills the process before the stdio handshake. All the host can say about that is
+// `-32000 Connection closed`, which names nothing — measured 2026-09-08, a full day of it
+// with the real cause visible only in a JSONL file the user has no reason to open.
+//
+// stderr is the one channel a launcher still has at that point. It reaches the plugin's own
+// log rather than the transcript, so this is a diagnosis for whoever goes looking, not a
+// substitute for the SessionStart notice — which is why both exist.
+async function importServerOrExplain(run, { dev = false } = {}) {
+  try {
+    await run();
+  } catch (e) {
+    // The classifier is loaded INSIDE its own try and any failure rethrows the ORIGINAL
+    // error. Importing it unconditionally destroyed `e`: this path exists to diagnose an
+    // install whose files are missing (issue #15), lib/schema-skew.mjs is a brand-new file,
+    // and resolveLaunchEntry can serve the server from dataDir while `../lib/…` still
+    // resolves against ROOT. Proven by review — with the module moved aside the process died
+    // naming ERR_MODULE_NOT_FOUND for the classifier while the real boot failure never
+    // appeared anywhere in the output.
+    let skewMod;
+    try {
+      skewMod = await import('../lib/schema-skew.mjs');
+    } catch {
+      throw e;
+    }
+    if (!skewMod.isSchemaSkewError(e)) throw e;
+    let shape = { managed: false, activePluginVersion: null };
+    try {
+      ({ ...shape } = await import('../lib/install-shape.mjs').then((m) =>
+        m.detectInstallShape({ installDir: dataDir }),
+      ));
+    } catch {
+      /* shape unknown → schemaSkewRemedy answers 'unknown', which is its job */
+    }
+    const skew = skewMod.schemaSkewFromError(e) || { dbVersion: null, binaryVersion: null };
+    process.stderr.write(
+      skewMod.formatSchemaSkewNotice({
+        dbVersion: skew.dbVersion,
+        binaryVersion: skew.binaryVersion,
+        // `dev` is passed because the useDevServer branch IS the dev install by definition —
+        // omitting it told a checkout to `npm i -g` over its own working tree. `root: ROOT`
+        // so a mixed managed+plugin machine gets the remedy for the tree that is behind.
+        remedy: skewMod.schemaSkewRemedy({
+          managed: shape.managed,
+          activePluginVersion: shape.activePluginVersion,
+          dev,
+          root: ROOT,
+        }),
+        codeHome: ROOT,
+      }) + '\n',
+    );
+    process.exit(1);
+  }
+}
 
 if (useDevServer) {
-  await import(pathToFileURL(devServer).href);
+  await importServerOrExplain(() => import(pathToFileURL(devServer).href), { dev: true });
 } else {
   // Preflight: detect incomplete primary install (issue #15) — if relative
   // imports referenced by server.mjs are missing on disk, fall back to the
   // hook-update.mjs-maintained ~/.claude-mem-lite/ copy when healthy, or exit
   // with a clear repair command instead of a Node ERR_MODULE_NOT_FOUND stack.
   const { resolveLaunchEntry } = await import('./launch-preflight.mjs');
-  try {
-    const entry = resolveLaunchEntry({
-      primaryRoot: ROOT,
-      fallbackRoot: dataDir,
-      warn: (msg) => process.stderr.write(msg + '\n'),
-    });
-    await import(pathToFileURL(entry.path).href);
-  } catch (e) {
-    if (e.code === 'INSTALL_INCOMPLETE') {
-      process.stderr.write(e.message + '\n');
-      process.exit(1);
+  await importServerOrExplain(async () => {
+    try {
+      const entry = resolveLaunchEntry({
+        primaryRoot: ROOT,
+        fallbackRoot: dataDir,
+        warn: (msg) => process.stderr.write(msg + '\n'),
+      });
+      await import(pathToFileURL(entry.path).href);
+    } catch (e) {
+      if (e.code === 'INSTALL_INCOMPLETE') {
+        process.stderr.write(e.message + '\n');
+        process.exit(1);
+      }
+      throw e;
     }
-    throw e;
-  }
+  });
 }

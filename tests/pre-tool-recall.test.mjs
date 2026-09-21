@@ -1,9 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
-import { writeFileSync, mkdirSync, rmSync, readFileSync, mkdtempSync } from 'fs';
-import { createTestDb, insertSession, insertObs, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
+import { writeFileSync, mkdirSync, rmSync, readFileSync, mkdtempSync, existsSync, readdirSync } from 'fs';
+import {
+  createTestDb,
+  insertSession,
+  insertObs,
+  SUBPROCESS_TIMEOUT_MS,
+  disposeFixtureDir,
+  makeFixtureTracker,
+} from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
+import { scrubSecrets } from '../secret-scrub.mjs';
 import Database from 'better-sqlite3';
 import { tmpdir } from 'os';
 
@@ -15,6 +23,8 @@ const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-tool-recall.js'
 // fast-path scripts must mirror schema.mjs env-var convention, and tests must
 // honor it too.
 const DEFAULT_SANDBOX = mkdtempSync(join(tmpdir(), 'pre-recall-sandbox-'));
+// One dir for the whole file, and it had no disposal at all — every run left it in /tmp.
+afterAll(() => disposeFixtureDir(DEFAULT_SANDBOX));
 
 // Helper: run script with piped stdin (spawn handles for-await stdin correctly)
 function runScriptRaw(inputStr, env = {}) {
@@ -28,13 +38,20 @@ function runScriptRaw(inputStr, env = {}) {
     });
     let stdout = '';
     let stderr = '';
-    child.stdout.on('data', d => { stdout += d; });
-    child.stderr.on('data', d => { stderr += d; });
+    child.stdout.on('data', (d) => {
+      stdout += d;
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d;
+    });
     child.on('close', () => resolve({ stdout, stderr }));
     child.on('error', reject);
     child.stdin.write(inputStr);
     child.stdin.end();
-    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
+    setTimeout(() => {
+      child.kill();
+      reject(new Error('timeout'));
+    }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 
@@ -98,42 +115,60 @@ describe('pre-tool-recall', () => {
 
       // Insert obs with lesson + high importance (SHOULD match)
       insertObs(db, {
-        sessionId: 'sess-1', title: 'FTS5 broke after schema change',
-        type: 'bugfix', importance: 2,
+        sessionId: 'sess-1',
+        title: 'FTS5 broke after schema change',
+        type: 'bugfix',
+        importance: 2,
         lessonLearned: 'Verify FTS5 integrity after schema changes',
         filesModified: '["schema.mjs"]',
       });
 
       // Insert obs without lesson (should NOT match)
       insertObs(db, {
-        sessionId: 'sess-1', title: 'Edited schema.mjs',
-        type: 'change', importance: 2, lessonLearned: null,
+        sessionId: 'sess-1',
+        title: 'Edited schema.mjs',
+        type: 'change',
+        importance: 2,
+        lessonLearned: null,
         filesModified: '["schema.mjs"]',
       });
 
       // Insert obs with low importance (should NOT match)
       insertObs(db, {
-        sessionId: 'sess-1', title: 'Minor tweak',
-        type: 'change', importance: 1, lessonLearned: 'Some lesson',
+        sessionId: 'sess-1',
+        title: 'Minor tweak',
+        type: 'change',
+        importance: 1,
+        lessonLearned: 'Some lesson',
         filesModified: '["schema.mjs"]',
       });
 
       // Insert compressed obs (should NOT match)
       insertObs(db, {
-        sessionId: 'sess-1', title: 'Old compressed',
-        type: 'bugfix', importance: 3, lessonLearned: 'Important lesson',
-        filesModified: '["schema.mjs"]', compressedInto: 999,
+        sessionId: 'sess-1',
+        title: 'Old compressed',
+        type: 'bugfix',
+        importance: 3,
+        lessonLearned: 'Important lesson',
+        filesModified: '["schema.mjs"]',
+        compressedInto: 999,
       });
 
       // Insert superseded obs (should NOT match)
       insertObs(db, {
-        sessionId: 'sess-1', title: 'Superseded obs',
-        type: 'bugfix', importance: 3, lessonLearned: 'Old lesson',
-        filesModified: '["schema.mjs"]', supersededAt: new Date().toISOString(),
+        sessionId: 'sess-1',
+        title: 'Superseded obs',
+        type: 'bugfix',
+        importance: 3,
+        lessonLearned: 'Old lesson',
+        filesModified: '["schema.mjs"]',
+        supersededAt: new Date().toISOString(),
       });
 
       const cutoff = Date.now() - 60 * 86400000;
-      const rows = db.prepare(`
+      const rows = db
+        .prepare(
+          `
         SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
         FROM observations o
         JOIN observation_files of2 ON of2.obs_id = o.id
@@ -147,7 +182,9 @@ describe('pre-tool-recall', () => {
           AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
         ORDER BY o.created_at_epoch DESC
         LIMIT 2
-      `).all('test', cutoff, 'schema.mjs', '%schema.mjs');
+      `,
+        )
+        .all('test', cutoff, 'schema.mjs', '%schema.mjs');
 
       expect(rows).toHaveLength(1);
       expect(rows[0].lesson_learned).toBe('Verify FTS5 integrity after schema changes');
@@ -159,13 +196,18 @@ describe('pre-tool-recall', () => {
       insertSession(db, { id: 'sess-1' });
 
       insertObs(db, {
-        sessionId: 'sess-1', title: 'Fix in utils',
-        type: 'bugfix', importance: 2, lessonLearned: 'Check CJK boundary',
+        sessionId: 'sess-1',
+        title: 'Fix in utils',
+        type: 'bugfix',
+        importance: 2,
+        lessonLearned: 'Check CJK boundary',
         filesModified: '["/mnt/data/projects/mem/utils.mjs"]',
       });
 
       const cutoff = Date.now() - 60 * 86400000;
-      const rows = db.prepare(`
+      const rows = db
+        .prepare(
+          `
         SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
         FROM observations o
         JOIN observation_files of2 ON of2.obs_id = o.id
@@ -179,7 +221,9 @@ describe('pre-tool-recall', () => {
           AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
         ORDER BY o.created_at_epoch DESC
         LIMIT 2
-      `).all('test', cutoff, '/mnt/data/projects/mem/utils.mjs', '%utils.mjs');
+      `,
+        )
+        .all('test', cutoff, '/mnt/data/projects/mem/utils.mjs', '%utils.mjs');
 
       expect(rows).toHaveLength(1);
       expect(rows[0].lesson_learned).toBe('Check CJK boundary');
@@ -198,8 +242,8 @@ describe('pre-tool-recall', () => {
     it('truncates long lessons at 240 chars', () => {
       const LESSON_MAX = 240;
       const longLesson = 'A'.repeat(400);
-      const truncated = longLesson.length > LESSON_MAX
-        ? longLesson.slice(0, LESSON_MAX - 3) + '...' : longLesson;
+      const truncated =
+        longLesson.length > LESSON_MAX ? longLesson.slice(0, LESSON_MAX - 3) + '...' : longLesson;
       expect(truncated).toHaveLength(LESSON_MAX);
       expect(truncated.endsWith('...')).toBe(true);
     });
@@ -207,8 +251,7 @@ describe('pre-tool-recall', () => {
     it('preserves lessons ≤ 240 chars untouched', () => {
       const LESSON_MAX = 240;
       const midLesson = 'B'.repeat(218); // matches observed p50 length
-      const result = midLesson.length > LESSON_MAX
-        ? midLesson.slice(0, LESSON_MAX - 3) + '...' : midLesson;
+      const result = midLesson.length > LESSON_MAX ? midLesson.slice(0, LESSON_MAX - 3) + '...' : midLesson;
       expect(result).toBe(midLesson);
       expect(result.endsWith('...')).toBe(false);
     });
@@ -242,7 +285,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     function runWithEnv(input, extraEnv = {}) {
@@ -259,10 +304,13 @@ describe('pre-tool-recall', () => {
     }
 
     it('does NOT emit the backfill reminder by default (opt-in only)', async () => {
-      const { stdout } = await runWithEnv({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'no-nudge.py') },
-      }, { CLAUDE_MEM_PRETOOL_NUDGE: '' });
+      const { stdout } = await runWithEnv(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'no-nudge.py') },
+        },
+        { CLAUDE_MEM_PRETOOL_NUDGE: '' },
+      );
       expect(stdout).toBe('');
     });
 
@@ -274,7 +322,9 @@ describe('pre-tool-recall', () => {
       });
       // Output is now JSON with hookSpecificOutput.additionalContext carrying the reminder.
       const parsed = JSON.parse(stdout);
-      expect(parsed.hookSpecificOutput.additionalContext).toContain('[mem] No prior lessons for credit_service.py');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        '[mem] No prior lessons for credit_service.py',
+      );
       // Should mention the /lesson command so Claude knows how to backfill.
       expect(parsed.hookSpecificOutput.additionalContext).toContain('/lesson');
     });
@@ -285,8 +335,10 @@ describe('pre-tool-recall', () => {
       db.pragma('foreign_keys = OFF');
       initSchema(db);
       insertObs(db, {
-        sessionId: 'mem-r4', project: 'parent--r4test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-r4',
+        project: 'parent--r4test',
+        type: 'bugfix',
+        importance: 2,
         title: 'FTS5 broke after schema change',
         lessonLearned: 'Verify FTS5 integrity after schema changes',
         filesModified: `["${join(projectDir, 'schema.mjs')}"]`,
@@ -316,8 +368,10 @@ describe('pre-tool-recall', () => {
       // reopen now correctly enforces ON DELETE CASCADE, so an orphan obs is rejected.
       insertSession(db, { id: 'sess-frame', project: 'parent--frametest', memoryId: 'mem-frame' });
       insertObs(db, {
-        sessionId: 'mem-frame', project: 'parent--frametest',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-frame',
+        project: 'parent--frametest',
+        type: 'bugfix',
+        importance: 2,
         title: 'Some lesson-bearing bug',
         lessonLearned: 'A lesson body used as framing probe',
         filesModified: `["${join(projectDir, 'frame.mjs')}"]`,
@@ -351,7 +405,9 @@ describe('pre-tool-recall', () => {
         tool_input: { file_path: filePath },
       });
       const parsedFirst = JSON.parse(first);
-      expect(parsedFirst.hookSpecificOutput.additionalContext).toContain('[mem] No prior lessons for cool.py');
+      expect(parsedFirst.hookSpecificOutput.additionalContext).toContain(
+        '[mem] No prior lessons for cool.py',
+      );
 
       const { stdout: second } = await runWithEnv({
         tool_name: 'Edit',
@@ -370,7 +426,9 @@ describe('pre-tool-recall', () => {
         session_id: 'session-alpha',
         tool_input: { file_path: filePath },
       });
-      expect(JSON.parse(first).hookSpecificOutput.additionalContext).toContain('No prior lessons for scope.py');
+      expect(JSON.parse(first).hookSpecificOutput.additionalContext).toContain(
+        'No prior lessons for scope.py',
+      );
 
       const { stdout: second } = await runWithEnv({
         tool_name: 'Edit',
@@ -387,7 +445,9 @@ describe('pre-tool-recall', () => {
         session_id: 'session-alpha',
         tool_input: { file_path: filePath },
       });
-      expect(JSON.parse(first).hookSpecificOutput.additionalContext).toContain('No prior lessons for fresh.py');
+      expect(JSON.parse(first).hookSpecificOutput.additionalContext).toContain(
+        'No prior lessons for fresh.py',
+      );
 
       const { stdout: second } = await runWithEnv({
         tool_name: 'Edit',
@@ -395,7 +455,9 @@ describe('pre-tool-recall', () => {
         tool_input: { file_path: filePath },
       });
       // Fresh session → recall fires again.
-      expect(JSON.parse(second).hookSpecificOutput.additionalContext).toContain('No prior lessons for fresh.py');
+      expect(JSON.parse(second).hookSpecificOutput.additionalContext).toContain(
+        'No prior lessons for fresh.py',
+      );
     });
 
     // v2.34.6 Gap 3: Read-side recall. Tighter filter (lesson_learned required),
@@ -407,16 +469,22 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       // Seed TWO lessons — Read should only inject the most recent one.
       insertObs(db, {
-        sessionId: 'mem-r4', project: 'parent--r4test',
-        type: 'bugfix', importance: 2,
-        title: 'Older bug', lessonLearned: 'Older lesson A',
+        sessionId: 'mem-r4',
+        project: 'parent--r4test',
+        type: 'bugfix',
+        importance: 2,
+        title: 'Older bug',
+        lessonLearned: 'Older lesson A',
         filesModified: `["${join(projectDir, 'readable.mjs')}"]`,
         epochOffset: -86400000, // 1 day ago
       });
       insertObs(db, {
-        sessionId: 'mem-r4', project: 'parent--r4test',
-        type: 'bugfix', importance: 2,
-        title: 'Newer bug', lessonLearned: 'Newer lesson B',
+        sessionId: 'mem-r4',
+        project: 'parent--r4test',
+        type: 'bugfix',
+        importance: 2,
+        title: 'Newer bug',
+        lessonLearned: 'Newer lesson B',
         filesModified: `["${join(projectDir, 'readable.mjs')}"]`,
       });
       db.close();
@@ -438,9 +506,12 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       // Edit-path would match this (type=bugfix). Read-path must skip it.
       insertObs(db, {
-        sessionId: 'mem-r4', project: 'parent--r4test',
-        type: 'bugfix', importance: 3,
-        title: 'Important but no lesson', lessonLearned: null,
+        sessionId: 'mem-r4',
+        project: 'parent--r4test',
+        type: 'bugfix',
+        importance: 3,
+        title: 'Important but no lesson',
+        lessonLearned: null,
         filesModified: `["${join(projectDir, 'typed.mjs')}"]`,
       });
       db.close();
@@ -466,8 +537,10 @@ describe('pre-tool-recall', () => {
       db.pragma('foreign_keys = OFF');
       initSchema(db);
       insertObs(db, {
-        sessionId: 'mem-r4', project: 'parent--r4test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-r4',
+        project: 'parent--r4test',
+        type: 'bugfix',
+        importance: 2,
         title: 'Long lesson',
         lessonLearned: 'X'.repeat(300),
         filesModified: `["${join(projectDir, 'longlesson.mjs')}"]`,
@@ -481,7 +554,7 @@ describe('pre-tool-recall', () => {
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       // Lesson line = "  #N [bugfix] " + up to 120 chars (with '...' if over).
       // Find the lesson line and verify the payload post-"[bugfix] " is ≤120 chars and ends in '...'.
-      const line = ctx.split('\n').find(l => l.includes('[bugfix]'));
+      const line = ctx.split('\n').find((l) => l.includes('[bugfix]'));
       expect(line).toBeDefined();
       const payload = line.split('[bugfix] ')[1];
       expect(payload.length).toBeLessThanOrEqual(120);
@@ -495,16 +568,20 @@ describe('pre-tool-recall', () => {
       // Real-world noise: hook-llm fallback title for an error episode. Type=bugfix, no lesson.
       // Pre-v2.34.7 this was surfaced to Edit as low-value context; now filtered out.
       insertObs(db, {
-        sessionId: 'mem-r4', project: 'parent--r4test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-r4',
+        project: 'parent--r4test',
+        type: 'bugfix',
+        importance: 2,
         title: 'Error: foo.mjs, bar.mjs: 145|project|raw-log-noise',
         lessonLearned: null,
         filesModified: `["${join(projectDir, 'low_signal.mjs')}"]`,
       });
       // Also insert a "Modified X" fallback title — same class of noise.
       insertObs(db, {
-        sessionId: 'mem-r4', project: 'parent--r4test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-r4',
+        project: 'parent--r4test',
+        type: 'bugfix',
+        importance: 2,
         title: 'Modified low_signal.mjs',
         lessonLearned: null,
         filesModified: `["${join(projectDir, 'low_signal.mjs')}"]`,
@@ -531,8 +608,10 @@ describe('pre-tool-recall', () => {
       // Real human-written bugfix title, no lesson_learned — should still be surfaced
       // to Edit as contextual signal (Edit keeps the wider type-OR fallback).
       insertObs(db, {
-        sessionId: 'mem-r4', project: 'parent--r4test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-r4',
+        project: 'parent--r4test',
+        type: 'bugfix',
+        importance: 2,
         title: 'hook-update SOURCE_FILES drift',
         lessonLearned: null,
         filesModified: `["${join(projectDir, 'real_bug.mjs')}"]`,
@@ -596,7 +675,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     function runWithEnv(input) {
@@ -615,8 +696,10 @@ describe('pre-tool-recall', () => {
       db.pragma('foreign_keys = OFF');
       initSchema(db);
       insertObs(db, {
-        sessionId: 'mem-t2', project: 'parent--t2test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-t2',
+        project: 'parent--t2test',
+        type: 'bugfix',
+        importance: 2,
         title: 'Some bug',
         lessonLearned: 'Verify FTS5 integrity after schema changes',
         filesModified: `["${join(projectDir, 'hook-llm.mjs')}"]`,
@@ -643,7 +726,9 @@ describe('pre-tool-recall', () => {
       const parsed = JSON.parse(stdout);
       expect(parsed.suppressOutput).toBe(true);
       expect(parsed.hookSpecificOutput?.hookEventName).toBe('PreToolUse');
-      expect(parsed.hookSpecificOutput.additionalContext).toContain('[mem] No prior lessons for brand_new.py');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        '[mem] No prior lessons for brand_new.py',
+      );
       expect(parsed.hookSpecificOutput.additionalContext).toContain('/lesson');
     });
   });
@@ -673,7 +758,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     function runWithEnv(input) {
@@ -690,10 +777,12 @@ describe('pre-tool-recall', () => {
       const db = new Database(dbPath);
       db.pragma('foreign_keys = OFF');
       initSchema(db);
-      db.prepare(`
+      db.prepare(
+        `
         INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
         VALUES (?, 'lesson', ?, ?, ?, 2, ?)
-      `).run(
+      `,
+      ).run(
         'parent--t9test',
         'events-table lesson on foo',
         'remember to flush the cache before rotating keys',
@@ -721,10 +810,12 @@ describe('pre-tool-recall', () => {
       const db = new Database(dbPath);
       db.pragma('foreign_keys = OFF');
       initSchema(db);
-      db.prepare(`
+      db.prepare(
+        `
         INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
         VALUES (?, 'bugfix', ?, ?, ?, 3, ?)
-      `).run(
+      `,
+      ).run(
         'parent--t9test',
         'full-path bugfix',
         'null-check before dereferencing bar()',
@@ -748,17 +839,21 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       // Legacy observations lesson
       insertObs(db, {
-        sessionId: 'mem-t9', project: 'parent--t9test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-t9',
+        project: 'parent--t9test',
+        type: 'bugfix',
+        importance: 2,
         title: 'obs-era bugfix',
         lessonLearned: 'always await the promise before closing db',
         filesModified: `["${join(projectDir, 'mixed.mjs')}"]`,
       });
       // New event lesson
-      db.prepare(`
+      db.prepare(
+        `
         INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
         VALUES (?, 'lesson', ?, ?, ?, 2, ?)
-      `).run(
+      `,
+      ).run(
         'parent--t9test',
         'event-era lesson',
         'check the feature flag in config before rollout',
@@ -782,10 +877,12 @@ describe('pre-tool-recall', () => {
       const db = new Database(dbPath);
       db.pragma('foreign_keys = OFF');
       initSchema(db);
-      db.prepare(`
+      db.prepare(
+        `
         INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
         VALUES (?, 'lesson', ?, ?, ?, 1, ?)
-      `).run(
+      `,
+      ).run(
         'parent--t9test',
         'low-importance lesson',
         'this should not surface',
@@ -807,10 +904,12 @@ describe('pre-tool-recall', () => {
       const db = new Database(dbPath);
       db.pragma('foreign_keys = OFF');
       initSchema(db);
-      db.prepare(`
+      db.prepare(
+        `
         INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch, superseded_at_epoch)
         VALUES (?, 'bugfix', ?, ?, ?, 3, ?, ?)
-      `).run(
+      `,
+      ).run(
         'parent--t9test',
         'stale bugfix',
         'this was replaced — should not surface',
@@ -850,8 +949,10 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       insertSession(db, { id: 'sess-memdir', project: 'parent--memdirtest', memoryId: 'mem-memdir' });
       insertObs(db, {
-        sessionId: 'mem-memdir', project: 'parent--memdirtest',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-memdir',
+        project: 'parent--memdirtest',
+        type: 'bugfix',
+        importance: 2,
         title: 'memdir alignment lesson',
         lessonLearned: 'A specific lesson visible only when DB is correctly sandboxed',
         filesModified: `["${join(projectDir, 'target.mjs')}"]`,
@@ -860,38 +961,51 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     it('CLAUDE_MEM_DIR alone redirects DB read', async () => {
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'target.mjs') },
-        session_id: 'sess-memdir-1',
-      }, {
-        CLAUDE_MEM_DIR: tmpRoot,
-        CLAUDE_PROJECT_DIR: projectDir,
-      });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'target.mjs') },
+          session_id: 'sess-memdir-1',
+        },
+        {
+          CLAUDE_MEM_DIR: tmpRoot,
+          CLAUDE_PROJECT_DIR: projectDir,
+        },
+      );
       const parsed = JSON.parse(stdout);
-      expect(parsed.hookSpecificOutput.additionalContext).toContain('A specific lesson visible only when DB is correctly sandboxed');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        'A specific lesson visible only when DB is correctly sandboxed',
+      );
     });
 
     it('CLAUDE_MEM_DIR alone redirects cooldown writes (no leak to ~/.claude-mem-lite/runtime)', async () => {
       // First call seeds cooldown; second call should be silent.
-      await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'target.mjs') },
-        session_id: 'sess-memdir-2',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'target.mjs') },
+          session_id: 'sess-memdir-2',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       const { existsSync } = await import('fs');
       expect(existsSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-memdir-2.json'))).toBe(true);
 
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'target.mjs') },
-        session_id: 'sess-memdir-2',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'target.mjs') },
+          session_id: 'sess-memdir-2',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
       expect(stdout).toBe('');
     });
 
@@ -902,26 +1016,35 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       insertSession(db, { id: 'sess-alt', project: 'parent--memdirtest', memoryId: 'mem-alt' });
       insertObs(db, {
-        sessionId: 'mem-alt', project: 'parent--memdirtest',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-alt',
+        project: 'parent--memdirtest',
+        type: 'bugfix',
+        importance: 2,
         title: 'override marker',
         lessonLearned: 'Sourced from CLAUDE_MEM_DB_PATH override, not CLAUDE_MEM_DIR default',
         filesModified: `["${join(projectDir, 'target.mjs')}"]`,
       });
       db.close();
 
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'target.mjs') },
-        session_id: 'sess-memdir-3',
-      }, {
-        CLAUDE_MEM_DIR: tmpRoot,
-        CLAUDE_MEM_DB_PATH: altDb,
-        CLAUDE_PROJECT_DIR: projectDir,
-      });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'target.mjs') },
+          session_id: 'sess-memdir-3',
+        },
+        {
+          CLAUDE_MEM_DIR: tmpRoot,
+          CLAUDE_MEM_DB_PATH: altDb,
+          CLAUDE_PROJECT_DIR: projectDir,
+        },
+      );
       const parsed = JSON.parse(stdout);
-      expect(parsed.hookSpecificOutput.additionalContext).toContain('Sourced from CLAUDE_MEM_DB_PATH override');
-      expect(parsed.hookSpecificOutput.additionalContext).not.toContain('A specific lesson visible only when DB is correctly sandboxed');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        'Sourced from CLAUDE_MEM_DB_PATH override',
+      );
+      expect(parsed.hookSpecificOutput.additionalContext).not.toContain(
+        'A specific lesson visible only when DB is correctly sandboxed',
+      );
     });
 
     it('resolves the project from PWD (not cwd) when CLAUDE_PROJECT_DIR is unset — save-path parity', async () => {
@@ -930,17 +1053,22 @@ describe('pre-tool-recall', () => {
       // Here CLAUDE_PROJECT_DIR='' disables the primary and the child's cwd is the repo root
       // (≠ projectDir), so the seeded "parent--memdirtest" lesson surfaces ONLY if inferProject
       // honors the PWD fallback. Pre-fix (cwd-only) this recalled nothing.
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'target.mjs') },
-        session_id: 'sess-memdir-pwd',
-      }, {
-        CLAUDE_MEM_DIR: tmpRoot,
-        CLAUDE_PROJECT_DIR: '',
-        PWD: projectDir,
-      });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'target.mjs') },
+          session_id: 'sess-memdir-pwd',
+        },
+        {
+          CLAUDE_MEM_DIR: tmpRoot,
+          CLAUDE_PROJECT_DIR: '',
+          PWD: projectDir,
+        },
+      );
       const parsed = JSON.parse(stdout);
-      expect(parsed.hookSpecificOutput.additionalContext).toContain('A specific lesson visible only when DB is correctly sandboxed');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        'A specific lesson visible only when DB is correctly sandboxed',
+      );
     });
   });
 
@@ -963,8 +1091,10 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       insertSession(db, { id: 'sess-cb', project: 'parent--citeback', memoryId: 'mem-cb' });
       const info = insertObs(db, {
-        sessionId: 'mem-cb', project: 'parent--citeback',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-cb',
+        project: 'parent--citeback',
+        type: 'bugfix',
+        importance: 2,
         title: 'cite-back lesson',
         lessonLearned: 'A lesson that should be cited back',
         filesModified: `["${join(projectDir, 'foo.mjs')}"]`,
@@ -974,19 +1104,24 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     it('writes {ts, lessonIds} object schema when lessons are emitted', async () => {
-      await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'foo.mjs') },
-        session_id: 'sess-cb-1',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'foo.mjs') },
+          session_id: 'sess-cb-1',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
-      const cooldown = JSON.parse(readFileSync(
-        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-1.json'), 'utf8',
-      ));
+      const cooldown = JSON.parse(
+        readFileSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-1.json'), 'utf8'),
+      );
       const entry = cooldown[join(projectDir, 'foo.mjs')];
       expect(entry).toBeTypeOf('object');
       expect(typeof entry.ts).toBe('number');
@@ -996,15 +1131,18 @@ describe('pre-tool-recall', () => {
     });
 
     it('writes {ts, lessonIds: []} when no lessons were emitted (empty Edit)', async () => {
-      await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'no-lessons.mjs') },
-        session_id: 'sess-cb-2',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'no-lessons.mjs') },
+          session_id: 'sess-cb-2',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
-      const cooldown = JSON.parse(readFileSync(
-        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-2.json'), 'utf8',
-      ));
+      const cooldown = JSON.parse(
+        readFileSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-2.json'), 'utf8'),
+      );
       const entry = cooldown[join(projectDir, 'no-lessons.mjs')];
       expect(entry).toBeTypeOf('object');
       expect(entry.lessonIds).toEqual([]);
@@ -1017,22 +1155,32 @@ describe('pre-tool-recall', () => {
       const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
       db.pragma('foreign_keys = OFF');
       initSchema(db);
-      db.prepare(`
+      db.prepare(
+        `
         INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
         VALUES (?, 'lesson', ?, ?, ?, 2, ?)
-      `).run('parent--citeback', 'event lesson on foo', 'event body lesson',
-        JSON.stringify(['foo.mjs']), Date.now());
+      `,
+      ).run(
+        'parent--citeback',
+        'event lesson on foo',
+        'event body lesson',
+        JSON.stringify(['foo.mjs']),
+        Date.now(),
+      );
       db.close();
 
-      await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'foo.mjs') },
-        session_id: 'sess-cb-obsids',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'foo.mjs') },
+          session_id: 'sess-cb-obsids',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
-      const cooldown = JSON.parse(readFileSync(
-        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-obsids.json'), 'utf8',
-      ));
+      const cooldown = JSON.parse(
+        readFileSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-obsids.json'), 'utf8'),
+      );
       const entry = cooldown[join(projectDir, 'foo.mjs')];
       // lessonIds keeps the mixed set (cite-back hint contract, unchanged) …
       expect(entry.lessonIds.length).toBeGreaterThanOrEqual(2);
@@ -1049,11 +1197,14 @@ describe('pre-tool-recall', () => {
 
       // Re-running Edit on the same file should be silent (already cooled down
       // in this session) even though the entry is a bare number.
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: targetFile },
-        session_id: 'sess-cb-legacy',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: targetFile },
+          session_id: 'sess-cb-legacy',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
       expect(stdout).toBe('');
     });
   });
@@ -1080,7 +1231,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     it('Edit: prefers the heavily-cited older lesson over the never-cited newer one', async () => {
@@ -1089,8 +1242,10 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       // Older (60d ago) but cited 5 times — proven helpful.
       insertObs(db, {
-        sessionId: 'mem-a15', project: 'parent--a15test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-a15',
+        project: 'parent--a15test',
+        type: 'bugfix',
+        importance: 2,
         title: 'OLD-CITED lesson',
         lessonLearned: 'this body was cited five times across sessions',
         filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
@@ -1099,8 +1254,10 @@ describe('pre-tool-recall', () => {
       });
       // Newer (today) but never cited.
       insertObs(db, {
-        sessionId: 'mem-a15', project: 'parent--a15test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-a15',
+        project: 'parent--a15test',
+        type: 'bugfix',
+        importance: 2,
         title: 'NEW-FRESH lesson',
         lessonLearned: 'fresh body never cited',
         filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
@@ -1109,11 +1266,14 @@ describe('pre-tool-recall', () => {
       });
       db.close();
 
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a15-1',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a15-1',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       // Edit caps at 2 rows total — both surface, but the cited one MUST come first.
@@ -1129,8 +1289,10 @@ describe('pre-tool-recall', () => {
       db.pragma('foreign_keys = OFF');
       initSchema(db);
       insertObs(db, {
-        sessionId: 'mem-a15', project: 'parent--a15test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-a15',
+        project: 'parent--a15test',
+        type: 'bugfix',
+        importance: 2,
         title: 'OLD-CITED lesson',
         lessonLearned: 'this body was cited five times across sessions',
         filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
@@ -1138,8 +1300,10 @@ describe('pre-tool-recall', () => {
         citedCount: 5,
       });
       insertObs(db, {
-        sessionId: 'mem-a15', project: 'parent--a15test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-a15',
+        project: 'parent--a15test',
+        type: 'bugfix',
+        importance: 2,
         title: 'NEW-FRESH lesson',
         lessonLearned: 'fresh body never cited',
         filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
@@ -1148,11 +1312,14 @@ describe('pre-tool-recall', () => {
       });
       db.close();
 
-      const { stdout } = await runScript({
-        tool_name: 'Read',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a15-2',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Read',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a15-2',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       expect(ctx).toContain('cited five times');
@@ -1165,8 +1332,10 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       // Newer but accumulating uncited streak — agent has been declining it.
       insertObs(db, {
-        sessionId: 'mem-a15', project: 'parent--a15test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-a15',
+        project: 'parent--a15test',
+        type: 'bugfix',
+        importance: 2,
         title: 'STREAKED lesson',
         lessonLearned: 'body with streak of 2 uncited sessions',
         filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
@@ -1175,8 +1344,10 @@ describe('pre-tool-recall', () => {
       });
       // Older and neutral (cited=0, streak=0).
       insertObs(db, {
-        sessionId: 'mem-a15', project: 'parent--a15test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-a15',
+        project: 'parent--a15test',
+        type: 'bugfix',
+        importance: 2,
         title: 'NEUTRAL lesson',
         lessonLearned: 'older body neutral state',
         filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
@@ -1184,11 +1355,14 @@ describe('pre-tool-recall', () => {
       });
       db.close();
 
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a15-3',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a15-3',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       const neutralIdx = ctx.indexOf('older body neutral state');
@@ -1223,8 +1397,10 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       insertSession(db, { id: 'sess-sal', project: 'parent--saltest', memoryId: 'mem-sal' });
       const info = insertObs(db, {
-        sessionId: 'mem-sal', project: 'parent--saltest',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-sal',
+        project: 'parent--saltest',
+        type: 'bugfix',
+        importance: 2,
         title: 'salience probe bug',
         lessonLearned: 'recover orphaned children before hard-deleting a keeper',
         filesModified: `["${join(projectDir, 'maintain.mjs')}"]`,
@@ -1234,7 +1410,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     const envFor = (extra = {}) => ({
@@ -1244,11 +1422,14 @@ describe('pre-tool-recall', () => {
     });
 
     it('Edit: lesson block ends with the ack directive line', async () => {
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'maintain.mjs') },
-        session_id: 'sess-sal-1',
-      }, envFor());
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'maintain.mjs') },
+          session_id: 'sess-sal-1',
+        },
+        envFor(),
+      );
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       expect(ctx).toContain('[mem] Lessons for maintain.mjs:');
       expect(ctx).toContain("'#NN applied'");
@@ -1256,22 +1437,28 @@ describe('pre-tool-recall', () => {
     });
 
     it('Edit: CLAUDE_MEM_SALIENCE=legacy restores the passive block (no directive)', async () => {
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'maintain.mjs') },
-        session_id: 'sess-sal-2',
-      }, envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }));
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'maintain.mjs') },
+          session_id: 'sess-sal-2',
+        },
+        envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }),
+      );
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       expect(ctx).toContain('[mem] Lessons for maintain.mjs:');
       expect(ctx).not.toContain("'#NN applied'");
     });
 
     it('Read: stays passive — no ack directive on the quiet 1-lesson injection', async () => {
-      const { stdout } = await runScript({
-        tool_name: 'Read',
-        tool_input: { file_path: join(projectDir, 'maintain.mjs') },
-        session_id: 'sess-sal-3',
-      }, envFor());
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Read',
+          tool_input: { file_path: join(projectDir, 'maintain.mjs') },
+          session_id: 'sess-sal-3',
+        },
+        envFor(),
+      );
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       expect(ctx).toContain('[mem] Lessons for maintain.mjs:');
       expect(ctx).not.toContain("'#NN applied'");
@@ -1279,17 +1466,23 @@ describe('pre-tool-recall', () => {
 
     it('Read→Edit same session: Edit emits a compact ack nudge naming the Read-time IDs', async () => {
       const filePath = join(projectDir, 'maintain.mjs');
-      await runScript({
-        tool_name: 'Read',
-        tool_input: { file_path: filePath },
-        session_id: 'sess-sal-4',
-      }, envFor());
+      await runScript(
+        {
+          tool_name: 'Read',
+          tool_input: { file_path: filePath },
+          session_id: 'sess-sal-4',
+        },
+        envFor(),
+      );
 
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: filePath },
-        session_id: 'sess-sal-4',
-      }, envFor());
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: filePath },
+          session_id: 'sess-sal-4',
+        },
+        envFor(),
+      );
       const parsed = JSON.parse(stdout);
       const ctx = parsed.hookSpecificOutput.additionalContext;
       expect(ctx).toContain(`#${lessonObsId}`);
@@ -1303,77 +1496,104 @@ describe('pre-tool-recall', () => {
     it('Read→Edit→Edit: the ack nudge fires once — second Edit is silent', async () => {
       const filePath = join(projectDir, 'maintain.mjs');
       const session = 'sess-sal-5';
-      await runScript({
-        tool_name: 'Read',
-        tool_input: { file_path: filePath },
-        session_id: session,
-      }, envFor());
-      await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: filePath },
-        session_id: session,
-      }, envFor());
-      const { stdout: third } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: filePath },
-        session_id: session,
-      }, envFor());
+      await runScript(
+        {
+          tool_name: 'Read',
+          tool_input: { file_path: filePath },
+          session_id: session,
+        },
+        envFor(),
+      );
+      await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: filePath },
+          session_id: session,
+        },
+        envFor(),
+      );
+      const { stdout: third } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: filePath },
+          session_id: session,
+        },
+        envFor(),
+      );
       expect(third).toBe('');
     });
 
     it('Read→Edit on a file with NO lessons stays silent (no spurious ack nudge)', async () => {
       const filePath = join(projectDir, 'lessonless.mjs');
       const session = 'sess-sal-6';
-      await runScript({
-        tool_name: 'Read',
-        tool_input: { file_path: filePath },
-        session_id: session,
-      }, envFor());
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: filePath },
-        session_id: session,
-      }, envFor());
+      await runScript(
+        {
+          tool_name: 'Read',
+          tool_input: { file_path: filePath },
+          session_id: session,
+        },
+        envFor(),
+      );
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: filePath },
+          session_id: session,
+        },
+        envFor(),
+      );
       expect(stdout).toBe('');
     });
 
     it('Read→Edit ack nudge suppressed under CLAUDE_MEM_SALIENCE=legacy (old full-dedup)', async () => {
       const filePath = join(projectDir, 'maintain.mjs');
       const session = 'sess-sal-7';
-      await runScript({
-        tool_name: 'Read',
-        tool_input: { file_path: filePath },
-        session_id: session,
-      }, envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }));
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: filePath },
-        session_id: session,
-      }, envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }));
+      await runScript(
+        {
+          tool_name: 'Read',
+          tool_input: { file_path: filePath },
+          session_id: session,
+        },
+        envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }),
+      );
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: filePath },
+          session_id: session,
+        },
+        envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }),
+      );
       expect(stdout).toBe('');
     });
 
     it('cooldown entry records the injection mode (read vs edit)', async () => {
       const readFile = join(projectDir, 'maintain.mjs');
-      await runScript({
-        tool_name: 'Read',
-        tool_input: { file_path: readFile },
-        session_id: 'sess-sal-8',
-      }, envFor());
-      const cooldown = JSON.parse(readFileSync(
-        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-sal-8.json'), 'utf8',
-      ));
+      await runScript(
+        {
+          tool_name: 'Read',
+          tool_input: { file_path: readFile },
+          session_id: 'sess-sal-8',
+        },
+        envFor(),
+      );
+      const cooldown = JSON.parse(
+        readFileSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-sal-8.json'), 'utf8'),
+      );
       expect(cooldown[readFile].mode).toBe('read');
 
       const editFile = join(projectDir, 'fresh-edit.mjs');
-      await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: editFile },
-        session_id: 'sess-sal-9',
-      }, envFor());
-      const cooldown2 = JSON.parse(readFileSync(
-        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-sal-9.json'), 'utf8',
-      ));
+      await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: editFile },
+          session_id: 'sess-sal-9',
+        },
+        envFor(),
+      );
+      const cooldown2 = JSON.parse(
+        readFileSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-sal-9.json'), 'utf8'),
+      );
       expect(cooldown2[editFile].mode).toBe('edit');
     });
 
@@ -1386,11 +1606,14 @@ describe('pre-tool-recall', () => {
         join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-sal-legacy.json'),
         JSON.stringify({ [filePath]: { ts: Date.now(), lessonIds: [lessonObsId] } }),
       );
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: filePath },
-        session_id: 'sess-sal-legacy',
-      }, envFor());
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: filePath },
+          session_id: 'sess-sal-legacy',
+        },
+        envFor(),
+      );
       expect(stdout).toBe('');
     });
   });
@@ -1416,8 +1639,10 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       insertSession(db, { id: 'sess-a3', project: 'parent--a3test', memoryId: 'mem-a3' });
       const info = insertObs(db, {
-        sessionId: 'mem-a3', project: 'parent--a3test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-a3',
+        project: 'parent--a3test',
+        type: 'bugfix',
+        importance: 2,
         title: 'lesson that UPS already showed',
         lessonLearned: 'Body the agent already has from prompt-time inject',
         filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
@@ -1427,7 +1652,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     function seedUpsInjected(ids, sessionId, ageMs = 0) {
@@ -1435,17 +1662,23 @@ describe('pre-tool-recall', () => {
       // D#120: session-keyed file name, so the seed must carry the same session
       // id the script receives on stdin or the read side derives another path.
       const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test-${sessionId}`);
-      writeFileSync(file, JSON.stringify({ ids: ids.map(String), ts: Date.now() - ageMs, count: 1, session: sessionId }));
+      writeFileSync(
+        file,
+        JSON.stringify({ ids: ids.map(String), ts: Date.now() - ageMs, count: 1, session: sessionId }),
+      );
       return file;
     }
 
     it('drops a lesson row whose ID was just injected by UPS', async () => {
       seedUpsInjected([lessonObsId], 'sess-a3-1');
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a3-1',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a3-1',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       // Lesson dropped → either empty stdout (no other rows) or the no-prior
       // backfill reminder fires. Either way, `#<lessonObsId>` must not appear.
@@ -1459,11 +1692,14 @@ describe('pre-tool-recall', () => {
     it('keeps the lesson when UPS state is older than DEDUP_STALE_MS', async () => {
       // 10 minutes old — stale, should be ignored. Lesson should surface.
       seedUpsInjected([lessonObsId], 'sess-a3-2', 10 * 60_000);
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a3-2',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a3-2',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       expect(ctx).toContain(`#${lessonObsId}`);
@@ -1471,11 +1707,14 @@ describe('pre-tool-recall', () => {
 
     it('keeps the lesson when UPS state file is absent', async () => {
       // No UPS file at all — pre-tool-recall must not crash and must emit normally.
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a3-3',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a3-3',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       expect(ctx).toContain(`#${lessonObsId}`);
@@ -1484,16 +1723,121 @@ describe('pre-tool-recall', () => {
     it('records emitted IDs back so subsequent UPS reads see them', async () => {
       // Simulates PreToolUse emitting → UPS next prompt — UPS dedup logic at
       // 80%-overlap rule should see this id in the file. We assert presence.
-      await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a3-4',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a3-4',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test-sess-a3-4`);
       const state = JSON.parse(readFileSync(file, 'utf8'));
       const idStrings = (state.ids || []).map(String);
       expect(idStrings).toContain(String(lessonObsId));
+    });
+  });
+
+  // ─── D#188: the seen-set is a UNION across TABLES, and `events` shares the numeric
+  // id space with `observations` (90.1% of observation ids also exist as an event id
+  // on the live store, 2026-09-01). The dedup predicate compared bare numbers while
+  // the rows it filtered already carried a `src` tag added for exactly this reason —
+  // the comment three lines above it says "events share the numeric id space with
+  // observations" in as many words. So a UPS-injected observation #42 silently made
+  // event #42 unreachable for the 5-minute window, and vice versa.
+  //
+  // The fixture forces the collision (same id in both tables) and puts the two rows on
+  // DIFFERENT files, so only the event can match the path under test — the bare-number
+  // predicate is then the only thing that can suppress it.
+  describe('cross-hook dedup respects the id NAMESPACE (D#188)', () => {
+    let tmpRoot;
+    let projectDir;
+    let collidingId;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-d188-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'd188');
+      mkdirSync(projectDir, { recursive: true });
+      mkdirSync(join(tmpRoot, 'runtime'), { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-d188', project: 'parent--d188', memoryId: 'mem-d188' });
+      // The observation lives on obs-only.mjs and is never a candidate for the path
+      // under test — its ONLY role is to be the id UPS reports as already injected.
+      const info = insertObs(db, {
+        sessionId: 'mem-d188',
+        project: 'parent--d188',
+        type: 'bugfix',
+        importance: 2,
+        title: 'observation on a different file',
+        lessonLearned: 'OBSERVATION-BODY-MARKER',
+        filesModified: `["${join(projectDir, 'obs-only.mjs')}"]`,
+      });
+      collidingId = Number(info?.lastInsertRowid ?? info);
+      // Same numeric id, other table, on the file the run below touches.
+      db.prepare(
+        `
+        INSERT INTO events (id, project, event_type, title, body, file_paths, importance, created_at_epoch)
+        VALUES (?, 'parent--d188', 'lesson', 'event that shares the number', 'EVENT-BODY-MARKER', ?, 2, ?)
+      `,
+      ).run(collidingId, JSON.stringify([join(projectDir, 'evt-only.mjs')]), Date.now());
+      db.close();
+    });
+
+    afterEach(() => {
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
+    });
+
+    function seedSeen(ids, sessionId) {
+      writeFileSync(
+        join(tmpRoot, 'runtime', `.claude-mem-injected-parent--d188-${sessionId}`),
+        JSON.stringify({ ids: ids.map(String), ts: Date.now(), count: 1, session: sessionId }),
+      );
+    }
+
+    async function runOnEventFile(sessionId) {
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'evt-only.mjs') },
+          session_id: sessionId,
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
+      if (!stdout) return '';
+      return JSON.parse(stdout).hookSpecificOutput?.additionalContext || '';
+    }
+
+    it('an injected OBSERVATION id no longer blocks the event that shares its number', async () => {
+      seedSeen([collidingId], 'sess-d188-1');
+      expect(await runOnEventFile('sess-d188-1')).toContain('EVENT-BODY-MARKER');
+    });
+
+    it('but the namespaced EVENT key still dedups the event — the fix is not "stop deduping"', async () => {
+      // Anti-tautology for the case above: dropping the events arm from the dedup
+      // entirely would pass it. This is the arm that pins the key, not its absence.
+      seedSeen([`E${collidingId}`], 'sess-d188-2');
+      expect(await runOnEventFile('sess-d188-2')).not.toContain('EVENT-BODY-MARKER');
+    });
+
+    it('the face writes the event back under its namespaced key, not as a bare number', async () => {
+      // Otherwise the collision returns on the next prompt from the other direction:
+      // a bare event id in this file blocks the same-numbered observation on the next
+      // UPS prompt. (It also reaches hook.mjs's pathAInjectedIds, but suppresses
+      // nothing there — every id in this file is a string and that consumer compares
+      // against a numeric row id. That inertness is D#193, not this test's subject.)
+      await runOnEventFile('sess-d188-3');
+      const state = JSON.parse(
+        readFileSync(join(tmpRoot, 'runtime', '.claude-mem-injected-parent--d188-sess-d188-3'), 'utf8'),
+      );
+      const written = (state.ids || []).map(String);
+      expect(written).toContain(`E${collidingId}`);
+      expect(written).not.toContain(String(collidingId));
     });
   });
 
@@ -1525,8 +1869,10 @@ describe('pre-tool-recall', () => {
       // resolution). Ranks: A(3) > B(2) > C(1) > D(0).
       ids = [3, 2, 1, 0].map((cited, i) => {
         const info = insertObs(db, {
-          sessionId: 'mem-a4', project: 'parent--algo4',
-          type: 'bugfix', importance: 2,
+          sessionId: 'mem-a4',
+          project: 'parent--algo4',
+          type: 'bugfix',
+          importance: 2,
           title: `algo4 lesson rank ${i}`,
           lessonLearned: `Lesson body number ${i} for the about-to-edit agent`,
           filesModified: `["${target}"]`,
@@ -1542,23 +1888,29 @@ describe('pre-tool-recall', () => {
       const evtFile = join(projectDir, 'events-only.mjs');
       const now = Date.now();
       eventIds = [0, 1, 2, 3].map((k) => {
-        const info = db.prepare(`
+        const info = db
+          .prepare(
+            `
           INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
           VALUES (?, 'lesson', ?, ?, ?, 2, ?)
-        `).run(
-          'parent--algo4',
-          `algo4 event rank ${k}`,
-          `Event body number ${k} for the about-to-edit agent`,
-          JSON.stringify([evtFile]),
-          now - k * 60_000,
-        );
+        `,
+          )
+          .run(
+            'parent--algo4',
+            `algo4 event rank ${k}`,
+            `Event body number ${k} for the about-to-edit agent`,
+            JSON.stringify([evtFile]),
+            now - k * 60_000,
+          );
         return Number(info.lastInsertRowid);
       });
       db.close();
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     it('still fills the slot when UPS already injected every row the old LIMIT could reach', async () => {
@@ -1569,15 +1921,24 @@ describe('pre-tool-recall', () => {
       // fail — stdout carries no `#<id>` for any of the four rows (measured
       // 2026-09-01, same fixture).
       const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-1');
-      writeFileSync(file, JSON.stringify({
-        ids: [ids[0], ids[1]].map(String), ts: Date.now(), count: 2, session: 'sess-a4-1',
-      }));
+      writeFileSync(
+        file,
+        JSON.stringify({
+          ids: [ids[0], ids[1]].map(String),
+          ts: Date.now(),
+          count: 2,
+          session: 'sess-a4-1',
+        }),
+      );
 
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a4-1',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a4-1',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       // Assert the emptiness FIRST and by name: the pre-fix behaviour is that the
       // face emits nothing at all, and letting JSON.parse throw on '' reports that as
@@ -1597,11 +1958,14 @@ describe('pre-tool-recall', () => {
       // and the LIMITs are exactly what they were before ALGO-4. Without this case a
       // slack that ALWAYS over-fetched would pass the test above while quietly
       // inflating the PreToolUse injection budget.
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a4-2',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a4-2',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       expect(ctx).toContain(`#${ids[0]}`);
@@ -1616,15 +1980,24 @@ describe('pre-tool-recall', () => {
       // drive Edit. Testing the arm the headline is about, not the neighbouring one.
       // VERIFIED RED: reverting `obsLimit` to `(isRead ? 1 : 2)` empties stdout.
       const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-4');
-      writeFileSync(file, JSON.stringify({
-        ids: [ids[0]].map(String), ts: Date.now(), count: 1, session: 'sess-a4-4',
-      }));
+      writeFileSync(
+        file,
+        JSON.stringify({
+          ids: [ids[0]].map(String),
+          ts: Date.now(),
+          count: 1,
+          session: 'sess-a4-4',
+        }),
+      );
 
-      const { stdout } = await runScript({
-        tool_name: 'Read',
-        tool_input: { file_path: join(projectDir, 'shared.mjs') },
-        session_id: 'sess-a4-4',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Read',
+          tool_input: { file_path: join(projectDir, 'shared.mjs') },
+          session_id: 'sess-a4-4',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       expect(stdout, 'Read path silenced: obsLimit 1 minus one dedup hit left zero rows').not.toBe('');
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
@@ -1642,16 +2015,29 @@ describe('pre-tool-recall', () => {
       // hit silences it outright. Driven through a file that has NO observation rows,
       // so the merge is events-only and the assertion cannot be satisfied by the obs arm.
       // VERIFIED RED: reverting `eventsLimit` to `(isRead ? 1 : 2)` empties stdout.
+      // D#188: an event is recorded in the seen-set under its namespaced `E<id>` key.
+      // Seeding bare numbers here would no longer suppress anything — and note this
+      // fixture's obs and event ids genuinely collide (both tables auto-number from 1),
+      // which is exactly the machine-wide condition D#188 measured at 90.1%.
       const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-3');
-      writeFileSync(file, JSON.stringify({
-        ids: [eventIds[0], eventIds[1]].map(String), ts: Date.now(), count: 2, session: 'sess-a4-3',
-      }));
+      writeFileSync(
+        file,
+        JSON.stringify({
+          ids: [eventIds[0], eventIds[1]].map((id) => `E${id}`),
+          ts: Date.now(),
+          count: 2,
+          session: 'sess-a4-3',
+        }),
+      );
 
-      const { stdout } = await runScript({
-        tool_name: 'Edit',
-        tool_input: { file_path: join(projectDir, 'events-only.mjs') },
-        session_id: 'sess-a4-3',
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      const { stdout } = await runScript(
+        {
+          tool_name: 'Edit',
+          tool_input: { file_path: join(projectDir, 'events-only.mjs') },
+          session_id: 'sess-a4-3',
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
 
       expect(stdout, 'events source was truncated to nothing by the dedup').not.toBe('');
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
@@ -1682,8 +2068,10 @@ describe('pre-tool-recall', () => {
       initSchema(db);
       insertSession(db, { id: 'sess-p2', project: 'parent--p2test', memoryId: 'mem-p2' });
       const r = insertObs(db, {
-        sessionId: 'mem-p2', project: 'parent--p2test',
-        type: 'bugfix', importance: 2,
+        sessionId: 'mem-p2',
+        project: 'parent--p2test',
+        type: 'bugfix',
+        importance: 2,
         title: 'decayable edge lesson',
         lessonLearned: 'lesson behind a decaying edge',
         filesModified: '["edgy.mjs"]',
@@ -1693,7 +2081,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     function setStreak(streak) {
@@ -1703,11 +2093,14 @@ describe('pre-tool-recall', () => {
     }
 
     function editFile(session, env = {}) {
-      return runScript({
-        tool_name: 'Edit',
-        session_id: session,
-        tool_input: { file_path: join(projectDir, 'edgy.mjs') },
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir, ...env });
+      return runScript(
+        {
+          tool_name: 'Edit',
+          session_id: session,
+          tool_input: { file_path: join(projectDir, 'edgy.mjs') },
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir, ...env },
+      );
     }
 
     it('flag ON: an edge at the default threshold (3 misses) stops firing', async () => {
@@ -1780,7 +2173,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     function seedObs(filesModified, lesson, title = 'seed') {
@@ -1788,20 +2183,26 @@ describe('pre-tool-recall', () => {
       db.pragma('foreign_keys = OFF');
       initSchema(db);
       insertObs(db, {
-        sessionId: 'mem-p0', project: 'parent--p0test',
-        type: 'bugfix', importance: 2,
-        title, lessonLearned: lesson,
+        sessionId: 'mem-p0',
+        project: 'parent--p0test',
+        type: 'bugfix',
+        importance: 2,
+        title,
+        lessonLearned: lesson,
         filesModified: JSON.stringify(filesModified),
       });
       db.close();
     }
 
     function editFile(name, session) {
-      return runScript({
-        tool_name: 'Edit',
-        session_id: session,
-        tool_input: { file_path: join(projectDir, name) },
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      return runScript(
+        {
+          tool_name: 'Edit',
+          session_id: session,
+          tool_input: { file_path: join(projectDir, name) },
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
     }
 
     it('does NOT match a different basename sharing a suffix (bash-utils.mjs vs utils.mjs)', async () => {
@@ -1874,26 +2275,33 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     function seedEvent({ title, body, files, epochOffset = 0 }) {
       const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
       db.pragma('foreign_keys = OFF');
       initSchema(db);
-      db.prepare(`
+      db.prepare(
+        `
         INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
         VALUES (?, 'bugfix', ?, ?, ?, 2, ?)
-      `).run('parent--p0evtest', title, body, JSON.stringify(files), Date.now() + epochOffset);
+      `,
+      ).run('parent--p0evtest', title, body, JSON.stringify(files), Date.now() + epochOffset);
       db.close();
     }
 
     function editFile(name, session) {
-      return runScript({
-        tool_name: 'Edit',
-        session_id: session,
-        tool_input: { file_path: join(projectDir, name) },
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      return runScript(
+        {
+          tool_name: 'Edit',
+          session_id: session,
+          tool_input: { file_path: join(projectDir, name) },
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
     }
 
     it('filters bodyless LOW_SIGNAL-titled events on Edit', async () => {
@@ -1920,7 +2328,12 @@ describe('pre-tool-recall', () => {
 
     it('orders body-bearing events above bodyless-but-substantive-titled ones', async () => {
       // Newer bodyless row with a real title vs older row with a body — body wins.
-      seedEvent({ title: 'registry UPSERT preserve-on-empty drift', body: null, files: ['ordered.mjs'], epochOffset: 0 });
+      seedEvent({
+        title: 'registry UPSERT preserve-on-empty drift',
+        body: null,
+        files: ['ordered.mjs'],
+        epochOffset: 0,
+      });
       seedEvent({
         title: 'older but body-bearing',
         body: 'body-bearing lesson outranks bare title',
@@ -1967,7 +2380,9 @@ describe('pre-tool-recall', () => {
     });
 
     afterEach(() => {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
     });
 
     function seedObs(file, lesson, extra = {}) {
@@ -1975,9 +2390,12 @@ describe('pre-tool-recall', () => {
       db.pragma('foreign_keys = OFF');
       initSchema(db);
       insertObs(db, {
-        sessionId: 'mem-live', project: 'parent--livetest',
-        type: 'bugfix', importance: 2,
-        title: 'seeded lesson', lessonLearned: lesson,
+        sessionId: 'mem-live',
+        project: 'parent--livetest',
+        type: 'bugfix',
+        importance: 2,
+        title: 'seeded lesson',
+        lessonLearned: lesson,
         filesModified: JSON.stringify([file]),
         ...extra,
       });
@@ -1985,11 +2403,14 @@ describe('pre-tool-recall', () => {
     }
 
     function editFile(name, session) {
-      return runScript({
-        tool_name: 'Edit',
-        session_id: session,
-        tool_input: { file_path: join(projectDir, name) },
-      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      return runScript(
+        {
+          tool_name: 'Edit',
+          session_id: session,
+          tool_input: { file_path: join(projectDir, name) },
+        },
+        { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir },
+      );
     }
 
     it('excludes a superseded observation while still injecting the live one', async () => {
@@ -2051,6 +2472,195 @@ describe('pre-tool-recall', () => {
       const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
       expect(ctx).toContain('recent lesson inside the window');
       expect(ctx).not.toContain('stale lesson outside the window');
+    });
+  });
+
+  // R12 audit, partition B. Two defects that share one root: the event this hook
+  // actually receives is not the event its parser encodes. B-2 is a field name
+  // (`NotebookEdit` carries `notebook_path`, never `file_path`) and B-1 is a LIKE
+  // escape (the events leg escapes `%` and `_` but not the escape character, so a
+  // Windows path's backslashes are eaten by `ESCAPE '\'`).
+  //
+  // Both were invisible to the existing guards for the same reason: every guard in
+  // this file builds its own event with `file_path`, and `tests/cite-back-hint.test.mjs`
+  // even forges a `file_path` onto a `.ipynb` entry. They asserted what the fix
+  // blocks, never what the host sends.
+  describe('event shapes the host actually sends (R12 B-1 / B-2)', () => {
+    const fixtures = makeFixtureTracker();
+    let tmpRoot;
+    let dbPath;
+    let runtimeDir;
+    let projectDir;
+
+    afterAll(() => fixtures.disposeAll());
+
+    beforeEach(() => {
+      tmpRoot = fixtures.track(mkdtempSync(join(tmpdir(), 'pre-recall-hostshape-')));
+      dbPath = join(tmpRoot, 'test.db');
+      runtimeDir = join(tmpRoot, 'runtime');
+      mkdirSync(runtimeDir, { recursive: true });
+      projectDir = join(tmpRoot, 'parent', 'hostshape');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-hs', project: 'parent--hostshape', memoryId: 'mem-hs' });
+      db.close();
+    });
+
+    function runWithEnv(input) {
+      return runScript(input, {
+        CLAUDE_MEM_DB_PATH: dbPath,
+        CLAUDE_MEM_RUNTIME_DIR: runtimeDir,
+        CLAUDE_PROJECT_DIR: projectDir,
+      });
+    }
+
+    /** Seed one events-table lesson whose `file_paths` array is exactly `paths`. */
+    function seedEvent(paths, body) {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      db.prepare(
+        `INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+         VALUES (?, 'lesson', ?, ?, ?, 2, ?)`,
+      ).run('parent--hostshape', 'host-shape lesson', body, JSON.stringify(paths), Date.now());
+      db.close();
+    }
+
+    /** All hook-error records this block's runtime dir collected. */
+    function hookErrorRecords() {
+      const dir = join(runtimeDir, 'hook-errors');
+      if (!existsSync(dir)) return [];
+      const out = [];
+      for (const f of readdirSync(dir)) {
+        if (!f.endsWith('.jsonl')) continue;
+        for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
+          if (!line) continue;
+          try {
+            out.push(JSON.parse(line));
+          } catch {
+            /* skip */
+          }
+        }
+      }
+      return out;
+    }
+
+    // D#44. The events leg matches `events.file_paths` with its own needle rather
+    // than fileMatchClause, so scrubbing the writer (lib/activity.mjs) without
+    // scrubbing THIS key derivation would leave the hook's two legs deriving
+    // different keys from one path — which the note above `keyPath` forbids.
+    // FAILS IF: scripts/pre-tool-recall.js derives its needles from the raw path.
+    // The credential sits in the BASENAME on purpose: a directory-segment secret
+    // leaves the basename needle intact and this case would pass unscrubbed.
+    it('recalls an event stored under a scrubbed path when the edit names the raw one', async () => {
+      const rawPath = join(projectDir, `ghp_${'a'.repeat(36)}.mjs`);
+      seedEvent([scrubSecrets(rawPath)], 'this file is named after a token and still has a lesson');
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: rawPath, old_string: 'a', new_string: 'b' },
+      });
+
+      expect(stdout, 'the events leg returned nothing at all').not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('this file is named after a token and still has a lesson');
+      expect(ctx, 'the hook echoed the raw credential back into model context').not.toContain(
+        `ghp_${'a'.repeat(36)}`,
+      );
+    });
+
+    // B-2 ①. FAILS IF: the parser reads only `tool_input.file_path`.
+    it('recalls for a NotebookEdit, which carries notebook_path and no file_path', async () => {
+      seedEvent(['x.ipynb'], 'the notebook kernel must be restarted after an import edit');
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'NotebookEdit',
+        tool_input: {
+          notebook_path: join(projectDir, 'x.ipynb'),
+          new_source: 'import pandas as pd',
+          edit_mode: 'replace',
+        },
+      });
+
+      expect(stdout).not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('the notebook kernel must be restarted after an import edit');
+    });
+
+    // B-2 ②. The shape probe at pre-tool-recall.js exists to tell "Claude Code
+    // renamed the field" apart from "this event genuinely has no path". It could
+    // not: its whitelist of tools-we-handle was also its silence list, so the one
+    // population that carries the rename signal was the one it never recorded.
+    // FAILS IF: a handled tool arriving with no recognizable path field is silent.
+    it('records telemetry when a tool it handles arrives with no recognizable path field', async () => {
+      const { stdout } = await runWithEnv({ tool_name: 'Edit', tool_input: {} });
+
+      // Still silent on stdout — this is telemetry, not a user-facing message.
+      expect(stdout).toBe('');
+      const keys = hookErrorRecords().map((r) => r.scope);
+      expect(keys).toContain('pre-recall:no-path-field');
+    });
+
+    // Control for the case above: an unhandled tool keeps its own distinct key,
+    // so the two populations stay separable in the log.
+    it('keeps the unknown-tool key distinct from the missing-path-field key', async () => {
+      const { stdout } = await runWithEnv({ tool_name: 'Bash', tool_input: { command: 'ls' } });
+
+      expect(stdout).toBe('');
+      const keys = hookErrorRecords().map((r) => r.scope);
+      expect(keys).toContain('pre-recall:unknown-tool');
+      expect(keys).not.toContain('pre-recall:no-path-field');
+    });
+
+    // B-1 ①. The basename arm cannot save this: real rows store path-shaped
+    // entries (measured 1541/1541 on the author's corpus, bare basenames = 0), so
+    // the full-path arm is the only one that can match, and it is the escaped one.
+    // FAILS IF: the events leg escapes `%` and `_` without first escaping `\`.
+    it('matches a Windows-shaped full path, whose backslashes ESCAPE would otherwise eat', async () => {
+      const winPath = 'C:\\proj\\src\\utils.mjs';
+      seedEvent([winPath], 'close the handle before renaming on win32');
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: winPath },
+      });
+
+      expect(stdout).not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('close the handle before renaming on win32');
+    });
+
+    // POSIX control. Green before and after the escaping fix — it is here so a
+    // mutation that reverts the escape helper shows up as ONE red case, proving the
+    // Windows case discriminates escaping rather than "any change at all".
+    it('still matches a POSIX full path after the escaping change', async () => {
+      const posixPath = join(projectDir, 'deep', 'utils.mjs');
+      seedEvent([posixPath], 'unlink is atomic on posix, rename is not');
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: posixPath },
+      });
+
+      expect(stdout).not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('unlink is atomic on posix, rename is not');
+    });
+
+    // A literal `%` in a filename must stay literal — the wildcard escaping the
+    // new helper inherits has to survive the backslash escaping added in front of it.
+    it('treats a literal % in a filename as a literal, not a wildcard', async () => {
+      seedEvent([join(projectDir, 'a%b.mjs')], 'percent-named file lesson');
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'aXXXb.mjs') },
+      });
+
+      expect(stdout).toBe('');
     });
   });
 });

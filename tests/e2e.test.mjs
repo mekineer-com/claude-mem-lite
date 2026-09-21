@@ -2,7 +2,7 @@
 // Tests the actual CLI entry point (node hook.mjs <event>) as a subprocess
 // Isolation via HOME env var → redirects ~/.claude-mem-lite/ to temp dir
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { execFileSync } from 'child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, unlinkSync } from 'fs';
 import { join, resolve, dirname } from 'path';
@@ -12,16 +12,23 @@ import Database from 'better-sqlite3';
 import { computeMinHash } from '../utils.mjs';
 import { initSchema } from '../schema.mjs';
 import { saveEvent } from '../lib/activity.mjs';
+import { makeFixtureTracker } from './test-helpers.mjs';
 
 const HOOK_PATH = resolve('hook.mjs');
 const MOCK_CLAUDE = resolve('scripts/mock-claude.mjs');
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 
+// The afterEach below removes each sandbox and succeeds; a detached hook worker then
+// recreates the data dir under the HOME it was handed. See makeFixtureTracker's docblock —
+// this file was 13 of the 30 dirs one clean suite run used to leave in /tmp.
+const fixtures = makeFixtureTracker();
+afterAll(() => fixtures.disposeAll());
+
 function makeTmpDir() {
   const dir = join(tmpdir(), `mem-e2e-${randomUUID().slice(0, 8)}`);
   mkdirSync(dir, { recursive: true });
-  return dir;
+  return fixtures.track(dir);
 }
 
 function initTestDb(tmpHome) {
@@ -108,7 +115,11 @@ function readMetricRows(tmpHome) {
     if (!f.endsWith('.jsonl')) continue;
     for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
       if (!line) continue;
-      try { rows.push(JSON.parse(line)); } catch { /* skip malformed */ }
+      try {
+        rows.push(JSON.parse(line));
+      } catch {
+        /* skip malformed */
+      }
     }
   }
   return rows;
@@ -116,7 +127,7 @@ function readMetricRows(tmpHome) {
 
 function getSessionFile(tmpHome) {
   const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
-  const files = readdirSync(runtimeDir).filter(f => f.startsWith('session-'));
+  const files = readdirSync(runtimeDir).filter((f) => f.startsWith('session-'));
   return files.length > 0 ? join(runtimeDir, files[0]) : null;
 }
 
@@ -125,18 +136,22 @@ function getSessionIdFromFile(tmpHome) {
   if (!sf) return null;
   try {
     return JSON.parse(readFileSync(sf, 'utf8')).id;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 function getEpisodeFile(tmpHome) {
   const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
-  const files = readdirSync(runtimeDir).filter(f => f.startsWith('ep-') && f.endsWith('.json') && !f.startsWith('ep-flush-'));
+  const files = readdirSync(runtimeDir).filter(
+    (f) => f.startsWith('ep-') && f.endsWith('.json') && !f.startsWith('ep-flush-'),
+  );
   return files.length > 0 ? join(runtimeDir, files[0]) : null;
 }
 
 function getFlushFiles(tmpHome) {
   const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
-  return readdirSync(runtimeDir).filter(f => f.startsWith('ep-flush-'));
+  return readdirSync(runtimeDir).filter((f) => f.startsWith('ep-flush-'));
 }
 
 // ─── Test Suites ─────────────────────────────────────────────────────────────
@@ -152,19 +167,30 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  try { rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+  try {
+    rmSync(tmpHome, { recursive: true, force: true });
+  } catch {}
 });
 
 describe('Suite 1: Full Session Lifecycle', () => {
   it('disabled plugin setting makes session-start exit without side effects', () => {
     const settingsDir = join(tmpHome, '.claude');
     mkdirSync(settingsDir, { recursive: true });
-    writeFileSync(join(settingsDir, 'settings.json'), JSON.stringify({
-      enabledPlugins: { 'claude-mem-lite@sdsrss': false },
-      hooks: {
-        SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: `node "${HOOK_PATH}" session-start` }] }]
-      }
-    }, null, 2));
+    writeFileSync(
+      join(settingsDir, 'settings.json'),
+      JSON.stringify(
+        {
+          enabledPlugins: { 'claude-mem-lite@sdsrss': false },
+          hooks: {
+            SessionStart: [
+              { matcher: '*', hooks: [{ type: 'command', command: `node "${HOOK_PATH}" session-start` }] },
+            ],
+          },
+        },
+        null,
+        2,
+      ),
+    );
 
     const { stdout, exitCode } = runHook('session-start', { env: { HOME: tmpHome } });
     expect(exitCode).toBe(0);
@@ -203,11 +229,15 @@ describe('Suite 1: Full Session Lifecycle', () => {
     // Start session first
     runHook('session-start', { env: { HOME: tmpHome } });
 
-    const payload = makeToolPayload('Edit', {
-      file_path: '/tmp/src/index.js',
-      old_string: 'foo',
-      new_string: 'bar',
-    }, 'OK — edited file');
+    const payload = makeToolPayload(
+      'Edit',
+      {
+        file_path: '/tmp/src/index.js',
+        old_string: 'foo',
+        new_string: 'bar',
+      },
+      'OK — edited file',
+    );
 
     const { exitCode } = runHook('post-tool-use', {
       stdin: payload,
@@ -231,11 +261,15 @@ describe('Suite 1: Full Session Lifecycle', () => {
     // Three related edits to the same file
     for (let i = 0; i < 3; i++) {
       runHook('post-tool-use', {
-        stdin: makeToolPayload('Edit', {
-          file_path: '/tmp/src/index.js',
-          old_string: `old${i}`,
-          new_string: `new${i}`,
-        }, 'OK — edited file'),
+        stdin: makeToolPayload(
+          'Edit',
+          {
+            file_path: '/tmp/src/index.js',
+            old_string: `old${i}`,
+            new_string: `new${i}`,
+          },
+          'OK — edited file',
+        ),
         env: { HOME: tmpHome },
       });
     }
@@ -252,11 +286,15 @@ describe('Suite 1: Full Session Lifecycle', () => {
 
     // Add some entries
     runHook('post-tool-use', {
-      stdin: makeToolPayload('Edit', {
-        file_path: '/tmp/src/app.js',
-        old_string: 'a',
-        new_string: 'b',
-      }, 'OK — edited file'),
+      stdin: makeToolPayload(
+        'Edit',
+        {
+          file_path: '/tmp/src/app.js',
+          old_string: 'a',
+          new_string: 'b',
+        },
+        'OK — edited file',
+      ),
       env: { HOME: tmpHome },
     });
 
@@ -282,9 +320,13 @@ describe('Suite 1: Full Session Lifecycle', () => {
     const epFile = getEpisodeFile(tmpHome);
     expect(epFile).toBeNull();
 
-    // Session file should be cleaned up
+    // Session file SURVIVES Stop, and still names the session that just ran. Restated
+    // from `expect(sf).toBeNull()` in the R10-P1-1 fix: Stop fires every turn, so deleting
+    // the file here re-minted a mem session per turn and left handleSessionStart's
+    // mid-restart probe permanently blind. See handleStop's docblock for the measurements.
     const sf = getSessionFile(tmpHome);
-    expect(sf).toBeNull();
+    expect(sf).not.toBeNull();
+    expect(getSessionIdFromFile(tmpHome)).toBe(sessionId);
   });
 
   it('full cycle: start → tool-use ×3 → stop → verify DB', () => {
@@ -294,11 +336,15 @@ describe('Suite 1: Full Session Lifecycle', () => {
     // Three edits
     for (let i = 0; i < 3; i++) {
       runHook('post-tool-use', {
-        stdin: makeToolPayload('Edit', {
-          file_path: `/tmp/src/file${i}.js`,
-          old_string: 'old',
-          new_string: 'new',
-        }, 'OK — edited file'),
+        stdin: makeToolPayload(
+          'Edit',
+          {
+            file_path: `/tmp/src/file${i}.js`,
+            old_string: 'old',
+            new_string: 'new',
+          },
+          'OK — edited file',
+        ),
         env: { HOME: tmpHome },
       });
     }
@@ -326,11 +372,15 @@ describe('Suite 2: Episode Buffer Management', () => {
     // Send 11 entries to the same file (10 = buffer full → flush)
     for (let i = 0; i < 11; i++) {
       runHook('post-tool-use', {
-        stdin: makeToolPayload('Edit', {
-          file_path: '/tmp/src/big.js',
-          old_string: `line${i}`,
-          new_string: `fixed${i}`,
-        }, 'OK — edited file'),
+        stdin: makeToolPayload(
+          'Edit',
+          {
+            file_path: '/tmp/src/big.js',
+            old_string: `line${i}`,
+            new_string: `fixed${i}`,
+          },
+          'OK — edited file',
+        ),
         env: { HOME: tmpHome },
       });
     }
@@ -377,7 +427,10 @@ describe('Suite 2: Episode Buffer Management', () => {
     // only fires at entries.length >= 2) keeps both in ONE buffer, and distinct
     // files give distinct obs titles so they aren't fuzzy-deduped into one. The
     // split must therefore happen at flush (planEpisodeFlush), not via transition.
-    for (const [sid, file] of [['cc-A', '/tmp/src/alpha.js'], ['cc-B', '/tmp/src/beta.js']]) {
+    for (const [sid, file] of [
+      ['cc-A', '/tmp/src/alpha.js'],
+      ['cc-B', '/tmp/src/beta.js'],
+    ]) {
       runHook('post-tool-use', {
         stdin: JSON.stringify({
           tool_name: 'Edit',
@@ -398,7 +451,9 @@ describe('Suite 2: Episode Buffer Management', () => {
     try {
       const n = db.prepare('SELECT COUNT(*) c FROM observations').get().c;
       expect(n).toBe(2); // one immediate observation per session group
-    } finally { db.close(); }
+    } finally {
+      db.close();
+    }
   });
 
   it('mixed significance: only the significant session-group produces an observation', () => {
@@ -412,21 +467,27 @@ describe('Suite 2: Episode Buffer Management', () => {
       stdin: JSON.stringify({
         tool_name: 'Edit',
         tool_input: { file_path: '/tmp/src/gamma.js', old_string: 'x', new_string: 'y' },
-        tool_response: 'OK — edited file', session_id: 'cc-A',
-      }), env,
+        tool_response: 'OK — edited file',
+        session_id: 'cc-A',
+      }),
+      env,
     });
     runHook('post-tool-use', {
       stdin: JSON.stringify({
         tool_name: 'Bash',
         tool_input: { command: 'pwd' },
-        tool_response: '/home/user/project/subdir', session_id: 'cc-B',
-      }), env,
+        tool_response: '/home/user/project/subdir',
+        session_id: 'cc-B',
+      }),
+      env,
     });
     runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env });
     const db = openTestDb(tmpHome);
     try {
       expect(db.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(1);
-    } finally { db.close(); }
+    } finally {
+      db.close();
+    }
   });
 
   it('same-file concurrent sessions dedupe to one un-mixed observation (accepted limitation)', () => {
@@ -442,15 +503,19 @@ describe('Suite 2: Episode Buffer Management', () => {
         stdin: JSON.stringify({
           tool_name: 'Edit',
           tool_input: { file_path: '/tmp/src/same.js', old_string: sid, new_string: sid + '!' },
-          tool_response: 'OK — edited file', session_id: sid,
-        }), env,
+          tool_response: 'OK — edited file',
+          session_id: sid,
+        }),
+        env,
       });
     }
     runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env });
     const db = openTestDb(tmpHome);
     try {
       expect(db.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(1); // deduped, not 2
-    } finally { db.close(); }
+    } finally {
+      db.close();
+    }
   });
 
   it('PostToolUse flush emits receipt JSON with correct event tag', () => {
@@ -466,11 +531,15 @@ describe('Suite 2: Episode Buffer Management', () => {
     let flushStdout = '';
     for (let i = 0; i < 11; i++) {
       const { stdout } = runHook('post-tool-use', {
-        stdin: makeToolPayload('Edit', {
-          file_path: '/tmp/src/receipt.js',
-          old_string: `old${i}`,
-          new_string: `new${i}`,
-        }, 'OK — edited file'),
+        stdin: makeToolPayload(
+          'Edit',
+          {
+            file_path: '/tmp/src/receipt.js',
+            old_string: `old${i}`,
+            new_string: `new${i}`,
+          },
+          'OK — edited file',
+        ),
         env: { HOME: tmpHome },
       });
       if (stdout && stdout.includes('episode flushed')) flushStdout = stdout;
@@ -500,14 +569,23 @@ describe('Suite 2: Episode Buffer Management', () => {
     // Build a leftover episode (below the 10-entry auto-flush threshold).
     for (let i = 0; i < 2; i++) {
       runHook('post-tool-use', {
-        stdin: makeToolPayload('Edit', {
-          file_path: '/tmp/src/carry.js', old_string: `o${i}`, new_string: `n${i}`,
-        }, 'OK — edited file'),
+        stdin: makeToolPayload(
+          'Edit',
+          {
+            file_path: '/tmp/src/carry.js',
+            old_string: `o${i}`,
+            new_string: `n${i}`,
+          },
+          'OK — edited file',
+        ),
         env: { HOME: tmpHome },
       });
     }
     // SessionStart (clear) flushes the leftover episode AND prints the dashboard.
-    const { stdout } = runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env: { HOME: tmpHome } });
+    const { stdout } = runHook('session-start', {
+      stdin: JSON.stringify({ source: 'clear' }),
+      env: { HOME: tmpHome },
+    });
     expect(stdout.trim(), 'the leftover episode + dashboard produced no output at all').not.toBe('');
     expect(stdout).not.toContain('}{');
     // The whole stdout — not each line — must be one JSON document.
@@ -517,8 +595,13 @@ describe('Suite 2: Episode Buffer Management', () => {
     // Both surfaces ride it: the flushed episode receipt and the dashboard.
     expect(parsed.hookSpecificOutput.additionalContext).toMatch(/\[mem\] episode flushed: \d+ entries/);
     // And nothing rides outside it.
-    expect(stdout.trim().split('\n').filter((l) => l.trim() && !l.startsWith('{')).length === 0
-      || parsed.hookSpecificOutput.additionalContext.length > 0).toBe(true);
+    expect(
+      stdout
+        .trim()
+        .split('\n')
+        .filter((l) => l.trim() && !l.startsWith('{')).length === 0 ||
+        parsed.hookSpecificOutput.additionalContext.length > 0,
+    ).toBe(true);
     expect(stdout.split('\n').filter((l) => l.trim().startsWith('{'))).toHaveLength(1);
   });
 
@@ -546,48 +629,59 @@ describe('Suite 2: Episode Buffer Management', () => {
 
     // First, create a normal episode entry
     runHook('post-tool-use', {
-      stdin: makeToolPayload('Edit', {
-        file_path: '/tmp/src/app.js',
-        old_string: 'a',
-        new_string: 'b',
-      }, 'OK — edited file'),
+      stdin: makeToolPayload(
+        'Edit',
+        {
+          file_path: '/tmp/src/app.js',
+          old_string: 'a',
+          new_string: 'b',
+        },
+        'OK — edited file',
+      ),
       env: { HOME: tmpHome },
     });
 
     // Manually create a pending file (simulates what writePendingEntry does on lock failure)
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const pendingFile = join(runtimeDir, `pending-${Date.now()}-test.json`);
-    writeFileSync(pendingFile, JSON.stringify({
-      entry: {
-        tool: 'Write',
-        desc: 'Created app.js (200 chars)',
-        files: ['/tmp/src/app.js'],
+    writeFileSync(
+      pendingFile,
+      JSON.stringify({
+        entry: {
+          tool: 'Write',
+          desc: 'Created app.js (200 chars)',
+          files: ['/tmp/src/app.js'],
+          ts: Date.now(),
+          isError: false,
+          isSignificant: true,
+          bashSig: null,
+        },
+        sessionId,
+        project: 'parent--testproj',
         ts: Date.now(),
-        isError: false,
-        isSignificant: true,
-        bashSig: null,
-      },
-      sessionId,
-      project: 'parent--testproj',
-      ts: Date.now(),
-    }));
+      }),
+    );
 
     // Verify pending file exists
-    const pendingBefore = readdirSync(runtimeDir).filter(f => f.startsWith('pending-'));
+    const pendingBefore = readdirSync(runtimeDir).filter((f) => f.startsWith('pending-'));
     expect(pendingBefore.length).toBe(1);
 
     // Next post-tool-use should merge the pending entry
     runHook('post-tool-use', {
-      stdin: makeToolPayload('Edit', {
-        file_path: '/tmp/src/app.js',
-        old_string: 'x',
-        new_string: 'y',
-      }, 'OK — edited file'),
+      stdin: makeToolPayload(
+        'Edit',
+        {
+          file_path: '/tmp/src/app.js',
+          old_string: 'x',
+          new_string: 'y',
+        },
+        'OK — edited file',
+      ),
       env: { HOME: tmpHome },
     });
 
     // Pending files should be consumed
-    const remainingPending = readdirSync(runtimeDir).filter(f => f.startsWith('pending-'));
+    const remainingPending = readdirSync(runtimeDir).filter((f) => f.startsWith('pending-'));
     expect(remainingPending.length).toBe(0);
 
     // Episode should contain the merged entries (original + pending + new)
@@ -603,22 +697,30 @@ describe('Suite 2: Episode Buffer Management', () => {
     // Two entries on file A
     for (let i = 0; i < 2; i++) {
       runHook('post-tool-use', {
-        stdin: makeToolPayload('Edit', {
-          file_path: '/tmp/src/moduleA.js',
-          old_string: `a${i}`,
-          new_string: `b${i}`,
-        }, 'OK — edited file'),
+        stdin: makeToolPayload(
+          'Edit',
+          {
+            file_path: '/tmp/src/moduleA.js',
+            old_string: `a${i}`,
+            new_string: `b${i}`,
+          },
+          'OK — edited file',
+        ),
         env: { HOME: tmpHome },
       });
     }
 
     // Entry on completely unrelated file B → triggers phase change flush
     runHook('post-tool-use', {
-      stdin: makeToolPayload('Edit', {
-        file_path: '/tmp/tests/unrelated.test.js',
-        old_string: 'x',
-        new_string: 'y',
-      }, 'OK — edited file'),
+      stdin: makeToolPayload(
+        'Edit',
+        {
+          file_path: '/tmp/tests/unrelated.test.js',
+          old_string: 'x',
+          new_string: 'y',
+        },
+        'OK — edited file',
+      ),
       env: { HOME: tmpHome },
     });
 
@@ -636,23 +738,28 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
     // Create a flush file manually (simulating what flushEpisode does)
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flushFile = join(runtimeDir, `ep-flush-${Date.now()}-test.json`);
-    writeFileSync(flushFile, JSON.stringify({
-      sessionId,
-      project: 'parent--testproj',
-      startedAt: Date.now() - 5000,
-      lastAt: Date.now(),
-      files: ['/tmp/src/index.js'],
-      entries: [{
-        tool: 'Edit',
-        desc: 'index.js: "foo" → "bar"',
+    writeFileSync(
+      flushFile,
+      JSON.stringify({
+        sessionId,
+        project: 'parent--testproj',
+        startedAt: Date.now() - 5000,
+        lastAt: Date.now(),
         files: ['/tmp/src/index.js'],
-        ts: Date.now(),
-        isError: false,
-        isSignificant: true,
-        bashSig: null,
-      }],
-      filesRead: [],
-    }));
+        entries: [
+          {
+            tool: 'Edit',
+            desc: 'index.js: "foo" → "bar"',
+            files: ['/tmp/src/index.js'],
+            ts: Date.now(),
+            isError: false,
+            isSignificant: true,
+            bashSig: null,
+          },
+        ],
+        filesRead: [],
+      }),
+    );
 
     // Run llm-episode — it reads the flush file, calls mock LLM, saves observation
     const { exitCode } = runHook('llm-episode', {
@@ -681,23 +788,28 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
 
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flushFile = join(runtimeDir, `ep-flush-${Date.now()}-bad.json`);
-    writeFileSync(flushFile, JSON.stringify({
-      sessionId,
-      project: 'parent--testproj',
-      startedAt: Date.now() - 5000,
-      lastAt: Date.now(),
-      files: ['/tmp/src/broken.js'],
-      entries: [{
-        tool: 'Edit',
-        desc: 'broken.js: fixed syntax error',
+    writeFileSync(
+      flushFile,
+      JSON.stringify({
+        sessionId,
+        project: 'parent--testproj',
+        startedAt: Date.now() - 5000,
+        lastAt: Date.now(),
         files: ['/tmp/src/broken.js'],
-        ts: Date.now(),
-        isError: false,
-        isSignificant: true,
-        bashSig: null,
-      }],
-      filesRead: [],
-    }));
+        entries: [
+          {
+            tool: 'Edit',
+            desc: 'broken.js: fixed syntax error',
+            files: ['/tmp/src/broken.js'],
+            ts: Date.now(),
+            isError: false,
+            isSignificant: true,
+            bashSig: null,
+          },
+        ],
+        filesRead: [],
+      }),
+    );
 
     const { exitCode } = runHook('llm-episode', {
       env: { HOME: tmpHome, CLAUDE_CODE_PATH: '/dev/null', CLAUDE_MEM_NO_DELAY: '1' },
@@ -718,23 +830,28 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
 
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flushFile = join(runtimeDir, `ep-flush-${Date.now()}-bad.json`);
-    writeFileSync(flushFile, JSON.stringify({
-      sessionId,
-      project: 'parent--testproj',
-      startedAt: Date.now() - 5000,
-      lastAt: Date.now(),
-      files: ['/tmp/src/broken.js'],
-      entries: [{
-        tool: 'Edit',
-        desc: 'broken.js: fixed syntax error',
+    writeFileSync(
+      flushFile,
+      JSON.stringify({
+        sessionId,
+        project: 'parent--testproj',
+        startedAt: Date.now() - 5000,
+        lastAt: Date.now(),
         files: ['/tmp/src/broken.js'],
-        ts: Date.now(),
-        isError: false,
-        isSignificant: true,
-        bashSig: null,
-      }],
-      filesRead: [],
-    }));
+        entries: [
+          {
+            tool: 'Edit',
+            desc: 'broken.js: fixed syntax error',
+            files: ['/tmp/src/broken.js'],
+            ts: Date.now(),
+            isError: false,
+            isSignificant: true,
+            bashSig: null,
+          },
+        ],
+        filesRead: [],
+      }),
+    );
 
     const { exitCode } = runHook('llm-episode', {
       env: {
@@ -762,30 +879,44 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
     // Seed first observation directly in DB (avoids dedup with identical mock titles)
     const db = openTestDb(tmpHome);
     const now = new Date();
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'shared refactor concepts', 'refactor', 'Refactored shared module', 'shared.js, a.js', 'Refactored the shared module', 'refactor shared', 'updated exports', '[]', ?, 1, ?, ?)
-    `).run(sessionId, JSON.stringify(['/tmp/src/shared.js', '/tmp/src/a.js']), now.toISOString(), now.getTime());
+    `,
+    ).run(
+      sessionId,
+      JSON.stringify(['/tmp/src/shared.js', '/tmp/src/a.js']),
+      now.toISOString(),
+      now.getTime(),
+    );
     db.close();
 
     // Second observation via llm-episode — overlapping file (shared.js)
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flush2 = join(runtimeDir, `ep-flush-${Date.now()}-r2.json`);
-    writeFileSync(flush2, JSON.stringify({
-      sessionId,
-      project: 'parent--testproj',
-      startedAt: Date.now() - 3000,
-      lastAt: Date.now(),
-      files: ['/tmp/src/shared.js', '/tmp/src/b.js'],
-      entries: [{
-        tool: 'Write',
-        desc: 'Created b.js (200 chars)',
+    writeFileSync(
+      flush2,
+      JSON.stringify({
+        sessionId,
+        project: 'parent--testproj',
+        startedAt: Date.now() - 3000,
+        lastAt: Date.now(),
         files: ['/tmp/src/shared.js', '/tmp/src/b.js'],
-        ts: Date.now() - 1000,
-        isError: false, isSignificant: true, bashSig: null,
-      }],
-      filesRead: [],
-    }));
+        entries: [
+          {
+            tool: 'Write',
+            desc: 'Created b.js (200 chars)',
+            files: ['/tmp/src/shared.js', '/tmp/src/b.js'],
+            ts: Date.now() - 1000,
+            isError: false,
+            isSignificant: true,
+            bashSig: null,
+          },
+        ],
+        filesRead: [],
+      }),
+    );
     runHook('llm-episode', { env: { HOME: tmpHome, CLAUDE_MEM_NO_DELAY: '1' }, args: [flush2] });
 
     // Both observations should have related_ids referencing each other
@@ -809,10 +940,12 @@ describe('Suite 4: Session Summary', { retry: 2 }, () => {
     // Seed an observation directly in DB
     const db = openTestDb(tmpHome);
     const now = new Date();
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'test text', 'change', 'Test observation', '', 'Did some changes', '', '', '[]', '[]', 1, ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     db.close();
 
     // Run llm-summary (pass sessionId and project as args)
@@ -824,7 +957,9 @@ describe('Suite 4: Session Summary', { retry: 2 }, () => {
 
     // Session summary should exist
     const db2 = openTestDb(tmpHome);
-    const summaries = db2.prepare('SELECT * FROM session_summaries WHERE memory_session_id = ?').all(sessionId);
+    const summaries = db2
+      .prepare('SELECT * FROM session_summaries WHERE memory_session_id = ?')
+      .all(sessionId);
     db2.close();
     expect(summaries.length).toBe(1);
     expect(summaries[0].request).toBe('Mock session request description');
@@ -892,7 +1027,8 @@ describe('Suite 5: User Prompt', () => {
     // Seed an event (the canonical store for promoted bugfix memories) matching the prompt.
     const db = openTestDb(tmpHome);
     const evId = saveEvent(db, {
-      project: 'parent--testproj', event_type: 'bugfix',
+      project: 'parent--testproj',
+      event_type: 'bugfix',
       title: 'redis connection timeout fix',
       body: 'raise the pool size and add exponential backoff on connect',
       importance: 2,
@@ -921,7 +1057,8 @@ describe('Suite 5: User Prompt', () => {
     runHook('session-start', { env: nonQuiet });
     const db = openTestDb(tmpHome);
     const evId = saveEvent(db, {
-      project: 'parent--testproj', event_type: 'decision',
+      project: 'parent--testproj',
+      event_type: 'decision',
       title: 'chose WAL + busy_timeout for concurrent sessions',
       body: 'immediate transactions serialize writers across sessions',
       importance: 3,
@@ -939,7 +1076,10 @@ describe('Suite 5: User Prompt', () => {
     const sessionId = getSessionIdFromFile(tmpHome);
 
     const { exitCode } = runHook('user-prompt', {
-      stdin: JSON.stringify({ prompt: '<task-notification>\n<task-id>abc123</task-id>\n<status>completed</status>\n</task-notification>' }),
+      stdin: JSON.stringify({
+        prompt:
+          '<task-notification>\n<task-id>abc123</task-id>\n<status>completed</status>\n</task-notification>',
+      }),
       env: { HOME: tmpHome },
     });
     expect(exitCode).toBe(0);
@@ -962,8 +1102,12 @@ describe('Suite 5: User Prompt', () => {
     }
 
     const db = openTestDb(tmpHome);
-    const prompts = db.prepare('SELECT prompt_number FROM user_prompts WHERE content_session_id = ? ORDER BY id').all(sessionId);
-    const sess = db.prepare('SELECT prompt_counter FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
+    const prompts = db
+      .prepare('SELECT prompt_number FROM user_prompts WHERE content_session_id = ? ORDER BY id')
+      .all(sessionId);
+    const sess = db
+      .prepare('SELECT prompt_counter FROM sdk_sessions WHERE content_session_id = ?')
+      .get(sessionId);
     db.close();
     expect(prompts.length).toBe(3);
     expect(prompts[0].prompt_number).toBe(1);
@@ -981,23 +1125,31 @@ describe('Suite 6: Error Recall', () => {
     // Seed DB with a relevant observation carrying a lesson_learned (→ inlined top-1)
     const db = openTestDb(tmpHome);
     const now = new Date();
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, lesson_learned, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'ECONNREFUSED connection refused port 3000', 'bugfix', 'Fixed ECONNREFUSED on port 3000', '', 'Server was not running, needed to start it first', 'Start the dev server before curling the health endpoint.', '', '', '[]', '[]', 2, ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     // Low-signal "Modified %" obs that ALSO matches the FTS keywords (econnrefused
     // in text) — must be gated OUT of error-recall by notLowSignalTitleClause.
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'ECONNREFUSED noise low signal row', 'change', 'Modified netcfg.json', '', '', '', '', '[]', '[]', 1, ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     db.close();
 
     // Bash error containing matching keywords
     const { stdout } = runHook('post-tool-use', {
-      stdin: makeToolPayload('Bash', {
-        command: 'curl http://localhost:3000/api/health',
-      }, 'Error: connect ECONNREFUSED 127.0.0.1:3000\n    at TCPConnectWrap.afterConnect [as oncomplete] (net.js:1141:16)'),
+      stdin: makeToolPayload(
+        'Bash',
+        {
+          command: 'curl http://localhost:3000/api/health',
+        },
+        'Error: connect ECONNREFUSED 127.0.0.1:3000\n    at TCPConnectWrap.afterConnect [as oncomplete] (net.js:1141:16)',
+      ),
       env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
     });
 
@@ -1005,7 +1157,7 @@ describe('Suite 6: Error Recall', () => {
 
     // G13: each fired error-recall injection must be metered — the G8 gate change
     // (isError→isHardError) had no post-fix volume signal in metrics before this.
-    const erRows = readMetricRows(tmpHome).filter(r => r.event === 'error_recall');
+    const erRows = readMetricRows(tmpHome).filter((r) => r.event === 'error_recall');
     expect(erRows.length).toBe(1);
     expect(erRows[0].returned).toBeGreaterThanOrEqual(1);
     expect(stdout).toContain('ECONNREFUSED');
@@ -1021,7 +1173,9 @@ describe('Suite 6: Error Recall', () => {
     const lines = stdout.split('\n').filter(Boolean);
     expect(lines.length).toBeGreaterThan(0);
     const parsed = lines.map((l) => JSON.parse(l)); // throws (RED) if any line is raw text
-    const hint = parsed.find((p) => p.hookSpecificOutput?.additionalContext?.includes('Related memories found for this error'));
+    const hint = parsed.find((p) =>
+      p.hookSpecificOutput?.additionalContext?.includes('Related memories found for this error'),
+    );
     expect(hint).toBeTruthy();
     expect(hint.hookSpecificOutput.hookEventName).toBe('PostToolUse');
   });
@@ -1040,26 +1194,32 @@ describe('Suite 6: Error Recall', () => {
     // proves the gate blocked recall, not that FTS found nothing.
     const db = openTestDb(tmpHome);
     const now = new Date();
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, lesson_learned, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'ECONNREFUSED connection refused port 3000', 'bugfix', 'Fixed ECONNREFUSED on port 3000', '', '', 'Start the dev server before curling the health endpoint.', '', '', '[]', '[]', 2, ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     db.close();
 
     // Non-search command (node → no isReadOnlyCommand exemption), output contains
     // "error" + a matching keyword but NO hard-error fingerprint: no stack "at "
     // line, no TypeError:/ENOENT/panic → isError=true, isHardError=false.
     const { stdout } = runHook('post-tool-use', {
-      stdin: makeToolPayload('Bash', {
-        command: 'node scripts/health-report.mjs',
-      }, 'Health report: 2 endpoints degraded, last error ECONNREFUSED on port 3000 (recovered), overall status OK'),
+      stdin: makeToolPayload(
+        'Bash',
+        {
+          command: 'node scripts/health-report.mjs',
+        },
+        'Health report: 2 endpoints degraded, last error ECONNREFUSED on port 3000 (recovered), overall status OK',
+      ),
       env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
     });
 
     expect(stdout).not.toContain('Related memories found for this error');
     // G13 negative: no injection → no error_recall metric row (metrics enabled,
     // so absence proves the gate, not a disabled sink).
-    expect(readMetricRows(tmpHome).filter(r => r.event === 'error_recall').length).toBe(0);
+    expect(readMetricRows(tmpHome).filter((r) => r.event === 'error_recall').length).toBe(0);
   });
 });
 
@@ -1073,27 +1233,31 @@ describe('Suite 6: Error Recall', () => {
 // would make this path silently do nothing, which looks exactly like the old behaviour
 // — so the field name is asserted directly rather than inferred from a passing case.
 describe('Suite 6b: PostToolUseFailure — host-flagged failures reach error-recall (D#170)', () => {
-  const FAILURE_TEXT = "Error: ENOENT: no such file or directory, open '/app/package.json'\n"
-    + '    at Object.openSync (node:fs:596:3)';
+  const FAILURE_TEXT =
+    "Error: ENOENT: no such file or directory, open '/app/package.json'\n" +
+    '    at Object.openSync (node:fs:596:3)';
 
-  const failurePayload = (over = {}) => JSON.stringify({
-    hook_event_name: 'PostToolUseFailure',
-    tool_name: 'Bash',
-    tool_input: { command: 'node scripts/build.mjs' },
-    tool_use_id: 'toolu_d170',
-    error: FAILURE_TEXT,
-    ...over,
-  });
+  const failurePayload = (over = {}) =>
+    JSON.stringify({
+      hook_event_name: 'PostToolUseFailure',
+      tool_name: 'Bash',
+      tool_input: { command: 'node scripts/build.mjs' },
+      tool_use_id: 'toolu_d170',
+      error: FAILURE_TEXT,
+      ...over,
+    });
 
   function seed() {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
     const db = openTestDb(tmpHome);
     const now = new Date();
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, lesson_learned, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'ENOENT package.json missing openSync build', 'bugfix', 'ENOENT on package.json means the cwd is wrong', '', '', 'Run the build from the package root, not from scripts/.', '', '', '[]', '[]', 2, ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     db.close();
   }
 
@@ -1110,7 +1274,10 @@ describe('Suite 6b: PostToolUseFailure — host-flagged failures reach error-rec
     // The envelope's event name is the field a copy-paste from the PostToolUse path
     // gets wrong, and the host rejects a mismatch — so the injection would vanish while
     // every other assertion here still passed.
-    const parsed = stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const parsed = stdout
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
     const hint = parsed.find((p) => p.hookSpecificOutput?.additionalContext?.includes('Related memories'));
     expect(hint).toBeTruthy();
     expect(hint.hookSpecificOutput.hookEventName).toBe('PostToolUseFailure');
@@ -1148,8 +1315,9 @@ describe('Suite 6b: PostToolUseFailure — host-flagged failures reach error-rec
   // proved it — disabling ONLY the refusal branch passed every test in the release. The
   // text below carries `ENOENT` and `package.json`, which the seeded memory matches, so
   // the ONLY thing keeping this quiet is the gate.
-  const REFUSAL_WITH_TERMS = '[claudemd] §11 memory-hint: refused — the ENOENT probe on '
-    + "package.json was blocked before it ran.\nError: command not executed.";
+  const REFUSAL_WITH_TERMS =
+    '[claudemd] §11 memory-hint: refused — the ENOENT probe on ' +
+    'package.json was blocked before it ran.\nError: command not executed.';
 
   it('stays silent for a tool-chain refusal', () => {
     // 68.9% of host-flagged Bash failures on the maintainer's machine. Injecting three
@@ -1179,8 +1347,10 @@ describe('Suite 6b: PostToolUseFailure — host-flagged failures reach error-rec
       }),
       env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
     });
-    expect(stdout, 'the refusal case must be silent because of the MARKER, not because its text matches nothing')
-      .toContain('Related memories found for this error');
+    expect(
+      stdout,
+      'the refusal case must be silent because of the MARKER, not because its text matches nothing',
+    ).toContain('Related memories found for this error');
   });
 
   it('stays silent when the user interrupted the command', () => {
@@ -1226,8 +1396,9 @@ describe('Suite 6b: PostToolUseFailure — host-flagged failures reach error-rec
         stdin: failurePayload({ tool_input: toolInput }),
         env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
       });
-      expect(stdout, `tool_input=${JSON.stringify(toolInput)}`)
-        .not.toContain('Related memories found for this error');
+      expect(stdout, `tool_input=${JSON.stringify(toolInput)}`).not.toContain(
+        'Related memories found for this error',
+      );
     }
   });
 
@@ -1251,9 +1422,13 @@ describe('Suite 7: Secret Scrubbing E2E', () => {
   it('post-tool-use with password=secret scrubs episode desc', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
 
-    const payload = makeToolPayload('Bash', {
-      command: 'curl -u admin:password=secret123 http://api.example.com/deploy',
-    }, 'HTTP 200 OK deployed successfully — this is a longer response for the length check');
+    const payload = makeToolPayload(
+      'Bash',
+      {
+        command: 'curl -u admin:password=secret123 http://api.example.com/deploy',
+      },
+      'HTTP 200 OK deployed successfully — this is a longer response for the length check',
+    );
 
     runHook('post-tool-use', {
       stdin: payload,
@@ -1277,33 +1452,43 @@ describe('Suite 8a: Cross-Session MinHash Dedup', () => {
     const db = openTestDb(tmpHome);
     const now = new Date();
     const title1 = 'Fixed authentication bug in login flow for user sessions';
-    const narrative1 = 'The authentication module had a bug where expired tokens were not being refreshed properly';
+    const narrative1 =
+      'The authentication module had a bug where expired tokens were not being refreshed properly';
     const sig = computeMinHash(title1 + ' ' + narrative1);
 
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', ?, 'bugfix', ?, '', ?, '', '', '[]', '[]', 1, ?, ?, ?)
-    `).run(sessionId, title1, title1, narrative1, sig, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, title1, title1, narrative1, sig, now.toISOString(), now.getTime());
     db.close();
 
     // Try to save a near-duplicate observation via llm-episode
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flushFile = join(runtimeDir, `ep-flush-${Date.now()}-dedup.json`);
-    writeFileSync(flushFile, JSON.stringify({
-      sessionId: `hook-parent--testproj-different-session`,
-      project: 'parent--testproj',
-      startedAt: Date.now() - 5000,
-      lastAt: Date.now(),
-      files: ['/tmp/src/auth.js'],
-      entries: [{
-        tool: 'Edit',
-        desc: 'auth.js: fixed token refresh',
+    writeFileSync(
+      flushFile,
+      JSON.stringify({
+        sessionId: `hook-parent--testproj-different-session`,
+        project: 'parent--testproj',
+        startedAt: Date.now() - 5000,
+        lastAt: Date.now(),
         files: ['/tmp/src/auth.js'],
-        ts: Date.now(),
-        isError: false, isSignificant: true, bashSig: null,
-      }],
-      filesRead: [],
-    }));
+        entries: [
+          {
+            tool: 'Edit',
+            desc: 'auth.js: fixed token refresh',
+            files: ['/tmp/src/auth.js'],
+            ts: Date.now(),
+            isError: false,
+            isSignificant: true,
+            bashSig: null,
+          },
+        ],
+        filesRead: [],
+      }),
+    );
 
     // Run llm-episode - the mock LLM will return a generic title, which won't match
     // by Jaccard but the MinHash check happens on the combined title+narrative
@@ -1340,7 +1525,9 @@ describe('Suite 8a: Additional E2E', () => {
     const dbPath = join(freshHome, '.claude-mem-lite', 'claude-mem-lite.db');
     expect(existsSync(dbPath)).toBe(true);
 
-    try { rmSync(freshHome, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(freshHome, { recursive: true, force: true });
+    } catch {}
   });
 
   it('auto-migrates ~/claude-mem-lite/claude-mem.db → ~/.claude-mem-lite/claude-mem-lite.db on session-start', () => {
@@ -1359,8 +1546,12 @@ describe('Suite 8a: Additional E2E', () => {
     // Insert a marker observation
     const now = new Date();
     const sessId = 'migrate-test-sess';
-    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run(sessId, sessId, now.toISOString(), now.getTime());
-    db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'marker', 'discovery', 'Migration marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run(sessId, now.toISOString(), now.getTime());
+    db.prepare(
+      `INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`,
+    ).run(sessId, sessId, now.toISOString(), now.getTime());
+    db.prepare(
+      `INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'marker', 'discovery', 'Migration marker', '', '', '', '', '[]', '[]', 1, ?, ?)`,
+    ).run(sessId, now.toISOString(), now.getTime());
     db.close();
 
     // Old file should exist, new hidden dir should not
@@ -1391,24 +1582,30 @@ describe('Suite 8a: Additional E2E', () => {
     expect(obs).not.toBeUndefined();
     expect(obs.title).toBe('Migration marker');
 
-    try { rmSync(migrateHome, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(migrateHome, { recursive: true, force: true });
+    } catch {}
   });
 
   it('expired sessions get cleaned up on session-start', () => {
     // Seed an old active session (>24h ago)
     const db = openTestDb(tmpHome);
     const oldEpoch = Date.now() - 25 * 3600000;
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, 'parent--testproj', ?, ?, 'active')
-    `).run('old-sess', 'old-sess', new Date(oldEpoch).toISOString(), oldEpoch);
+    `,
+    ).run('old-sess', 'old-sess', new Date(oldEpoch).toISOString(), oldEpoch);
     db.close();
 
     // Start a new session — should mark old one as expired
     runHook('session-start', { env: { HOME: tmpHome } });
 
     const db2 = openTestDb(tmpHome);
-    const oldSess = db2.prepare("SELECT status FROM sdk_sessions WHERE content_session_id = 'old-sess'").get();
+    const oldSess = db2
+      .prepare("SELECT status FROM sdk_sessions WHERE content_session_id = 'old-sess'")
+      .get();
     db2.close();
     // Old active sessions should be marked as expired/completed
     if (oldSess) {
@@ -1421,13 +1618,17 @@ describe('Suite 8a: Additional E2E', () => {
     const sessionId = getSessionIdFromFile(tmpHome);
 
     const { exitCode } = runHook('user-prompt', {
-      stdin: JSON.stringify({ user_prompt: 'Deploy with token=sk-abc123def456ghi789jklmnopqrstuvwxyz to production' }),
+      stdin: JSON.stringify({
+        user_prompt: 'Deploy with token=sk-abc123def456ghi789jklmnopqrstuvwxyz to production',
+      }),
       env: { HOME: tmpHome },
     });
     expect(exitCode).toBe(0);
 
     const db = openTestDb(tmpHome);
-    const prompts = db.prepare('SELECT prompt_text FROM user_prompts WHERE content_session_id = ?').all(sessionId);
+    const prompts = db
+      .prepare('SELECT prompt_text FROM user_prompts WHERE content_session_id = ?')
+      .all(sessionId);
     db.close();
     expect(prompts.length).toBe(1);
     // The sk- token should be scrubbed
@@ -1446,7 +1647,9 @@ describe('Suite 8a: Additional E2E', () => {
     });
 
     const db = openTestDb(tmpHome);
-    const prompts = db.prepare('SELECT prompt_text FROM user_prompts WHERE content_session_id = ?').all(sessionId);
+    const prompts = db
+      .prepare('SELECT prompt_text FROM user_prompts WHERE content_session_id = ?')
+      .all(sessionId);
     db.close();
     expect(prompts.length).toBe(1);
     expect(prompts[0].prompt_text.length).toBeLessThanOrEqual(10000);
@@ -1465,14 +1668,18 @@ describe('Suite 8a: Additional E2E', () => {
     const db = openTestDb(tmpHome);
     const now = new Date();
     const sessId = `hook-parent--idempotent-${randomUUID().slice(0, 8)}`;
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, 'parent--idempotent', ?, ?, 'completed')
-    `).run(sessId, sessId, now.toISOString(), now.getTime());
-    db.prepare(`
+    `,
+    ).run(sessId, sessId, now.toISOString(), now.getTime());
+    db.prepare(
+      `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
       VALUES (?, 'parent--idempotent', 'Test request', 'Test completed', 'Test next', ?, ?)
-    `).run(sessId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessId, now.toISOString(), now.getTime());
     db.close();
 
     // Two session-starts
@@ -1501,31 +1708,39 @@ describe('Suite 8a: Additional E2E', () => {
     const sessId = `hook-parent--testproj-${randomUUID().slice(0, 8)}`;
     const hundredDaysAgo = Date.now() - 100 * 86400000;
 
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, 'parent--testproj', ?, ?, 'completed')
-    `).run(sessId, sessId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessId, sessId, now.toISOString(), now.getTime());
 
     // Old, low-importance observation (should be auto-compressed)
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'old routine note', 'discovery', 'Old routine observation', '', '', '', '', '[]', '[]', 1, ?, ?)
-    `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
+    `,
+    ).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
 
     // Old imp=0 observation (citation-decay floor / LLM low-signal filter) — STRICTLY lower
     // value than imp=1, so it MUST be GC-eligible too. Pre-fix the auto-compress predicate was
     // `importance = 1` (exact) and imp=0 rows were immortal — ~40% of a mature DB. (audit imp=0)
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'old floored note', 'discovery', 'Old floored observation', '', '', '', '', '[]', '[]', 0, ?, ?)
-    `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
+    `,
+    ).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
 
     // Old, higher-importance observation (should NOT be auto-compressed)
     // access_count=1 prevents auto-maintain decay from reducing importance
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'old notable note', 'decision', 'Old notable observation', '', '', '', '', '[]', '[]', 2, 1, ?, ?)
-    `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
+    `,
+    ).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
 
     db.close();
 
@@ -1542,13 +1757,13 @@ describe('Suite 8a: Additional E2E', () => {
 
     expect(obs.length).toBe(3);
     // importance=1 should be marked as auto-compressed
-    const lowImportance = obs.find(o => o.importance === 1);
+    const lowImportance = obs.find((o) => o.importance === 1);
     expect(lowImportance.compressed_into).toBe(-1);
     // importance=0 (decay floor / filtered) must ALSO be auto-compressed, not immortal
-    const flooredImportance = obs.find(o => o.importance === 0);
+    const flooredImportance = obs.find((o) => o.importance === 0);
     expect(flooredImportance.compressed_into).toBe(-1);
     // importance=2 should be untouched
-    const highImportance = obs.find(o => o.importance === 2);
+    const highImportance = obs.find((o) => o.importance === 2);
     expect(highImportance.compressed_into).toBeNull();
   });
 
@@ -1558,9 +1773,11 @@ describe('Suite 8a: Additional E2E', () => {
     // nothing reaped the rows). auto-maintain now deletes past-expiry rows with a +1d margin.
     const db = openTestDb(tmpHome);
     const now = Date.now();
-    const ins = db.prepare('INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch) VALUES (?,?,?,?,?)');
-    ins.run('parent--testproj', 'exit', 's-old', 'old', now - 10 * 86400000);     // 10d → GC
-    ins.run('parent--testproj', 'exit', 's-new', 'new', now - 1 * 86400000);      // 1d  → keep
+    const ins = db.prepare(
+      'INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch) VALUES (?,?,?,?,?)',
+    );
+    ins.run('parent--testproj', 'exit', 's-old', 'old', now - 10 * 86400000); // 10d → GC
+    ins.run('parent--testproj', 'exit', 's-new', 'new', now - 1 * 86400000); // 1d  → keep
     ins.run('parent--testproj', 'clear', 's-clr', 'old clear', now - 2 * 86400000); // 2d → GC (clear 6h+1d)
     db.close();
 
@@ -1572,7 +1789,10 @@ describe('Suite 8a: Additional E2E', () => {
     runHook('auto-maintain', { env: { HOME: tmpHome } });
 
     const db2 = openTestDb(tmpHome);
-    const surviving = db2.prepare('SELECT session_id FROM session_handoffs ORDER BY session_id').all().map(r => r.session_id);
+    const surviving = db2
+      .prepare('SELECT session_id FROM session_handoffs ORDER BY session_id')
+      .all()
+      .map((r) => r.session_id);
     db2.close();
     expect(surviving).toEqual(['s-new']); // only the within-expiry exit handoff remains
   });
@@ -1595,24 +1815,30 @@ describe('Suite 8a: Additional E2E', () => {
     anchor.setUTCDate(anchor.getUTCDate() + daysToWed);
     const wedNoonEpoch = anchor.getTime();
 
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, 'parent--testproj', ?, ?, 'completed')
-    `).run(sessId, sessId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessId, sessId, now.toISOString(), now.getTime());
 
     // Insert 4 old, low-importance, never-accessed observations in the same week
     for (let i = 0; i < 4; i++) {
       const epoch = wedNoonEpoch + i * 3600000; // 1 hour apart on a Wednesday afternoon
-      db.prepare(`
+      db.prepare(
+        `
         INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
           concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
         VALUES (?, 'parent--testproj', 'old text', 'change', ?, '', '', '', '', '[]', '[]', 1, 0, ?, ?)
-      `).run(sessId, `Old change ${i}`, new Date(epoch).toISOString(), epoch);
+      `,
+      ).run(sessId, `Old change ${i}`, new Date(epoch).toISOString(), epoch);
     }
 
     // Clear the last-auto-maintain file so maintenance runs
     const maintainFile = join(tmpHome, '.claude-mem-lite', 'runtime', 'last-auto-maintain.json');
-    try { unlinkSync(maintainFile); } catch {}
+    try {
+      unlinkSync(maintainFile);
+    } catch {}
 
     db.close();
 
@@ -1623,16 +1849,16 @@ describe('Suite 8a: Additional E2E', () => {
 
     const db2 = openTestDb(tmpHome);
     // Should have: 4 original (compressed_into = summaryId) + 1 summary (importance=2)
-    const summary = db2.prepare(
-      "SELECT id, title, importance FROM observations WHERE title LIKE 'Weekly summary%'"
-    ).get();
+    const summary = db2
+      .prepare("SELECT id, title, importance FROM observations WHERE title LIKE 'Weekly summary%'")
+      .get();
     expect(summary).toBeTruthy();
     expect(summary.title).toContain('Weekly summary');
     expect(summary.importance).toBe(2);
 
-    const compressed = db2.prepare(
-      'SELECT COUNT(*) as c FROM observations WHERE compressed_into = ?'
-    ).get(summary.id);
+    const compressed = db2
+      .prepare('SELECT COUNT(*) as c FROM observations WHERE compressed_into = ?')
+      .get(summary.id);
     expect(compressed.c).toBe(4);
     db2.close();
   });
@@ -1645,13 +1871,19 @@ describe('Suite 8a: Additional E2E', () => {
     // A broken row (empty title AND narrative) is a cleanup candidate, so
     // hardDeleteCandidateCount() > 0 and the maintenance pass takes a pre-delete
     // snapshot. That snapshot is the audit's named boot-path blocker (VACUUM INTO).
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'orphan body', 'change', '', '', '', '', '', '[]', '[]', 1, ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     db.close();
     // Make maintenance due for the worker's internal 24h gate.
-    try { unlinkSync(join(tmpHome, '.claude-mem-lite', 'runtime', 'last-auto-maintain.json')); } catch { /* absent */ }
+    try {
+      unlinkSync(join(tmpHome, '.claude-mem-lite', 'runtime', 'last-auto-maintain.json'));
+    } catch {
+      /* absent */
+    }
 
     // The heavy pass now runs in the detached worker, not synchronously in SessionStart.
     runHook('auto-maintain', { env: { HOME: tmpHome } });
@@ -1671,19 +1903,25 @@ describe('Suite 8a: Additional E2E', () => {
     const db = openTestDb(tmpHome);
     const now = new Date();
     const sessId = `hook-parent--noclaudemd-${randomUUID().slice(0, 8)}`;
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, 'parent--noclaudemd', ?, ?, 'completed')
-    `).run(sessId, sessId, now.toISOString(), now.getTime());
-    db.prepare(`
+    `,
+    ).run(sessId, sessId, now.toISOString(), now.getTime());
+    db.prepare(
+      `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
       VALUES (?, 'parent--noclaudemd', 'Build API', 'API built', 'Add tests', ?, ?)
-    `).run(sessId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessId, now.toISOString(), now.getTime());
     db.close();
 
     // MEM_NO_AUTO_ADOPT isolates the context-delivery invariant from the v3.13
     // managed-block write (which would legitimately create CLAUDE.md).
-    const run = runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir3, MEM_NO_AUTO_ADOPT: '1' } });
+    const run = runHook('session-start', {
+      env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir3, MEM_NO_AUTO_ADOPT: '1' },
+    });
 
     // CLAUDE.md must NOT be created
     const claudeMdPath = join(projDir3, 'CLAUDE.md');
@@ -1710,15 +1948,19 @@ describe('Suite 8: Session-start context delivery', () => {
     const now = new Date();
     const sessionId = `hook-parent--testproj-${randomUUID().slice(0, 8)}`;
 
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, 'parent--testproj', ?, ?, 'completed')
-    `).run(sessionId, sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, sessionId, now.toISOString(), now.getTime());
 
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'Fix auth bug', 'Checked login flow', 'Token was expired', 'Fixed token refresh', 'Add tests for token refresh', '[]', '[]', '', ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     db.close();
 
     const run = runHook('session-start', {
@@ -1745,7 +1987,8 @@ describe('Suite 8: Session-start context delivery', () => {
     // context block in CLAUDE.md. The hook should remove it on first run.
     const projDir = join(tmpHome, 'parent', 'migrate');
     mkdirSync(projDir, { recursive: true });
-    const hint = '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
+    const hint =
+      '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
     writeFileSync(
       join(projDir, 'CLAUDE.md'),
       `# My Project\n\n${hint}\n<claude-mem-context>\nstale content from v2.29\n</claude-mem-context>\n\n# Footer\n`,
@@ -1755,14 +1998,18 @@ describe('Suite 8: Session-start context delivery', () => {
     const db = openTestDb(tmpHome);
     const now = new Date();
     const sessId = `hook-parent--migrate-${randomUUID().slice(0, 8)}`;
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, 'parent--migrate', ?, ?, 'completed')
-    `).run(sessId, sessId, now.toISOString(), now.getTime());
-    db.prepare(`
+    `,
+    ).run(sessId, sessId, now.toISOString(), now.getTime());
+    db.prepare(
+      `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
       VALUES (?, 'parent--migrate', 'Migrate', 'Done', 'Verify', ?, ?)
-    `).run(sessId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessId, now.toISOString(), now.getTime());
     db.close();
 
     runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir } });
@@ -1793,8 +2040,12 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     db.pragma('foreign_keys = OFF');
     initSchema(db);
     const now = new Date();
-    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run('race-sess', 'race-sess', now.toISOString(), now.getTime());
-    db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'race marker', 'discovery', 'Race condition marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run('race-sess', now.toISOString(), now.getTime());
+    db.prepare(
+      `INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`,
+    ).run('race-sess', 'race-sess', now.toISOString(), now.getTime());
+    db.prepare(
+      `INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'race marker', 'discovery', 'Race condition marker', '', '', '', '', '[]', '[]', 1, ?, ?)`,
+    ).run('race-sess', now.toISOString(), now.getTime());
     db.close();
 
     // Pre-create new hidden dir with runtime/ (simulates module-level mkdir)
@@ -1819,7 +2070,9 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     db2.close();
     expect(obs).not.toBeUndefined();
 
-    try { rmSync(home, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {}
   });
 
   it('skips migration when hidden dir already has DB', () => {
@@ -1836,8 +2089,16 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     oldDb.pragma('foreign_keys = OFF');
     initSchema(oldDb);
     const now = new Date();
-    oldDb.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run('old-sess', 'old-sess', now.toISOString(), now.getTime());
-    oldDb.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'old data', 'discovery', 'Old marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run('old-sess', now.toISOString(), now.getTime());
+    oldDb
+      .prepare(
+        `INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`,
+      )
+      .run('old-sess', 'old-sess', now.toISOString(), now.getTime());
+    oldDb
+      .prepare(
+        `INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'old data', 'discovery', 'Old marker', '', '', '', '', '[]', '[]', 1, ?, ?)`,
+      )
+      .run('old-sess', now.toISOString(), now.getTime());
     oldDb.close();
 
     // New hidden dir with different marker
@@ -1847,8 +2108,16 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     newDb.pragma('journal_mode = WAL');
     newDb.pragma('foreign_keys = OFF');
     initSchema(newDb);
-    newDb.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run('new-sess', 'new-sess', now.toISOString(), now.getTime());
-    newDb.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'new data', 'discovery', 'New marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run('new-sess', now.toISOString(), now.getTime());
+    newDb
+      .prepare(
+        `INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`,
+      )
+      .run('new-sess', 'new-sess', now.toISOString(), now.getTime());
+    newDb
+      .prepare(
+        `INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'new data', 'discovery', 'New marker', '', '', '', '', '[]', '[]', 1, ?, ?)`,
+      )
+      .run('new-sess', now.toISOString(), now.getTime());
     newDb.close();
 
     const projDir = join(home, 'parent', 'skipproj');
@@ -1869,7 +2138,9 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     expect(newMarker).not.toBeUndefined();
     expect(oldMarker).toBeUndefined(); // old data NOT merged in
 
-    try { rmSync(home, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {}
   });
 
   it('migrates dir with already-renamed DB (no file rename needed)', () => {
@@ -1886,8 +2157,12 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     db.pragma('foreign_keys = OFF');
     initSchema(db);
     const now = new Date();
-    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run('renamed-sess', 'renamed-sess', now.toISOString(), now.getTime());
-    db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'already renamed', 'discovery', 'Already renamed DB', '', '', '', '', '[]', '[]', 1, ?, ?)`).run('renamed-sess', now.toISOString(), now.getTime());
+    db.prepare(
+      `INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`,
+    ).run('renamed-sess', 'renamed-sess', now.toISOString(), now.getTime());
+    db.prepare(
+      `INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'already renamed', 'discovery', 'Already renamed DB', '', '', '', '', '[]', '[]', 1, ?, ?)`,
+    ).run('renamed-sess', now.toISOString(), now.getTime());
     db.close();
 
     const projDir = join(home, 'parent', 'renameproj');
@@ -1911,7 +2186,9 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     db2.close();
     expect(obs).not.toBeUndefined();
 
-    try { rmSync(home, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {}
   });
 
   it('full lifecycle uses hidden dir for all runtime files', () => {
@@ -1933,32 +2210,38 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     expect(existsSync(join(hiddenDir, 'claude-mem-lite.db'))).toBe(true);
 
     // Session file created under hidden dir
-    const sessionFiles = readdirSync(runtimeDir).filter(f => f.startsWith('session-'));
+    const sessionFiles = readdirSync(runtimeDir).filter((f) => f.startsWith('session-'));
     expect(sessionFiles.length).toBe(1);
 
     // Post-tool-use → episode buffer under hidden dir
     runHook('post-tool-use', {
-      stdin: makeToolPayload('Edit', {
-        file_path: '/tmp/src/hidden.js',
-        old_string: 'old',
-        new_string: 'new',
-      }, 'OK — edited file'),
+      stdin: makeToolPayload(
+        'Edit',
+        {
+          file_path: '/tmp/src/hidden.js',
+          old_string: 'old',
+          new_string: 'new',
+        },
+        'OK — edited file',
+      ),
       env: { HOME: home, CLAUDE_PROJECT_DIR: projDir },
     });
 
-    const epFiles = readdirSync(runtimeDir).filter(f => f.startsWith('ep-') && !f.startsWith('ep-flush-'));
+    const epFiles = readdirSync(runtimeDir).filter((f) => f.startsWith('ep-') && !f.startsWith('ep-flush-'));
     expect(epFiles.length).toBe(1);
 
     // Stop → session completed, flush file created
     runHook('stop', { env: { HOME: home, CLAUDE_PROJECT_DIR: projDir } });
 
-    const flushFiles = readdirSync(runtimeDir).filter(f => f.startsWith('ep-flush-'));
+    const flushFiles = readdirSync(runtimeDir).filter((f) => f.startsWith('ep-flush-'));
     expect(flushFiles.length).toBeGreaterThanOrEqual(1);
 
     // No unhidden dir should have been created
     expect(existsSync(join(home, 'claude-mem-lite'))).toBe(false);
 
-    try { rmSync(home, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {}
   });
 });
 
@@ -1969,7 +2252,7 @@ describe('Suite 10: Code Review Fix Validations', () => {
     // SOURCE_FILES now lives in source-files.mjs (shared between install.mjs and
     // hook-update.mjs). tests/source-files-sync.test.mjs does the full walker
     // check; this quicker spot-check asserts the shared list has not regressed
-    // for the two most critical entry points.
+    // for the two most critical entry points — statically AND dynamically imported.
     const { SOURCE_FILES } = await import('../source-files.mjs');
 
     const entryFiles = ['server.mjs', 'hook.mjs'];
@@ -1981,7 +2264,16 @@ describe('Suite 10: Code Review Fix Validations', () => {
       if (visited.has(file)) continue;
       visited.add(file);
       const src = readFileSync(resolve(file), 'utf8');
-      const imports = [...src.matchAll(/from\s+'\.\/([^']+\.mjs)'/g)].map(m => m[1]);
+      // Static AND dynamic specifiers. Static-only silently narrowed this walk when P1-8
+      // converted six of hook.mjs's imports to `await import()`: four modules and their
+      // whole subgraphs left the traversal while the comment above still said it covered
+      // the two entry points. Not a coverage LOSS at the time — source-files-sync.test.mjs
+      // walks dynamic specifiers too — but a spot-check whose stated scope is wider than
+      // its regex is the shape that goes unnoticed the next time.
+      const imports = [
+        ...[...src.matchAll(/from\s+'\.\/([^']+\.mjs)'/g)].map((m) => m[1]),
+        ...[...src.matchAll(/import\s*\(\s*['"]\.\/([^'"]+\.mjs)['"]/g)].map((m) => m[1]),
+      ];
       for (const imp of imports) {
         // Resolve './' imports relative to the importing file's dir so a lib/ module's
         // sibling import (lib/compress-core.mjs -> './scrub-record.mjs') maps to
@@ -2027,7 +2319,9 @@ describe('Suite 10: Code Review Fix Validations', () => {
     // Old dir should still exist (migration couldn't proceed)
     expect(existsSync(oldDir)).toBe(true);
 
-    try { rmSync(home, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {}
   });
 });
 
@@ -2062,7 +2356,7 @@ describe('Suite 11: first-run auto-adopt', () => {
     expect(adopted(projectDir)).toBe(true);
     // Marker key is inferProject() output — contains "testproj"
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
-    const markers = readdirSync(runtimeDir).filter(f => f.startsWith('.auto-adopt-'));
+    const markers = readdirSync(runtimeDir).filter((f) => f.startsWith('.auto-adopt-'));
     expect(markers.length).toBeGreaterThan(0);
   });
 
@@ -2078,7 +2372,7 @@ describe('Suite 11: first-run auto-adopt', () => {
     });
     expect(adopted(projectDir)).toBe(true);
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
-    const markers = readdirSync(runtimeDir).filter(f => f.startsWith('.auto-adopt-'));
+    const markers = readdirSync(runtimeDir).filter((f) => f.startsWith('.auto-adopt-'));
     expect(markers.length).toBeGreaterThan(0);
   });
 
@@ -2139,7 +2433,12 @@ describe('Suite 11: first-run auto-adopt', () => {
   // re-running re-adopts — only `--disable` / MEM_NO_AUTO_ADOPT stops it. This
   // replaces the pre-v3.13 "marker present → skips" behavior.
   it('block removed but marker present → next SessionStart RE-ADOPTS (sync is ungated)', () => {
-    const env = { HOME: tmpHome, CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root', MEM_QUIET_HOOKS: undefined, MEM_NO_AUTO_ADOPT: undefined };
+    const env = {
+      HOME: tmpHome,
+      CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
+      MEM_QUIET_HOOKS: undefined,
+      MEM_NO_AUTO_ADOPT: undefined,
+    };
     runHook('session-start', { env });
     expect(adopted(projectDir)).toBe(true);
 
@@ -2158,15 +2457,24 @@ describe('Suite 11: first-run auto-adopt', () => {
     const memdir = encodedMemdir(tmpHome, projectDir);
     mkdirSync(memdir, { recursive: true });
     // seed a legacy v1 block + a state sidecar (so the migration proves authorship)
-    writeFileSync(join(memdir, 'MEMORY.md'),
-      '## 用户偏好\n- keep\n<!-- claude-mem-lite:begin v1 -->\n## 插件契约\n- legacy line\n<!-- claude-mem-lite:end -->\n');
-    writeFileSync(join(memdir, '.plugin_claude_mem_lite_state.json'),
-      JSON.stringify({ version: 'v1', bodyHash: 'x', writtenAt: '2026-01-01' }));
+    writeFileSync(
+      join(memdir, 'MEMORY.md'),
+      '## 用户偏好\n- keep\n<!-- claude-mem-lite:begin v1 -->\n## 插件契约\n- legacy line\n<!-- claude-mem-lite:end -->\n',
+    );
+    writeFileSync(
+      join(memdir, '.plugin_claude_mem_lite_state.json'),
+      JSON.stringify({ version: 'v1', bodyHash: 'x', writtenAt: '2026-01-01' }),
+    );
     writeFileSync(join(memdir, 'plugin_claude_mem_lite.md'), '# legacy');
     expect(legacySentinelPresent(tmpHome, projectDir)).toBe(true);
 
     runHook('session-start', {
-      env: { HOME: tmpHome, CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root', MEM_QUIET_HOOKS: undefined, MEM_NO_AUTO_ADOPT: undefined },
+      env: {
+        HOME: tmpHome,
+        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
+        MEM_QUIET_HOOKS: undefined,
+        MEM_NO_AUTO_ADOPT: undefined,
+      },
     });
 
     expect(legacySentinelPresent(tmpHome, projectDir)).toBe(false); // legacy stripped
@@ -2216,7 +2524,19 @@ describe('Suite: G3 unpersisted-decision reminder (Stop → payload → next Ses
     });
     const transcript = writeTranscript([
       bashToolUse('ls'),
-      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'mcp__plugin_claude-mem-lite_mem-lite__mem_defer', input: { title: 'the decision' } }] } },
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              name: 'mcp__plugin_claude-mem-lite_mem-lite__mem_defer',
+              input: { title: 'the decision' },
+            },
+          ],
+        },
+      },
     ]);
     runHook('stop', {
       stdin: JSON.stringify({ session_id: randomUUID(), transcript_path: transcript }),
@@ -2229,6 +2549,45 @@ describe('Suite: G3 unpersisted-decision reminder (Stop → payload → next Ses
 
     const { stdout } = runHook('session-start', { env: { HOME: tmpHome } });
     expect(stdout).not.toContain('finalized decision');
+  });
+
+  // D#19 WIRING. lib/cite-back-hint.mjs has unit coverage for reading the gate* triple;
+  // this is the half that proves somebody WRITES it. Without this the reader could be
+  // perfect while trackCitationsAtStop never emits the keys and every payload silently
+  // falls back to the wide denominator — a fix that is proven and not connected.
+  it('Stop writes the hook-injected denominator beside the wide one', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const attach = (command, stdout) => ({
+      type: 'attachment',
+      attachment: { type: 'hook_success', command, stdout },
+    });
+    const transcript = writeTranscript([
+      // Three ids the PRE-TOOL-RECALL face put in front of the model.
+      attach(
+        'node "/x/scripts/pre-tool-recall.js"',
+        '  #101 [lesson] alpha\n  #102 [bugfix] beta\n  #103 [decision] gamma',
+      ),
+      // The model cites one of them, plus a #904 that was never injected — which is
+      // exactly the asymmetry the two denominators disagree about.
+      {
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'applying #102, and see #904' }] },
+      },
+    ]);
+    runHook('stop', {
+      stdin: JSON.stringify({ session_id: randomUUID(), transcript_path: transcript }),
+      env: { HOME: tmpHome },
+    });
+
+    const payloadFile = join(tmpHome, '.claude-mem-lite', 'runtime', 'cite-recall-parent--testproj.json');
+    const payload = JSON.parse(readFileSync(payloadFile, 'utf8'));
+    expect(payload.gateInjected, 'the gate denominator is the 3 hook-injected ids').toBe(3);
+    expect(payload.gateRecalled, 'only #102 was both injected and cited').toBe(1);
+    expect(payload.gateRatio).toBeCloseTo(1 / 3, 5);
+    // The wide triple must still be written — it answers a different question and the
+    // gate falling back to it is the documented back-compat path.
+    expect(typeof payload.injected).toBe('number');
+    expect(typeof payload.ratio).toBe('number');
   });
 });
 
@@ -2243,10 +2602,12 @@ describe('Suite: G1+G2 enrich-save worker (spawned-env recursion guard)', () => 
     const sessionId = getSessionIdFromFile(tmpHome);
     const db = openTestDb(tmpHome);
     const now = new Date();
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'FTS trigger stale body fix', 'bugfix', 'Fixed stale FTS trigger body', '', 'Trigger body was not updated by CREATE IF NOT EXISTS', '', '', '[]', '[]', 2, ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     const id = db.prepare('SELECT last_insert_rowid() AS id').get().id;
     db.close();
 
@@ -2256,7 +2617,9 @@ describe('Suite: G1+G2 enrich-save worker (spawned-env recursion guard)', () => 
     });
 
     const db2 = openTestDb(tmpHome);
-    const o = db2.prepare('SELECT lesson_learned, search_aliases, optimized_at FROM observations WHERE id = ?').get(id);
+    const o = db2
+      .prepare('SELECT lesson_learned, search_aliases, optimized_at FROM observations WHERE id = ?')
+      .get(id);
     db2.close();
     expect(o.lesson_learned).toContain('Mock distilled lesson');
     expect(o.search_aliases).toContain('mock alias one');
@@ -2265,7 +2628,7 @@ describe('Suite: G1+G2 enrich-save worker (spawned-env recursion guard)', () => 
 
     // G13: the worker's outcome must land in metrics — pre-fix handleEnrichSave
     // discarded executeSaveEnrich's reason and the jsonl had zero enrich rows.
-    const enrichRows = readMetricRows(tmpHome).filter(r => r.event === 'enrich_save');
+    const enrichRows = readMetricRows(tmpHome).filter((r) => r.event === 'enrich_save');
     expect(enrichRows.length).toBe(1);
     expect(enrichRows[0].id).toBe(id);
     expect(enrichRows[0].enriched).toBe(true);
@@ -2285,28 +2648,41 @@ describe('Suite: D#60 concurrent-session decay idempotency (G10)', () => {
     const sessionId = getSessionIdFromFile(tmpHome);
     const db = openTestDb(tmpHome);
     const now = new Date();
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, 'parent--testproj', 'decay probe row', 'bugfix', 'Decay probe observation', '', '', '', '', '[]', '[]', 2, ?, ?)
-    `).run(sessionId, now.toISOString(), now.getTime());
+    `,
+    ).run(sessionId, now.toISOString(), now.getTime());
     const obsId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
     db.close();
 
     const mkTranscript = (tag) => {
       const p = join(tmpHome, `transcript-${tag}.jsonl`);
-      writeFileSync(p, [
-        // Injection surface the decay scan recognizes (error-recall hint shape).
-        {
-          type: 'attachment',
-          attachment: {
-            type: 'hook_success',
-            command: 'bash "/home/x/.claude-mem-lite/scripts/post-tool-use.sh"',
-            stdout: `[claude-mem-lite] Related memories found for this error:\n  #${obsId} [bugfix] Decay probe observation\n`,
+      writeFileSync(
+        p,
+        [
+          // Injection surface the decay scan recognizes (error-recall hint shape).
+          {
+            type: 'attachment',
+            attachment: {
+              type: 'hook_success',
+              command: 'bash "/home/x/.claude-mem-lite/scripts/post-tool-use.sh"',
+              stdout: `[claude-mem-lite] Related memories found for this error:\n  #${obsId} [bugfix] Decay probe observation\n`,
+            },
           },
-        },
-        // Main-thread assistant text WITHOUT a #NN citation (text-floor gate).
-        { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'still investigating the failure' }] } },
-      ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+          // Main-thread assistant text WITHOUT a #NN citation (text-floor gate).
+          {
+            type: 'assistant',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'still investigating the failure' }],
+            },
+          },
+        ]
+          .map((e) => JSON.stringify(e))
+          .join('\n') + '\n',
+      );
       return p;
     };
 
@@ -2326,10 +2702,127 @@ describe('Suite: D#60 concurrent-session decay idempotency (G10)', () => {
     });
 
     const db2 = openTestDb(tmpHome);
-    const o = db2.prepare('SELECT uncited_streak, decay_seen_count FROM observations WHERE id = ?').get(obsId);
+    const o = db2
+      .prepare('SELECT uncited_streak, decay_seen_count FROM observations WHERE id = ?')
+      .get(obsId);
     db2.close();
     // Pre-fix: session B is skipped (streak 1, seen 1). Post-fix: both resolve.
     expect(o.uncited_streak).toBe(2);
     expect(o.decay_seen_count).toBe(2);
+  });
+});
+
+describe('Suite: R10-P1-1 — /clear handoff over the real host event sequence', () => {
+  // Every other /clear test in this repo drives `session-start {source:'clear'}` WITHOUT a
+  // preceding `stop`, and tests/handoff-simulation.test.mjs asserts on its own local
+  // re-implementation of the SessionStart output rather than on the hook's. So the ONLY
+  // sequence a user can actually produce — Stop fires at the end of every assistant turn,
+  // then /clear — was untested, and the clear-handoff branch was unreachable in production:
+  // the maintainer's live DB held 0 `clear` rows against 21 sessions.
+  //
+  // Host semantics, measured 2026-09-07 and not assumed: of 21 real transcripts under
+  // ~/.claude/projects/<slug>/, 12 carry a `<command-name>/clear</command-name>` record,
+  // and in 12/12 that record's timestamp precedes its OWN file's first record by ~0.1s
+  // (delta -0.08…-0.19s). The command is issued in the old session and replayed into a NEW
+  // file under a NEW session id — i.e. the host ROTATES its session id across /clear.
+  // The rotated arm below is therefore the production shape; the kept-id arm is the
+  // counterfactual the audit asked for, and guards the prompt-scope fallback either way.
+  const CC_A = 'cc-11111111-1111-4111-8111-111111111111';
+  const CC_B = 'cc-22222222-2222-4222-8222-222222222222';
+  const PROMPT = 'fix the retry backoff in worker.mjs';
+
+  function turnThenClear(clearCcId) {
+    // CLAUDE_MEM_SKIP_SUMMARY: the detached llm-summary worker outlives this test and
+    // recreates the sandbox behind its cleanup (see handleStop's docblock).
+    const env = { HOME: tmpHome, CLAUDE_MEM_SKIP_SUMMARY: '1' };
+    runHook('session-start', { stdin: JSON.stringify({ source: 'startup', session_id: CC_A }), env });
+    runHook('user-prompt', { stdin: JSON.stringify({ prompt: PROMPT, session_id: CC_A }), env });
+    runHook('stop', { stdin: JSON.stringify({ session_id: CC_A }), env });
+    return runHook('session-start', {
+      stdin: JSON.stringify({ source: 'clear', session_id: clearCcId }),
+      env,
+    });
+  }
+
+  function clearHandoffRows() {
+    const db = openTestDb(tmpHome);
+    try {
+      return db.prepare("SELECT session_id, working_on FROM session_handoffs WHERE type = 'clear'").all();
+    } finally {
+      db.close();
+    }
+  }
+
+  it('rotated session id (production shape): /clear after a completed turn writes the handoff', () => {
+    const { stdout } = turnThenClear(CC_B);
+    const rows = clearHandoffRows();
+    expect(rows.length).toBe(1);
+    expect(rows[0].session_id).toBe(CC_B); // scoped to the NEW session, which is the reader
+    expect(rows[0].working_on).toContain('retry backoff'); // carried from the OLD session's prompt
+    expect(stdout).toContain('Working State (from /clear)');
+  });
+
+  it('kept session id: the same sequence with an unchanged session id', () => {
+    const { stdout } = turnThenClear(CC_A);
+    const rows = clearHandoffRows();
+    expect(rows.length).toBe(1);
+    expect(rows[0].session_id).toBe(CC_A);
+    expect(rows[0].working_on).toContain('retry backoff');
+    expect(stdout).toContain('Working State (from /clear)');
+  });
+
+  it('plain startup after a completed turn writes NO clear handoff', () => {
+    // The counter-case that keeps the fix honest: making the branch reachable must not make
+    // it fire on every session start. `source:'startup'` means the previous session ended
+    // normally — its per-turn `exit` handoff already carries continuity.
+    const env = { HOME: tmpHome, CLAUDE_MEM_SKIP_SUMMARY: '1' };
+    runHook('session-start', { stdin: JSON.stringify({ source: 'startup', session_id: CC_A }), env });
+    runHook('user-prompt', { stdin: JSON.stringify({ prompt: PROMPT, session_id: CC_A }), env });
+    runHook('stop', { stdin: JSON.stringify({ session_id: CC_A }), env });
+    const { stdout } = runHook('session-start', {
+      stdin: JSON.stringify({ source: 'startup', session_id: CC_B }),
+      env,
+    });
+    expect(clearHandoffRows().length).toBe(0);
+    expect(stdout).not.toContain('Working State (from /clear)');
+  });
+
+  it('one mem session per host session, not one per turn', () => {
+    // R10-P1-1(c). Stop deleted the session file at the end of EVERY turn, so getSessionId()
+    // minted a fresh mem session on the next event. Measured on the maintainer's live DB
+    // 2026-09-07: 58 prompts over 16 host sessions produced 56 distinct mem sessions and 56
+    // session_summaries rows, 0 of which carried the LLM-only fields.
+    const env = { HOME: tmpHome, CLAUDE_MEM_SKIP_SUMMARY: '1' };
+    runHook('session-start', { stdin: JSON.stringify({ source: 'startup', session_id: CC_A }), env });
+    for (const text of ['first turn', 'second turn', 'third turn']) {
+      runHook('user-prompt', { stdin: JSON.stringify({ prompt: text, session_id: CC_A }), env });
+      runHook('stop', { stdin: JSON.stringify({ session_id: CC_A }), env });
+    }
+    const db = openTestDb(tmpHome);
+    const n = db
+      .prepare('SELECT COUNT(DISTINCT content_session_id) c FROM user_prompts WHERE cc_session_id = ?')
+      .get(CC_A).c;
+    db.close();
+    expect(n).toBe(1);
+  });
+
+  it('CLAUDE_MEM_LEGACY_STOP_UNLINK=1 restores the pre-v5.4.0 per-turn unlink', () => {
+    // The documented revert path for this release. It must actually revert — an escape
+    // hatch nobody can observe is not an escape hatch, so this asserts the OLD symptom
+    // comes back: a fresh mem session per turn, and no clear handoff.
+    const env = { HOME: tmpHome, CLAUDE_MEM_SKIP_SUMMARY: '1', CLAUDE_MEM_LEGACY_STOP_UNLINK: '1' };
+    runHook('session-start', { stdin: JSON.stringify({ source: 'startup', session_id: CC_A }), env });
+    for (const text of ['first turn', 'second turn']) {
+      runHook('user-prompt', { stdin: JSON.stringify({ prompt: text, session_id: CC_A }), env });
+      runHook('stop', { stdin: JSON.stringify({ session_id: CC_A }), env });
+    }
+    runHook('session-start', { stdin: JSON.stringify({ source: 'clear', session_id: CC_B }), env });
+    const db = openTestDb(tmpHome);
+    const n = db
+      .prepare('SELECT COUNT(DISTINCT content_session_id) c FROM user_prompts WHERE cc_session_id = ?')
+      .get(CC_A).c;
+    db.close();
+    expect(n).toBe(2); // one per turn, as before v5.4.0
+    expect(clearHandoffRows().length).toBe(0);
   });
 });

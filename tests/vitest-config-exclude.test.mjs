@@ -20,6 +20,12 @@ describe('vitest test.exclude (D#168)', () => {
     expect(exclude, 'test.exclude must be configured at all').toBeInstanceOf(Array);
     expect(exclude).toContain('tmp/**');
     expect(exclude).toContain('.tmp/**');
+    // `tasks/**` joined them in the 2026-09-02 P2-1 round. Same known weakness as the two
+    // above and the same reason (a real probe means spawning vitest from inside vitest):
+    // this asserts the pattern is in the array the runner reads, not that collection
+    // honours it. The eslint half of that round was probe-verified instead, because eslint
+    // CAN be run as a subprocess — see the round's note in the audit report.
+    expect(exclude).toContain('tasks/**');
   });
 
   it('re-states every default it replaces — `exclude` overrides, it does not extend', () => {
@@ -29,11 +35,26 @@ describe('vitest test.exclude (D#168)', () => {
     // list copied into a comment, so a vitest upgrade that adds a default fails here
     // instead of silently widening collection.
     for (const pattern of configDefaults.exclude) {
-      expect(exclude, `default exclude "${pattern}" was dropped by overriding test.exclude`)
-        .toContain(pattern);
+      expect(exclude, `default exclude "${pattern}" was dropped by overriding test.exclude`).toContain(
+        pattern,
+      );
     }
-    expect(configDefaults.exclude.length,
-      'sanity: the installed vitest must have some defaults, else this case is vacuous')
-      .toBeGreaterThan(0);
+    expect(
+      configDefaults.exclude.length,
+      'sanity: the installed vitest must have some defaults, else this case is vacuous',
+    ).toBeGreaterThan(0);
+  });
+});
+
+describe('vitest hook budget (D#7)', () => {
+  it('gives setup/teardown the same budget as the tests they serve', () => {
+    // Same override-does-not-extend trap as the case above, one field over: `testTimeout`
+    // was set and `hookTimeout` was not, so hooks silently kept vitest's 10 s default
+    // while the tests they set up had 20 s — in a suite where 153 of 362 files run
+    // mkdtemp / new Database / initSchema / execFileSync / rmSync inside before*/after*.
+    // That is the same class of work the 20 s was chosen for, so the split was an
+    // omission, not a policy. Deleting the line would be silent again without this.
+    expect(config.test.hookTimeout, 'hookTimeout must be configured at all').toBeTypeOf('number');
+    expect(config.test.hookTimeout).toBe(config.test.testTimeout);
   });
 });

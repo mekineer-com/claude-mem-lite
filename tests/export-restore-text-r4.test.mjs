@@ -5,7 +5,7 @@
 // transcript collapsed each row's content to its bare title — unrecoverable AND
 // unsearchable (`text` is its own FTS5 column). The pre-fix export SELECT omitted
 // `text`; restore reconstructed content from `narrative || title`.
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { execFileSync } from 'child_process';
 import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
@@ -13,14 +13,17 @@ import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import { insertSession, insertObs } from './test-helpers.mjs';
+import { insertSession, insertObs, makeFixtureTracker } from './test-helpers.mjs';
 
 const CLI_PATH = resolve('cli.mjs');
+
+const fixtures = makeFixtureTracker();
+afterAll(() => fixtures.disposeAll());
 
 function makeTmpDir() {
   const dir = join(tmpdir(), `mem-exptext-${randomUUID().slice(0, 8)}`);
   mkdirSync(dir, { recursive: true });
-  return dir;
+  return fixtures.track(dir);
 }
 function initDb(dataDir) {
   mkdirSync(dataDir, { recursive: true });
@@ -33,13 +36,23 @@ function initDb(dataDir) {
 function runCli(args, dataDir) {
   try {
     const stdout = execFileSync(process.execPath, [CLI_PATH, ...args], {
-      encoding: 'utf8', timeout: 15000,
-      env: { ...process.env, CLAUDE_MEM_DIR: dataDir, CLAUDE_PROJECT_DIR: dataDir, CLAUDE_MEM_HOOK_RUNNING: undefined },
+      encoding: 'utf8',
+      timeout: 15000,
+      env: {
+        ...process.env,
+        CLAUDE_MEM_DIR: dataDir,
+        CLAUDE_PROJECT_DIR: dataDir,
+        CLAUDE_MEM_HOOK_RUNNING: undefined,
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     return { stdout, stderr: '', exitCode: 0 };
   } catch (e) {
-    return { stdout: e.stdout?.toString() || '', stderr: e.stderr?.toString() || '', exitCode: e.status ?? 1 };
+    return {
+      stdout: e.stdout?.toString() || '',
+      stderr: e.stderr?.toString() || '',
+      exitCode: e.status ?? 1,
+    };
   }
 }
 
@@ -55,13 +68,22 @@ describe('R4 export→restore preserves the observation body (text column)', () 
     insertSession(db, { id: 'imp-sess', project: 'srcproj', memoryId: 'imp-sess' });
     // Mimic an import-jsonl row: body lives in `text`, narrative is empty.
     insertObs(db, {
-      sessionId: 'imp-sess', project: 'srcproj', type: 'discovery',
-      title: 'Bash: run tests', narrative: '', text: BODY, importance: 2,
+      sessionId: 'imp-sess',
+      project: 'srcproj',
+      type: 'discovery',
+      title: 'Bash: run tests',
+      narrative: '',
+      text: BODY,
+      importance: 2,
     });
     db.close();
   });
   afterEach(() => {
-    for (const d of [srcDir, dstDir]) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
+    for (const d of [srcDir, dstDir]) {
+      try {
+        rmSync(d, { recursive: true, force: true });
+      } catch {}
+    }
   });
 
   it('exports the text column and restores it verbatim (body stays searchable)', () => {

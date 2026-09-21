@@ -1,8 +1,7 @@
 // claude-mem-lite shared utilities
 // Used by server.mjs, hook.mjs, and tests
 
-
-import { basename, dirname, resolve, sep } from 'path';
+import { basename, dirname } from 'path';
 import { execSync } from 'child_process';
 import { buildLowSignalRegex } from './lib/low-signal-patterns.mjs';
 // Local binding for internal use: the `export … from './secret-scrub.mjs'` re-export below
@@ -10,16 +9,49 @@ import { buildLowSignalRegex } from './lib/low-signal-patterns.mjs';
 import { scrubSecrets as _scrubSecrets } from './secret-scrub.mjs';
 
 // ─── Re-exports from extracted modules ──────────────────────────────────────
-// Backward compatibility: all consumers import from utils.mjs
-
-export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM25, EVT_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, OBS_FTS_COLUMNS, notLowSignalTitleClause, noisePenaltyClause } from './scoring-sql.mjs';
-export { cjkBigrams, extractCjkSynonymTokens, extractCjkKeywords, extractCjkLikePatterns, SYNONYM_MAP, expandToken, sanitizeFtsQuery, relaxFtsQueryToOr, FTS_STOP_WORDS, CJK_COMPOUNDS } from './nlp.mjs';
-export { inferProject, resolveProject, _resetProjectCache } from './project-utils.mjs';
-export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';
+// Backward compatibility: consumers that predate the extraction import from utils.mjs.
+//
+// The barrel carries what in-tree code actually imports THROUGH it, and nothing else.
+// "Backward compatible" here means compatible with this repo's own call sites: there is no
+// `main`/`exports` in package.json, so nothing outside the tree can import this module, and
+// a re-export with no importer is not a compatibility guarantee — it is a name knip has to
+// keep reporting. Eleven were dropped 2026-09-14 after both knip (whose entry set includes
+// tests, so a test-only consumer would have kept them) and a per-name import scan covering
+// named, namespace, dynamic and re-export forms agreed nothing imports them from here.
+// Each one is still exported by its own leaf module, where its real callers import it.
+// Same disposal the `extractResponseFromError` docblock records for the same reason.
+export {
+  DECAY_HALF_LIFE_BY_TYPE,
+  DEFAULT_DECAY_HALF_LIFE_MS,
+  OBS_BM25,
+  SESS_BM25,
+  EVT_BM25,
+  TYPE_QUALITY_CASE,
+  OBS_FTS_COLUMNS,
+  notLowSignalTitleClause,
+  noisePenaltyClause,
+} from './scoring-sql.mjs';
+export { cjkBigrams, sanitizeFtsQuery, ftsQueryTokens, relaxFtsQueryToOr } from './nlp.mjs';
+export { inferProject } from './project-utils.mjs';
+export { scrubSecrets } from './secret-scrub.mjs';
 export { stripPrivate } from './lib/private-strip.mjs';
-export { truncate, typeIcon, fmtDate, fmtTime, isoWeekKey, formatErrorRecallHints, neutralizeContextDelimiters } from './format-utils.mjs';
+export {
+  truncate,
+  queryLabel,
+  typeIcon,
+  fmtDate,
+  fmtTime,
+  isoWeekKey,
+  formatErrorRecallHints,
+  neutralizeContextDelimiters,
+} from './format-utils.mjs';
 export { computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity } from './hash-utils.mjs';
-export { detectBashSignificance, extractErrorKeywords, planErrorRecall, extractFilePaths, stripTestSuffix } from './bash-utils.mjs';
+export {
+  detectBashSignificance,
+  extractErrorKeywords,
+  extractFilePaths,
+  stripTestSuffix,
+} from './bash-utils.mjs';
 
 // Internal imports for functions that remain in this module
 import { truncate } from './format-utils.mjs';
@@ -37,18 +69,10 @@ export const COMPRESSED_PENDING_PURGE = -2;
 
 // ─── Path Safety ──────────────────────────────────────────────────────────
 
-/**
- * Check if a resolved path is confined within an allowed base directory.
- * Prevents path traversal attacks via '../' sequences.
- * @param {string} candidate Path to check
- * @param {string} allowedBase Base directory the path must stay within
- * @returns {boolean} true if safe
- */
-export function isPathConfined(candidate, allowedBase) {
-  const resolved = resolve(candidate);
-  const base = resolve(allowedBase);
-  return resolved === base || resolved.startsWith(base + sep);
-}
+// `isPathConfined` lived here until 2026-09. Its consumers were the skill-registry
+// enrichment confinement gate and mem_use's managed-path check, both removed with that
+// subsystem (docs/audits/20260906-145304.md); keeping the export would have added a dead
+// name to the knip baseline — the same call made for `basenameAnySep` below.
 
 // `basenameAnySep` lived here until 2026-08-22. Its sole production consumer was
 // `recallForFile` (hook-memory.mjs), which had no callers of its own and was
@@ -75,9 +99,13 @@ export function estimateTokens(text) {
   let cjkCount = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
-    if ((c >= 0x4e00 && c <= 0x9fff) || (c >= 0x3400 && c <= 0x4dbf) ||
-        (c >= 0x3000 && c <= 0x303f) || (c >= 0xff00 && c <= 0xffef) ||
-        (c >= 0xac00 && c <= 0xd7af)) {
+    if (
+      (c >= 0x4e00 && c <= 0x9fff) ||
+      (c >= 0x3400 && c <= 0x4dbf) ||
+      (c >= 0x3000 && c <= 0x303f) ||
+      (c >= 0xff00 && c <= 0xffef) ||
+      (c >= 0xac00 && c <= 0xd7af)
+    ) {
       cjkCount++;
     }
   }
@@ -95,7 +123,7 @@ export function estimateTokens(text) {
 export function clampImportance(val) {
   // Coerce numeric strings: an LLM emitting "importance":"2" (quoted) would otherwise
   // collapse to 1, silently dropping its signal. Non-numeric strings → NaN → 1.
-  const n = typeof val === 'number' ? val : (typeof val === 'string' ? Number(val) : NaN);
+  const n = typeof val === 'number' ? val : typeof val === 'string' ? Number(val) : NaN;
   if (!Number.isFinite(n)) return 1;
   return Math.max(1, Math.min(3, Math.round(n)));
 }
@@ -145,18 +173,33 @@ export function computeRuleImportance(episode) {
     if (lastWasError && EDIT_TOOLS.has(entry.tool)) hasErrorThenEdit = true;
     lastWasError = entry.isError || sig?.isError;
 
-    if (sig?.isError && (sig?.isTest || sig?.isBuild)) { importance = 3; break; }
+    if (sig?.isError && (sig?.isTest || sig?.isBuild)) {
+      importance = 3;
+      break;
+    }
     // Sensitive-file → critical only when the file was EDITED, not merely read or
     // referenced in a bash command (finding #7): reading auth.js / .env / schema.mjs
     // incidentally during an unrelated task must not promote the whole memory to
     // imp=3 and outrank genuine memories in top-K injection.
     const isEdit = EDIT_TOOLS.has(entry.tool);
-    if (isEdit && files.some(f => /\.(env|pem|key)$|\/auth\.|\/credential|\/password/i.test(f))) { importance = 3; break; }
-    if (isEdit && files.some(f => /migration|schema\.|prisma|alembic/i.test(f))) { importance = 3; break; }
+    if (isEdit && files.some((f) => /\.(env|pem|key)$|\/auth\.|\/credential|\/password/i.test(f))) {
+      importance = 3;
+      break;
+    }
+    if (isEdit && files.some((f) => /migration|schema\.|prisma|alembic/i.test(f))) {
+      importance = 3;
+      break;
+    }
     if (sig?.isError && importance < 2) importance = 2;
     if (sig?.isGit && importance < 2) importance = 2;
     if (sig?.isDeploy && importance < 2) importance = 2;
-    if (files.some(f => /\.config\.|tsconfig|Dockerfile|docker-compose|package\.json|\.yml$|\.yaml$/i.test(basename(f))) && importance < 2) importance = 2;
+    if (
+      files.some((f) =>
+        /\.config\.|tsconfig|Dockerfile|docker-compose|package\.json|\.yml$|\.yaml$/i.test(basename(f)),
+      ) &&
+      importance < 2
+    )
+      importance = 2;
   }
 
   // Debug cycle: error followed by edit = active debugging
@@ -232,7 +275,9 @@ export function makeEntryDesc(toolName, input, resp, opts) {
       const cmd = scrubTruncate(input.command || '', 50);
       // Use caller-provided bashSig.isError (word-boundary aware) when available;
       // fall back to inline regex only for standalone callers (tests, etc.)
-      const isErr = opts?.isError ?? (/\berror\b|\bfail(ed|ure)?\b|\bexception\b|\bpanic\b/i.test(resp) && resp.length > 30);
+      const isErr =
+        opts?.isError ??
+        (/\berror\b|\bfail(ed|ure)?\b|\bexception\b|\bpanic\b/i.test(resp) && resp.length > 30);
       const snippet = scrubTruncate(resp, 60);
       return isErr ? `${cmd} → ERROR: ${snippet}` : `${cmd} → ${snippet}`;
     }
@@ -240,7 +285,8 @@ export function makeEntryDesc(toolName, input, resp, opts) {
       return `Search "${scrubTruncate(input.pattern || '', 20)}" → ${scrubTruncate(resp, 60)}`;
     case 'LSP':
       return `${input.operation || ''} ${basename(input.filePath || '')}`;
-    case 'Task': case 'Agent':
+    case 'Task':
+    case 'Agent':
       return scrubTruncate(input.description || '', 60);
     case 'WebSearch':
       return `Web: ${scrubTruncate(input.query || '', 50)}`;
@@ -297,7 +343,9 @@ export function debugCatch(e, context) {
       try {
         const { maybeSampleError } = await import('./lib/err-sampler.mjs');
         maybeSampleError(e, context, resolveDataDir(process.env.CLAUDE_MEM_DIR));
-      } catch { /* sampler dynamic-import fault must not propagate */ }
+      } catch {
+        /* sampler dynamic-import fault must not propagate */
+      }
     })();
   }
 }
@@ -318,9 +366,18 @@ function firstBalancedJsonObject(text) {
   const brackAt = text.indexOf('[');
   let start, open, close;
   if (braceAt === -1 && brackAt === -1) return null;
-  if (brackAt !== -1 && (braceAt === -1 || brackAt < braceAt)) { start = brackAt; open = '['; close = ']'; }
-  else { start = braceAt; open = '{'; close = '}'; }
-  let depth = 0, inStr = false, esc = false;
+  if (brackAt !== -1 && (braceAt === -1 || brackAt < braceAt)) {
+    start = brackAt;
+    open = '[';
+    close = ']';
+  } else {
+    start = braceAt;
+    open = '{';
+    close = '}';
+  }
+  let depth = 0,
+    inStr = false,
+    esc = false;
   for (let i = start; i < text.length; i++) {
     const c = text[i];
     if (inStr) {
@@ -342,16 +399,24 @@ function firstBalancedJsonObject(text) {
  */
 export function parseJsonFromLLM(text) {
   if (!text) return null;
-  try { return JSON.parse(text); } catch {}
+  try {
+    return JSON.parse(text);
+  } catch {}
   // No `\s*` around the lazy capture: `\s*([\s\S]*?)\s*` catastrophically backtracks
   // (O(n²)) on a fence + long whitespace + no closing fence — a ~5KB partial buffer hung
   // the CLI-timeout salvage path for 10+s (round-5 review). `([\s\S]*?)```` is a single
   // O(n) lazy scan; JSON.parse tolerates the surrounding whitespace the trim used to strip.
   const fenced = text.match(/```(?:json)?([\s\S]*?)```/);
-  if (fenced) try { return JSON.parse(fenced[1]); } catch {}
+  if (fenced)
+    try {
+      return JSON.parse(fenced[1]);
+    } catch {}
   // First balanced object — survives unfenced output wrapped in brace-containing prose.
   const balanced = firstBalancedJsonObject(text);
-  if (balanced) try { return JSON.parse(balanced); } catch {}
+  if (balanced)
+    try {
+      return JSON.parse(balanced);
+    } catch {}
   // Last-resort span from the first `{` to the last `}` — handles a payload that isn't the
   // FIRST balanced object. Resolved via index scan (O(n)) rather than the greedy
   // /\{[\s\S]*\}/, which backtracks O(n²) across k unclosed opening braces (a synthetic
@@ -361,7 +426,9 @@ export function parseJsonFromLLM(text) {
   const firstBrace = text.indexOf('{');
   const lastBrace = text.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace > firstBrace) {
-    try { return JSON.parse(text.slice(firstBrace, lastBrace + 1)); } catch {}
+    try {
+      return JSON.parse(text.slice(firstBrace, lastBrace + 1));
+    } catch {}
   }
   return null;
 }
@@ -369,15 +436,85 @@ export function parseJsonFromLLM(text) {
 // ─── Handoff Utilities ──────────────────────────────────────────────────────
 
 /** Stop words for handoff keyword extraction (broader than ERROR_STOP_WORDS). */
-export const HANDOFF_STOP_WORDS = new Set([
-  'the', 'and', 'for', 'that', 'this', 'with', 'from', 'are', 'was', 'were',
-  'been', 'have', 'has', 'had', 'does', 'did', 'will', 'would', 'should', 'could',
-  'can', 'may', 'must', 'not', 'but', 'its', 'all', 'any', 'each', 'some',
-  'into', 'over', 'after', 'before', 'between', 'about', 'also', 'just', 'then',
-  'than', 'when', 'where', 'how', 'what', 'which', 'who', 'why', 'here', 'there',
-  'more', 'very', 'only', 'still', 'now', 'new', 'old', 'get', 'got', 'set',
-  'true', 'false', 'null', 'undefined', 'function', 'return', 'const', 'let', 'var',
-  'import', 'export', 'default', 'class', 'async', 'await', 'try', 'catch',
+// Module-private since v6.6.0: hook-memory.mjs was its last importer, and it went away
+// with extractQueryTerms when the coverage denominator moved to the shared term source.
+const HANDOFF_STOP_WORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'that',
+  'this',
+  'with',
+  'from',
+  'are',
+  'was',
+  'were',
+  'been',
+  'have',
+  'has',
+  'had',
+  'does',
+  'did',
+  'will',
+  'would',
+  'should',
+  'could',
+  'can',
+  'may',
+  'must',
+  'not',
+  'but',
+  'its',
+  'all',
+  'any',
+  'each',
+  'some',
+  'into',
+  'over',
+  'after',
+  'before',
+  'between',
+  'about',
+  'also',
+  'just',
+  'then',
+  'than',
+  'when',
+  'where',
+  'how',
+  'what',
+  'which',
+  'who',
+  'why',
+  'here',
+  'there',
+  'more',
+  'very',
+  'only',
+  'still',
+  'now',
+  'new',
+  'old',
+  'get',
+  'got',
+  'set',
+  'true',
+  'false',
+  'null',
+  'undefined',
+  'function',
+  'return',
+  'const',
+  'let',
+  'var',
+  'import',
+  'export',
+  'default',
+  'class',
+  'async',
+  'await',
+  'try',
+  'catch',
 ]);
 
 /**
@@ -390,8 +527,8 @@ export function tokenizeHandoff(text) {
   if (!text) return [];
   return text
     .split(/[\s,;:.()[\]{}'"`<>→|/\\#@!?=+*&^%$~]+/)
-    .map(w => w.toLowerCase().replace(/^[.-]+|[.-]+$/g, ''))
-    .filter(w => w.length >= 3);
+    .map((w) => w.toLowerCase().replace(/^[.-]+|[.-]+$/g, ''))
+    .filter((w) => w.length >= 3);
 }
 
 /**
@@ -481,12 +618,14 @@ let _branchCacheTime = 0;
 const BRANCH_CACHE_TTL = 60000; // 60s TTL for long-running MCP server process
 export function getCurrentBranch() {
   const now = Date.now();
-  if (_cachedBranch !== undefined && (now - _branchCacheTime) < BRANCH_CACHE_TTL) return _cachedBranch;
+  if (_cachedBranch !== undefined && now - _branchCacheTime < BRANCH_CACHE_TTL) return _cachedBranch;
   try {
     const result = execSync('git rev-parse --abbrev-ref HEAD', {
-      encoding: 'utf8', timeout: 2000, stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf8',
+      timeout: 2000,
+      stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
-    _cachedBranch = (result && result !== 'HEAD') ? result : null;
+    _cachedBranch = result && result !== 'HEAD' ? result : null;
   } catch {
     _cachedBranch = null;
   }

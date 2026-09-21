@@ -9,6 +9,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   extractCitationsFromTranscript,
+  classifyCitationContext,
   extractUserTypedIds,
   buildCitationRelevanceSet,
   assertRelevanceCoversAllFaces,
@@ -16,7 +17,7 @@ import {
   bumpCitationAccess,
   computeCiteRecall,
 } from '../lib/citation-tracker.mjs';
-import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs, disposeFixtureDir } from './test-helpers.mjs';
 import { keyContextIdsFileName } from '../lib/injected-ids.mjs';
 
 describe('extractCitationsFromTranscript', () => {
@@ -27,12 +28,14 @@ describe('extractCitationsFromTranscript', () => {
   });
 
   afterEach(() => {
-    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(tmp, { recursive: true, force: true });
+    } catch {}
   });
 
   function writeTranscript(entries) {
     const path = join(tmp, 'transcript.jsonl');
-    writeFileSync(path, entries.map(e => JSON.stringify(e)).join('\n'));
+    writeFileSync(path, entries.map((e) => JSON.stringify(e)).join('\n'));
     return path;
   }
 
@@ -115,7 +118,10 @@ describe('extractCitationsFromTranscript', () => {
 
   it('tolerates malformed JSONL lines', () => {
     const path = join(tmp, 'bad.jsonl');
-    writeFileSync(path, 'not json\n{"type":"assistant","message":{"content":[{"type":"text","text":"#42"}]}}\nalso bad');
+    writeFileSync(
+      path,
+      'not json\n{"type":"assistant","message":{"content":[{"type":"text","text":"#42"}]}}\nalso bad',
+    );
     const ids = extractCitationsFromTranscript(path);
     expect(ids.has(42)).toBe(true);
     expect(ids.size).toBe(1);
@@ -147,7 +153,9 @@ describe('bumpCitationAccess', () => {
 
     const n = bumpCitationAccess(db, [id1, id2], 'projects--test', ALL(id1, id2));
     expect(n).toBe(2);
-    const rows = db.prepare('SELECT id, access_count, last_accessed_at FROM observations WHERE id IN (?, ?)').all(id1, id2);
+    const rows = db
+      .prepare('SELECT id, access_count, last_accessed_at FROM observations WHERE id IN (?, ?)')
+      .all(id1, id2);
     for (const r of rows) {
       expect(r.access_count).toBe(1);
       expect(r.last_accessed_at).toBeGreaterThan(0);
@@ -174,12 +182,43 @@ describe('bumpCitationAccess', () => {
     expect(bumpCitationAccess(db, [999999], 'projects--test', ALL(999999))).toBe(0);
   });
 
-  it('accumulates across multiple citation rounds', () => {
+  // R11-B-P1-1. This case used to read `accumulates across multiple citation rounds`
+  // and assert 3 — it encoded the defect. `Stop` fires once per assistant TURN and
+  // rescans the WHOLE transcript, so "multiple rounds" is what one citation looks like
+  // from inside a single session: real-corpus replay read 338 credits over 43 distinct
+  // (session, id) pairs = 7.86x, feeding boostAccessed (access_count > 3 → importance+1).
+  // The unit of a credit is the CC SESSION, not the call.
+  it('accumulates across sessions, not within one', () => {
+    const id1 = newObs({ title: 'X', type: 'bugfix', project: 'projects--test' });
+    const acc = () => db.prepare('SELECT access_count FROM observations WHERE id = ?').get(id1).access_count;
+
+    expect(bumpCitationAccess(db, [id1], 'projects--test', ALL(id1), { sessionId: 'cc-a' })).toBe(1);
+    expect(bumpCitationAccess(db, [id1], 'projects--test', ALL(id1), { sessionId: 'cc-a' })).toBe(0);
+    expect(bumpCitationAccess(db, [id1], 'projects--test', ALL(id1), { sessionId: 'cc-a' })).toBe(0);
+    expect(acc()).toBe(1);
+
+    // A later session is a new credit — the contract is "cite next time", and a
+    // citation in tomorrow's session is a second, real signal.
+    expect(bumpCitationAccess(db, [id1], 'projects--test', ALL(id1), { sessionId: 'cc-b' })).toBe(1);
+    expect(acc()).toBe(2);
+  });
+
+  it('stamps the crediting session so a later Stop in it is a no-op', () => {
+    const id1 = newObs({ title: 'X', type: 'bugfix', project: 'projects--test' });
+    bumpCitationAccess(db, [id1], 'projects--test', ALL(id1), { sessionId: 'cc-a' });
+    expect(
+      db.prepare('SELECT last_access_session_id FROM observations WHERE id = ?').get(id1)
+        .last_access_session_id,
+    ).toBe('cc-a');
+  });
+
+  it('a null sessionId keeps the pre-R11 behaviour, because there is no scope to dedupe within', () => {
+    // Not a compromise: no CC session means no session to be idempotent inside. The
+    // production caller (hook.mjs handleStop) always has one; this is the non-CC path.
     const id1 = newObs({ title: 'X', type: 'bugfix', project: 'projects--test' });
     bumpCitationAccess(db, [id1], 'projects--test', ALL(id1));
-    bumpCitationAccess(db, [id1], 'projects--test', ALL(id1));
-    bumpCitationAccess(db, [id1], 'projects--test', ALL(id1));
-    expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(id1).access_count).toBe(3);
+    bumpCitationAccess(db, [id1], 'projects--test', ALL(id1), { sessionId: null });
+    expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(id1).access_count).toBe(2);
   });
 
   it('accepts Set and Array iterables', () => {
@@ -226,20 +265,28 @@ describe('bumpCitationAccess', () => {
     // measured.
     const discussed = newObs({ title: 'X', type: 'bugfix', project: 'projects--test' });
     const env = { CLAUDE_MEM_CITATION_RELEVANCE_GATE: 'off' };
-    expect(bumpCitationAccess(db, [discussed], 'projects--test', new Set(), env)).toBe(1);
-    expect(bumpCitationAccess(db, [discussed], 'projects--test', undefined, env)).toBe(1);
-    expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(discussed).access_count).toBe(2);
+    expect(bumpCitationAccess(db, [discussed], 'projects--test', new Set(), { env })).toBe(1);
+    expect(bumpCitationAccess(db, [discussed], 'projects--test', undefined, { env })).toBe(1);
+    expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(discussed).access_count).toBe(
+      2,
+    );
   });
 
   it('an unset or unrelated flag value leaves the gate ON', () => {
     // Off-by-default reverts are how a guard quietly stops guarding. Only the documented
     // token disarms it.
     const discussed = newObs({ title: 'X', type: 'bugfix', project: 'projects--test' });
-    for (const env of [{}, { CLAUDE_MEM_CITATION_RELEVANCE_GATE: '' },
-      { CLAUDE_MEM_CITATION_RELEVANCE_GATE: '0' }, { CLAUDE_MEM_CITATION_RELEVANCE_GATE: 'false' }]) {
-      expect(bumpCitationAccess(db, [discussed], 'projects--test', new Set(), env)).toBe(0);
+    for (const env of [
+      {},
+      { CLAUDE_MEM_CITATION_RELEVANCE_GATE: '' },
+      { CLAUDE_MEM_CITATION_RELEVANCE_GATE: '0' },
+      { CLAUDE_MEM_CITATION_RELEVANCE_GATE: 'false' },
+    ]) {
+      expect(bumpCitationAccess(db, [discussed], 'projects--test', new Set(), { env })).toBe(0);
     }
-    expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(discussed).access_count).toBe(0);
+    expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(discussed).access_count).toBe(
+      0,
+    );
   });
 
   it('the flag does NOT restore crediting a tombstone (FLOW-6 is not part of the revert)', () => {
@@ -247,9 +294,14 @@ describe('bumpCitationAccess', () => {
     // sides of the flag.
     const keeper = newObs({ title: 'K', type: 'bugfix', project: 'projects--test' });
     const dead = newObs({ title: 'D', type: 'bugfix', project: 'projects--test' });
-    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?')
-      .run(Date.now(), keeper, dead);
-    bumpCitationAccess(db, [dead], 'projects--test', undefined, { CLAUDE_MEM_CITATION_RELEVANCE_GATE: 'off' });
+    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?').run(
+      Date.now(),
+      keeper,
+      dead,
+    );
+    bumpCitationAccess(db, [dead], 'projects--test', undefined, {
+      env: { CLAUDE_MEM_CITATION_RELEVANCE_GATE: 'off' },
+    });
     const acc = (id) => db.prepare('SELECT access_count FROM observations WHERE id = ?').get(id).access_count;
     expect(acc(keeper)).toBe(1);
     expect(acc(dead)).toBe(0);
@@ -261,8 +313,11 @@ describe('bumpCitationAccess', () => {
     // absorbed it.
     const keeper = newObs({ title: 'K', type: 'bugfix', project: 'projects--test' });
     const dead = newObs({ title: 'D', type: 'bugfix', project: 'projects--test' });
-    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?')
-      .run(Date.now(), keeper, dead);
+    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?').run(
+      Date.now(),
+      keeper,
+      dead,
+    );
 
     // Cited AND gated by the OLD id — both sides must redirect, or the keeper id in one
     // would never meet its superseded twin in the other.
@@ -275,16 +330,24 @@ describe('bumpCitationAccess', () => {
 });
 
 describe('extractUserTypedIds', () => {
+  // D#2: `write` used to drop the mkdtempSync root on the floor, and this describe had
+  // no afterEach at all — one leaked dir per call, four per run.
+  const roots = [];
   const write = (entries) => {
-    const f = join(mkdtempSync(join(tmpdir(), 'mem-usertyped-')), 't.jsonl');
+    const root = mkdtempSync(join(tmpdir(), 'mem-usertyped-'));
+    roots.push(root);
+    const f = join(root, 't.jsonl');
     writeFileSync(f, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
     return f;
   };
 
+  afterEach(() => {
+    for (const root of roots) disposeFixtureDir(root);
+    roots.length = 0;
+  });
+
   it('picks up an id the user typed in their own message', () => {
-    const f = write([
-      { type: 'user', message: { content: 'please re-read #10716 before editing' } },
-    ]);
+    const f = write([{ type: 'user', message: { content: 'please re-read #10716 before editing' } }]);
     expect([...extractUserTypedIds(f)]).toEqual([10716]);
   });
 
@@ -292,10 +355,15 @@ describe('extractUserTypedIds', () => {
     // A tool_result rides inside a user turn but is program output, not something the
     // user wrote — crediting ids echoed back by a tool would reopen the gate sideways.
     const f = write([
-      { type: 'user', message: { content: [
-        { type: 'text', text: 'compare with #4242' },
-        { type: 'tool_result', content: 'grep output mentioning #9999' },
-      ] } },
+      {
+        type: 'user',
+        message: {
+          content: [
+            { type: 'text', text: 'compare with #4242' },
+            { type: 'tool_result', content: 'grep output mentioning #9999' },
+          ],
+        },
+      },
     ]);
     const ids = extractUserTypedIds(f);
     expect(ids.has(4242)).toBe(true);
@@ -311,9 +379,7 @@ describe('extractUserTypedIds', () => {
   });
 
   it('honours mainOnly for sidechain user turns', () => {
-    const f = write([
-      { type: 'user', isSidechain: true, message: { content: 'see #555' } },
-    ]);
+    const f = write([{ type: 'user', isSidechain: true, message: { content: 'see #555' } }]);
     expect(extractUserTypedIds(f).has(555)).toBe(true);
     expect(extractUserTypedIds(f, { mainOnly: true }).has(555)).toBe(false);
   });
@@ -327,17 +393,24 @@ describe('computeCiteRecall', () => {
   });
 
   afterEach(() => {
-    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(tmp, { recursive: true, force: true });
+    } catch {}
   });
 
   function writeTranscript(entries) {
     const path = join(tmp, 'transcript.jsonl');
-    writeFileSync(path, entries.map(e => JSON.stringify(e)).join('\n'));
+    writeFileSync(path, entries.map((e) => JSON.stringify(e)).join('\n'));
     return path;
   }
 
   it('returns zeros for missing transcript', () => {
-    expect(computeCiteRecall(join(tmp, 'nope.jsonl'))).toEqual({ injected: 0, cited: 0, recalled: 0, ratio: 0 });
+    expect(computeCiteRecall(join(tmp, 'nope.jsonl'))).toEqual({
+      injected: 0,
+      cited: 0,
+      recalled: 0,
+      ratio: 0,
+    });
   });
 
   it('computes 1.0 ratio when assistant cites every injected #NN', () => {
@@ -401,8 +474,16 @@ describe('computeCiteRecall', () => {
 // install, and the configuration where that block is the most prominent surface there is.
 describe('buildCitationRelevanceSet', () => {
   let dir;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'mem-relset-')); });
-  afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mem-relset-'));
+  });
+  afterEach(() => {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
 
   const transcript = (entries) => {
     const f = join(dir, 't.jsonl');
@@ -414,17 +495,23 @@ describe('buildCitationRelevanceSet', () => {
     const runtimeDir = join(dir, 'runtime');
     mkdirSync(runtimeDir, { recursive: true });
     // The marker filename is session-scoped too — write the name the extractor reads.
-    writeFileSync(join(runtimeDir, keyContextIdsFileName('proj', 'sess-a')),
-      JSON.stringify({ ids: [777], session: 'sess-a' }));
+    writeFileSync(
+      join(runtimeDir, keyContextIdsFileName('proj', 'sess-a')),
+      JSON.stringify({ ids: [777], session: 'sess-a' }),
+    );
     const set = buildCitationRelevanceSet({
-      transcriptPath: transcript([]), runtimeDir, project: 'proj', sessionId: 'sess-a',
+      transcriptPath: transcript([]),
+      runtimeDir,
+      project: 'proj',
+      sessionId: 'sess-a',
     });
     expect(set.has(777)).toBe(true);
   });
 
   it('includes a subagent id the caller hands in', () => {
     const set = buildCitationRelevanceSet({
-      transcriptPath: transcript([]), subagentInjected: new Set([888]),
+      transcriptPath: transcript([]),
+      subagentInjected: new Set([888]),
     });
     expect(set.has(888)).toBe(true);
   });
@@ -446,10 +533,15 @@ describe('buildCitationRelevanceSet', () => {
     mkdirSync(runtimeDir, { recursive: true });
     // Same filename this session would read, but stamped by another window: exercises the
     // session field guard rather than just missing the file.
-    writeFileSync(join(runtimeDir, keyContextIdsFileName('proj', 'sess-a')),
-      JSON.stringify({ ids: [777], session: 'other-window' }));
+    writeFileSync(
+      join(runtimeDir, keyContextIdsFileName('proj', 'sess-a')),
+      JSON.stringify({ ids: [777], session: 'other-window' }),
+    );
     const set = buildCitationRelevanceSet({
-      transcriptPath: transcript([]), runtimeDir, project: 'proj', sessionId: 'sess-a',
+      transcriptPath: transcript([]),
+      runtimeDir,
+      project: 'proj',
+      sessionId: 'sess-a',
     });
     expect(set.has(777)).toBe(false);
   });
@@ -457,11 +549,150 @@ describe('buildCitationRelevanceSet', () => {
   it('every face in CITATION_SURFACES has a source', () => {
     expect(assertRelevanceCoversAllFaces()).toBe(true);
     // The guard can say NO: drop either non-attachment face and it must throw by name.
-    expect(() => assertRelevanceCoversAllFaces(
-      CITATION_SURFACES.filter((f) => f !== 'keyctx'),
-    )).toThrow(/keyctx/);
-    expect(() => assertRelevanceCoversAllFaces(
-      CITATION_SURFACES.filter((f) => f !== 'subagent'),
-    )).toThrow(/subagent/);
+    expect(() => assertRelevanceCoversAllFaces(CITATION_SURFACES.filter((f) => f !== 'keyctx'))).toThrow(
+      /keyctx/,
+    );
+    expect(() => assertRelevanceCoversAllFaces(CITATION_SURFACES.filter((f) => f !== 'subagent'))).toThrow(
+      /subagent/,
+    );
+  });
+});
+
+// D#179 prerequisite: split each cited id into "named while acting" and "named in
+// prose only". The unit is one model RESPONSE (requestId), because a whole user-to-user
+// exchange nearly always contains some tool call — bounding on user messages would
+// classify everything as applied and measure nothing.
+describe('classifyCitationContext (D#179)', () => {
+  let tmp;
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'cite-ctx-'));
+  });
+  afterEach(() => {
+    try {
+      rmSync(tmp, { recursive: true, force: true });
+    } catch {}
+  });
+
+  function writeTranscript(entries) {
+    const path = join(tmp, 'transcript.jsonl');
+    writeFileSync(path, entries.map((e) => JSON.stringify(e)).join('\n'));
+    return path;
+  }
+  const say = (requestId, text) => ({
+    type: 'assistant',
+    requestId,
+    message: { content: [{ type: 'text', text }] },
+  });
+  const act = (requestId) => ({
+    type: 'assistant',
+    requestId,
+    message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+  });
+
+  it('counts an id named in a response that also calls a tool as applied', () => {
+    const ctx = classifyCitationContext(writeTranscript([say('r1', 'Applying #42 now.'), act('r1')]));
+    expect(ctx.get(42)).toEqual({ withTool: 1, textOnly: 0 });
+  });
+
+  it('counts an id named in a prose-only response as text-only', () => {
+    const ctx = classifyCitationContext(writeTranscript([say('r1', 'The release note discusses #42.')]));
+    expect(ctx.get(42)).toEqual({ withTool: 0, textOnly: 1 });
+  });
+
+  it('does NOT let a tool call in a DIFFERENT response mark the mention as applied', () => {
+    // The whole reason the unit is a requestId. Grouping by user turn (or by file)
+    // would make one Edit anywhere mark every id in the session as acted on, and the
+    // measurement would report ~0% contamination on any coding session.
+    const ctx = classifyCitationContext(
+      writeTranscript([
+        say('r1', 'Release note: #42 was the lesson that closed it.'),
+        say('r2', 'Now the unrelated change.'),
+        act('r2'),
+      ]),
+    );
+    expect(ctx.get(42)).toEqual({ withTool: 0, textOnly: 1 });
+  });
+
+  it('groups the blocks of one response even when split across entries', () => {
+    const ctx = classifyCitationContext(writeTranscript([say('r1', 'Per #42.'), act('r1'), act('r1')]));
+    expect(ctx.get(42)).toEqual({ withTool: 1, textOnly: 0 });
+  });
+
+  it('keys on message.id when requestId is absent — the shape production actually emits', () => {
+    // The fallback chain is `requestId || message.id || uuid`. Real Claude Code entries
+    // that lack a requestId still carry message.id, so THIS is the arm that runs in
+    // production; the uuid arm below is the keyless last resort. The pre-tag review
+    // caught the original of this case testing only the uuid arm and describing it as
+    // "the fallback", i.e. validating a shape production never emits.
+    const ctx = classifyCitationContext(
+      writeTranscript([
+        { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Discussing #42.' }] } },
+        {
+          type: 'assistant',
+          message: { id: 'm2', content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        },
+      ]),
+    );
+    expect(ctx.get(42)).toEqual({ withTool: 0, textOnly: 1 });
+  });
+
+  it('falls back to uuid when there is no requestId and no message.id — never one giant bucket', () => {
+    // Merging keyless entries would let a single tool call anywhere in the file mark
+    // every id as applied.
+    const ctx = classifyCitationContext(
+      writeTranscript([
+        { type: 'assistant', uuid: 'u1', message: { content: [{ type: 'text', text: 'Discussing #42.' }] } },
+        {
+          type: 'assistant',
+          uuid: 'u2',
+          message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        },
+      ]),
+    );
+    expect(ctx.get(42)).toEqual({ withTool: 0, textOnly: 1 });
+  });
+
+  it('groups by message.id across split entries, not by position', () => {
+    // The positive arm of the case above: two entries sharing one message.id ARE one
+    // response, so the tool call marks the text's id applied.
+    const ctx = classifyCitationContext(
+      writeTranscript([
+        { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Applying #42.' }] } },
+        {
+          type: 'assistant',
+          message: { id: 'm1', content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        },
+      ]),
+    );
+    expect(ctx.get(42)).toEqual({ withTool: 1, textOnly: 0 });
+  });
+
+  it('ignores thinking blocks — it must classify the same numerator decay acts on', () => {
+    const ctx = classifyCitationContext(
+      writeTranscript([
+        {
+          type: 'assistant',
+          requestId: 'r1',
+          message: { content: [{ type: 'thinking', thinking: 'recall #42' }] },
+        },
+      ]),
+    );
+    expect(ctx.has(42)).toBe(false);
+  });
+
+  it('skips sidechain records by default and includes them when asked', () => {
+    const entries = [
+      {
+        type: 'assistant',
+        requestId: 'r1',
+        isSidechain: true,
+        message: { content: [{ type: 'text', text: 'Subagent used #42.' }] },
+      },
+    ];
+    expect(classifyCitationContext(writeTranscript(entries)).has(42)).toBe(false);
+    expect(classifyCitationContext(writeTranscript(entries), { mainOnly: false }).get(42)).toEqual({
+      withTool: 0,
+      textOnly: 1,
+    });
   });
 });

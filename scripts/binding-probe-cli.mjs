@@ -36,18 +36,20 @@ const ROOT = process.env.PROBE_ROOT || join(dirname(fileURLToPath(import.meta.ur
 // because bareProbe runs when lib/ could not be imported. Same 240 cap, same
 // ellipsis, same 'unknown' floor — asserted for parity by the tests.
 function flattenLocal(err, max = 240) {
-  const s = String(err ?? '').replace(/\s+/g, ' ').trim();
+  const s = String(err ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (!s) return 'unknown';
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
 function bareProbe(root) {
   const script =
-    'try {'
-    + 'const { createRequire } = require("node:module");'
-    + `const D = createRequire(${JSON.stringify(join(root, 'package.json'))})("better-sqlite3");`
-    + 'new D(":memory:").close();'
-    + '} catch (e) { process.stdout.write(String((e && e.message) || e)); process.exit(1); }';
+    'try {' +
+    'const { createRequire } = require("node:module");' +
+    `const D = createRequire(${JSON.stringify(join(root, 'package.json'))})("better-sqlite3");` +
+    'new D(":memory:").close();' +
+    '} catch (e) { process.stdout.write(String((e && e.message) || e)); process.exit(1); }';
   const r = spawnSync(process.execPath, ['-e', script], { stdio: 'pipe', timeout: 8000 });
   if (!r.error && r.status === 0) return true;
   // Say WHY. The inline predecessor printed the cause here; dropping it left the
@@ -72,8 +74,10 @@ function bareProbe(root) {
   // FIRST, then flatten it.
   const printed = String(r.stdout || '').trim();
   const spawnErr = r.error && r.error.message;
-  const why = printed ? flattenLocal(printed)
-    : spawnErr ? flattenLocal(spawnErr)
+  const why = printed
+    ? flattenLocal(printed)
+    : spawnErr
+      ? flattenLocal(spawnErr)
       : `probe exited ${r.status ?? `on signal ${r.signal}`}`;
   process.stderr.write(`[claude-mem-lite] binding probe: ${why}\n`);
   return false;
@@ -82,8 +86,9 @@ function bareProbe(root) {
 let helpers = null;
 try {
   const [probeMod, lockMod, dirMod] = await Promise.all(
-    ['binding-probe.mjs', 'proc-lock.mjs', 'resolve-data-dir.mjs']
-      .map((f) => import(pathToFileURL(join(ROOT, 'lib', f)).href)),
+    ['binding-probe.mjs', 'proc-lock.mjs', 'resolve-data-dir.mjs'].map(
+      (f) => import(pathToFileURL(join(ROOT, 'lib', f)).href),
+    ),
   );
   helpers = { ...probeMod, ...lockMod, ...dirMod };
 } catch {
@@ -102,7 +107,7 @@ if (first.ok) process.exit(0);
 // .node mid-compile.
 let lockPath;
 try {
-  lockPath = join(helpers.resolveDataDir(process.env.CLAUDE_MEM_DIR), 'runtime', 'install.lock');
+  lockPath = join(helpers.resolveDataDir(process.env.CLAUDE_MEM_DIR), 'runtime', 'install.lock'); // runtime-dir:stays-put — install lock serialises real installers
 } catch (e) {
   // resolveDataDir THROWS on a non-absolute CLAUDE_MEM_DIR. Unhandled, that
   // prints an 8-line rejection stack onto SessionStart stderr; one line is enough.
@@ -112,8 +117,8 @@ try {
 const release = helpers.acquireLock(lockPath);
 if (!release) {
   process.stderr.write(
-    `[claude-mem-lite] binding probe: ${helpers.flattenBindingError(first.error)} `
-    + '(another install/repair in flight — deferring heal)\n',
+    `[claude-mem-lite] binding probe: ${helpers.flattenBindingError(first.error)} ` +
+      '(another install/repair in flight — deferring heal)\n',
   );
   process.exit(1);
 }
@@ -127,6 +132,14 @@ try {
     probe: () => first,
     exec: (cmd, opts) => execSync(cmd, { ...opts, timeout: 20000 }),
     verify: () => helpers.probeBindingInFreshProcess(ROOT, { timeoutMs: 8000 }),
+    // NOT on this path (A20260906-R8b-P0-1). The source build is
+    // `node-gyp clean && node-gyp rebuild`: it deletes build/ before compiling, and a full
+    // compile takes ~41 s against the 20 s cap above — so under this budget it does not fail
+    // harmlessly, it destroys a binding that was working (measured: DB opens YES → NO, .node
+    // gone, SIGTERM at 20.02 s), and repeats every SessionStart because setup.sh writes its
+    // marker only on success. The compile belongs on a foreground path with no cap:
+    // `claude-mem-lite rebuild-binding`, which is what the repair hints now print.
+    sourceBuild: false,
   });
 } finally {
   // process.exit skips finally blocks — every exit below this point, so the

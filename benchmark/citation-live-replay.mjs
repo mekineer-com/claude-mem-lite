@@ -70,6 +70,7 @@ import {
   DECAY_DENOMINATOR_SURFACES,
   extractInjectedBySurface,
   extractCitationsFromTranscript,
+  classifyCitationContext,
   collectSubagentSurface,
 } from '../lib/citation-tracker.mjs';
 import { readTranscriptEntries } from '../lib/transcript-scan.mjs';
@@ -86,11 +87,20 @@ const has = (flag) => argv.includes(flag);
 
 // ─── 0. Which faces this ruler can and cannot reach ──────────────────────────
 
-// Stamped into every `--dump` and required by `--corpus`. Bump it whenever a record's
-// shape changes, so a corpus frozen months ago is REFUSED rather than half-read.
-// Bumped to /2 by the FLOW-2 annotation: records now carry `citedTotal`. The
-// format check below refuses a /1 dump rather than reading a missing field as zero,
-// which would report every frozen session as pollution-free.
+// Stamped into every `--dump` and required by `--corpus`.
+//
+// THE RULE, restated precisely after v3.86.0's pre-tag review found it stated in a form
+// the same release then violated: bump this whenever a reader could MISREAD an older
+// dump — that is, whenever a field a consumer treats as REQUIRED changes shape or
+// meaning. Bumped to /2 by the FLOW-2 annotation, because records gained `citedTotal`
+// and reading its absence as zero would report every frozen session as pollution-free.
+//
+// It was deliberately NOT bumped for D#179's `applied`, and the difference is the
+// reader, not the record: `mentionVsApplication` returns `null` when no record carries
+// the field, so an older dump comes back as "unavailable" rather than as 0% applied. An
+// optional field whose own reader refuses to guess does not need a format bump; the
+// earlier wording ("whenever a record's shape changes") did not admit that distinction
+// and made this file state a rule and break it in one release.
 const CORPUS_FORMAT = 'citation-live-replay/2';
 
 // DERIVED from the production table, not a second list of face names: calling the
@@ -103,7 +113,10 @@ const REPLAYABLE = [...ATTACHMENT_FACES, 'subagent'];
 // to stdout and its ids live in a per-session runtime marker file that is deleted with
 // the runtime dir. Naming it here rather than letting it be quietly absent: a face
 // missing from a coverage table reads as "covered, scored zero".
-const NOT_REPLAYABLE = { keyctx: 'SessionStart render leaves no transcript trace (ids live in a runtime marker; see extractInjectedFromKeyContext)' };
+const NOT_REPLAYABLE = {
+  keyctx:
+    'SessionStart render leaves no transcript trace (ids live in a runtime marker; see extractInjectedFromKeyContext)',
+};
 
 /**
  * Every face the product knows about must be either scored here or declared unreachable.
@@ -111,18 +124,25 @@ const NOT_REPLAYABLE = { keyctx: 'SessionStart render leaves no transcript trace
  * neither and see it throw — a guard that can only be exercised through the real
  * CITATION_SURFACES is a guard nobody has watched fail.
  */
-export function assertFaceCoverage(replayable = REPLAYABLE, notReplayable = NOT_REPLAYABLE, allFaces = CITATION_SURFACES) {
+export function assertFaceCoverage(
+  replayable = REPLAYABLE,
+  notReplayable = NOT_REPLAYABLE,
+  allFaces = CITATION_SURFACES,
+) {
   const claimed = new Set([...replayable, ...Object.keys(notReplayable)]);
   const missing = allFaces.filter((f) => !claimed.has(f));
   if (missing.length) {
     throw new Error(
-      `face coverage: ${missing.join(', ')} is in CITATION_SURFACES but this replay neither scores it `
-      + 'nor declares it unreachable. Add it to REPLAYABLE (with an extractor) or to NOT_REPLAYABLE '
-      + '(with the reason) — a face silently absent from the table reads as a face scoring zero.');
+      `face coverage: ${missing.join(', ')} is in CITATION_SURFACES but this replay neither scores it ` +
+        'nor declares it unreachable. Add it to REPLAYABLE (with an extractor) or to NOT_REPLAYABLE ' +
+        '(with the reason) — a face silently absent from the table reads as a face scoring zero.',
+    );
   }
   const unknown = [...claimed].filter((f) => !allFaces.includes(f));
   if (unknown.length) {
-    throw new Error(`face coverage: ${unknown.join(', ')} is scored here but is not a CITATION_SURFACES face.`);
+    throw new Error(
+      `face coverage: ${unknown.join(', ')} is scored here but is not a CITATION_SURFACES face.`,
+    );
   }
   // EXACTLY one list, not at-least-one. `claimed` is a union, so without this a face in
   // BOTH lists satisfies the missing-check and the unknown-check at once — and the run
@@ -131,8 +151,10 @@ export function assertFaceCoverage(replayable = REPLAYABLE, notReplayable = NOT_
   // asserting something else entirely.
   const both = allFaces.filter((f) => replayable.includes(f) && f in notReplayable);
   if (both.length) {
-    throw new Error(`face coverage: ${both.join(', ')} is BOTH scored and declared unreachable — `
-      + 'the two lists must partition CITATION_SURFACES, or the report contradicts itself.');
+    throw new Error(
+      `face coverage: ${both.join(', ')} is BOTH scored and declared unreachable — ` +
+        'the two lists must partition CITATION_SURFACES, or the report contradicts itself.',
+    );
   }
 }
 
@@ -142,8 +164,12 @@ function projectDirs() {
   const root = process.env.CLAUDE_MEM_TRANSCRIPT_ROOT || join(homedir(), '.claude', 'projects');
   let dirs;
   try {
-    dirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => join(root, d.name));
-  } catch { return []; }
+    dirs = readdirSync(root, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => join(root, d.name));
+  } catch {
+    return [];
+  }
   const filter = argOf('--project');
   return filter ? dirs.filter((d) => basename(d).includes(filter)) : dirs;
 }
@@ -162,18 +188,39 @@ function scanSession(project, path) {
   let ts = NaN;
   for (const e of entries) {
     const t = Date.parse(e?.timestamp || '');
-    if (Number.isFinite(t)) { ts = t; break; }
+    if (Number.isFinite(t)) {
+      ts = t;
+      break;
+    }
   }
   // A transcript with no parsable timestamp still has a file mtime; losing it from the
   // window would silently shrink the denominator.
-  if (!Number.isFinite(ts)) { try { ts = statSync(path).mtimeMs; } catch { return null; } }
+  if (!Number.isFinite(ts)) {
+    try {
+      ts = statSync(path).mtimeMs;
+    } catch {
+      return null;
+    }
+  }
 
   const bySurface = extractInjectedBySurface(path, { mainOnly: true });
   const cited = extractCitationsFromTranscript(path, { mainOnly: true });
+  // D#179: split each hit into "named while acting" and "named in prose only", keyed by
+  // requestId. Must run BEFORE collectSubagentSurface, which parses the sidechain files
+  // and evicts the single-slot entry memo the three extractors above share.
+  const ctx = classifyCitationContext(path, { mainOnly: true });
   const faces = {};
   for (const face of ATTACHMENT_FACES) {
     const inj = [...bySurface[face]];
-    if (inj.length) faces[face] = { inj, hit: inj.filter((id) => cited.has(id)) };
+    if (!inj.length) continue;
+    const hit = inj.filter((id) => cited.has(id));
+    faces[face] = {
+      inj,
+      hit,
+      // Optional field: a frozen corpus dumped before this existed simply lacks it, and
+      // the --mentions mode says so rather than reporting the absence as zero.
+      applied: hit.filter((id) => (ctx.get(id)?.withTool ?? 0) > 0).length,
+    };
   }
   // Parses the sidechain files (evicting the memo), so it goes last.
   const sub = collectSubagentSurface(path);
@@ -186,8 +233,12 @@ function scanSession(project, path) {
   // only contain ids that face injected, so nothing already in this record could see a
   // session that names fifty ids none of which were ever injected.
   return {
-    project, session: basename(path, '.jsonl'), ts,
-    anyCite: cited.size > 0, citedTotal: cited.size, faces,
+    project,
+    session: basename(path, '.jsonl'),
+    ts,
+    anyCite: cited.size > 0,
+    citedTotal: cited.size,
+    faces,
   };
 }
 
@@ -196,7 +247,11 @@ function walk() {
   let files = 0;
   for (const dir of projectDirs()) {
     let names;
-    try { names = readdirSync(dir).filter((n) => n.endsWith('.jsonl')); } catch { continue; }
+    try {
+      names = readdirSync(dir).filter((n) => n.endsWith('.jsonl'));
+    } catch {
+      continue;
+    }
     for (const n of names) {
       files++;
       if (files % 200 === 0) process.stderr.write(`  … ${files} transcripts\n`);
@@ -213,7 +268,10 @@ export function aggregate(records) {
   const per = new Map();
   const row = (face) => {
     let r = per.get(face);
-    if (!r) { r = { face, sessions: 0, pairs: 0, hits: 0, silentPairs: 0, sidechainFiles: 0, projects: new Set() }; per.set(face, r); }
+    if (!r) {
+      r = { face, sessions: 0, pairs: 0, hits: 0, silentPairs: 0, sidechainFiles: 0, projects: new Set() };
+      per.set(face, r);
+    }
     return r;
   };
   for (const rec of records) {
@@ -273,28 +331,39 @@ export function assertRulerCanSayNo(rows, { windowed = false, frozen = false } =
     // `--since` that excludes everything.
     const why = windowed
       ? 'the --since/--until window excludes every session'
-      : frozen ? `the frozen corpus passed to --corpus holds no injections`
+      : frozen
+        ? `the frozen corpus passed to --corpus holds no injections`
         : 'the shipped extractors matched nothing — point CLAUDE_MEM_TRANSCRIPT_ROOT at a real transcript root';
     throw new Error(`ruler check: no injections in scope — ${why}. No number below would mean anything.`);
   }
   if (hits === pairs) {
-    throw new Error(`ruler check: all ${pairs} injected pairs count as cited — the membership test is `
-      + 'ALWAYS-TRUE and every rate below would read 100% regardless of behaviour.');
+    throw new Error(
+      `ruler check: all ${pairs} injected pairs count as cited — the membership test is ` +
+        'ALWAYS-TRUE and every rate below would read 100% regardless of behaviour.',
+    );
   }
   if (hits === 0) {
-    throw new Error(`ruler check: none of ${pairs} injected pairs counts as cited — the numerator cannot `
-      + 'see the denominator\'s ids (the classic cause is a caliber mismatch between the injected and '
-      + 'cited id patterns), so a 0% reading here is a defect in this script, not a finding.');
+    throw new Error(
+      `ruler check: none of ${pairs} injected pairs counts as cited — the numerator cannot ` +
+        "see the denominator's ids (the classic cause is a caliber mismatch between the injected and " +
+        'cited id patterns), so a 0% reading here is a defect in this script, not a finding.',
+    );
   }
   const saturated = rows.filter((r) => r.pairs >= RULER_FACE_FLOOR && r.hits === r.pairs);
   if (saturated.length) {
-    throw new Error(`ruler check: face(s) ${saturated.map((r) => r.face).join(', ')} cite at 100% over `
-      + `${RULER_FACE_FLOOR}+ pairs — that face's membership test is ALWAYS-TRUE. A global rate below `
-      + '100% hid it, which is why this check is per-face.');
+    throw new Error(
+      `ruler check: face(s) ${saturated.map((r) => r.face).join(', ')} cite at 100% over ` +
+        `${RULER_FACE_FLOOR}+ pairs — that face's membership test is ALWAYS-TRUE. A global rate below ` +
+        '100% hid it, which is why this check is per-face.',
+    );
   }
-  return rows.filter((r) => r.pairs >= RULER_FACE_FLOOR && r.hits === 0)
-    .map((r) => `face ${r.face} cites at exactly 0% over ${r.pairs} pairs — check its extractor in `
-      + 'SURFACE_MATCHERS before reading that as a finding.');
+  return rows
+    .filter((r) => r.pairs >= RULER_FACE_FLOOR && r.hits === 0)
+    .map(
+      (r) =>
+        `face ${r.face} cites at exactly 0% over ${r.pairs} pairs — check its extractor in ` +
+        'SURFACE_MATCHERS before reading that as a finding.',
+    );
 }
 
 /**
@@ -362,17 +431,22 @@ export function pollutionSensitivity(records, rows) {
 
 function report(label, rows) {
   console.log(`\n─── ${label} ───`);
-  console.table(rows.map((r) => ({
-    face: r.face,
-    inDecayDenominator: DECAY_DENOMINATOR_SURFACES.includes(r.face) ? 'yes' : 'no',
-    sessions: r.sessions,
-    projects: r.projects.size,
-    pairs: r.pairs,
-    cited: r.hits,
-    rate: pct(r.hits, r.pairs),
-    ci95: (() => { const [lo, hi] = wilson95(r.hits, r.pairs); return `[${(lo * 100).toFixed(1)}, ${(hi * 100).toFixed(1)}]%`; })(),
-    inSilentSessions: r.silentPairs ? pct(r.silentPairs, r.pairs) : '—',
-  })));
+  console.table(
+    rows.map((r) => ({
+      face: r.face,
+      inDecayDenominator: DECAY_DENOMINATOR_SURFACES.includes(r.face) ? 'yes' : 'no',
+      sessions: r.sessions,
+      projects: r.projects.size,
+      pairs: r.pairs,
+      cited: r.hits,
+      rate: pct(r.hits, r.pairs),
+      ci95: (() => {
+        const [lo, hi] = wilson95(r.hits, r.pairs);
+        return `[${(lo * 100).toFixed(1)}, ${(hi * 100).toFixed(1)}]%`;
+      })(),
+      inSilentSessions: r.silentPairs ? pct(r.silentPairs, r.pairs) : '—',
+    })),
+  );
 }
 
 // ─── 3. Main ─────────────────────────────────────────────────────────────────
@@ -390,14 +464,17 @@ function parseWhen(flag) {
 
 function main() {
   const frozen = argOf('--corpus');
-  let records; let files;
+  let records;
+  let files;
   if (frozen) {
     const loaded = JSON.parse(readFileSync(frozen, 'utf8'));
     // A frozen corpus outlives the code that wrote it — that is the point of freezing
     // one. Refuse a shape this build cannot read rather than silently scoring a
     // partially-understood file and reporting the result as a measurement (#9332).
     if (loaded.format !== CORPUS_FORMAT) {
-      console.error(`--corpus ${frozen}: format ${loaded.format ?? '(none)'} — this build reads ${CORPUS_FORMAT}. Re-dump it.`);
+      console.error(
+        `--corpus ${frozen}: format ${loaded.format ?? '(none)'} — this build reads ${CORPUS_FORMAT}. Re-dump it.`,
+      );
       process.exit(2);
     }
     records = loaded.records;
@@ -411,7 +488,9 @@ function main() {
 
   const since = parseWhen('--since');
   const until = parseWhen('--until');
-  const inWindow = records.filter((r) => (since === null || r.ts >= since) && (until === null || r.ts < until));
+  const inWindow = records.filter(
+    (r) => (since === null || r.ts >= since) && (until === null || r.ts < until),
+  );
 
   const all = aggregate(inWindow);
   const pollution = pollutionSensitivity(inWindow, all);
@@ -423,52 +502,73 @@ function main() {
   const split = parseWhen('--split');
 
   if (has('--json')) {
-    const shape = (rows) => rows.map((r) => ({
-      face: r.face, sessions: r.sessions, projects: r.projects.size, pairs: r.pairs,
-      cited: r.hits, rate: r.pairs ? r.hits / r.pairs : 0, ci95: wilson95(r.hits, r.pairs),
-      in_silent_sessions: r.silentPairs,
-      // `sidechain_files` is the number of subagent transcripts walked for this face —
-      // NOT the per-dispatch denominator. `collectSubagentSurface` documents a
-      // per-dispatch caliber of (dispatch, id) PAIRS, and it does not return that count;
-      // dividing by files instead reads 8.6% against the documented 14.6%, which is the
-      // "two counters that were never the same ruler" defect this project shipped in
-      // v3.80.0. So the field is exposed under a name that says what it is and no rate is
-      // computed from it. A real per-dispatch rate needs the pair count added to
-      // collectSubagentSurface's return; deliberately out of scope at a release gate.
-      ...(r.sidechainFiles ? { sidechain_files: r.sidechainFiles } : {}),
-      in_decay_denominator: DECAY_DENOMINATOR_SURFACES.includes(r.face),
-    }));
-    console.log(JSON.stringify({
-      transcripts_scanned: files,
-      sessions_with_injection: inWindow.length,
-      window: { since, until },
-      not_replayable: NOT_REPLAYABLE,
-      ruler_flags: rulerFlags,
-      overall: shape(all),
-      ...(split === null ? {} : {
-        split_at: split,
-        before: shape(aggregate(inWindow.filter((r) => r.ts < split))),
-        after: shape(aggregate(inWindow.filter((r) => r.ts >= split))),
-      }),
-      pollution_sensitivity: {
-        doc_session_threshold: DOC_SESSION_CITED_IDS,
-        doc_sessions: pollution.docSessions,
-        total_sessions: inWindow.length,
-        by_face: pollution.rows,
-      },
-      ...(has('--by-project') ? { by_project: byProject(inWindow) } : {}),
-      ...(has('--by-scope') ? { by_scope: byScope(inWindow, scopeLookup()) } : {}),
-    }, null, 2));
+    const shape = (rows) =>
+      rows.map((r) => ({
+        face: r.face,
+        sessions: r.sessions,
+        projects: r.projects.size,
+        pairs: r.pairs,
+        cited: r.hits,
+        rate: r.pairs ? r.hits / r.pairs : 0,
+        ci95: wilson95(r.hits, r.pairs),
+        in_silent_sessions: r.silentPairs,
+        // `sidechain_files` is the number of subagent transcripts walked for this face —
+        // NOT the per-dispatch denominator. `collectSubagentSurface` documents a
+        // per-dispatch caliber of (dispatch, id) PAIRS, and it does not return that count;
+        // dividing by files instead reads 8.6% against the documented 14.6%, which is the
+        // "two counters that were never the same ruler" defect this project shipped in
+        // v3.80.0. So the field is exposed under a name that says what it is and no rate is
+        // computed from it. A real per-dispatch rate needs the pair count added to
+        // collectSubagentSurface's return; deliberately out of scope at a release gate.
+        ...(r.sidechainFiles ? { sidechain_files: r.sidechainFiles } : {}),
+        in_decay_denominator: DECAY_DENOMINATOR_SURFACES.includes(r.face),
+      }));
+    console.log(
+      JSON.stringify(
+        {
+          transcripts_scanned: files,
+          sessions_with_injection: inWindow.length,
+          window: { since, until },
+          not_replayable: NOT_REPLAYABLE,
+          ruler_flags: rulerFlags,
+          overall: shape(all),
+          ...(split === null
+            ? {}
+            : {
+                split_at: split,
+                before: shape(aggregate(inWindow.filter((r) => r.ts < split))),
+                after: shape(aggregate(inWindow.filter((r) => r.ts >= split))),
+              }),
+          pollution_sensitivity: {
+            doc_session_threshold: DOC_SESSION_CITED_IDS,
+            doc_sessions: pollution.docSessions,
+            total_sessions: inWindow.length,
+            by_face: pollution.rows,
+          },
+          ...(has('--by-project') ? { by_project: byProject(inWindow) } : {}),
+          ...(has('--by-scope') ? { by_scope: byScope(inWindow, scopeLookup()) } : {}),
+          // Review S2: the `applied` field is computed in scanSession from the transcript,
+          // and until this was exposed nothing exercised that path — setting it to a
+          // literal 0 left the suite green while the CHANGELOG headlined a figure derived
+          // from it. `null` when no record carries the field, never 0.
+          ...(has('--mentions') ? { mention_vs_application: mentionVsApplication(inWindow) } : {}),
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
 
   for (const flag of rulerFlags) console.log(`⚠ ruler flag: ${flag}`);
 
   console.log('─── citation live replay ───');
-  console.log(`transcripts scanned ${files}  ·  sessions carrying an injection ${inWindow.length}`
-    + `  ·  projects ${new Set(inWindow.map((r) => r.project)).size}`);
+  console.log(
+    `transcripts scanned ${files}  ·  sessions carrying an injection ${inWindow.length}` +
+      `  ·  projects ${new Set(inWindow.map((r) => r.project)).size}`,
+  );
   console.log('caliber: denominator = (session, id) PAIRS; numerator = that id cited as #NN in the');
-  console.log('         session\'s own assistant text (main thread; for `subagent`, the RECEIVING agent\'s).');
+  console.log("         session's own assistant text (main thread; for `subagent`, the RECEIVING agent's).");
   for (const [face, why] of Object.entries(NOT_REPLAYABLE)) {
     console.log(`not replayable here: ${face} — ${why}`);
   }
@@ -482,8 +582,10 @@ function main() {
     console.log(`no session in window cites more than ${DOC_SESSION_CITED_IDS} ids — no document-shaped`);
     console.log('sessions to discount. The rates above carry no measurable mention-inflation.');
   } else {
-    console.log(`${pollution.docSessions} of ${inWindow.length} sessions cite more than `
-      + `${DOC_SESSION_CITED_IDS} ids — the document-shaped ones (CHANGELOG / release notes /`);
+    console.log(
+      `${pollution.docSessions} of ${inWindow.length} sessions cite more than ` +
+        `${DOC_SESSION_CITED_IDS} ids — the document-shaped ones (CHANGELOG / release notes /`,
+    );
     console.log('audit reports naming ids in prose). The `#NN` extractor cannot tell those from real');
     console.log('citations, so every rate above is biased UP. Below: the same faces with those sessions');
     console.log('excluded. Reported, not filtered — which mentions were real uses is not decidable from');
@@ -493,9 +595,17 @@ function main() {
 
   if (split !== null) {
     console.log(`\nsplit at ${new Date(split).toISOString()} — BOTH arms come from the one walk above,`);
-    console.log('so nothing between them is corpus growth. Small arms move on single sessions; read the CIs.');
-    report(`before ${new Date(split).toISOString().slice(0, 10)}`, aggregate(inWindow.filter((r) => r.ts < split)));
-    report(`on/after ${new Date(split).toISOString().slice(0, 10)}`, aggregate(inWindow.filter((r) => r.ts >= split)));
+    console.log(
+      'so nothing between them is corpus growth. Small arms move on single sessions; read the CIs.',
+    );
+    report(
+      `before ${new Date(split).toISOString().slice(0, 10)}`,
+      aggregate(inWindow.filter((r) => r.ts < split)),
+    );
+    report(
+      `on/after ${new Date(split).toISOString().slice(0, 10)}`,
+      aggregate(inWindow.filter((r) => r.ts >= split)),
+    );
   }
 
   if (has('--by-project')) {
@@ -503,12 +613,83 @@ function main() {
     console.table(byProject(inWindow));
   }
 
+  if (has('--mentions')) {
+    console.log('\n─── cited while ACTING vs cited in PROSE (D#179) ───');
+    const rows = mentionVsApplication(inWindow);
+    if (!rows) {
+      console.log('unavailable: these records carry no `applied` field (frozen corpus dumped');
+      console.log('before D#179). Re-walk live, or re-dump the corpus — an absent field is not a zero.');
+    } else {
+      console.log('Unit = one model RESPONSE (requestId). `applied` = the id was named in a response');
+      console.log('that also called a tool; `mentionOnly` = every response naming it was prose.');
+      console.log('NEITHER column is a bound: co-occurring with a tool call is not evidence the');
+      console.log('lesson was followed, and acting in one response then citing in a later summary');
+      console.log('lands in mentionOnly. This sizes the question; it does not settle it.');
+      console.table(rows);
+      console.log('`subagent` is unavailable here BY CONSTRUCTION — its hits come from the receiving');
+      console.log("agent's transcript, which this classification does not walk. Not a zero.");
+    }
+  }
+
   if (has('--by-scope')) {
     console.log('\n─── per observations.scope (D#153) ───');
     console.log('`pretool` IS the file-triggered face CLAUDE_MEM_SCOPE_FILTER gates. `(gone)` = the row');
-    console.log('left the table since injection; kept so the buckets still sum to the face\'s pair count.');
+    console.log("left the table since injection; kept so the buckets still sum to the face's pair count.");
     console.table(byScope(inWindow, scopeLookup()));
   }
+}
+
+/**
+ * D#179: of the hits that make up each face's numerator, how many were named in a
+ * response that also DID something, and how many only in prose?
+ *
+ * This is the prerequisite the deferred item names — it sizes the contamination, it does
+ * not fix it. `applyCitationDecay` promotes on any `#NN` in assistant text, so a release
+ * note or an audit promotes every memory it discusses; the same signal feeds
+ * citation_surface_log, citation-stats and this replay, so all three move together.
+ *
+ * NEITHER COLUMN IS A BOUND. `applied` over-counts, because naming an id in a response
+ * that also calls a tool is co-occurrence and not evidence the lesson was followed.
+ * `mentionOnly` also over-counts, because an agent that acts in one response and cites
+ * the lesson in a later summary is classified pure-mention. The split sizes the
+ * question; it does not settle it, and a first draft of this docblock called
+ * `mentionOnly` a floor, which is wrong in the second direction.
+ *
+ * `subagent` is absent from the output BY CONSTRUCTION, not because it scored zero: its
+ * hits come from the RECEIVING agent's own transcript via collectSubagentSurface, which
+ * this classification does not walk. It is declared unavailable rather than omitted —
+ * a missing row reads as "that face has no contamination", which is not what is known.
+ *
+ * Returns null when the records predate the `applied` field (a frozen corpus dumped
+ * before this existed) — an absent field must not be reported as zero.
+ */
+export function mentionVsApplication(records) {
+  const per = new Map();
+  let sawField = false;
+  for (const rec of records) {
+    for (const [face, v] of Object.entries(rec.faces)) {
+      if (!v.hit?.length) continue;
+      if (typeof v.applied !== 'number') continue;
+      sawField = true;
+      let e = per.get(face);
+      if (!e) {
+        e = { face, hits: 0, applied: 0 };
+        per.set(face, e);
+      }
+      e.hits += v.hit.length;
+      e.applied += v.applied;
+    }
+  }
+  if (!sawField) return null;
+  return [...per.values()]
+    .map((e) => ({
+      face: e.face,
+      hits: e.hits,
+      applied: e.applied,
+      mentionOnly: e.hits - e.applied,
+      mentionOnlyPct: e.hits ? `${((100 * (e.hits - e.applied)) / e.hits).toFixed(1)}%` : 'n/a',
+    }))
+    .sort((a, b) => b.hits - a.hits);
 }
 
 /**
@@ -546,10 +727,15 @@ export function byScope(records, scopeOf) {
       }
     }
   }
-  return [...per.values()].sort((a, b) => (a.face === b.face ? b.pairs - a.pairs : a.face.localeCompare(b.face)))
+  return [...per.values()]
+    .sort((a, b) => (a.face === b.face ? b.pairs - a.pairs : a.face.localeCompare(b.face)))
     .map((r) => {
       const [lo, hi] = wilson95(r.cited, r.pairs);
-      return { ...r, rate: pct(r.cited, r.pairs), ci95: `[${(lo * 100).toFixed(1)}, ${(hi * 100).toFixed(1)}]%` };
+      return {
+        ...r,
+        rate: pct(r.cited, r.pairs),
+        ci95: `[${(lo * 100).toFixed(1)}, ${(hi * 100).toFixed(1)}]%`,
+      };
     });
 }
 
@@ -561,7 +747,9 @@ function scopeLookup() {
     for (const r of db.prepare('SELECT id, scope FROM observations').all()) {
       map.set(r.id, r.scope || '(null)');
     }
-  } finally { db.close(); }
+  } finally {
+    db.close();
+  }
   return (id) => map.get(Number(id)) ?? '(gone)';
 }
 
@@ -576,7 +764,8 @@ function byProject(records) {
       per.set(k, r);
     }
   }
-  return [...per.values()].sort((a, b) => b.pairs - a.pairs)
+  return [...per.values()]
+    .sort((a, b) => b.pairs - a.pairs)
     .map((r) => ({ ...r, rate: pct(r.cited, r.pairs) }));
 }
 

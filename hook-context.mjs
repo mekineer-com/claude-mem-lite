@@ -6,13 +6,28 @@
 // Handles adaptive time windows, token-budgeted selection, and legacy CLAUDE.md cleanup.
 
 import { basename, join } from 'path';
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { atomicWriteFileSync } from './lib/atomic-write.mjs';
 import {
-  estimateTokens, truncate, typeIcon, fmtTime, inferProject,
-  debugLog, debugCatch, neutralizeContextDelimiters,
-  DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause,
+  estimateTokens,
+  truncate,
+  typeIcon,
+  fmtTime,
+  inferProject,
+  debugLog,
+  neutralizeContextDelimiters,
+  DECAY_HALF_LIFE_BY_TYPE,
+  DEFAULT_DECAY_HALF_LIFE_MS,
+  notLowSignalTitleClause,
 } from './utils.mjs';
-import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet, isQuietHooks, KEY_CONTEXT_LIMIT } from './hook-shared.mjs';
+import {
+  STALE_SESSION_MS,
+  RELATED_OBS_WINDOW_MS,
+  RUNTIME_DIR,
+  effectiveQuiet,
+  isQuietHooks,
+  KEY_CONTEXT_LIMIT,
+} from './hook-shared.mjs';
 import { extractUnfinishedSummary } from './hook-handoff.mjs';
 import { recentInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
@@ -38,15 +53,26 @@ import { DAY_MS } from './lib/time-constants.mjs';
 // SessionStart. Escape pipes and collapse any CR/LF/tab to a space so one obs
 // stays one row/cell.
 function mdCell(s) {
-  return String(s ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\|/g, '\\|');
+  return String(s ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\|/g, '\\|');
 }
 
 export function computeAdaptiveWindows(db, project) {
   const sevenDaysAgo = Date.now() - 7 * DAY_MS;
-  const row = db.prepare(`
+  // liveObsFilterSql, not a hand-written half of it (A20260906-R8-§11.3). This COUNT is a
+  // POOL-SIZING input: the windows returned below are handed to the recall queries at :201 /
+  // :468 / :502, all three of which filter live rows. Counting a strictly larger population
+  // than the window is applied to inverts the documented intent — 80 superseded rows read as
+  // >10 obs/day and earned the TIGHTEST window (12h) for finding the few live rows left.
+  const row = db
+    .prepare(
+      `
     SELECT COUNT(*) as c FROM observations
-    WHERE project = ? AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
-  `).get(project, sevenDaysAgo);
+    WHERE project = ? AND created_at_epoch > ? AND ${liveObsFilterSql('')}
+  `,
+    )
+    .get(project, sevenDaysAgo);
   const velocity = (row?.c || 0) / 7; // observations per day
 
   if (velocity > 10) {
@@ -59,6 +85,98 @@ export function computeAdaptiveWindows(db, project) {
     // Low velocity: wider windows, older data still relevant
     return { tier1: 48 * 3600000, tier2: 14 * DAY_MS, tier3: 60 * DAY_MS, sessWindow: 14 * DAY_MS };
   }
+}
+
+// D#192 (filed as D#189, re-scoped after measurement). These two are REACHABILITY bounds, not ranking bounds — the D#172 shape, and
+// the fifth surface it has been found on. Both SELECTs order by pure `created_at_epoch
+// DESC`; the JS below then re-sorts every candidate by `valueDensity`, a composite of
+// typeQuality x impBoost(1.0/1.5/2.0) x lessonBoost(1.0/1.3) / sqrt(cost) whose dynamic
+// range is far wider than the (1,2] that recency contributes. So the key the SQL sorts
+// on barely participates in the final order, and anything past the LIMIT is unreachable
+// however well it scores.
+//
+// Named rather than inline so benchmark/keyctx-pool-replay.mjs can patch a twin and
+// price a change to them. Keep the `const NAME = <int>;` shape — that ruler patches the
+// DECLARATION by regex and throws when the anchor moves. (Said `export const` until
+// D#207: the names went module-private once knip could finally see this file and
+// reported them as permanently unused, and the ruler's regex was widened to match a bare
+// `const`, which is what its rerank-pool sibling always matched.)
+//
+// OBS was 50 through v3.86.0 and is now an OOM backstop, not a relevance gate. What the
+// ruler measured before the change (2026-09-02T06:11Z, 11 projects with >=20 live rows,
+// budget 2000, AGAINST THE 50/10 TREE — reproduce with `--population --ref-obs 50
+// --ref-sess 10` and with `--wide-obs 50 --wide-sess 10`, which runs the comparison
+// backwards; the bare command now reports 0/11 because shipped is the wider bound):
+// the 50-row bound truncated the pool in 3 of 11 projects, and lifting it
+// alone moved the injected block in 2 of 11 — 8 rows newly reachable against 2 displaced,
+// for +81 and +16 tokens. Selection here is NOT monotone, so a displaced row is a real
+// cost and the ruler prints it as a first-class number (`--why-displaced` names the rows
+// and the gate that dropped each).
+//
+// Both displaced rows lost their slot to the 3-per-type diversity cap. That is not a
+// three-way discrimination: the token budget does not bind on this corpus (651 of 2000 in
+// the widest arm's largest project) and the file-overlap `continue` that used to sit in
+// the selector was UNREACHABLE and has since been deleted (D#197) — so the cap is
+// currently the only gate that can fire. ("below" until v3.88.0; there is nothing below
+// any more, and a reader who went looking found the sentence outliving its referent.)
+//
+// 200 is ~2x the largest pool observed (107). The ruler CANNOT distinguish 200 from 500
+// on this corpus — every bound >= the largest pool is one arm, identical in both
+// selection and cost — so this value is a headroom choice, not a measured optimum.
+// computeAdaptiveWindows NARROWS the windows as velocity rises (tier3 60d -> 30d -> 14d),
+// so activity counteracts pool growth instead of driving it: the largest pool here is the
+// lowest-velocity high-volume project (1.14 obs/day, 107 rows) while the only project a
+// band up has 2.9x the velocity and 29% of the pool. A draft of this comment had that
+// backwards.
+//
+// Cost is PER PROJECT: ~2.7x where the pool is 107, ~2.0x at 59, ~1.5x at 62, and
+// unchanged (inferred, not measured) for the eight projects whose pool never reached 50.
+// Once per SessionStart, both arms in the low single-digit milliseconds. It is NOT a clean
+// function of pool growth — the 59-row project grows less than the 62-row one and costs
+// more, on two independent harnesses, because fixed per-call work (SQL fetch,
+// estimateTokens, JSON.parse, the unchanged summary half) sets the denominator. Three
+// drafts were wrong here in three ways: a point estimate (2.65x), a global range
+// (2.1x-3.8x) no measurement produced, and a causal claim n=3 refutes. Absolute
+// milliseconds are not quotable. Re-derive with `--cost --wide-obs 50 --wide-sess 10
+// --project <p>`, which prices the widening in the correct direction.
+//
+// SESS stays 10 DELIBERATELY, and the discriminator is `sessDisplaced = 0` in 11 of 11
+// projects, not the observation column. Widening it to 40 displaces no summary at all —
+// it is PURELY ADDITIVE, so that LIMIT is a volume cap and not the D#172 shape, which is
+// the actual reason it does not need lifting. (It also changed zero observations, but
+// that only says the obs side is unaffected.) What widening does buy is 130 newly injected
+// summaries, roughly tripling the emitted block on the largest projects. It truncates MORE
+// projects than the obs bound, 5 of 11 against 3 of 11, which is what made the original
+// review propose it first; truncation count is not harm.
+// Module-private, like their siblings RERANK_POOL_SAME_PROJECT / RERANK_POOL_CROSS_PROJECT
+// in hook-memory.mjs. Nothing imports them: `benchmark/keyctx-pool-replay.mjs` rewrites
+// these DECLARATIONS with a regex over this file's text, which needs no export, and being
+// exported by habit put two permanently-unused names into knip's report the moment D#207
+// made this module visible to it. Raising a baseline is the wrong way to hold a name
+// (v3.70.0 precedent, #9675). The replay's `patchConst` matches `const <NAME> = <n>;`.
+const KEYCTX_POOL_OBS = 200;
+const KEYCTX_POOL_SESS = 10;
+
+/**
+ * Split the shared Key Context pool between its two sections (D#196).
+ *
+ * Each keeps a guaranteed half and may take whatever the other cannot use, so the two
+ * together still emit at most KEY_CONTEXT_LIMIT rows. Extracted from the render block so
+ * the additivity property can be asserted over every split rather than sampled through a
+ * seeded database.
+ *
+ * @param {number} fileLessonCount rows that landed in the File Lessons section
+ * @param {number} keyContextCount rows that landed in the Key Context section
+ * @returns {{fileLessonQuota: number, keyContextQuota: number}}
+ */
+export function sectionQuotas(fileLessonCount, keyContextCount) {
+  const half = Math.floor(KEY_CONTEXT_LIMIT / 2);
+  const fileLessonQuota = Math.min(
+    fileLessonCount,
+    Math.max(half, KEY_CONTEXT_LIMIT - Math.min(keyContextCount, half)),
+  );
+  const keyContextQuota = Math.min(keyContextCount, KEY_CONTEXT_LIMIT - fileLessonQuota);
+  return { fileLessonQuota, keyContextQuota };
 }
 
 /**
@@ -80,7 +198,9 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   // R1/R3: exclude LOW_SIGNAL degraded titles ("Modified X", "Worked on X",
   // "Reviewed N files:", raw error logs) from the Key Context table at
   // session start — they pollute the visible "Recent" table with noise.
-  const obsPool = db.prepare(`
+  const obsPool = db
+    .prepare(
+      `
     SELECT id, type, title, narrative, importance, created_at_epoch, files_modified, lesson_learned
     FROM observations
     WHERE project = ? AND ${liveObsFilterSql('')}
@@ -91,16 +211,22 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
         OR (created_at_epoch > ? AND importance >= 3)
       )
     ORDER BY created_at_epoch DESC
-    LIMIT 50
-  `).all(project, tier1Ago, tier2Ago, tier3Ago);
+    LIMIT ${KEYCTX_POOL_OBS}
+  `,
+    )
+    .all(project, tier1Ago, tier2Ago, tier3Ago);
 
-  const sessPool = db.prepare(`
+  const sessPool = db
+    .prepare(
+      `
     SELECT id, request, completed, next_steps, created_at_epoch
     FROM session_summaries
     WHERE project = ? AND created_at_epoch > ?
     ORDER BY created_at_epoch DESC
-    LIMIT 10
-  `).all(project, now_ms - windows.sessWindow);
+    LIMIT ${KEYCTX_POOL_SESS}
+  `,
+    )
+    .all(project, now_ms - windows.sessWindow);
 
   const selectedObs = [];
   const selectedSess = [];
@@ -108,9 +234,9 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
 
   // Score each candidate: value = recency * type_quality * importance, cost = tokens
   // Recency uses exponential half-life (consistent with server.mjs BM25 scoring)
-  const scoredObs = obsPool.map(o => {
+  const scoredObs = obsPool.map((o) => {
     const halfLifeMs = DECAY_HALF_LIFE_BY_TYPE[o.type] || DEFAULT_DECAY_HALF_LIFE_MS;
-    const recency = 1.0 + Math.exp(-0.693 * (now_ms - o.created_at_epoch) / halfLifeMs);
+    const recency = 1.0 + Math.exp((-0.693 * (now_ms - o.created_at_epoch)) / halfLifeMs);
     const typeQuality = TYPE_QUALITY[o.type] || TYPE_QUALITY_DEFAULT;
     const impBoost = 0.5 + 0.5 * (o.importance || 1);
     const lessonBoost = o.lesson_learned ? 1.3 : 1.0;
@@ -124,8 +250,8 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
     return { ...o, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
   });
 
-  const scoredSess = sessPool.map(s => {
-    const recency = 1.0 + Math.exp(-0.693 * (now_ms - s.created_at_epoch) / DEFAULT_DECAY_HALF_LIFE_MS);
+  const scoredSess = sessPool.map((s) => {
+    const recency = 1.0 + Math.exp((-0.693 * (now_ms - s.created_at_epoch)) / DEFAULT_DECAY_HALF_LIFE_MS);
     const value = recency * 1.5; // Session summaries slightly boosted
     const cost = estimateTokens((s.request || '') + (s.completed || '') + (s.next_steps || ''));
     return { ...s, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
@@ -133,11 +259,10 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
 
   // Combine and sort by value density (greedy knapsack)
   const allCandidates = [
-    ...scoredObs.map(o => ({ ...o, _kind: 'obs' })),
-    ...scoredSess.map(s => ({ ...s, _kind: 'sess' })),
+    ...scoredObs.map((o) => ({ ...o, _kind: 'obs' })),
+    ...scoredSess.map((s) => ({ ...s, _kind: 'sess' })),
   ].sort((a, b) => b.valueDensity - a.valueDensity);
 
-  const selectedFiles = new Set();
   const selectedTypes = new Map(); // type → count for diversity constraint
 
   for (const c of allCandidates) {
@@ -149,29 +274,52 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
       if (typeCount >= 3) continue;
     }
 
-    // Diversity penalty: reduce value for file overlap with already-selected
-    if (c._kind === 'obs' && c.files_modified) {
-      let cFiles;
-      try { cFiles = JSON.parse(c.files_modified || '[]'); } catch (e) { debugCatch(e, 'budgetSelect-parseFiles'); cFiles = []; }
-      if (cFiles.length > 0 && selectedFiles.size > 0) {
-        const overlap = cFiles.filter(f => selectedFiles.has(f)).length;
-        const overlapRatio = overlap / cFiles.length;
-        const penalizedValue = c.valueDensity * (1 - 0.3 * overlapRatio);
-        if (penalizedValue < 0.001) continue;
-      }
-      for (const f of cFiles) selectedFiles.add(f);
-    }
-
-    // Commit type diversity counter after both gates pass
+    // D#197: a "Diversity penalty: reduce value for file overlap" block used to sit
+    // here. It is gone, and the deletion is behaviour-preserving, because it reduced
+    // nothing. Two independent reasons, both verified rather than reasoned about:
+    //
+    //  (1) Its `penalizedValue` was a local read by exactly one `continue`. Order was
+    //      already fixed upstream by the raw-valueDensity sort and this greedy loop
+    //      never re-sorts — so the comment's promise could not happen at all.
+    //  (2) That `continue` was unreachable. penalizedValue >= 0.7 * valueDensity, and
+    //      valueDensity = value / sqrt(cost) with value > 0.5 (recency > 1 x
+    //      TYPE_QUALITY min 0.5 x impBoost >= 1.0 x lessonBoost >= 1.0) and cost >= 1
+    //      — estimateTokens('') returns 1, checked, so there is no zero-cost row that
+    //      would drive valueDensity to 0 and make it fire. Triggering needed a title
+    //      costing > 122500 tokens. Measured over the 2027 live rows carrying
+    //      files_modified: zero zero-cost rows, minimum valueDensity 0.1147 (80x the
+    //      trigger), longest title 171 chars = 43 tokens by this code's own
+    //      estimateTokens (ceil(ascii/4) + ceil(cjk/1.5)). A first version of this line
+    //      said 49, which is 3.5 chars/token — a rate nothing here uses.
+    //
+    // With both gone `selectedFiles` had no reader left, so the Set and its
+    // JSON.parse went with it. Type diversity above is the only diversity constraint
+    // that was ever live, which is why the counter below no longer says "both gates".
+    //
+    // Real overlap down-weighting, if wanted, belongs in the sort key — a ranking
+    // change owing an A/B, not a revival of this block. tests/hook-context.test.mjs
+    // pins the current unpenalized order and asserts its own discriminator, so a
+    // penalty that reached the ordering turns red instead of landing silently.
     if (c._kind === 'obs' && c.type) {
       selectedTypes.set(c.type, (selectedTypes.get(c.type) || 0) + 1);
     }
 
     totalTokens += c.cost;
     if (c._kind === 'obs') {
-      selectedObs.push({ id: c.id, type: c.type, title: c.title, created_at: new Date(c.created_at_epoch).toISOString() });
+      selectedObs.push({
+        id: c.id,
+        type: c.type,
+        title: c.title,
+        created_at: new Date(c.created_at_epoch).toISOString(),
+      });
     } else {
-      selectedSess.push({ id: c.id, request: c.request, completed: c.completed, next_steps: c.next_steps, created_at: new Date(c.created_at_epoch).toISOString() });
+      selectedSess.push({
+        id: c.id,
+        request: c.request,
+        completed: c.completed,
+        next_steps: c.next_steps,
+        created_at: new Date(c.created_at_epoch).toISOString(),
+      });
     }
   }
 
@@ -188,6 +336,69 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
  * removes the paired hint comment if present, and normalizes residual whitespace
  * at the seam. Uses atomic tmp+rename write.
  */
+/**
+ * Half-open [start, end) ranges of every fenced code span in a markdown document.
+ *
+ * A fence opens on a line whose first non-space run is three or more backticks or tildes,
+ * and closes on the next line opening with at least as many of the SAME character — CommonMark's
+ * rule, and the reason a ```` ```` ```` block can contain a ``` line. An unterminated fence
+ * runs to EOF.
+ */
+function fencedRanges(content) {
+  const ranges = [];
+  let open = null;
+  let offset = 0;
+  for (const line of content.split('\n')) {
+    const m = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (m) {
+      if (!open) {
+        open = { char: m[1][0], len: m[1].length, start: offset };
+      } else if (m[1][0] === open.char && m[1].length >= open.len) {
+        ranges.push([open.start, offset + line.length]);
+        open = null;
+      }
+    }
+    offset += line.length + 1; // +1 for the '\n' split removed
+  }
+  if (open) ranges.push([open.start, content.length]);
+  return ranges;
+}
+
+/** True when `idx` sits inside a backtick-delimited inline code span on its own line. */
+function insideInlineCode(content, idx) {
+  const lineStart = content.lastIndexOf('\n', idx - 1) + 1;
+  // Count backtick RUNS before the position; an odd count means the position is inside a
+  // span. Runs, not characters: ``code with ` inside`` is one span opened by two ticks.
+  const before = content.slice(lineStart, idx);
+  const runs = before.match(/`+/g);
+  return runs !== null && runs.length % 2 === 1;
+}
+
+/**
+ * The last index of `needle` that is a real block's tag, or -1.
+ *
+ * Three exclusions, and the pre-ship review is why there are three rather than one. A
+ * legacy block written by the old `updateClaudeMd` put its tags at COLUMN 0 on their own
+ * lines, so anything else is prose ABOUT the tag:
+ *   - inside a fenced code span (```/~~~)          — the first cut, and only a third of it
+ *   - not at the start of a line                    — an inline mention mid-sentence
+ *   - indented four or more spaces                  — CommonMark's other code block
+ * Measured before the widening, with the shipped function: an inline span went 101 -> 55
+ * bytes and an indented block 95 -> 33, atomically, with no backup.
+ */
+function lastIndexOutsideFences(content, needle, ranges) {
+  let idx = content.lastIndexOf(needle);
+  while (idx !== -1) {
+    const lineStart = content.lastIndexOf('\n', idx - 1) + 1;
+    const indent = content.slice(lineStart, idx);
+    const atLineStart = indent.length === 0;
+    const inFence = ranges.some(([a, b]) => idx >= a && idx < b);
+    if (atLineStart && !inFence && !insideInlineCode(content, idx)) return idx;
+    idx = content.lastIndexOf(needle, idx - 1);
+  }
+  return -1;
+}
+
 export function cleanupClaudeMdLegacyBlock() {
   // v2.48 P2-4: idempotent marker. First run (whether it finds a block or not,
   // whether CLAUDE.md exists or not) drops a project-scoped marker in RUNTIME_DIR.
@@ -200,23 +411,42 @@ export function cleanupClaudeMdLegacyBlock() {
 
   const claudeMdPath = join(inferProjectDir(), 'CLAUDE.md');
   let content;
-  try { content = readFileSync(claudeMdPath, 'utf8'); } catch {
+  try {
+    content = readFileSync(claudeMdPath, 'utf8');
+  } catch {
     // CLAUDE.md missing — still drop the marker so we don't re-stat every session
-    try { writeFileSync(markerPath, String(Date.now())); } catch {}
+    try {
+      writeFileSync(markerPath, String(Date.now()));
+    } catch {}
     return;
   }
 
   // Helper: drop the marker regardless of exit path (found / not found / write failed).
   // Kept inline so the early-return sites below stay readable.
-  const dropMarker = () => { try { writeFileSync(markerPath, String(Date.now())); } catch {} };
+  const dropMarker = () => {
+    try {
+      writeFileSync(markerPath, String(Date.now()));
+    } catch {}
+  };
 
   const startTag = '<claude-mem-context>';
   const endTag = '</claude-mem-context>';
 
-  // Use lastIndexOf so documentation references to the tag earlier in the file
-  // (e.g. inside a code block in architecture notes) are not accidentally swept.
-  const startIdx = content.lastIndexOf(startTag);
-  const endIdx = content.lastIndexOf(endTag);
+  // A4 (audit 2026-09-08): `lastIndexOf` alone was NOT the protection the old comment
+  // here claimed. It shields a documentation reference only when a real block sits AFTER
+  // it; when the file's only occurrence IS the reference — the ordinary case for someone
+  // who wrote down what this plugin emits — both searches land on it, `startIdx < endIdx`
+  // holds, and the user's fenced sample is deleted with its two fences spliced into a
+  // broken ``````. Atomic write, no backup, once per project, so it shows up as a small
+  // stray diff days later. Measured on a plain 226-byte CLAUDE.md: 226 → 145.
+  //
+  // "The tag is alone on its line" does not discriminate — inside a fence it usually is.
+  // The fence itself is the signal, so fenced spans are excluded before the search, and an
+  // UNTERMINATED fence is treated as running to EOF: that errs toward leaving the file
+  // alone, which is the safe direction for a write into someone's own notes.
+  const fenced = fencedRanges(content);
+  const startIdx = lastIndexOutsideFences(content, startTag, fenced);
+  const endIdx = lastIndexOutsideFences(content, endTag, fenced);
   if (startIdx === -1 || endIdx === -1 || startIdx >= endIdx) {
     dropMarker();
     return;
@@ -246,21 +476,68 @@ export function cleanupClaudeMdLegacyBlock() {
   // Collapse any ≥3 consecutive newlines to two, then ensure exactly one trailing newline.
   const normalized = cleaned.replace(/\n{3,}/g, '\n\n').replace(/\s*$/, '\n');
 
-  if (normalized === content) { dropMarker(); return; }
+  if (normalized === content) {
+    dropMarker();
+    return;
+  }
 
-  // Per-pid temp suffix so two concurrent first-run SessionStarts in the same
-  // project (e.g. two terminals) can't rename each other's half-written temp
-  // onto the user's tracked CLAUDE.md. Matches the idiom in hook-shared.mjs.
-  const tmp = claudeMdPath + `.mem-tmp-${process.pid}`;
+  // atomicWriteFileSync keeps the per-pid temp (two concurrent first-run SessionStarts in
+  // one project must not rename each other's half-written temp onto the user's tracked
+  // CLAUDE.md) AND adds the lstat the local twin lacked: renaming onto a symlink NAME
+  // replaces the link with a regular file, orphaning a dotfiles-managed CLAUDE.md
+  // (audit 2026-09-02 P0-5). Its temp lands beside the RESOLVED target, so the rename
+  // stays same-device even when the real file lives on another mount.
   try {
-    writeFileSync(tmp, normalized);
-    renameSync(tmp, claudeMdPath);
+    atomicWriteFileSync(claudeMdPath, normalized);
     dropMarker();
   } catch (e) {
-    try { unlinkSync(tmp); } catch {}
     debugLog('ERROR', 'cleanupClaudeMdLegacyBlock', `CLAUDE.md write failed: ${e.message}`);
     // Intentionally do NOT drop the marker on write failure — retry next session.
   }
+}
+
+/**
+ * How many locally-selected observations count as a thick enough pool to skip the
+ * cross-project fallback. Named because the number appeared three times: the guard
+ * that DECIDES to run the fallback query and the two sites that consume it.
+ */
+const MIN_LOCAL_OBS = 3;
+
+/**
+ * The rows to render: everything `selectWithTokenBudget` chose, topped up with any
+ * fallback rows it does not already cover.
+ *
+ * R12 A2 — this used to be `observations.length >= 3 ? observations : fallbackObs`,
+ * written inline at BOTH consumer sites. The two row sets come from different windows
+ * (obsPool's low-speed tier1 is 48h/imp>=1; the fallback query is 24h/imp>=1 OR
+ * 7d/imp>=2) and neither contains the other, so a whole-set switch could hand back
+ * FEWER rows than it was given — measured on tests/hook-context.test.mjs's own `thin(n)`
+ * fixture: 2 rows in the DB, both selected, and a 0-byte context block, against 241 bytes
+ * and 3 table rows at n=3. Output was non-monotonic in corpus size, and the victims were
+ * exactly the thin/new projects the 60-day tier exists to serve. (An earlier revision of
+ * this line said 391 bytes, carried over from the audit's own differently-seeded fixture
+ * rather than measured here.)
+ *
+ * Top-up, not truncate-to-three: the union never renders fewer rows than the old
+ * expression did on any input, which a "fill to 3" fix would not hold — at 0 selected rows
+ * the fallback query's own LIMIT 5 already governs, and capping at 3 would have been a
+ * second, unrelated behaviour change. Growth is bounded: the union only runs below
+ * MIN_LOCAL_OBS, so the table gains at most two rows.
+ *
+ * The COUNT never shrinks; the composition can, and that is a ranking decision rather than
+ * an accident. At the uncapped table site this only adds. At the `.slice(0, MIN_LOCAL_OBS)`
+ * site the selected rows are PREPENDED, so with 1 local row and 3+ fallback rows the third
+ * fallback title is evicted — still three rows, one of them now local. Exhaustive
+ * enumeration over 42,436 ordered input pairs: 0 cases render fewer rows, 3,000 evict a
+ * fallback row that way, max gain 2. Preferring the project's own rows over cross-project
+ * ones inside a fixed window is the intended order, and saying so is the point: a new
+ * population entering a limit-bounded window without a stated ranking is this repo's
+ * recorded failure shape.
+ */
+function withFallbackTopUp(observations, fallbackObs) {
+  if (observations.length >= MIN_LOCAL_OBS) return observations;
+  const seen = new Set(observations.map((o) => o.id));
+  return [...observations, ...fallbackObs.filter((o) => !seen.has(o.id))];
 }
 
 /**
@@ -289,7 +566,13 @@ export function cleanupClaudeMdLegacyBlock() {
  *   (D#123: the exclude-set must mirror real injections, not the keyObs query).
  * @returns {string} Joined markdown lines (without <claude-mem-context> wrappers)
  */
-export function buildSessionContextLines(db, project, now = new Date(), currentCcSessionId = null, collector = null) {
+export function buildSessionContextLines(
+  db,
+  project,
+  now = new Date(),
+  currentCcSessionId = null,
+  collector = null,
+) {
   if (collector) collector.keyContextIds = [];
   // 1. Token-budgeted observation selection
   const selected = selectWithTokenBudget(db, project, 2000);
@@ -297,10 +580,12 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
 
   // 2. Fallback: recent across all projects with tiered windows (when local pool is thin)
   let fallbackObs = [];
-  if (observations.length < 3) {
+  if (observations.length < MIN_LOCAL_OBS) {
     const fbOneDayAgo = now.getTime() - STALE_SESSION_MS;
-    const fbSevenDaysAgo = now.getTime() - FALLBACK_OBS_WINDOW_MS;
-    fallbackObs = db.prepare(`
+    const fbSevenDaysAgo = now.getTime() - RELATED_OBS_WINDOW_MS;
+    fallbackObs = db
+      .prepare(
+        `
       SELECT id, type, title, project, created_at
       FROM observations
       WHERE ${liveObsFilterSql('')}
@@ -311,28 +596,39 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
         )
       ORDER BY created_at_epoch DESC
       LIMIT 5
-    `).all(fbOneDayAgo, fbSevenDaysAgo);
+    `,
+      )
+      .all(fbOneDayAgo, fbSevenDaysAgo);
   }
 
   // 3. Latest session summary → base summaryLines
-  const latestSummary = db.prepare(`
+  const latestSummary = db
+    .prepare(
+      `
     SELECT request, completed, next_steps, remaining_items, lessons, key_decisions, created_at
     FROM session_summaries
     WHERE project = ?
     ORDER BY created_at_epoch DESC
     LIMIT 1
-  `).get(project);
+  `,
+    )
+    .get(project);
 
   const summaryLines = buildSummaryLines(latestSummary);
 
   // 4. Key context: top high-importance observations split into File Lessons (actionable)
   //    and Key Context (informational). Pushed into summaryLines.
-  const keyObs = db.prepare(`
+  const keyObs = db
+    .prepare(
+      `
     SELECT o.id, o.type, o.title, o.lesson_learned, o.files_modified FROM observations o
     WHERE o.project = ? AND ${liveObsFilterSql('o')}
       AND COALESCE(o.importance, 1) >= 2
-    ORDER BY o.created_at_epoch DESC LIMIT ${KEY_CONTEXT_LIMIT}
-  `).all(project);
+      AND ${notLowSignalTitleClause('o')}
+    ORDER BY o.created_at_epoch DESC, o.id DESC LIMIT ${KEY_CONTEXT_LIMIT}
+  `,
+    )
+    .all(project);
 
   if (keyObs.length > 0) {
     const fileLessons = [];
@@ -353,10 +649,15 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
             fileLessons.push({ id: o.id, line: `- ${fname}: ${truncate(o.lesson_learned, 100)} (#${o.id})` });
             continue;
           }
-        } catch { /* fall through to keyContext */ }
+        } catch {
+          /* fall through to keyContext */
+        }
       }
       const lesson = hasLesson ? ` — ${truncate(o.lesson_learned, 60)}` : '';
-      keyContext.push({ id: o.id, line: `- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}` });
+      keyContext.push({
+        id: o.id,
+        line: `- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}`,
+      });
     }
 
     // Phase A (QUIET_HOOKS) + Phase D (adopted sentinel): drop descriptive
@@ -366,15 +667,35 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     // remain reachable via mem_get. The collector sees only rows that survive
     // BOTH the quiet gate and the per-section slice — rendered rows, nothing else.
     const quiet = effectiveQuiet();
+
+    // D#196: the two sections draw from ONE pool of KEY_CONTEXT_LIMIT rows but each used
+    // to cap at half of it, so a pool that is all one shape emitted 5 lines and left the
+    // other section empty — half the rows the query had already paid for. Not a ranking
+    // bound (SQL order is preserved and nothing is re-scored); a plain under-fill.
+    //
+    // Measured 2026-09-02T10:28Z over the 11 projects with >=20 live rows: 10 of them
+    // lose rows to the per-section cap right now, 28 of 110 pooled rows (25.5%) fetched
+    // and discarded. code-graph-mcp is the extreme at 10 fileLessons / 0 keyContext,
+    // emitting 5 of 10; projects--mem is 9/1 and emits 6; only claudemd (5/5) loses
+    // nothing. The shapes are not evenly mixed because "has a lesson AND names a file" is
+    // the standard shape of a bugfix or decision row, which is most of what gets saved.
+    //
+    // Each section keeps its guaranteed half and may take what the other cannot use, so
+    // the combined ceiling is still KEY_CONTEXT_LIMIT. STRICTLY ADDITIVE: every quota is
+    // >= min(section length, half), i.e. no row that used to be shown can be dropped —
+    // asserted in tests/hook-context.test.mjs rather than left as a claim, because "it
+    // only adds" is exactly the kind of sentence this repo keeps finding to be false.
+    const { fileLessonQuota, keyContextQuota } = sectionQuotas(fileLessons.length, keyContext.length);
+
     if (fileLessons.length > 0 && !quiet) {
-      const shown = fileLessons.slice(0, 5);
+      const shown = fileLessons.slice(0, fileLessonQuota);
       summaryLines.push('### File Lessons');
       summaryLines.push(...shown.map((e) => e.line));
       summaryLines.push('');
       if (collector) collector.keyContextIds.push(...shown.map((e) => e.id));
     }
     if (keyContext.length > 0 && !quiet) {
-      const shown = keyContext.slice(0, 5);
+      const shown = keyContext.slice(0, keyContextQuota);
       summaryLines.push('### Key Context');
       summaryLines.push(...shown.map((e) => e.line));
       summaryLines.push('');
@@ -383,7 +704,12 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
   } else if (!latestSummary && !effectiveQuiet()) {
     // Fallback: no summary AND no key observations — show recent activity.
     // Skipped under QUIET_HOOKS since the Recent table already carries titles.
-    const recentObs = (observations.length >= 3 ? observations : fallbackObs).slice(0, 3);
+    // Slice FIRST, then sort: the slice is the selection (top 3 by value density) and must
+    // stay that way; only the order they are printed in is corrected, same as the Recent
+    // table below. Sorting before the slice would silently change WHICH three are injected.
+    const recentObs = withFallbackTopUp(observations, fallbackObs)
+      .slice(0, MIN_LOCAL_OBS)
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
     if (recentObs.length > 0) {
       summaryLines.push('### Recent Activity');
       for (const o of recentObs) {
@@ -420,18 +746,26 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
   const HANDOFF_TTL_MS = 48 * 60 * 60 * 1000;
   const handoffMinEpoch = Date.now() - HANDOFF_TTL_MS;
   const prevClearHandoff = currentCcSessionId
-    ? db.prepare(`
+    ? db
+        .prepare(
+          `
         SELECT working_on, unfinished, key_files
         FROM session_handoffs
         WHERE project = ? AND type = 'clear' AND session_id = ? AND created_at_epoch > ?
         ORDER BY created_at_epoch DESC LIMIT 1
-      `).get(project, currentCcSessionId, handoffMinEpoch)
-    : db.prepare(`
+      `,
+        )
+        .get(project, currentCcSessionId, handoffMinEpoch)
+    : db
+        .prepare(
+          `
         SELECT working_on, unfinished, key_files
         FROM session_handoffs
         WHERE project = ? AND type = 'clear' AND created_at_epoch > ?
         ORDER BY created_at_epoch DESC LIMIT 1
-      `).get(project, handoffMinEpoch);
+      `,
+        )
+        .get(project, handoffMinEpoch);
 
   const handoffLines = [];
   if (prevClearHandoff) {
@@ -446,8 +780,10 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     if (prevClearHandoff.key_files) {
       try {
         const files = JSON.parse(prevClearHandoff.key_files);
-        if (files.length > 0) handoffLines.push(`- Key files: ${files.map(f => basename(f)).join(', ')}`);
-      } catch { /* malformed JSON — skip */ }
+        if (files.length > 0) handoffLines.push(`- Key files: ${files.map((f) => basename(f)).join(', ')}`);
+      } catch {
+        /* malformed JSON — skip */
+      }
     }
     handoffLines.push('');
   }
@@ -457,7 +793,9 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
   // ordinal so user can refer to "处理1" / "handle item 1" naturally; D#<id>
   // is the stable handle for tool-layer references (closes_deferred=[N]).
   // Quiet-hooks does NOT suppress: cross-session continuity is the whole point.
-  const deferredItems = db.prepare(`
+  const deferredItems = db
+    .prepare(
+      `
     SELECT id, title, priority,
            ROW_NUMBER() OVER (
              ORDER BY priority DESC, created_at_epoch ASC
@@ -466,23 +804,33 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     WHERE project = ? AND status = 'open'
     ORDER BY priority DESC, created_at_epoch ASC
     LIMIT 5
-  `).all(project);
+  `,
+    )
+    .all(project);
 
   const deferredLines = [];
   if (deferredItems.length > 0) {
     deferredLines.push('### Deferred Work');
     for (const d of deferredItems) {
       const pTag = d.priority === 3 ? '🔴' : d.priority === 1 ? '⚪' : '🟡';
-      deferredLines.push(
-        `${d.ordinal}. ${pTag} [P${d.priority}] ${truncate(d.title, 120)} (D#${d.id})`
-      );
+      deferredLines.push(`${d.ordinal}. ${pTag} [P${d.priority}] ${truncate(d.title, 120)} (D#${d.id})`);
     }
     deferredLines.push('');
   }
 
   // 6. Recent observations table
+  //
+  // SELECTION order (greedy knapsack, value density) is not DISPLAY order. This block used
+  // to render the picks in the order the knapsack happened to take them, under a heading
+  // that says "Recent" next to a Time column — so row 1 was not the newest row, and both a
+  // human and the model read it as if it were. Sorting here is display-only: `obsToShow` is
+  // already chosen, so the token budget and the row set are untouched (pinned by a case in
+  // tests/hook-context.test.mjs). Tiebroken on id for the same reason D#9 gives — an
+  // untiebroken tie flips direction, and two saves in one millisecond are common.
   const obsLines = [];
-  const obsToShow = observations.length >= 3 ? observations : fallbackObs;
+  const obsToShow = [...withFallbackTopUp(observations, fallbackObs)].sort(
+    (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id,
+  );
   if (obsToShow.length > 0) {
     const today = now.toISOString().slice(0, 10);
     obsLines.push(`### Recent (${today})`);
@@ -491,7 +839,9 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     obsLines.push('|----|------|---|-------|');
     for (const o of obsToShow) {
       const proj = o.project && o.project !== project ? ` (${o.project})` : '';
-      obsLines.push(`| #${o.id} | ${fmtTime(o.created_at)} | ${typeIcon(o.type)} | ${mdCell(truncate(o.title || '(untitled)', 60) + proj)} |`);
+      obsLines.push(
+        `| #${o.id} | ${fmtTime(o.created_at)} | ${typeIcon(o.type)} | ${mdCell(truncate(o.title || '(untitled)', 60) + proj)} |`,
+      );
     }
   }
 
@@ -499,7 +849,9 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
   // can't prematurely close the <claude-mem-context> block it's wrapped in (mdCell does
   // the same for `|`). One source of truth: both the SessionStart hook and the CLI
   // `context` command consume this return.
-  return neutralizeContextDelimiters([...summaryLines, ...handoffLines, ...deferredLines, ...obsLines].join('\n'));
+  return neutralizeContextDelimiters(
+    [...summaryLines, ...handoffLines, ...deferredLines, ...obsLines].join('\n'),
+  );
 }
 
 /**

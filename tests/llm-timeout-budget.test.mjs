@@ -48,7 +48,10 @@ describe('save-enrich asks for a CLI-aware budget', () => {
     });
     let seen = null;
     await executeSaveEnrich(db, id, {
-      callJson: async (_prompt, _model, opts) => { seen = opts; return null; },
+      callJson: async (_prompt, _model, opts) => {
+        seen = opts;
+        return null;
+      },
     });
     db.close();
     expect(seen).not.toBeNull();
@@ -61,39 +64,36 @@ describe('background LLM call sites use the shared constant, not a bare literal'
   // FAILS-IF a background site is reverted to a hard-coded sub-floor timeout, or
   // a NEW background site lands with one. Scanning source (rather than calling
   // each site) is what makes a re-introduction visible without a live LLM.
-  const BACKGROUND_SITES = [
-    'lib/save-enrich.mjs',
-    'hook-optimize.mjs',
-    'registry-enricher.mjs',
-    'hook-llm.mjs',
-    'hook-shared.mjs',
-  ];
+  // `lib/llm-call.mjs` is where callLLM's `timeoutMs = BG_LLM_TIMEOUT_MS` default lives
+  // since audit 2026-09-05 P1-2 moved it out of hook-shared.mjs, which now only
+  // re-exports the name and therefore has no call site left to guard.
+  const BACKGROUND_SITES = ['lib/save-enrich.mjs', 'hook-optimize.mjs', 'hook-llm.mjs', 'lib/llm-call.mjs'];
 
   // Per-file floor on how many LLM calls must carry the constant. Raise when a
   // file gains a call; never lower without saying why.
   const BG_TIMEOUT_USE_COUNTS = {
     'lib/save-enrich.mjs': 1,
     'hook-optimize.mjs': 5,
-    'registry-enricher.mjs': 1,
     'hook-llm.mjs': 2,
-    'hook-shared.mjs': 1,
+    'lib/llm-call.mjs': 1,
   };
 
   for (const file of BACKGROUND_SITES) {
     it(`${file} passes BG_LLM_TIMEOUT_MS at every LLM call it makes`, () => {
       const src = read(file);
       // A bare `toContain('BG_LLM_TIMEOUT_MS')` was satisfied by the IMPORT line:
-      // deleting `timeout: BG_LLM_TIMEOUT_MS` from registry-enricher or from all
+      // deleting `timeout: BG_LLM_TIMEOUT_MS` from a call site or from all
       // five hook-optimize sites left the suite green while each call silently
       // fell back to its dispatcher default (10s / 15s) — the exact regression
       // this release exists to fix, and no numeric literal appears so the
       // sub-floor scan below cannot see it either.
       // Two call shapes carry it: an options object (`timeout: BG_...`) and
-      // hook-shared's positional `callLLM(prompt, BG_...)`.
-      const uses = (src.match(/timeout(?:Ms)?\s*[:=]\s*BG_LLM_TIMEOUT_MS/g) || []).length
-        + (src.match(/\bcallLLM\([^)]*?,\s*BG_LLM_TIMEOUT_MS\s*\)/g) || []).length;
+      // callLLM's own positional default / `callLLM(prompt, BG_...)`.
+      const uses =
+        (src.match(/timeout(?:Ms)?\s*[:=]\s*BG_LLM_TIMEOUT_MS/g) || []).length +
+        (src.match(/\bcallLLM\([^)]*?,\s*BG_LLM_TIMEOUT_MS\s*\)/g) || []).length;
       expect(uses, `${file} has ${uses} timeout:BG_LLM_TIMEOUT_MS uses`).toBeGreaterThanOrEqual(
-        BG_TIMEOUT_USE_COUNTS[file]
+        BG_TIMEOUT_USE_COUNTS[file],
       );
     });
 

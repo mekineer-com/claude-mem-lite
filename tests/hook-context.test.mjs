@@ -1,10 +1,20 @@
 // Tests for hook-context.mjs — adaptive time windows, token budgeting, CLAUDE.md updates
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import { join } from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { computeAdaptiveWindows, selectWithTokenBudget, cleanupClaudeMdLegacyBlock, buildSummaryLines, buildSessionContextLines } from '../hook-context.mjs';
+import { estimateTokens } from '../utils.mjs';
+import {
+  computeAdaptiveWindows,
+  selectWithTokenBudget,
+  cleanupClaudeMdLegacyBlock,
+  buildSummaryLines,
+  buildSessionContextLines,
+  sectionQuotas,
+} from '../hook-context.mjs';
 import { insertDeferred } from '../lib/deferred-work.mjs';
+import { KEY_CONTEXT_LIMIT } from '../hook-shared.mjs';
 
 // ─── computeAdaptiveWindows ──────────────────────────────────────────────────
 
@@ -18,9 +28,9 @@ describe('computeAdaptiveWindows', () => {
   it('returns low velocity windows when project has few observations', () => {
     // 0 observations in 7 days → velocity = 0 → low
     const windows = computeAdaptiveWindows(db, 'test');
-    expect(windows.tier1).toBe(48 * 3600000);  // 48 hours
-    expect(windows.tier2).toBe(14 * 86400000);  // 14 days
-    expect(windows.tier3).toBe(60 * 86400000);  // 60 days
+    expect(windows.tier1).toBe(48 * 3600000); // 48 hours
+    expect(windows.tier2).toBe(14 * 86400000); // 14 days
+    expect(windows.tier3).toBe(60 * 86400000); // 60 days
     expect(windows.sessWindow).toBe(14 * 86400000);
   });
 
@@ -35,8 +45,8 @@ describe('computeAdaptiveWindows', () => {
       });
     }
     const windows = computeAdaptiveWindows(db, 'test');
-    expect(windows.tier1).toBe(24 * 3600000);  // 24 hours
-    expect(windows.tier2).toBe(7 * 86400000);   // 7 days
+    expect(windows.tier1).toBe(24 * 3600000); // 24 hours
+    expect(windows.tier2).toBe(7 * 86400000); // 7 days
   });
 
   it('returns high velocity windows for >10 obs/day', () => {
@@ -50,8 +60,8 @@ describe('computeAdaptiveWindows', () => {
       });
     }
     const windows = computeAdaptiveWindows(db, 'test');
-    expect(windows.tier1).toBe(12 * 3600000);  // 12 hours
-    expect(windows.tier2).toBe(3 * 86400000);   // 3 days
+    expect(windows.tier1).toBe(12 * 3600000); // 12 hours
+    expect(windows.tier2).toBe(3 * 86400000); // 3 days
   });
 
   it('ignores compressed observations', () => {
@@ -68,6 +78,30 @@ describe('computeAdaptiveWindows', () => {
     const windows = computeAdaptiveWindows(db, 'test');
     // Should be low velocity since all are compressed
     expect(windows.tier1).toBe(48 * 3600000);
+  });
+
+  // Audit R8 §11.3, the other half of the case above. Velocity is a POOL-SIZING
+  // heuristic, not a history record: the windows it returns are handed to the recall
+  // queries at :201 / :468 / :502, every one of which filters with liveObsFilterSql. So
+  // counting a population strictly larger than the one the window is later applied to
+  // makes a project of tombstones read as busy and then hands it the TIGHTEST window —
+  // 12h instead of 48h — to find the few live rows it has. That is the opposite of the
+  // documented intent ("Low activity -> longer windows").
+  // FAILS IF: `superseded_at IS NULL` is dropped from computeAdaptiveWindows' COUNT.
+  it('ignores superseded observations', () => {
+    for (let i = 0; i < 80; i++) {
+      insertObs(db, {
+        sessionId: 'sess-1',
+        project: 'test',
+        title: `superseded obs ${i}`,
+        epochOffset: -(i * 1800000),
+        supersededAt: Date.now(),
+        supersededBy: 999,
+      });
+    }
+    const windows = computeAdaptiveWindows(db, 'test');
+    expect(windows.tier1, '80 tombstones must not read as a high-velocity project').toBe(48 * 3600000);
+    expect(windows.tier3).toBe(60 * 86400000);
   });
 
   it('scopes velocity to specific project', () => {
@@ -108,12 +142,24 @@ describe('selectWithTokenBudget', () => {
   // hidden near-duplicate resurface in the SessionStart "Recent" table. obsPool now filters
   // superseded_at IS NULL (parity with the sibling keyObs query).
   it('excludes superseded rows even when compressed_into is still 0 (auto-dedup shape)', () => {
-    insertObs(db, { sessionId: 'sess-1', project: 'test', type: 'decision', title: 'live decision', importance: 2 });
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test', type: 'decision', title: 'superseded dup', importance: 2,
-      supersededAt: Date.now(), supersededBy: 'auto-dedup', compressedInto: 0,
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'decision',
+      title: 'live decision',
+      importance: 2,
     });
-    const titles = selectWithTokenBudget(db, 'test', 2000).observations.map(o => o.title);
+    insertObs(db, {
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'decision',
+      title: 'superseded dup',
+      importance: 2,
+      supersededAt: Date.now(),
+      supersededBy: 'auto-dedup',
+      compressedInto: 0,
+    });
+    const titles = selectWithTokenBudget(db, 'test', 2000).observations.map((o) => o.title);
     expect(titles).toContain('live decision');
     expect(titles).not.toContain('superseded dup');
   });
@@ -154,20 +200,26 @@ describe('selectWithTokenBudget', () => {
   it('prioritizes high importance observations', () => {
     // Insert low importance old obs
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'low importance old', importance: 1,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'low importance old',
+      importance: 1,
       epochOffset: -86400000, // 1 day ago
     });
     // Insert high importance old obs
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'high importance old', importance: 3,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'high importance old',
+      importance: 3,
       epochOffset: -86400000 * 10, // 10 days ago
     });
     // Insert recent low importance
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'recent low importance', importance: 1,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'recent low importance',
+      importance: 1,
       epochOffset: -60000, // 1 min ago
     });
 
@@ -175,31 +227,39 @@ describe('selectWithTokenBudget', () => {
     expect(result.observations.length).toBeGreaterThan(0);
     // High importance should rank first — exponential decay preserves recency for
     // items within the half-life window (10d < 14d default), so importance=3 dominates
-    const titles = result.observations.map(o => o.title);
+    const titles = result.observations.map((o) => o.title);
     expect(titles[0]).toBe('high importance old');
   });
 
   it('filters by project', () => {
     insertSession(db, { id: 'sess-2', project: 'other' });
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test', title: 'test obs', importance: 1,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'test obs',
+      importance: 1,
     });
     insertObs(db, {
-      sessionId: 'sess-2', project: 'other', title: 'other obs', importance: 1,
+      sessionId: 'sess-2',
+      project: 'other',
+      title: 'other obs',
+      importance: 1,
     });
 
     const result = selectWithTokenBudget(db, 'test', 2000);
-    const titles = result.observations.map(o => o.title);
+    const titles = result.observations.map((o) => o.title);
     expect(titles).toContain('test obs');
     expect(titles).not.toContain('other obs');
   });
 
   it('includes session summaries', () => {
     const now = Date.now();
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('sess-1', 'test', 'fix bugs', 'fixed 3 bugs', 'run tests', new Date(now).toISOString(), now);
+    `,
+    ).run('sess-1', 'test', 'fix bugs', 'fixed 3 bugs', 'run tests', new Date(now).toISOString(), now);
 
     const result = selectWithTokenBudget(db, 'test', 2000);
     expect(result.summaries.length).toBe(1);
@@ -208,16 +268,21 @@ describe('selectWithTokenBudget', () => {
 
   it('skips compressed observations', () => {
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'compressed one', importance: 1, compressedInto: 42,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'compressed one',
+      importance: 1,
+      compressedInto: 42,
     });
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'active one', importance: 1,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'active one',
+      importance: 1,
     });
 
     const result = selectWithTokenBudget(db, 'test', 2000);
-    const titles = result.observations.map(o => o.title);
+    const titles = result.observations.map((o) => o.title);
     expect(titles).not.toContain('compressed one');
     expect(titles).toContain('active one');
   });
@@ -228,68 +293,198 @@ describe('selectWithTokenBudget', () => {
 
   it('R3: excludes "Modified X" titles from Key Context', () => {
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'Modified dispatch.mjs', importance: 2,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'Modified dispatch.mjs',
+      importance: 2,
       epochOffset: -1000,
     });
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'Fixed dispatch race condition', importance: 2,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'Fixed dispatch race condition',
+      importance: 2,
       epochOffset: -2000,
     });
     const result = selectWithTokenBudget(db, 'test', 2000);
-    const titles = result.observations.map(o => o.title);
+    const titles = result.observations.map((o) => o.title);
     expect(titles).toContain('Fixed dispatch race condition');
     expect(titles).not.toContain('Modified dispatch.mjs');
   });
 
   it('R3: excludes "Worked on X" and "Reviewed N files:" from Key Context', () => {
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'Worked on auth cache module', importance: 2,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'Worked on auth cache module',
+      importance: 2,
       epochOffset: -1000,
     });
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'Reviewed 6 files: auth.mjs, cache.mjs, utils.mjs', importance: 2,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'Reviewed 6 files: auth.mjs, cache.mjs, utils.mjs',
+      importance: 2,
       epochOffset: -2000,
     });
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'Implemented auth middleware', importance: 2,
+      sessionId: 'sess-1',
+      project: 'test',
+      title: 'Implemented auth middleware',
+      importance: 2,
       epochOffset: -3000,
     });
     const result = selectWithTokenBudget(db, 'test', 2000);
-    const titles = result.observations.map(o => o.title);
+    const titles = result.observations.map((o) => o.title);
     expect(titles).toContain('Implemented auth middleware');
     expect(titles).not.toContain('Worked on auth cache module');
-    expect(titles.every(t => !t.startsWith('Reviewed '))).toBe(true);
+    expect(titles.every((t) => !t.startsWith('Reviewed '))).toBe(true);
   });
 
-  it('applies diversity penalty for file overlap', () => {
-    // Two observations touching same files should have overlap penalty
+  // D#197. This case was named 'applies diversity penalty for file overlap' and
+  // asserted only `observations.length === 3`, with the comment "diversity
+  // affects ordering". Neither was true, and the assertion passed either way,
+  // which is a large part of why the dead branch survived: the file-overlap
+  // block computed a `penalizedValue` that nothing read except an unreachable
+  // `continue`, while the order was fixed by the raw valueDensity sort upstream.
+  //
+  // Rewritten to state the contract that actually holds AND to be able to fail
+  // if a real penalty is ever introduced — which per D#197 must be a deliberate,
+  // A/B'd ranking change, not a silent one.
+  //
+  // The fixture is built so the two are distinguishable. All three rows are the
+  // same type/importance and seconds apart, so value is ~equal (recency ~2.0 x
+  // typeQuality 1.1 x impBoost 1.0 x lessonBoost 1.0 = 2.2) and density is driven
+  // by title cost alone:
+  //   A  4 tokens -> 1.100   (selected first; puts server.mjs in the overlap set)
+  //   B 11 tokens -> 0.663   (FULL overlap with A)
+  //   C 13 tokens -> 0.610   (no overlap)
+  // B outranks C on raw density, but 0.7 x 0.663 = 0.464 < 0.610 — so under a
+  // penalty that actually reached the ordering, C would come before B.
+  it('file overlap does NOT reorder selection (D#197: the penalty never applied)', () => {
+    const A = 'fix auth guard';
+    const B = 'fix the same auth guard again in server file';
+    const C = 'fix an unrelated helper in the utils module today ok';
+    // Premise check: the discriminator above depends on these exact costs, so a
+    // change to estimateTokens must fail loudly here rather than quietly leave
+    // the case unable to tell the two behaviours apart.
+    expect([estimateTokens(A), estimateTokens(B), estimateTokens(C)]).toEqual([4, 11, 13]);
+    // …and the discriminator itself, asserted rather than only described: with
+    // equal value, B outranks C on raw density, and a 0.3 overlap penalty on B
+    // would put C ahead. If these two ever stop holding, the order assertion
+    // below can no longer tell the two behaviours apart and is just decoration.
+    const dB = 1 / Math.sqrt(estimateTokens(B));
+    const dC = 1 / Math.sqrt(estimateTokens(C));
+    expect(dB).toBeGreaterThan(dC); // raw order is B before C
+    expect(0.7 * dB).toBeLessThan(dC); // penalized order would be C before B
+
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'edit server.mjs', importance: 1,
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'bugfix',
+      title: A,
+      importance: 1,
       filesModified: '["server.mjs"]',
       epochOffset: -1000,
     });
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'also edit server.mjs', importance: 1,
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'bugfix',
+      title: B,
+      importance: 1,
       filesModified: '["server.mjs"]',
       epochOffset: -2000,
     });
     insertObs(db, {
-      sessionId: 'sess-1', project: 'test',
-      title: 'edit different utils.mjs', importance: 1,
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'bugfix',
+      title: C,
+      importance: 1,
       filesModified: '["utils.mjs"]',
       epochOffset: -3000,
     });
 
     const result = selectWithTokenBudget(db, 'test', 2000);
-    // All should be included but diversity affects ordering
     expect(result.observations.length).toBe(3);
+    // Raw-density order. If this ever reads [A, C, B], a file-overlap penalty
+    // has reached the ranking — which is a behaviour change owing an A/B.
+    expect(result.observations.map((o) => o.title)).toEqual([A, B, C]);
+  });
+
+  // D#192 — KEYCTX_POOL_OBS is a REACHABILITY backstop, not a relevance gate.
+  //
+  // The obsPool SELECT orders by `created_at_epoch DESC` and the selector below it
+  // re-sorts by valueDensity, into which recency enters compressed to (1,2] against
+  // impBoost 1.0-2.0 x typeQuality x lessonBoost. So the key the SQL sorts on barely
+  // participates in the final order, and a LIMIT on that SELECT decides what can be
+  // considered at all — the D#172 shape, fifth surface.
+  //
+  // This test pins the PROPERTY, not the number: a high-value row placed past position 50
+  // by created_at must still be selected. At KEYCTX_POOL_OBS = 50 it FAILS (verified:
+  // "expected [...] to contain 'reachability target'"); it passes at 57 and above, 57
+  // being the fixture's row count — so it guards reachability and the ruler prices the
+  // value.
+  //
+  // It is deliberately NOT a ranking test, and an earlier draft of this comment (and of
+  // the test name, and of the fixture's own lesson string) wrongly called the target the
+  // "densest" row. The pre-tag review computed the shipped formula by hand and refuted it:
+  // the control is denser (3.4883 against 3.3590) because it is newer and otherwise
+  // identical, so the target can never rank first by construction. Any rule that fills the
+  // pool in any order would turn this green. That is the correct scope for a reachability
+  // backstop; do not add ranking claims to it without changing the fixture.
+  it('D#192: selects a high-value row even when it sits past position 50 by recency', () => {
+    const DAY = 86400000;
+    // A control with the same shape at position 1, so a red run distinguishes "this row
+    // shape cannot be selected" from "this row's POSITION made it unreachable" — the
+    // discriminator this fixture exists to provide.
+    insertObs(db, {
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'decision',
+      title: 'reachability control',
+      importance: 3,
+      lessonLearned: 'high value density, newest row',
+      epochOffset: -1000,
+    });
+    // 55 newer, denser-to-read but lower-scoring rows: type `change` (quality 0.5),
+    // importance 1, long titles (cost is the denominator of valueDensity). They occupy
+    // every pool slot up to 50 under the shipped bound.
+    for (let i = 0; i < 55; i++) {
+      insertObs(db, {
+        sessionId: 'sess-1',
+        project: 'test',
+        type: 'change',
+        title: `routine change ${i} with a deliberately long title so its cost is high`,
+        importance: 1,
+        epochOffset: -(i * 60000 + 60000),
+      });
+    }
+    // The target: oldest row in the corpus, so it sorts LAST by created_at_epoch and
+    // lands past the 50-row LIMIT. Ten days keeps it inside tier3 (30d at this
+    // velocity) and importance 3 keeps it inside the tier3 arm of the WHERE.
+    insertObs(db, {
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'decision',
+      title: 'reachability target',
+      importance: 3,
+      lessonLearned: 'high value density, oldest row in the corpus',
+      epochOffset: -(10 * DAY),
+    });
+
+    // Pin the tier the fixture lands in. The target sits at -10d and only qualifies via the
+    // tier3 arm; at this row count velocity is 8/day (medium, tier3 = 30d), but ~15 more
+    // filler rows would cross 10/day into the high band, where tier3 collapses to 14d and
+    // the margin drops to 4 days. Without this assertion a later edit that adds fillers
+    // would turn the test red for a reason that has nothing to do with the pool bound.
+    const w = computeAdaptiveWindows(db, 'test');
+    expect(w.tier3).toBe(30 * DAY);
+
+    const titles = selectWithTokenBudget(db, 'test', 2000).observations.map((o) => o.title);
+    expect(titles).toContain('reachability control');
+    expect(titles).toContain('reachability target');
   });
 });
 
@@ -303,21 +498,42 @@ describe('cleanupClaudeMdLegacyBlock', () => {
   const testClaudeMd = join(testDir, 'CLAUDE.md');
 
   beforeEach(async () => {
-    try { mkdirSync(testDir, { recursive: true }); } catch {}
+    try {
+      mkdirSync(testDir, { recursive: true });
+    } catch {}
     vi.stubEnv('CLAUDE_PROJECT_DIR', testDir);
-    try { unlinkSync(testClaudeMd); } catch {}
+    try {
+      unlinkSync(testClaudeMd);
+    } catch {}
     // v2.48 P2-4: clear marker so each test exercises the full cleanup path.
     const { RUNTIME_DIR } = await import('../hook-shared.mjs');
     const { inferProject } = await import('../utils.mjs');
-    try { unlinkSync(join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`)); } catch {}
+    try {
+      unlinkSync(join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`));
+    } catch {}
   });
 
   afterEach(async () => {
     vi.unstubAllEnvs();
-    try { unlinkSync(testClaudeMd); } catch {}
+    try {
+      unlinkSync(testClaudeMd);
+    } catch {}
     const { RUNTIME_DIR } = await import('../hook-shared.mjs');
     const { inferProject } = await import('../utils.mjs');
-    try { unlinkSync(join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`)); } catch {}
+    try {
+      unlinkSync(join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`));
+    } catch {}
+  });
+
+  // R10 P2-18: the file was unlinked but the DIRECTORY never was, and `hook-ctx-test-` is
+  // not a prefix lib/tmp-fixture-sweep.mjs reclaims — so one dir leaked into /tmp on every
+  // run, permanently.
+  afterAll(() => {
+    try {
+      rmSync(testDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
   });
 
   it('is a no-op when CLAUDE.md does not exist', () => {
@@ -331,6 +547,68 @@ describe('cleanupClaudeMdLegacyBlock', () => {
     cleanupClaudeMdLegacyBlock();
     const content = readFileSync(testClaudeMd, 'utf8');
     expect(content).toBe(original);
+  });
+
+  // A4 (audit 2026-09-08). The comment above `lastIndexOf` claims it protects
+  // documentation references to the tag — "e.g. inside a code block in architecture
+  // notes". It only does so when a REAL block sits after them. When the file's only
+  // occurrence IS the documentation reference, both lastIndexOf calls land on it,
+  // `startIdx < endIdx` holds, and the user's own prose is deleted: the fenced block is
+  // emptied and its two fences are spliced into a broken ``````. There is no backup, the
+  // write is atomic, and the marker means it happens exactly once per project — so it
+  // surfaces at some later `git diff` as what looks like a small edit.
+  //
+  // This repo is safe by accident: its CLAUDE.md carries the OPEN tag with no closing
+  // one, so endIdx is -1. That is also why the "no context block" case above misses it.
+  it('leaves a fenced documentation reference byte-identical', () => {
+    const original =
+      '# Notes\n\nThe SessionStart hook prints:\n\n```\n<claude-mem-context>\n### Recent\n</claude-mem-context>\n```\n\nThat is all it does.\n';
+    writeFileSync(testClaudeMd, original);
+    cleanupClaudeMdLegacyBlock();
+    expect(readFileSync(testClaudeMd, 'utf8'), 'the user documented the tag and we deleted it').toBe(
+      original,
+    );
+  });
+
+  // Mixed file: a real legacy block AND a fenced reference. Without this case a wrong fix
+  // — "skip the whole cleanup if the file contains ``` anywhere" — passes the case above.
+  it('removes a real block while leaving a fenced reference intact', () => {
+    writeFileSync(
+      testClaudeMd,
+      '# Notes\n\n```\n<claude-mem-context>\ndocumented sample\n</claude-mem-context>\n```\n\n<claude-mem-context>\nreal legacy content\n</claude-mem-context>\n\n# Footer\n',
+    );
+    cleanupClaudeMdLegacyBlock();
+    const content = readFileSync(testClaudeMd, 'utf8');
+    expect(content, 'the fenced sample must survive').toContain('documented sample');
+    expect(content, 'the real legacy block must still go').not.toContain('real legacy content');
+    expect(content).toContain('# Footer');
+  });
+
+  // Pre-ship review (2026-09-09). The fence fix above closed ONE of the three markdown
+  // containers a person writes a tag in. Both of these were measured deleting user text
+  // with the shipped function: an inline code span 101 -> 55 bytes, a four-space indented
+  // block 95 -> 33. Fenced blocks are not how most people mention a tag mid-sentence.
+  //
+  // The discriminator that covers all three: a real legacy block was emitted by the old
+  // updateClaudeMd with its tags at COLUMN 0 on their own lines. An indented-code tag has
+  // four leading spaces; an inline-span tag has prose before it. So "outside a fence AND at
+  // the start of a line AND not inside a backtick span" keeps the removal power and drops
+  // every container. Widening the exclusion errs toward not touching the file, which is the
+  // only safe direction for a write into someone else's notes.
+  it('leaves an inline code span byte-identical', () => {
+    const original =
+      '# Notes\n\nThe hook wraps its output in `<claude-mem-context>` … `</claude-mem-context>` tags.\n\nAfter.\n';
+    writeFileSync(testClaudeMd, original);
+    cleanupClaudeMdLegacyBlock();
+    expect(readFileSync(testClaudeMd, 'utf8'), 'inline-span mention deleted').toBe(original);
+  });
+
+  it('leaves a four-space indented code block byte-identical', () => {
+    const original =
+      '# Notes\n\nIt prints:\n\n    <claude-mem-context>\n    ### Recent\n    </claude-mem-context>\n\nAfter.\n';
+    writeFileSync(testClaudeMd, original);
+    cleanupClaudeMdLegacyBlock();
+    expect(readFileSync(testClaudeMd, 'utf8'), 'indented-block mention deleted').toBe(original);
   });
 
   it('removes existing context block, preserving surrounding content', () => {
@@ -349,11 +627,9 @@ describe('cleanupClaudeMdLegacyBlock', () => {
   });
 
   it('removes the legacy hint comment alongside the block', () => {
-    const hint = '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
-    writeFileSync(
-      testClaudeMd,
-      `# Project\n\n${hint}\n<claude-mem-context>\nstale\n</claude-mem-context>\n`,
-    );
+    const hint =
+      '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
+    writeFileSync(testClaudeMd, `# Project\n\n${hint}\n<claude-mem-context>\nstale\n</claude-mem-context>\n`);
     cleanupClaudeMdLegacyBlock();
     const content = readFileSync(testClaudeMd, 'utf8');
     expect(content).toContain('# Project');
@@ -376,10 +652,7 @@ describe('cleanupClaudeMdLegacyBlock', () => {
   });
 
   it('does not collapse the file into pure whitespace when block spans most of it', () => {
-    writeFileSync(
-      testClaudeMd,
-      `# Only Header\n\n<claude-mem-context>\na\nb\nc\n</claude-mem-context>\n`,
-    );
+    writeFileSync(testClaudeMd, `# Only Header\n\n<claude-mem-context>\na\nb\nc\n</claude-mem-context>\n`);
     cleanupClaudeMdLegacyBlock();
     const content = readFileSync(testClaudeMd, 'utf8');
     expect(content).toContain('# Only Header');
@@ -395,12 +668,11 @@ describe('cleanupClaudeMdLegacyBlock', () => {
     const { RUNTIME_DIR } = await import('../hook-shared.mjs');
     const { inferProject } = await import('../utils.mjs');
     const markerPath = join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`);
-    try { unlinkSync(markerPath); } catch {}
+    try {
+      unlinkSync(markerPath);
+    } catch {}
 
-    writeFileSync(
-      testClaudeMd,
-      `# Project\n\n<claude-mem-context>\ncontent\n</claude-mem-context>\n`,
-    );
+    writeFileSync(testClaudeMd, `# Project\n\n<claude-mem-context>\ncontent\n</claude-mem-context>\n`);
     cleanupClaudeMdLegacyBlock();
 
     // Marker dropped after first call regardless of whether block existed
@@ -417,14 +689,18 @@ describe('cleanupClaudeMdLegacyBlock', () => {
     const afterSecond = readFileSync(testClaudeMd, 'utf8');
     expect(afterSecond).toBe(reintroduced); // untouched — proves short-circuit fired
 
-    try { unlinkSync(markerPath); } catch {}
+    try {
+      unlinkSync(markerPath);
+    } catch {}
   });
 
   it('writes marker even when CLAUDE.md does not exist (avoid repeated stat)', async () => {
     const { RUNTIME_DIR } = await import('../hook-shared.mjs');
     const { inferProject } = await import('../utils.mjs');
     const markerPath = join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`);
-    try { unlinkSync(markerPath); } catch {}
+    try {
+      unlinkSync(markerPath);
+    } catch {}
 
     expect(existsSync(testClaudeMd)).toBe(false);
     cleanupClaudeMdLegacyBlock();
@@ -435,7 +711,9 @@ describe('cleanupClaudeMdLegacyBlock', () => {
     // marker delete) is the recovery path.
     expect(existsSync(markerPath)).toBe(true);
 
-    try { unlinkSync(markerPath); } catch {}
+    try {
+      unlinkSync(markerPath);
+    } catch {}
   });
 });
 
@@ -473,7 +751,7 @@ describe('buildSummaryLines', () => {
   it('truncates long fields', () => {
     const summary = { request: 'x'.repeat(200), completed: '', next_steps: '', remaining_items: '' };
     const lines = buildSummaryLines(summary);
-    const requestLine = lines.find(l => l.startsWith('Request:'));
+    const requestLine = lines.find((l) => l.startsWith('Request:'));
     expect(requestLine.length).toBeLessThan(200);
   });
 });
@@ -484,7 +762,9 @@ describe('buildSessionContextLines: Deferred Work block (deferred_work-backed)',
     db = createTestDb();
     insertSession(db, { id: 'sess-x', project: 'test' });
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+  });
 
   it('renders open deferred_work items as numbered list with priority + D#N', () => {
     insertDeferred(db, { project: 'test', title: 'Round 2 zero-byte', priority: 3 });
@@ -526,9 +806,11 @@ describe('buildSessionContextLines: Deferred Work block (deferred_work-backed)',
     // Now they only appear in the Recent table; this block is dedicated to
     // the deferred_work table.
     insertObs(db, {
-      sessionId: 'sess-x', project: 'test',
+      sessionId: 'sess-x',
+      project: 'test',
       title: 'high-importance decision should not surface here anymore',
-      type: 'decision', importance: 3,
+      type: 'decision',
+      importance: 3,
     });
     const out = buildSessionContextLines(db, 'test');
     expect(out).not.toMatch(/### Deferred Work/);
@@ -537,18 +819,29 @@ describe('buildSessionContextLines: Deferred Work block (deferred_work-backed)',
 
 describe('buildSessionContextLines: Recent table cell safety', () => {
   let db;
-  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-r', project: 'test' }); });
-  afterEach(() => { db.close(); });
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-r', project: 'test' });
+  });
+  afterEach(() => {
+    db.close();
+  });
 
   it('escapes a literal pipe in a title so the markdown table stays 4 columns', () => {
-    insertObs(db, { sessionId: 'sess-r', project: 'test', type: 'decision', title: 'Use grep | sort | uniq pipeline', importance: 3 });
+    insertObs(db, {
+      sessionId: 'sess-r',
+      project: 'test',
+      type: 'decision',
+      title: 'Use grep | sort | uniq pipeline',
+      importance: 3,
+    });
     const out = buildSessionContextLines(db, 'test');
     // Select the TABLE ROW, not any line mentioning the word. On a project that is not
     // adopted the context block also renders a `### Key Context` bullet containing the same
     // title, and `.find()` returned that instead — so this passed or failed on whether the
     // HOST directory happened to be adopted (green in the maintainer's tree, red from any
     // clone). That is the very defect class this release's MAIN-1 fix is about.
-    const row = out.split('\n').find(l => l.startsWith('|') && l.includes('grep'));
+    const row = out.split('\n').find((l) => l.startsWith('|') && l.includes('grep'));
     expect(row).toBeTruthy();
     // Every cell-separating pipe is unescaped; title pipes are escaped \| — so a
     // correct row has exactly the 5 structural pipes of a 4-column row.
@@ -558,21 +851,303 @@ describe('buildSessionContextLines: Recent table cell safety', () => {
   });
 
   it('collapses CR/LF/tab in a title to spaces so one obs stays one row', () => {
-    insertObs(db, { sessionId: 'sess-r', project: 'test', type: 'bugfix', title: 'multi\nline\ttitle', importance: 2 });
+    insertObs(db, {
+      sessionId: 'sess-r',
+      project: 'test',
+      type: 'bugfix',
+      title: 'multi\nline\ttitle',
+      importance: 2,
+    });
     const out = buildSessionContextLines(db, 'test');
     // Table row, not any matching line — see the note in the pipe-escaping case above.
-    const row = out.split('\n').find(l => l.startsWith('|') && l.includes('multi'));
+    const row = out.split('\n').find((l) => l.startsWith('|') && l.includes('multi'));
     expect(row).toContain('multi line title');
+  });
+});
+
+// ─── "### Recent" must actually read newest-first ────────────────────────────────────────
+//
+// The table is headed "Recent (<date>)" and carries a Time column, so both a human and the
+// model read row 1 as "the last thing that happened". It was rendered in the greedy
+// knapsack's own pick order — value density — which is a SELECTION order, not a display
+// order. Observed in a real SessionStart injection: rows timed 14:34, 07:13, 11:20, 08:56,
+// 06:02, 13:46, 04:44, 07:27, 04:44, under that heading.
+//
+// The fix is display-only: which rows get picked (and the token budget that bounds them) is
+// unchanged; they are sorted by time before rendering. So the sweep below asserts the
+// rendered order AND a premise — that the selector's order really does differ here — since
+// a fixture where the two agree would pass without exercising anything.
+describe('buildSessionContextLines: Recent table is chronological', () => {
+  let db;
+  const HOUR = 3600000;
+  // Same-length titles so estimateTokens (the knapsack's cost term) cannot itself explain
+  // the ordering; the only axes that vary are age, importance and lesson_learned.
+  const rows = [
+    { title: 'aaaa newest row', epochOffset: -1 * HOUR, importance: 1, type: 'change' },
+    { title: 'bbbb second row', epochOffset: -10 * HOUR, importance: 1, type: 'change' },
+    { title: 'cccc third row!', epochOffset: -20 * HOUR, importance: 3, type: 'bugfix', lessonLearned: 'x' },
+    { title: 'dddd oldest row', epochOffset: -30 * HOUR, importance: 2, type: 'decision' },
+  ];
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-c', project: 'test' });
+    for (const r of rows) insertObs(db, { sessionId: 'sess-c', project: 'test', ...r });
+  });
+  afterEach(() => {
+    db.close();
+  });
+
+  it('renders the Recent table newest-first', () => {
+    const out = buildSessionContextLines(db, 'test');
+    const tag = (line) => line.slice(0, 40).match(/(aaaa|bbbb|cccc|dddd)/)?.[1];
+    const tableTags = out
+      .split('\n')
+      .filter((l) => l.startsWith('| #'))
+      .map(tag)
+      .filter(Boolean);
+    expect(tableTags).toEqual(['aaaa', 'bbbb', 'cccc', 'dddd']);
+  });
+
+  it('the selector order it corrects really does differ from time order (premise)', () => {
+    const picked = selectWithTokenBudget(db, 'test', 2000).observations;
+    const selectorTags = picked.map((o) => o.title.slice(0, 4));
+    expect(selectorTags).toHaveLength(4);
+    expect(selectorTags).not.toEqual(['aaaa', 'bbbb', 'cccc', 'dddd']);
+  });
+
+  it('sorting the display does not change WHICH rows the budget picked', () => {
+    const picked = new Set(selectWithTokenBudget(db, 'test', 2000).observations.map((o) => o.id));
+    const out = buildSessionContextLines(db, 'test');
+    const rendered = new Set(
+      out
+        .split('\n')
+        .filter((l) => l.startsWith('| #'))
+        .map((l) => Number(l.match(/^\| #(\d+)/)[1])),
+    );
+    expect(rendered).toEqual(picked);
+  });
+});
+
+describe('Key Context section quotas (D#196)', () => {
+  let db;
+  let savedEnv;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-q', project: 'test' });
+    // Both descriptive sections are dropped under `effectiveQuiet()`, which is
+    // `isQuietHooks() || isAdoptedHere(cwd)` — and THIS REPO IS ADOPTED, so with the
+    // default cwd every assertion below reads zero rows and would pass for a reason that
+    // has nothing to do with the quotas. Point the adoption probe at a directory that
+    // carries no managed block. Same hazard the Recent-table cases above call out:
+    // green in the maintainer's tree, red (or vacuous) from any clone.
+    savedEnv = { dir: process.env.CLAUDE_PROJECT_DIR, quiet: process.env.MEM_QUIET_HOOKS };
+    process.env.CLAUDE_PROJECT_DIR = mkdtempSync(join(tmpdir(), 'keyctx-notadopted-'));
+    delete process.env.MEM_QUIET_HOOKS;
+  });
+  afterEach(() => {
+    try {
+      rmSync(process.env.CLAUDE_PROJECT_DIR, { recursive: true, force: true });
+    } catch {
+      /* gone */
+    }
+    if (savedEnv.dir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+    else process.env.CLAUDE_PROJECT_DIR = savedEnv.dir;
+    if (savedEnv.quiet === undefined) delete process.env.MEM_QUIET_HOOKS;
+    else process.env.MEM_QUIET_HOOKS = savedEnv.quiet;
+    try {
+      db.close();
+    } catch {
+      /* already closed */
+    }
+  });
+
+  // R12 A2. `selectWithTokenBudget` and `fallbackObs` use DIFFERENT windows (obsPool's
+  // low-speed tier1 is 48h/imp>=1; fallback is 24h/imp>=1 OR 7d/imp>=2), and the two
+  // consumer sites resolved that with `observations.length >= 3 ? observations :
+  // fallbackObs` — a whole-set SWITCH. The windows are not nested, so at 1-2 selected
+  // rows the selection was thrown away for a fallback set that can be EMPTY: strictly
+  // less output from strictly more corpus.
+  const HOURS = 3600 * 1000;
+  const thin = (n) =>
+    insertObs(db, {
+      sessionId: 'sess-q',
+      project: 'test',
+      type: 'discovery',
+      importance: 1,
+      title: `thin row ${n}`,
+      epochOffset: -36 * HOURS - n * 1000,
+    });
+
+  it('premise: a 36h/imp=1 row is inside the selection window and outside both fallback arms', () => {
+    // Without this the case below cannot tell "the switch discarded the rows" from
+    // "the fixture never selected anything in the first place".
+    thin(0);
+    thin(1);
+    const { observations } = selectWithTokenBudget(db, 'test', 2000);
+    expect(observations.length, 'fixture rows were not selected — the window moved').toBe(2);
+  });
+
+  it('keeps 1-2 selected rows instead of swapping them for an empty fallback', () => {
+    thin(0);
+    thin(1);
+    const out = buildSessionContextLines(db, 'test');
+    expect(out, 'two real observations produced an empty context block').not.toBe('');
+    expect(out).toContain('thin row 0');
+    expect(out).toContain('thin row 1');
+  });
+
+  it('injected row count does not shrink as the corpus grows from 2 rows to 3', () => {
+    // The defect was visible as non-monotonicity: n=2 rendered 0 rows and n=3 rendered 3.
+    // Asserting monotonicity rather than an exact count keeps this case alive if the
+    // windows are ever retuned.
+    thin(0);
+    thin(1);
+    const atTwo = buildSessionContextLines(db, 'test')
+      .split('\n')
+      .filter((l) => l.startsWith('| #')).length;
+    thin(2);
+    const atThree = buildSessionContextLines(db, 'test')
+      .split('\n')
+      .filter((l) => l.startsWith('| #')).length;
+    expect(atTwo, 'n=2 rendered no rows at all').toBeGreaterThan(0);
+    expect(atThree).toBeGreaterThanOrEqual(atTwo);
+  });
+
+  it('does not render a row twice when it is in both the selection and the fallback', () => {
+    // Hazard introduced BY the top-up, not present in the switch it replaced: the fallback
+    // query carries no project filter, so a fresh local row satisfies both sides. 2h/imp=1
+    // is inside obsPool tier1 AND inside the fallback's 24h/imp>=1 arm.
+    insertObs(db, {
+      sessionId: 'sess-q',
+      project: 'test',
+      type: 'discovery',
+      importance: 1,
+      title: 'row in both sets',
+      epochOffset: -2 * HOURS,
+    });
+    const out = buildSessionContextLines(db, 'test');
+    // Scope to the Recent TABLE. A row legitimately appears in both Key Context and the
+    // table, so counting the title across the whole block asserts on the wrong population
+    // and reds on correct output — the first draft of this case did exactly that.
+    const tableRows = out.split('\n').filter((l) => l.startsWith('| #') && l.includes('row in both sets'));
+    expect(tableRows.length, 'the same observation was rendered twice in the Recent table').toBe(1);
+  });
+
+  it('premise: the sections render at all in this fixture', () => {
+    // Without this the three cases below cannot distinguish "the quota is wrong" from
+    // "the quiet gate ate the whole block", which is the failure mode that made the
+    // first draft of them report 0/0 and look like a quota bug.
+    lesson(0);
+    expect(buildSessionContextLines(db, 'test')).toContain('### File Lessons');
+  });
+
+  // A row lands in File Lessons only if it has BOTH a lesson and a parseable first
+  // filename; anything else falls to Key Context. These two helpers are the two shapes.
+  const lesson = (n) =>
+    insertObs(db, {
+      sessionId: 'sess-q',
+      project: 'test',
+      type: 'bugfix',
+      importance: 3,
+      title: `lesson row ${n}`,
+      lessonLearned: `retire the wrong thing ${n}`,
+      filesModified: JSON.stringify([`src/file${n}.mjs`]),
+      epochOffset: -n * 1000,
+    });
+  const plain = (n) =>
+    insertObs(db, {
+      sessionId: 'sess-q',
+      project: 'test',
+      type: 'decision',
+      importance: 3,
+      title: `plain row ${n}`,
+      epochOffset: -n * 1000,
+    });
+
+  it('an all-one-shape pool emits the whole pool, not half of it', () => {
+    // The defect: 10 rows fetched, 5 rendered, the sibling section empty. Measured on the
+    // live DB at 2026-09-02T10:28Z, 10 of 11 projects were in this state to some degree
+    // and code-graph-mcp was exactly this one — 10 File Lessons, 0 Key Context.
+    for (let i = 0; i < 10; i++) lesson(i);
+    const out = buildSessionContextLines(db, 'test');
+    const rows = extractSection(out, 'File Lessons')
+      .split('\n')
+      .filter((l) => l.startsWith('- '));
+    expect(rows.length, 'all ten pooled rows should be emitted, not five').toBe(10);
+    expect(extractSection(out, 'Key Context')).toBe('');
+  });
+
+  it('a balanced pool is unchanged — 5 and 5, exactly as before', () => {
+    // Guards the fix against being a widening: where both sections could already fill
+    // their half, nothing about the output may move.
+    for (let i = 0; i < 5; i++) lesson(i);
+    for (let i = 5; i < 10; i++) plain(i);
+    const out = buildSessionContextLines(db, 'test');
+    const fl = extractSection(out, 'File Lessons')
+      .split('\n')
+      .filter((l) => l.startsWith('- '));
+    const kc = extractSection(out, 'Key Context')
+      .split('\n')
+      .filter((l) => l.startsWith('- '));
+    expect([fl.length, kc.length]).toEqual([5, 5]);
+  });
+
+  it('a lopsided pool fills from the side that has rows', () => {
+    for (let i = 0; i < 9; i++) lesson(i);
+    plain(9);
+    const out = buildSessionContextLines(db, 'test');
+    const fl = extractSection(out, 'File Lessons')
+      .split('\n')
+      .filter((l) => l.startsWith('- '));
+    const kc = extractSection(out, 'Key Context')
+      .split('\n')
+      .filter((l) => l.startsWith('- '));
+    // 9/1 was emitting 6 of 10 (projects--mem's real shape on the measurement date).
+    expect([fl.length, kc.length]).toEqual([9, 1]);
+  });
+
+  it('sectionQuotas is strictly additive and never exceeds the pool, over every split', () => {
+    // The property the comment claims, asserted over the whole domain rather than at the
+    // three points above — "it only adds" is exactly the sentence this repo keeps finding
+    // to be false when only sampled.
+    // Derived, not hardcoded: `sectionQuotas` takes both from KEY_CONTEXT_LIMIT, so a
+    // re-tune of the constant must move this test's expectations with it rather than
+    // leaving it asserting a pool size the code no longer uses.
+    const POOL = KEY_CONTEXT_LIMIT;
+    const HALF = Math.floor(POOL / 2);
+    for (let fl = 0; fl <= 2 * POOL; fl++) {
+      for (let kc = 0; kc <= 2 * POOL; kc++) {
+        const q = sectionQuotas(fl, kc);
+        expect(q.fileLessonQuota, `fl=${fl} kc=${kc}: cannot show more than exist`).toBeLessThanOrEqual(fl);
+        expect(q.keyContextQuota, `fl=${fl} kc=${kc}: cannot show more than exist`).toBeLessThanOrEqual(kc);
+        // Never fewer than the old fixed halves — this is the additivity claim.
+        expect(q.fileLessonQuota, `fl=${fl} kc=${kc}: regression vs the old cap`).toBeGreaterThanOrEqual(
+          Math.min(fl, HALF),
+        );
+        expect(q.keyContextQuota, `fl=${fl} kc=${kc}: regression vs the old cap`).toBeGreaterThanOrEqual(
+          Math.min(kc, HALF),
+        );
+        // And the combined ceiling is still one pool, not two.
+        expect(
+          q.fileLessonQuota + q.keyContextQuota,
+          `fl=${fl} kc=${kc}: exceeded the pool`,
+        ).toBeLessThanOrEqual(POOL);
+      }
+    }
   });
 });
 
 function extractSection(text, header) {
   const lines = text.split('\n');
-  const startIdx = lines.findIndex(l => l.startsWith(`### ${header}`));
+  const startIdx = lines.findIndex((l) => l.startsWith(`### ${header}`));
   if (startIdx === -1) return '';
   let endIdx = lines.length;
   for (let i = startIdx + 1; i < lines.length; i++) {
-    if (lines[i].startsWith('### ')) { endIdx = i; break; }
+    if (lines[i].startsWith('### ')) {
+      endIdx = i;
+      break;
+    }
   }
   return lines.slice(startIdx, endIdx).join('\n');
 }

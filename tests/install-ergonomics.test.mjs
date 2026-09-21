@@ -10,6 +10,7 @@ import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import { collectOrphanHookPaths } from '../install.mjs';
+import { NATIVE_BINDING_REBUILD_CMD, NATIVE_BINDING_SOURCE_BUILD_CMD } from '../lib/binding-probe.mjs';
 
 const INSTALL_PATH = resolve('install.mjs');
 const SETUP_PATH = resolve('scripts/setup.sh');
@@ -74,7 +75,10 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       // instead skip the probe and coast on setup.sh's binding_usable fallback,
       // testing nothing about bareProbe.)
       mkdirSync(join(pluginRoot, 'scripts'), { recursive: true });
-      copyFileSync(resolve('scripts/binding-probe-cli.mjs'), join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'));
+      copyFileSync(
+        resolve('scripts/binding-probe-cli.mjs'),
+        join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'),
+      );
       makeWorkingNodeModules(dataDir);
 
       execFileSync('bash', [SETUP_PATH], {
@@ -85,7 +89,9 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
 
       expect(existsSync(flag)).toBe(false);
     } finally {
-      try { rmSync(home, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(home, { recursive: true, force: true });
+      } catch {}
     }
   });
 
@@ -106,7 +112,10 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       for (const f of ['binding-probe.mjs', 'proc-lock.mjs', 'resolve-data-dir.mjs']) {
         copyFileSync(resolve('lib', f), join(pluginRoot, 'lib', f));
       }
-      copyFileSync(resolve('scripts/binding-probe-cli.mjs'), join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'));
+      copyFileSync(
+        resolve('scripts/binding-probe-cli.mjs'),
+        join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'),
+      );
       const nm = makeWorkingNodeModules(pluginRoot);
 
       const flag = join(dataDir, 'runtime', '.deps-broken');
@@ -124,7 +133,9 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       const abi = process.versions.modules;
       expect(existsSync(join(nm, `.mem-binding-ok-${abi}`))).toBe(true);
     } finally {
-      try { rmSync(home, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(home, { recursive: true, force: true });
+      } catch {}
     }
   });
 
@@ -165,7 +176,9 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       // SessionStart stdout is a JSON envelope — a crashing child must not reach it.
       expect(out).toBe('');
     } finally {
-      try { rmSync(home, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(home, { recursive: true, force: true });
+      } catch {}
     }
   });
 
@@ -191,7 +204,10 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       for (const f of ['binding-probe.mjs', 'proc-lock.mjs', 'resolve-data-dir.mjs']) {
         copyFileSync(resolve('lib', f), join(pluginRoot, 'lib', f));
       }
-      copyFileSync(resolve('scripts/binding-probe-cli.mjs'), join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'));
+      copyFileSync(
+        resolve('scripts/binding-probe-cli.mjs'),
+        join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'),
+      );
 
       const flag = join(dataDir, 'runtime', '.deps-broken');
 
@@ -205,10 +221,28 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       expect(existsSync(flag)).toBe(true);
       const written = JSON.parse(readFileSync(flag, 'utf8'));
       expect(written.reason).toContain('binding probe/rebuild failed');
-      expect(written.repair).toContain('npm rebuild better-sqlite3 --dangerously-allow-all-scripts');
-      expect(existsSync(join(pluginRoot, 'node_modules', `.mem-binding-ok-${process.versions.modules}`))).toBe(false);
+      // Audit R8 §11.3. This line used to assert only the npm-rebuild command, which the
+      // repaired hint contains as its FIRST HALF — so the assertion held for both shapes and
+      // could not fail. Confirmed against the real revert, not a hand-typed one:
+      // `git show cb00974:scripts/setup.sh` line 190 passes `"npm rebuild better-sqlite3
+      // --dangerously-allow-all-scripts"` alone, and `toContain` on that substring is green
+      // against it. On better-sqlite3 13 that command exits 0 without compiling, so the shape
+      // this guard exists to catch is a repair line that reports success on a dead binding.
+      //
+      // Assert the CHAIN instead, against the constants rather than a literal: setup.sh cannot
+      // import lib/, so its copy is pinned to these two by
+      // tests/audit-r8-binding-repair-hint.test.mjs, and this case pins what setup.sh actually
+      // writes at runtime. `&&`, never `||` — step 1 exits 0 whether or not it compiled, so an
+      // `||` chain never reaches step 2, which is the original defect itself.
+      expect(written.repair).toContain(`${NATIVE_BINDING_REBUILD_CMD} && ${NATIVE_BINDING_SOURCE_BUILD_CMD}`);
+      expect(written.repair).not.toContain('||');
+      expect(
+        existsSync(join(pluginRoot, 'node_modules', `.mem-binding-ok-${process.versions.modules}`)),
+      ).toBe(false);
     } finally {
-      try { rmSync(home, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(home, { recursive: true, force: true });
+      } catch {}
     }
   }, 60000);
 });
@@ -222,10 +256,12 @@ describe('collectOrphanHookPaths (v2.79)', () => {
   it('returns empty for non-mem hooks even when paths are missing', () => {
     const settings = {
       hooks: {
-        SessionStart: [{
-          matcher: '*',
-          hooks: [{ type: 'command', command: 'node "/no/such/other/hook.mjs"' }],
-        }],
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [{ type: 'command', command: 'node "/no/such/other/hook.mjs"' }],
+          },
+        ],
       },
     };
     expect(collectOrphanHookPaths(settings)).toEqual([]);
@@ -234,14 +270,25 @@ describe('collectOrphanHookPaths (v2.79)', () => {
   it('flags mem hooks pointing at missing absolute paths', () => {
     const settings = {
       hooks: {
-        SessionStart: [{
-          matcher: '*',
-          hooks: [{ type: 'command', command: 'node "/tmp/nonexistent-claude-mem-lite/hook.mjs" session-start' }],
-        }],
-        PostToolUse: [{
-          matcher: '*',
-          hooks: [{ type: 'command', command: 'bash "/tmp/nonexistent-claude-mem-lite/scripts/post-tool-use.sh"' }],
-        }],
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [
+              { type: 'command', command: 'node "/tmp/nonexistent-claude-mem-lite/hook.mjs" session-start' },
+            ],
+          },
+        ],
+        PostToolUse: [
+          {
+            matcher: '*',
+            hooks: [
+              {
+                type: 'command',
+                command: 'bash "/tmp/nonexistent-claude-mem-lite/scripts/post-tool-use.sh"',
+              },
+            ],
+          },
+        ],
       },
     };
     const orphans = collectOrphanHookPaths(settings);
@@ -252,10 +299,12 @@ describe('collectOrphanHookPaths (v2.79)', () => {
   it('ignores ${CLAUDE_PLUGIN_ROOT}-templated hooks (those are plugin-owned, runtime-resolved)', () => {
     const settings = {
       hooks: {
-        SessionStart: [{
-          matcher: '*',
-          hooks: [{ type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/hook.mjs" session-start' }],
-        }],
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [{ type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/hook.mjs" session-start' }],
+          },
+        ],
       },
     };
     expect(collectOrphanHookPaths(settings)).toEqual([]);
@@ -266,10 +315,12 @@ describe('collectOrphanHookPaths (v2.79)', () => {
     const real = INSTALL_PATH;
     const settings = {
       hooks: {
-        SessionStart: [{
-          matcher: '*',
-          hooks: [{ type: 'command', command: `node "${real}" session-start` }],
-        }],
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [{ type: 'command', command: `node "${real}" session-start` }],
+          },
+        ],
       },
     };
     expect(collectOrphanHookPaths(settings)).toEqual([]);
@@ -285,13 +336,18 @@ describe('collectOrphanHookPaths (v2.79)', () => {
     // the trailing arg as $0 to the inline script). The parser is what we test.
     const settings = {
       hooks: {
-        SessionStart: [{
-          matcher: '*',
-          hooks: [{
-            type: 'command',
-            command: 'bash -c "claude-mem-lite tracer; exec bash" "/tmp/nonexistent-claude-mem-lite/scripts/wrapped.sh"',
-          }],
-        }],
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [
+              {
+                type: 'command',
+                command:
+                  'bash -c "claude-mem-lite tracer; exec bash" "/tmp/nonexistent-claude-mem-lite/scripts/wrapped.sh"',
+              },
+            ],
+          },
+        ],
       },
     };
     const orphans = collectOrphanHookPaths(settings);
@@ -302,18 +358,24 @@ describe('collectOrphanHookPaths (v2.79)', () => {
   it('deduplicates repeated missing paths across hook events', () => {
     const settings = {
       hooks: {
-        SessionStart: [{
-          matcher: '*',
-          hooks: [{ type: 'command', command: 'node "/tmp/nonexistent-claude-mem-lite/hook.mjs" session-start' }],
-        }],
-        Stop: [{
-          matcher: '*',
-          hooks: [{ type: 'command', command: 'node "/tmp/nonexistent-claude-mem-lite/hook.mjs" stop' }],
-        }],
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [
+              { type: 'command', command: 'node "/tmp/nonexistent-claude-mem-lite/hook.mjs" session-start' },
+            ],
+          },
+        ],
+        Stop: [
+          {
+            matcher: '*',
+            hooks: [{ type: 'command', command: 'node "/tmp/nonexistent-claude-mem-lite/hook.mjs" stop' }],
+          },
+        ],
       },
     };
     const orphans = collectOrphanHookPaths(settings);
-    expect(orphans.filter(p => p === '/tmp/nonexistent-claude-mem-lite/hook.mjs')).toHaveLength(1);
+    expect(orphans.filter((p) => p === '/tmp/nonexistent-claude-mem-lite/hook.mjs')).toHaveLength(1);
   });
 });
 
@@ -323,17 +385,28 @@ describe('doctor surfaces orphan hooks (v2.79)', () => {
     try {
       mkdirSync(join(home, '.claude'), { recursive: true });
       // Seed settings.json with mem hooks pointing at a non-existent install root
-      writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({
-        hooks: {
-          SessionStart: [{
-            matcher: '*',
-            hooks: [{
-              type: 'command',
-              command: 'node "/tmp/nonexistent-claude-mem-lite-doctor/hook.mjs" session-start',
-            }],
-          }],
-        },
-      }, null, 2));
+      writeFileSync(
+        join(home, '.claude', 'settings.json'),
+        JSON.stringify(
+          {
+            hooks: {
+              SessionStart: [
+                {
+                  matcher: '*',
+                  hooks: [
+                    {
+                      type: 'command',
+                      command: 'node "/tmp/nonexistent-claude-mem-lite-doctor/hook.mjs" session-start',
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          null,
+          2,
+        ),
+      );
 
       let output = '';
       try {
@@ -351,7 +424,154 @@ describe('doctor surfaces orphan hooks (v2.79)', () => {
       expect(output).toContain('/tmp/nonexistent-claude-mem-lite-doctor/hook.mjs');
       expect(output).toMatch(/Repair:.*install\.mjs uninstall/);
     } finally {
-      try { rmSync(home, { recursive: true, force: true }); } catch {}
+      try {
+        rmSync(home, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+});
+
+// `status`'s CLI check probes a BARE name, so one failure covers three different worlds and
+// the single remedy it used to print ("run install again to create symlink") was right in
+// only one of them. On the common one — `createCliSymlink` puts a working link in
+// ~/.local/bin, which a non-login shell frequently does not have on PATH — it told the user
+// to re-run an installer that would create the symlink that already exists, report ✓, and
+// leave `status` printing the same line. Advice that cannot converge is worse than the
+// silence it replaced.
+//
+// The fixture pins PATH to one EMPTY directory rather than filtering the inherited one: the
+// check's whole question is "does this bare name resolve", and a maintainer with a global
+// `npm i -g claude-mem-lite` would otherwise land in the ✓ branch and make every assertion
+// below vacuous on exactly one machine. The only other command `status` shells out to is
+// `claude` (for `mcp list`), already inside a try/catch that degrades to its own ⚠.
+//
+// PATH is controllable; `/usr/local/bin` is not. `CLI_BIN_DIRS[1]` is absolute, so a machine
+// that really has `/usr/local/bin/claude-mem-lite` would push the "no symlink anywhere" arms
+// into the linked branch and fail them for a reason that is not a regression. Rather than
+// leave that as a silent machine-dependency — the pre-ship reviewer found these two arms
+// passing here only by accident of this host — each such arm asserts the premise first, so
+// the failure says WHICH assumption broke instead of pointing at the code under test.
+describe('status distinguishes "no symlink" from "symlink off PATH"', () => {
+  const GLOBAL_BIN_CLI = '/usr/local/bin/claude-mem-lite';
+  function runStatus(home) {
+    const emptyBin = join(home, 'empty-bin');
+    mkdirSync(emptyBin, { recursive: true });
+    try {
+      return execFileSync(process.execPath, [INSTALL_PATH, 'status'], {
+        encoding: 'utf8',
+        env: envWithoutPluginRoot({
+          HOME: home,
+          PATH: emptyBin,
+          CLAUDE_MEM_DIR: join(home, '.claude-mem-lite'),
+          MEM_NO_AUTO_ADOPT: '1',
+        }),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      return (e.stdout || '') + (e.stderr || '');
+    }
+  }
+
+  it('names the directory to add when the symlink exists but is not on PATH', () => {
+    const home = makeTmpDir();
+    try {
+      const binDir = join(home, '.local', 'bin');
+      mkdirSync(binDir, { recursive: true });
+      symlinkSync(resolve('cli.mjs'), join(binDir, 'claude-mem-lite'));
+
+      const output = runStatus(home);
+      expect(output).toContain(`installed at ${join(binDir, 'claude-mem-lite')}`);
+      expect(output).toContain(`export PATH="${binDir}:$PATH"`);
+      // The reinstall remedy is the WRONG answer here; its absence is the fix.
+      expect(output).not.toContain('run install again to create symlink');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the reinstall remedy when no symlink exists anywhere', () => {
+    // Premise, not decoration: this arm is only about the empty case if BOTH bin dirs are
+    // empty, and only one of them is under the sandboxed HOME.
+    expect(existsSync(GLOBAL_BIN_CLI)).toBe(false);
+    const home = makeTmpDir();
+    try {
+      const output = runStatus(home);
+      expect(output).toContain('run install again to create symlink');
+      expect(output).not.toContain('is not on PATH — add it');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the failure itself, not PATH, when the command is on PATH but fails', () => {
+    // The non-ENOENT branch. It had zero coverage on its first cut — rewriting it to push
+    // 'ok' left the whole suite at baseline — yet it is reachable: a shim that exits
+    // non-zero is the same shape as the live case, a CLI whose native binding will not
+    // load. What this pins is the BRANCH CHOICE: neither PATH remedy may appear. The
+    // child's stderr assertion rides along because `e.message` already carries it
+    // ("Command failed: <cmd>\n<stderr>" under stdio:'pipe') — measured, after a redundant
+    // `e.stderr` suffix was written on a review finding and then withdrawn.
+    const home = makeTmpDir();
+    try {
+      const shimDir = join(home, 'shim');
+      mkdirSync(shimDir, { recursive: true });
+      const shim = join(shimDir, 'claude-mem-lite');
+      writeFileSync(shim, '#!/bin/sh\necho "native binding did not load" >&2\nexit 1\n');
+      execFileSync('chmod', ['+x', shim]);
+
+      const output = execFileSync(process.execPath, [INSTALL_PATH, 'status'], {
+        encoding: 'utf8',
+        env: envWithoutPluginRoot({
+          HOME: home,
+          PATH: shimDir,
+          CLAUDE_MEM_DIR: join(home, '.claude-mem-lite'),
+          MEM_NO_AUTO_ADOPT: '1',
+        }),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      expect(output).toContain('on PATH but "claude-mem-lite --help" failed');
+      expect(output).toContain('native binding did not load');
+      expect(output).not.toContain('is not on PATH — add it');
+      expect(output).not.toContain('run install again to create symlink');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a DIRECTORY of that name as absent, not as an off-PATH install', () => {
+    // `existsSync` is true for a directory, which would make status print "installed at …
+    // add it to PATH" about something that can never be executed — the same
+    // cannot-converge advice the whole split exists to remove, one shape over.
+    expect(existsSync(GLOBAL_BIN_CLI)).toBe(false);
+    const home = makeTmpDir();
+    try {
+      mkdirSync(join(home, '.local', 'bin', 'claude-mem-lite'), { recursive: true });
+      const output = runStatus(home);
+      expect(output).toContain('run install again to create symlink');
+      expect(output).not.toContain('is not on PATH — add it');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a DANGLING symlink as absent, not as an off-PATH install', () => {
+    expect(existsSync(GLOBAL_BIN_CLI)).toBe(false);
+    // existsSync follows the link, so a link whose target was deleted reads as missing —
+    // which is the answer we want: that is the installer's problem, not PATH's. Measured
+    // rather than assumed; the branch is one `existsSync` away from claiming a deleted
+    // install is merely unreachable.
+    const home = makeTmpDir();
+    try {
+      const binDir = join(home, '.local', 'bin');
+      mkdirSync(binDir, { recursive: true });
+      symlinkSync(join(home, 'deleted-install', 'cli.mjs'), join(binDir, 'claude-mem-lite'));
+
+      const output = runStatus(home);
+      expect(output).toContain('run install again to create symlink');
+      expect(output).not.toContain('is not on PATH — add it');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

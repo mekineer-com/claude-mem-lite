@@ -48,14 +48,16 @@ function seedRow(importance = 1) {
   initSchema(db);
   const old = Date.now() - 45 * 86400000;
   db.prepare(
-    "INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)"
-    + " VALUES ('s1','s1',?,?,?,'active')",
+    'INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)' +
+      " VALUES ('s1','s1',?,?,?,'active')",
   ).run(PROJECT, new Date(old).toISOString(), old);
-  const id = db.prepare(
-    "INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts,"
-    + " facts, files_read, files_modified, importance, related_ids, access_count, injection_count, created_at, created_at_epoch)"
-    + " VALUES ('s1', ?, 'stale body', 'change', 'stale row', '', '', '', '', '[]', '[]', ?, '[]', 0, 0, ?, ?)",
-  ).run(PROJECT, importance, new Date(old).toISOString(), old).lastInsertRowid;
+  const id = db
+    .prepare(
+      'INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts,' +
+        ' facts, files_read, files_modified, importance, related_ids, access_count, injection_count, created_at, created_at_epoch)' +
+        " VALUES ('s1', ?, 'stale body', 'change', 'stale row', '', '', '', '', '[]', '[]', ?, '[]', 0, 0, ?, ?)",
+    )
+    .run(PROJECT, importance, new Date(old).toISOString(), old).lastInsertRowid;
   db.close();
   return id;
 }
@@ -109,7 +111,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  try {
+    rmSync(dataDir, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
 });
 
 describe('auto-maintain — cross-process mutex', () => {
@@ -182,17 +188,19 @@ describe('auto-maintain — cross-process mutex', () => {
     expect(importanceOf(id)).toBe(1);
 
     rmSync(gateFile, { force: true });
-    holdLock();          // the peer is mid-pass, exactly as during a real overlap
+    holdLock(); // the peer is mid-pass, exactly as during a real overlap
     runAutoMaintain();
     expect(compressedInto(id)).toBe(0);
     expect(importanceOf(id)).toBe(1);
   });
 
-  it('is not named *.lock, so the 30s SessionStart lock sweeper cannot strip it mid-pass', () => {
-    // cleanStaleLockFiles() unlinks every `*.lock` in RUNTIME_DIR older than
-    // STALE_LOCK_MS (30s) WITHOUT checking whether the holder is alive — a policy sized
-    // for the episode lock's millisecond critical section. A maintenance pass is orders
-    // of magnitude longer, so being swept would hand the exclusion back to the race.
+  it('is not named *.lock, so the SessionStart lock sweeper cannot strip it mid-pass', () => {
+    // cleanStaleLockFiles() unlinks every `*.lock` in RUNTIME_DIR that it judges abandoned.
+    // Until A20260905-R5-P1-1 that judgement was age alone past STALE_LOCK_MS (30s) — a
+    // policy sized for the episode lock's millisecond critical section, while a maintenance
+    // pass is orders of magnitude longer. It now spares a live holder, but this mutex keeps
+    // its escape: not being enumerated at all is a stronger guarantee than being spared by a
+    // pid probe, and pids say nothing across a shared homedir.
     //
     // Behavioural, not a name assertion: age a live-held mutex past 30s, run the sweeper
     // by way of a real SessionStart, and require the mutex to survive. Renaming the file
@@ -205,8 +213,11 @@ describe('auto-maintain — cross-process mutex', () => {
     utimesSync(lockPath, aged, aged);
 
     // A decoy under the swept policy proves the sweeper actually ran in this subprocess.
+    // Its pid must be a DEAD one: since A20260905-R5-P1-1 a live holder is spared regardless
+    // of age, so a decoy carrying this process's pid would survive and stop witnessing
+    // anything. 0x7ffffffe is above Linux's default pid_max → process.kill reports ESRCH.
     const decoy = join(runtimeDir, 'decoy.lock');
-    writeFileSync(decoy, JSON.stringify({ pid: process.pid, ts: Date.now() - 5 * 60 * 1000 }));
+    writeFileSync(decoy, JSON.stringify({ pid: 0x7ffffffe, ts: Date.now() - 5 * 60 * 1000 }));
     utimesSync(decoy, aged, aged);
 
     execFileSync(process.execPath, [HOOK, 'session-start'], {

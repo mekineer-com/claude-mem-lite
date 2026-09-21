@@ -7,19 +7,21 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, chmodSync } from 'fs';
 import { OBS_FTS_COLUMNS, debugCatch } from './utils.mjs';
-import { resolveDataDir } from './lib/resolve-data-dir.mjs';
+// Imported, never re-declared: a hand-copied marker string is this repo's twin-drift
+// class, and every consumer of the forward-incompat throw keys on this exact value.
+// schema-skew.mjs imports nothing local, so this closes no cycle.
+import { SCHEMA_SKEW_CODE } from './lib/schema-skew.mjs';
+import { isFtsCorruptionError } from './lib/db-unusable.mjs';
 
-// DATA location — DB, managed resources, registry DB, runtime/. Honors
-// CLAUDE_MEM_DIR so users can relocate state to a larger/faster volume.
-export const DB_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
-export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
-export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
-// CODE / install location — server.mjs, hook.mjs, cli.mjs, package.json live
-// here. ALWAYS homedir-rooted: Claude Code's settings.json + MCP registration
-// bake ABSOLUTE paths to server.mjs/hooks, so the code must NOT follow the
-// CLAUDE_MEM_DIR relocation env var (mirrors install.mjs INSTALL_DIR). Equals
-// DB_DIR when CLAUDE_MEM_DIR is unset — the common, non-relocated case.
-export const CODE_DIR = join(homedir(), '.claude-mem-lite');
+// The three location constants now live in lib/data-paths.mjs — a leaf module with no
+// package imports — and are re-exported here so every existing importer is unchanged.
+// This file statically imports better-sqlite3, so holding a path constant here made the
+// native driver a load-time dependency of anything that wanted one; that is what put the
+// Ed25519-verified repair path out of reach on a tree with no node_modules. Imported AND
+// re-exported (not `export … from`) because schema.mjs uses DB_DIR / DB_PATH itself.
+// See lib/data-paths.mjs and tests/repair-path-no-native-dep.test.mjs.
+import { DB_DIR, DB_PATH, CODE_DIR } from './lib/data-paths.mjs';
+export { DB_DIR, DB_PATH, CODE_DIR };
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
 //
@@ -129,10 +131,6 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // 2026-07-14 on this machine's own DB). One version per migration batch keeps
 // the version number itself the detector. LATEST_MIGRATION_COLUMN advances to
 // observations.scope.
-// v45 (search-quality telemetry): search_runs records the two explicit search
-// surfaces and search_results records each exposed ranked item plus its optional
-// relevance judgment. This local fork addition shares the historical v45 number
-// with upstream's funnel table; current sentinels require both table families.
 // v45 (per-surface funnel): citation_surface_log — the same invocation→cite
 // funnel as citation_log (v38) but split by INJECTION FACE. citation_log answers
 // "is effectiveness rising or falling" for a project; it cannot answer "which
@@ -156,7 +154,23 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // (citation_surface_log.surface) in LATEST_MIGRATION_COLUMNS: a table that only
 // the forced pass can create is unreachable forever once the version row says
 // "done", which is not a hypothetical — see the note there.
-export const CURRENT_SCHEMA_VERSION = 46;
+// v47: two additive indexes (P2-11 + ALGO-7). The bump is LOAD-BEARING, not bookkeeping:
+// `initSchema`'s fast path returns before the `CREATE INDEX IF NOT EXISTS` block, so on
+// every existing install at v46 a new index there would simply never be created. Same trap
+// the FTS5 migration hit — a DDL change that is not reachable from the version the DB
+// already reports is a no-op with a convincing diff.
+// v48 (R11-B-P1-1): observations.last_access_session_id — the THIRD per-row session key
+// on this table, and it exists for the same reason as the other two. `Stop` fires once
+// per assistant TURN and rescans the whole transcript, so `bumpCitationAccess` re-credited
+// one citation on every later turn of the same session: real-corpus replay over 51
+// transcripts read 338 credits across 43 distinct (session, id) pairs = 7.86x, single
+// session worst case 18.75x. That feeds boostAccessed (access_count > 3 → importance + 1,
+// in DEFAULT_MAINTAIN_OPS, unattended daily) and suppresses noisePenaltyClause, whose
+// predicate reads `injection_count > access_count * 3`. Additive + nullable: legacy rows
+// read NULL and are credited exactly once more, on their next citation, then stamp.
+// The column holds the LAST crediting session, not a set, so two same-project sessions
+// interleaving their turns flip it between them — see the scope note in bumpCitationAccess.
+export const CURRENT_SCHEMA_VERSION = 49;
 
 // Sentinel columns for the LATEST migration set(s). The fast-path uses these
 // to self-heal half-migrated DBs — schema_version bumped but column ALTERs
@@ -177,19 +191,18 @@ export const CURRENT_SCHEMA_VERSION = 46;
 // pragma_table_info on a missing table returns zero rows (it does not throw), so
 // naming any column of the new table is a table-presence check.
 const LATEST_MIGRATION_COLUMNS = [
-  { table: 'observations', column: 'decay_seen_at_first_cite' },   // v46
-  { table: 'citation_surface_log', column: 'surface' },            // v45
-  { table: 'search_runs', column: 'search_id' },                   // local v45
-  { table: 'search_results', column: 'relevance' },                // local v45
-  { table: 'observations', column: 'scope' },                      // v44
+  { table: 'observations', column: 'last_access_session_id' }, // v48
+  { table: 'observations', column: 'decay_seen_at_first_cite' }, // v46
+  { table: 'citation_surface_log', column: 'surface' }, // v45
+  { table: 'search_runs', column: 'search_id' }, // local search telemetry
+  { table: 'search_results', column: 'relevance' }, // local search telemetry
+  { table: 'observations', column: 'scope' }, // v44
   { table: 'observation_files', column: 'last_cited_session_id' }, // v43
 ];
 
 function hasLatestMigrationColumn(db) {
   try {
-    const stmt = db.prepare(
-      `SELECT 1 AS present FROM pragma_table_info(?) WHERE name = ?`
-    );
+    const stmt = db.prepare(`SELECT 1 AS present FROM pragma_table_info(?) WHERE name = ?`);
     return LATEST_MIGRATION_COLUMNS.every(({ table, column }) => Boolean(stmt.get(table, column)));
   } catch {
     return false; // table itself missing → caller falls through to CORE_SCHEMA
@@ -356,7 +369,7 @@ const CORE_SCHEMA = `
 // Column migrations (idempotent — only swallow "duplicate column" errors)
 const MIGRATIONS = [
   'ALTER TABLE observations ADD COLUMN importance INTEGER DEFAULT 1',
-  'ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT \'[]\'',
+  "ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT '[]'",
   'ALTER TABLE observations ADD COLUMN minhash_sig TEXT',
   'ALTER TABLE observations ADD COLUMN access_count INTEGER DEFAULT 0',
   'ALTER TABLE observations ADD COLUMN compressed_into INTEGER DEFAULT NULL',
@@ -434,6 +447,32 @@ const MIGRATIONS = [
   // destroy the distinction the column exists to record. Legacy rows stay NULL — they
   // are not evidence of anything and must not be read as first-cite-at-0.
   'ALTER TABLE observations ADD COLUMN decay_seen_at_first_cite INTEGER DEFAULT NULL',
+  // v48 (R11-B-P1-1): the access-channel idempotency key. Sibling of
+  // last_decided_session_id (v40, uncited/streak arm) and last_cited_session_id (v41,
+  // promote arm) — three channels fire out of one Stop hook, each needs its own key
+  // because they resolve different id sets: decay reads mainOnly, access reads the whole
+  // transcript including sidechains, and the decay pair is additionally gated on
+  // hasMainThreadAssistantText, so a session can credit access while decay never runs.
+  // Sharing a key would make one channel silence the other.
+  'ALTER TABLE observations ADD COLUMN last_access_session_id TEXT DEFAULT NULL',
+  // v49 (Phase-2): drop the TF-IDF vector arm's two tables. Measured before removing —
+  // the arm is net-negative on both benchmark fixtures, including the vocabulary-mismatch
+  // suite that is its only reason to exist, and holds 0 rows on the real corpus. See
+  // tests/vector-arm-removed.test.mjs.
+  //
+  // These are the first DROPs in this array, and they are safe in this loop for a reason
+  // worth stating: the catch below only swallows 'duplicate column name', but DROP TABLE
+  // IF EXISTS never throws on an absent table, so it is idempotent on its own. Fresh DBs
+  // no longer CREATE these (CORE_SCHEMA lost them in the same change), so there the DROP
+  // is a no-op; existing DBs get them removed on the next open.
+  //
+  // No LATEST_MIGRATION_COLUMNS sentinel is added, and that is deliberate rather than an
+  // oversight: that mechanism is a column-PRESENCE probe and cannot express an absence.
+  // The hole it would guard is "version says 49 but the tables are still here", whose
+  // consequence is two dead tables nothing reads or writes — no data loss, no wrong
+  // answer, reclaimed on any later VACUUM.
+  'DROP TABLE IF EXISTS observation_vectors',
+  'DROP TABLE IF EXISTS vocab_state',
 ];
 
 /**
@@ -464,10 +503,21 @@ export function initSchema(db) {
         return db;
       }
       if (row.version > CURRENT_SCHEMA_VERSION) {
-        throw new Error(
+        // The MESSAGE is the long-standing contract (tests/schema.test.mjs and
+        // tests/wal-recovery.test.mjs both match on it, and older builds throw exactly
+        // this), so it is unchanged. The FIELDS are additive: every consumer downstream
+        // used to re-derive these numbers by regexing the sentence, and the `npm i -g`
+        // remedy baked into it is inert for a plugin-cache install — which is the shape
+        // that actually hits this. lib/schema-skew.mjs turns the fields into a
+        // shape-correct repair; see its header for the 2026-09-08 measurement.
+        const err = new Error(
           `DB schema is v${row.version} but this claude-mem-lite binary supports up to v${CURRENT_SCHEMA_VERSION}. ` +
-          `A newer version wrote this DB; upgrade claude-mem-lite (npm i -g claude-mem-lite@latest) or point CLAUDE_MEM_DIR to a fresh directory.`
+            `A newer version wrote this DB; upgrade claude-mem-lite (npm i -g claude-mem-lite@latest) or point CLAUDE_MEM_DIR to a fresh directory.`,
         );
+        err.code = SCHEMA_SKEW_CODE;
+        err.dbVersion = row.version;
+        err.binaryVersion = CURRENT_SCHEMA_VERSION;
+        throw err;
       }
     }
   } catch (e) {
@@ -493,14 +543,18 @@ export function initSchema(db) {
       db.pragma('foreign_keys = ON');
       return db;
     }
-  } catch { /* table absent — proceed */ }
+  } catch {
+    /* table absent — proceed */
+  }
 
   // Create core tables
   db.exec(CORE_SCHEMA);
 
   // Run column migrations
   for (const sql of MIGRATIONS) {
-    try { db.exec(sql); } catch (e) {
+    try {
+      db.exec(sql);
+    } catch (e) {
       if (!e.message?.includes('duplicate column name')) throw e;
     }
   }
@@ -509,7 +563,9 @@ export function initSchema(db) {
   // Old PK assumed one session per project, causing cross-session handoff overwrite
   // (see docs/bug.txt). Rebuild table if still on old PK. Idempotent.
   try {
-    const handoffDdl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='session_handoffs'`).get();
+    const handoffDdl = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='session_handoffs'`)
+      .get();
     const oldPk = handoffDdl && /PRIMARY KEY\s*\(\s*project\s*,\s*type\s*\)/i.test(handoffDdl.sql);
     if (oldPk) {
       const rebuild = db.transaction(() => {
@@ -539,37 +595,54 @@ export function initSchema(db) {
       });
       rebuild();
     }
-  } catch { /* non-critical — next open retries */ }
+  } catch {
+    /* non-critical — next open retries */
+  }
 
   // v25 (T10d): commit-anchored continuation — store HEAD sha at handoff time
   // so detectContinuationIntent can auto-confirm continuation when the working
   // tree hasn't moved since /exit or /clear. Runs AFTER the PK-widen rebuild
   // above so the new column is not clobbered by the DROP+CREATE path.
   try {
-    const handoffCols = db.prepare(`PRAGMA table_info(session_handoffs)`).all().map(c => c.name);
+    const handoffCols = db
+      .prepare(`PRAGMA table_info(session_handoffs)`)
+      .all()
+      .map((c) => c.name);
     if (!handoffCols.includes('git_sha_at_handoff')) {
       db.exec(`ALTER TABLE session_handoffs ADD COLUMN git_sha_at_handoff TEXT DEFAULT NULL`);
     }
-  } catch { /* non-critical — migration retries on next open */ }
+  } catch {
+    /* non-critical — migration retries on next open */
+  }
 
   // Dedup migration: ensure memory_session_id is unique, then enable FK
-  const hasIdx = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`).get();
+  const hasIdx = db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`)
+    .get();
   if (!hasIdx) {
-    const dupes = db.prepare(`
+    const dupes = db
+      .prepare(
+        `
       SELECT memory_session_id, COUNT(*) as cnt
       FROM sdk_sessions
       WHERE memory_session_id IS NOT NULL
       GROUP BY memory_session_id HAVING cnt > 1
-    `).all();
+    `,
+      )
+      .all();
 
     // Atomic: dedup + create unique index in one transaction
     const dedupAndIndex = db.transaction(() => {
       for (const { memory_session_id } of dupes) {
-        const rows = db.prepare(`
+        const rows = db
+          .prepare(
+            `
           SELECT s.id FROM sdk_sessions s
           WHERE s.memory_session_id = ?
           ORDER BY s.id ASC
-        `).all(memory_session_id);
+        `,
+          )
+          .all(memory_session_id);
         for (let i = 1; i < rows.length; i++) {
           db.prepare('DELETE FROM sdk_sessions WHERE id = ?').run(rows[i].id);
         }
@@ -581,21 +654,49 @@ export function initSchema(db) {
 
   // Performance indexes
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_epoch_project ON observations(created_at_epoch DESC, project)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_sess_sum_epoch ON session_summaries(created_at_epoch DESC, project)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_project_epoch_minhash ON observations(project, created_at_epoch DESC) WHERE minhash_sig IS NOT NULL`);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_sess_sum_epoch ON session_summaries(created_at_epoch DESC, project)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_obs_project_epoch_minhash ON observations(project, created_at_epoch DESC) WHERE minhash_sig IS NOT NULL`,
+  );
   db.exec(`CREATE INDEX IF NOT EXISTS idx_user_prompts_session ON user_prompts(content_session_id)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_user_prompts_cc ON user_prompts(cc_session_id) WHERE cc_session_id IS NOT NULL`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_superseded ON observations(superseded_at) WHERE superseded_at IS NOT NULL`);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_user_prompts_cc ON user_prompts(cc_session_id) WHERE cc_session_id IS NOT NULL`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_obs_superseded ON observations(superseded_at) WHERE superseded_at IS NOT NULL`,
+  );
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_branch ON observations(branch) WHERE branch IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_project ON sdk_sessions(project)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_not_compressed ON observations(created_at_epoch DESC) WHERE COALESCE(compressed_into, 0) = 0`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_handoffs_project_time ON session_handoffs(project, type, created_at_epoch DESC)`);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_obs_not_compressed ON observations(created_at_epoch DESC) WHERE COALESCE(compressed_into, 0) = 0`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_handoffs_project_time ON session_handoffs(project, type, created_at_epoch DESC)`,
+  );
+  // v47 (audit 2026-09-02 P2-11 + the previous round's ALGO-7), one additive migration for
+  // both. Additive only: new indexes on existing columns, no table rewrite, no data move.
+  //
+  // The first was the ONLY genuine full table scan in the 30 statements the audit ran
+  // through EXPLAIN QUERY PLAN. Stop and SessionStart both probe "does a summary exist for
+  // this memory session?", `session_summaries` is 10,160 rows here, and the cost grows
+  // linearly with the table for a question asked on every hook event.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sess_sum_memory_session ON session_summaries(memory_session_id)`);
+  // The second narrows the live-row scan the injection faces run per project. Partial on the
+  // same predicate `liveObsFilterSql` uses, so the index covers exactly the rows those
+  // queries can return.
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_obs_project_live ON observations(project, created_at_epoch DESC) WHERE superseded_at IS NULL AND COALESCE(compressed_into, 0) = 0`,
+  );
 
   // FTS5 migration: recreate observations_fts when columns are missing (one-time)
   // Detect old FTS5 table missing lesson_learned or search_aliases and recreate with full column set
   let obsFtsRecreated = false;
   try {
-    const ftsDdl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='observations_fts'`).get();
+    const ftsDdl = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='observations_fts'`)
+      .get();
     if (ftsDdl && (!ftsDdl.sql.includes('lesson_learned') || !ftsDdl.sql.includes('search_aliases'))) {
       db.exec(`DROP TRIGGER IF EXISTS observations_ai`);
       db.exec(`DROP TRIGGER IF EXISTS observations_ad`);
@@ -603,7 +704,9 @@ export function initSchema(db) {
       db.exec(`DROP TABLE IF EXISTS observations_fts`);
       obsFtsRecreated = true;
     }
-  } catch { /* non-critical — ensureFTS will create if missing */ }
+  } catch {
+    /* non-critical — ensureFTS will create if missing */
+  }
 
   // v27 migration: drop legacy _au triggers that fire on ANY row UPDATE so
   // ensureFTS reinstates them with `AFTER UPDATE OF <fts_cols>`. Trigger fires
@@ -612,21 +715,31 @@ export function initSchema(db) {
   // Conditional per #7647: only drop when the stored DDL lacks the scoped
   // `UPDATE OF` clause (handles re-run + fresh-DB cases).
   for (const [trg, tbl] of [
-    ['observations_au',      'observations'],
+    ['observations_au', 'observations'],
     ['session_summaries_au', 'session_summaries'],
-    ['user_prompts_au',      'user_prompts'],
+    ['user_prompts_au', 'user_prompts'],
   ]) {
     try {
       const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?`).get(trg);
       if (row && row.sql && !/\bAFTER\s+UPDATE\s+OF\s+/i.test(row.sql)) {
         db.exec(`DROP TRIGGER IF EXISTS ${tbl}_au`);
       }
-    } catch { /* non-critical — ensureFTS will recreate */ }
+    } catch {
+      /* non-critical — ensureFTS will recreate */
+    }
   }
 
   // FTS5 full-text search tables + triggers (idempotent)
   ensureFTS(db, 'observations_fts', 'observations', OBS_FTS_COLUMNS);
-  ensureFTS(db, 'session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes', 'remaining_items']);
+  ensureFTS(db, 'session_summaries_fts', 'session_summaries', [
+    'request',
+    'investigated',
+    'learned',
+    'completed',
+    'next_steps',
+    'notes',
+    'remaining_items',
+  ]);
   ensureFTS(db, 'user_prompts_fts', 'user_prompts', ['prompt_text']);
 
   // Rebuild FTS5 if we just recreated it above (the new index is empty and must be
@@ -640,7 +753,9 @@ export function initSchema(db) {
     try {
       const cnt = db.prepare(`SELECT COUNT(*) as cnt FROM observations`).get();
       if (cnt.cnt > 0) db.exec(`INSERT INTO observations_fts(observations_fts) VALUES('rebuild')`);
-    } catch { /* non-critical */ }
+    } catch {
+      /* non-critical */
+    }
   }
 
   // v36 migration: narrow events_fts_au like the v27 fix above. The events FTS
@@ -651,11 +766,15 @@ export function initSchema(db) {
   // the CREATE TRIGGER IF NOT EXISTS below reinstates the scoped form (handles
   // re-run + fresh-DB: undefined row on a fresh DB is a no-op).
   try {
-    const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='events_fts_au'`).get();
+    const row = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='events_fts_au'`)
+      .get();
     if (row && row.sql && !/\bAFTER\s+UPDATE\s+OF\s+/i.test(row.sql)) {
       db.exec(`DROP TRIGGER IF EXISTS events_fts_au`);
     }
-  } catch { /* non-critical — recreated below */ }
+  } catch {
+    /* non-critical — recreated below */
+  }
 
   // ─── v2.31 T6: events table + FTS5 (activity namespace) ───────────────────
   // Independent namespace for bugfix/lesson/bug/discovery/refactor/feature/
@@ -740,69 +859,19 @@ export function initSchema(db) {
     'ALTER TABLE observation_files ADD COLUMN last_resolved_session_id TEXT DEFAULT NULL',
     'ALTER TABLE observation_files ADD COLUMN last_cited_session_id TEXT DEFAULT NULL',
   ]) {
-    try { db.exec(sql); } catch (e) {
+    try {
+      db.exec(sql);
+    } catch (e) {
       if (!e.message?.includes('duplicate column name')) throw e;
     }
   }
 
-  // Data migration: populate observation_files from existing observations.files_modified JSON
-  // Only runs once: when observation_files is empty but observations has rows with files_modified
-  try {
-    const obsFilesCount = db.prepare('SELECT COUNT(*) as c FROM observation_files').get().c;
-    if (obsFilesCount === 0) {
-      const obsWithFiles = db.prepare(
-        `SELECT id, files_modified FROM observations WHERE files_modified IS NOT NULL AND files_modified != '[]'`
-      ).all();
-      if (obsWithFiles.length > 0) {
-        const migrateFiles = db.transaction(() => {
-          const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
-          for (const row of obsWithFiles) {
-            try {
-              const files = JSON.parse(row.files_modified);
-              if (Array.isArray(files)) {
-                for (const f of files) {
-                  if (typeof f === 'string' && f.length > 0) {
-                    insertFile.run(row.id, f);
-                  }
-                }
-              }
-            } catch { /* skip malformed JSON */ }
-          }
-        });
-        migrateFiles();
-      }
-    }
-  } catch { /* non-critical — migration can retry on next open */ }
+  // The files_modified -> observation_files backfill moved to runDeferredCleanups()
+  // (R12 pre-ship review P3-3). It used to live here gated on `COUNT(*) FROM
+  // observation_files === 0`, which is not the question: see DEFERRED_CLEANUPS.
 
   // observation_files orphan cleanup moved to runDeferredCleanups() (audit P1-5):
   // it now runs retryably outside the version fast-path. See DEFERRED_CLEANUPS.
-
-  // Observation vectors table for TF-IDF vector search
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS observation_vectors (
-      observation_id INTEGER PRIMARY KEY,
-      vector BLOB NOT NULL,
-      vocab_version TEXT NOT NULL,
-      created_at_epoch INTEGER NOT NULL,
-      FOREIGN KEY(observation_id) REFERENCES observations(id) ON DELETE CASCADE
-    )
-  `);
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_vectors_version ON observation_vectors(vocab_version)`);
-
-  // observation_vectors orphan cleanup moved to runDeferredCleanups() (audit P1-5).
-
-  // Persisted vocabulary for stable TF-IDF vector indexing
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS vocab_state (
-      term TEXT NOT NULL,
-      term_index INTEGER NOT NULL,
-      idf REAL NOT NULL,
-      version TEXT NOT NULL,
-      created_at_epoch INTEGER NOT NULL
-    )
-  `);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_vocab_state_version ON vocab_state(version)');
 
   // Project-name normalization moved to runDeferredCleanups() (audit P1-5) — it
   // now retries on a later open if it fails, instead of being lost behind the
@@ -933,36 +1002,64 @@ export function auditSessionConsistency(db, { graceMinutes = 5 } = {}) {
   const cutoff = Date.now() - graceMinutes * 60_000;
   // UUID-shape gate mirrors the v30 trigger — same length=36 + LIKE pattern.
   const UUID_LIKE = '________-____-____-____-____________';
-  const idMixUuidShape = db.prepare(`
+  const idMixUuidShape = db
+    .prepare(
+      `
     SELECT COUNT(*) AS c FROM sdk_sessions
     WHERE memory_session_id IS NOT NULL
       AND memory_session_id = content_session_id
       AND length(memory_session_id) = 36
       AND memory_session_id LIKE ?
-  `).get(UUID_LIKE).c;
-  const idMixOther = db.prepare(`
+  `,
+    )
+    .get(UUID_LIKE).c;
+  const idMixOther = db
+    .prepare(
+      `
     SELECT COUNT(*) AS c FROM sdk_sessions
     WHERE memory_session_id IS NOT NULL
       AND memory_session_id = content_session_id
       AND NOT (length(memory_session_id) = 36 AND memory_session_id LIKE ?)
-  `).get(UUID_LIKE).c;
-  const missingMemId = db.prepare(`
+  `,
+    )
+    .get(UUID_LIKE).c;
+  const missingMemId = db
+    .prepare(
+      `
     SELECT COUNT(*) AS c FROM sdk_sessions
     WHERE memory_session_id IS NULL
       AND started_at_epoch < ?
-  `).get(cutoff).c;
-  const orphanObs = db.prepare(`
+  `,
+    )
+    .get(cutoff).c;
+  const orphanObs = db
+    .prepare(
+      `
     SELECT COUNT(*) AS c FROM observations o
     WHERE NOT EXISTS (
       SELECT 1 FROM sdk_sessions s WHERE s.memory_session_id = o.memory_session_id
     )
-  `).get().c;
+  `,
+    )
+    .get().c;
+  // Audit P3-14 backstop. `observations.importance` is INTEGER DEFAULT 1 but NULLABLE, and
+  // the two maintenance faces disagree about what NULL means: decayAndMarkIdle reads
+  // COALESCE(importance,1)=1 and queues the row for purge, runIdleCleanup reads a bare
+  // `importance <= 1` which is NULL and skips it. lib/observation-write.mjs now coerces
+  // nullish to 1 on both write cores, so no NEW row can be in that state; this counts the
+  // ones that got in another way — an old version, a hand-edited DB, a restored dump.
+  // Reported here rather than in its own command because `orphan_obs` above establishes
+  // that this audit already covers observation-level integrity, not only sessions.
+  const obsImportanceNull = db
+    .prepare('SELECT COUNT(*) AS c FROM observations WHERE importance IS NULL')
+    .get().c;
   return {
     id_mix_uuid_shape: idMixUuidShape,
     id_mix_other: idMixOther,
     missing_mem_id: missingMemId,
     orphan_obs: orphanObs,
-    healthy: idMixUuidShape === 0 && missingMemId === 0 && orphanObs === 0,
+    obs_importance_null: obsImportanceNull,
+    healthy: idMixUuidShape === 0 && missingMemId === 0 && orphanObs === 0 && obsImportanceNull === 0,
   };
 }
 
@@ -978,63 +1075,140 @@ const DEFERRED_CLEANUPS = [
     // while early warm-start handles ran with foreign_keys OFF, so junction rows
     // leaked. Idempotent (NOT IN is empty on a clean DB).
     name: 'orphan-observation-files',
-    run: (db) => db.prepare(
-      `DELETE FROM observation_files WHERE obs_id NOT IN (SELECT id FROM observations)`
-    ).run(),
+    run: (db) =>
+      db.prepare(`DELETE FROM observation_files WHERE obs_id NOT IN (SELECT id FROM observations)`).run(),
   },
   {
-    // v28 (v2.47) P0-1: orphaned observation_vectors — same FK-OFF root cause.
-    name: 'orphan-observation-vectors',
-    run: (db) => db.prepare(
-      `DELETE FROM observation_vectors WHERE observation_id NOT IN (SELECT id FROM observations)`
-    ).run(),
+    // Backfill the junction from the files_modified JSON column. This ran inside initSchema
+    // for a long time, gated on `COUNT(*) FROM observation_files === 0` — which answers "has
+    // this store ever written an edge", not "has this backfill run". One real `mem_save`
+    // falsifies it forever, so every observation imported before v6.7.2 (the release that
+    // taught import-jsonl to write edges at all) stayed permanently unreachable by file, and
+    // re-importing could not repair them: cross-run dedup skips the row before the edge
+    // write. The marker here answers the question actually being asked, and an exception
+    // leaves it unset so the next open retries.
+    //
+    // Deliberately NOT a schema-version bump. A bump locks every older code home out of the
+    // database permanently (see lib/schema-skew.mjs), and on a plugin install that is
+    // reached routinely — far too much to charge for a derived table.
+    //
+    // One-shot by design: every live path that stores an observation routes its edges
+    // through the single junction writer (`insertObservationFiles`, lib/observation-write),
+    // so rows arriving after this pass need nothing from it. An earlier draft of this line
+    // said "the import and save paths both" — there are more than two entry points reaching
+    // that one writer (save, episode flush, insight promotion, restore, import), and the
+    // claim that matters is the single writer, not the count of callers.
+    // `NOT EXISTS` keeps the scan to the rows that are actually missing an edge, which is
+    // zero on a store that never imported.
+    name: 'backfill-observation-files',
+    run: (db) => {
+      const rows = db
+        .prepare(
+          `SELECT o.id, o.files_modified FROM observations o
+            WHERE o.files_modified IS NOT NULL AND o.files_modified != '[]'
+              AND NOT EXISTS (SELECT 1 FROM observation_files f WHERE f.obs_id = o.id)`,
+        )
+        .all();
+      if (rows.length === 0) return;
+      const insertFile = db.prepare(
+        'INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)',
+      );
+      db.transaction(() => {
+        for (const row of rows) {
+          let files;
+          try {
+            files = JSON.parse(row.files_modified);
+          } catch {
+            // One unparseable row must not cost every row after it its edges — the whole
+            // pass is marked done afterwards, so "skipped" here means "never backfilled".
+            continue;
+          }
+          if (!Array.isArray(files)) continue;
+          for (const f of files) {
+            if (typeof f === 'string' && f.length > 0) insertFile.run(row.id, f);
+          }
+        }
+      })();
+    },
   },
   {
     // Project-name normalization: migrate short names ("mem") to canonical
-    // ("projects--mem"). Exact suffix match first, then distinctive-token
-    // substring. Idempotent: only acts on remaining short-name records.
+    // ("projects--mem") by EXACT canonical-suffix match. Idempotent: only acts on
+    // remaining short-name records.
     name: 'normalize-project-names',
     run: (db) => {
-      const shortProjects = db.prepare(`
+      const shortProjects = db
+        .prepare(
+          `
         SELECT DISTINCT project FROM observations
         WHERE project NOT LIKE '%--_%' AND project != '' AND project IS NOT NULL
         UNION
         SELECT DISTINCT project FROM sdk_sessions
         WHERE project NOT LIKE '%--_%' AND project != '' AND project IS NOT NULL
-      `).all();
+      `,
+        )
+        .all();
       if (shortProjects.length === 0) return;
-      const normalize = db.transaction(() => {
-        for (const { project: shortName } of shortProjects) {
-          let canonical = db.prepare(
-            `SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
-          ).get(`%--${shortName}`);
-          if (!canonical) {
-            const tokens = shortName.split(/[-_.]/).filter(t => t.length >= 5);
-            for (const token of tokens) {
-              canonical = db.prepare(
-                `SELECT project FROM observations WHERE project LIKE ? AND project LIKE '%--_%'
-                 GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
-              ).get(`%${token}%`);
-              if (canonical) break;
-            }
-          }
-          if (canonical) {
-            // Rename the short project to canonical on EVERY project-scoped table.
-            // Originally only the first three were rewritten, so a short-named
-            // project's deferred TODOs (deferred_work), activity (events), citation
-            // history (citation_log + v45 citation_surface_log), and /clear-/exit
-            // handoffs (session_handoffs) were stranded on the old name — invisible to
-            // every project-scoped query after normalization. All eight carry a
-            // `project` column (verified).
-            for (const table of ['observations', 'sdk_sessions', 'session_summaries',
-                                 'session_handoffs', 'citation_log', 'citation_surface_log',
-                                 'events', 'deferred_work']) {
-              db.prepare(`UPDATE ${table} SET project = ? WHERE project = ?`).run(canonical.project, shortName);
-            }
-          }
+      // R10 P1-3: ONE transaction per short name, not one for the whole scan. Three of the
+      // eight tables below have a PRIMARY KEY containing `project`, so a single collision
+      // used to roll back every OTHER project's rename too, leave the sentinel unwritten,
+      // and replay the whole SELECT DISTINCT + N updates on every subsequent DB open —
+      // i.e. on every hook event, forever, never converging.
+      const renameOne = db.transaction((shortName, canonicalName) => {
+        // Rename the short project to canonical on EVERY project-scoped table.
+        // Originally only the first three were rewritten, so a short-named
+        // project's deferred TODOs (deferred_work), activity (events), citation
+        // history (citation_log + v45 citation_surface_log), and /clear-/exit
+        // handoffs (session_handoffs) were stranded on the old name — invisible to
+        // every project-scoped query after normalization. All eight carry a
+        // `project` column (verified).
+        for (const table of [
+          'observations',
+          'sdk_sessions',
+          'session_summaries',
+          'session_handoffs',
+          'citation_log',
+          'citation_surface_log',
+          'events',
+          'deferred_work',
+        ]) {
+          // R10 P1-3: OR IGNORE. session_handoffs (project,type,session_id),
+          // citation_log (project,memory_session_id) and citation_surface_log
+          // (project,session_id,surface) collide whenever the SAME session was recorded
+          // under both names — which is exactly what an in-session plugin upgrade
+          // produces. Skipping the colliding row keeps the canonical one, which is the
+          // newer and more complete of the two; the alternative was a permanent stall.
+          db.prepare(`UPDATE OR IGNORE ${table} SET project = ? WHERE project = ?`).run(
+            canonicalName,
+            shortName,
+          );
         }
       });
-      normalize();
+      for (const { project: shortName } of shortProjects) {
+        // R10 P1-2: EXACT canonical-suffix match only. There used to be a fallback that
+        // took any >=5-char token of the short name and substring-matched it against every
+        // canonical project — so `workspace`, the ordinary name for a devcontainer whose
+        // cwd is the filesystem root `/workspace`, was absorbed into an unrelated
+        // `workspaces--repo` across all eight tables. project-utils.mjs:109-120 already
+        // treats a root-directory short name as legitimate; this cleanup did not, there is
+        // no snapshot on this path, and the sentinel means it never runs again. A legacy
+        // name that only a token match could resolve is still readable — resolveProject
+        // step 3 does that substring match at READ time, where a wrong guess costs a query
+        // rather than the row's identity.
+        const canonical = db
+          .prepare(
+            `SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`,
+          )
+          .get(`%--${shortName}`);
+        if (canonical) {
+          try {
+            renameOne(shortName, canonical.project);
+          } catch (e) {
+            // One project's failure must not abandon the others, nor the sentinel.
+            debugCatch(e, 'normalize-project-names');
+          }
+        }
+      }
     },
   },
 ];
@@ -1048,7 +1222,12 @@ const DEFERRED_CLEANUPS = [
 export function runDeferredCleanups(db) {
   let done;
   try {
-    done = new Set(db.prepare('SELECT name FROM migration_cleanups').all().map(r => r.name));
+    done = new Set(
+      db
+        .prepare('SELECT name FROM migration_cleanups')
+        .all()
+        .map((r) => r.name),
+    );
   } catch {
     return; // table not present yet (pre-migration open) — nothing to do
   }
@@ -1078,7 +1257,7 @@ export function ensureDb() {
     // Remove DB_DIR only if it has no user data (no .db files)
     if (existsSync(DB_DIR)) {
       try {
-        const hasDbFiles = readdirSync(DB_DIR).some(f => f.endsWith('.db'));
+        const hasDbFiles = readdirSync(DB_DIR).some((f) => f.endsWith('.db'));
         if (!hasDbFiles) rmSync(DB_DIR, { recursive: true, force: true });
       } catch {}
     }
@@ -1092,12 +1271,17 @@ export function ensureDb() {
   if (!existsSync(DB_PATH) && existsSync(oldPath)) {
     renameSync(oldPath, DB_PATH);
     for (const ext of ['-wal', '-shm']) {
-      if (existsSync(oldPath + ext)) try { renameSync(oldPath + ext, DB_PATH + ext); } catch {}
+      if (existsSync(oldPath + ext))
+        try {
+          renameSync(oldPath + ext, DB_PATH + ext);
+        } catch {}
     }
   }
 
   const db = new Database(DB_PATH);
-  try { chmodSync(DB_PATH, 0o600); } catch {}
+  try {
+    chmodSync(DB_PATH, 0o600);
+  } catch {}
   db.pragma('journal_mode = WAL');
   // 5000ms matches the MCP server (server.mjs) — 3000ms wasn't enough under realistic
   // concurrency (parallel CLI saves + a long-running FTS rebuild can push individual
@@ -1115,7 +1299,9 @@ export function ensureDb() {
     runDeferredCleanups(ready);
     return ready;
   } catch (e) {
-    try { db.close(); } catch {}
+    try {
+      db.close();
+    } catch {}
     throw e;
   }
 }
@@ -1127,9 +1313,20 @@ export function ensureDb() {
  * uncheckpointed transactions — silent data loss.
  */
 export function isDbCorruptionError(err) {
-  return /SQLITE_CORRUPT|SQLITE_NOTADB|malformed|not a database|disk image/i
-    .test(`${err?.code || ''} ${err?.message || ''}`);
+  // R10 P3-9: SQLITE_CORRUPT_VTAB is EXCLUDED. It means a damaged FTS5 index over an
+  // otherwise healthy file, and both halves of the WAL remedy are wrong for it — deleting
+  // the WAL discards committed-but-uncheckpointed transactions (the reason this predicate
+  // exists at all, per the docblock above), and it cannot repair an index that lives in the
+  // main database file. isFtsCorruptionError below routes it to rebuildFTS instead.
+  const text = `${err?.code || ''} ${err?.message || ''}`;
+  if (isFtsCorruptionError(err)) return false;
+  return /SQLITE_CORRUPT|SQLITE_NOTADB|malformed|not a database|disk image/i.test(text);
 }
+
+// Definition moved to lib/db-unusable.mjs (v6.5.0) so the hook path's own classifier and this
+// one cannot drift; re-exported here because four call sites and a test import it from
+// schema.mjs. Same pattern as DB_DIR / DB_PATH above.
+export { isFtsCorruptionError };
 
 /**
  * ensureDb with corruption-gated WAL recovery. Was inlined in server.mjs only,
@@ -1148,16 +1345,61 @@ export function ensureDbWithWalRecovery({ warn, info } = {}) {
   try {
     return ensureDb();
   } catch (firstErr) {
+    // R10 P3-9: FTS index damage first, because its remedy is both correct and lossless
+    // while the WAL remedy below is neither. Open a raw handle (ensureDb just failed, so
+    // its schema pass cannot be trusted to get far enough), rebuild every FTS table from
+    // its content table, then retry the real opener.
+    if (isFtsCorruptionError(firstErr)) {
+      warn?.(`FTS index corruption detected, rebuilding indexes: ${firstErr.message}`);
+      let raw = null;
+      try {
+        raw = new Database(DB_PATH);
+        const { errors } = rebuildFTS(raw);
+        if (errors.length) warn?.(`FTS rebuild reported: ${errors.join('; ')}`);
+      } catch (rebuildErr) {
+        warn?.(`FTS rebuild failed: ${rebuildErr.message}`);
+      } finally {
+        try {
+          raw?.close();
+        } catch {
+          /* best-effort */
+        }
+      }
+      try {
+        const db = ensureDb();
+        info?.('DB recovered after FTS rebuild');
+        return db;
+      } catch (retryErr) {
+        try {
+          retryErr.ftsRebuildAttempted = true;
+        } catch {
+          /* frozen error — fine */
+        }
+        throw retryErr;
+      }
+    }
     if (!isDbCorruptionError(firstErr)) throw firstErr;
     warn?.(`DB corruption detected, attempting WAL recovery: ${firstErr.message}`);
-    try { rmSync(DB_PATH + '-wal', { force: true }); } catch { /* best-effort */ }
-    try { rmSync(DB_PATH + '-shm', { force: true }); } catch { /* best-effort */ }
+    try {
+      rmSync(DB_PATH + '-wal', { force: true });
+    } catch {
+      /* best-effort */
+    }
+    try {
+      rmSync(DB_PATH + '-shm', { force: true });
+    } catch {
+      /* best-effort */
+    }
     try {
       const db = ensureDb();
       info?.('DB recovered after WAL cleanup');
       return db;
     } catch (retryErr) {
-      try { retryErr.walRecoveryAttempted = true; } catch { /* frozen error — fine */ }
+      try {
+        retryErr.walRecoveryAttempted = true;
+      } catch {
+        /* frozen error — fine */
+      }
       throw retryErr;
     }
   }
@@ -1180,9 +1422,15 @@ export function rebuildFTS(db) {
   const errors = [];
   for (const fts of FTS_TABLES) {
     try {
-      if (!idRe.test(fts)) { errors.push(`${fts}: invalid identifier`); continue; }
+      if (!idRe.test(fts)) {
+        errors.push(`${fts}: invalid identifier`);
+        continue;
+      }
       const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(fts);
-      if (!exists) { errors.push(`${fts}: not found`); continue; }
+      if (!exists) {
+        errors.push(`${fts}: not found`);
+        continue;
+      }
       db.exec(`INSERT INTO ${fts}(${fts}) VALUES('rebuild')`);
       rebuilt.push(fts);
     } catch (e) {
@@ -1204,9 +1452,17 @@ export function checkFTSIntegrity(db) {
   let healthy = true;
   for (const fts of FTS_TABLES) {
     try {
-      if (!idRe.test(fts)) { details.push(`${fts}: invalid identifier`); healthy = false; continue; }
+      if (!idRe.test(fts)) {
+        details.push(`${fts}: invalid identifier`);
+        healthy = false;
+        continue;
+      }
       const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(fts);
-      if (!exists) { details.push(`${fts}: missing`); healthy = false; continue; }
+      if (!exists) {
+        details.push(`${fts}: missing`);
+        healthy = false;
+        continue;
+      }
       db.exec(`INSERT INTO ${fts}(${fts}) VALUES('integrity-check')`);
       details.push(`${fts}: ok`);
     } catch (e) {
@@ -1221,13 +1477,13 @@ export function ensureFTS(db, ftsName, tableName, columns) {
   // Validate identifiers to prevent SQL injection (done upfront; both
   // branches below use these identifiers in string-interpolated SQL)
   const idRe = /^[a-z][a-z0-9_]*$/;
-  if (!idRe.test(ftsName) || !idRe.test(tableName) || !columns.every(c => idRe.test(c))) {
+  if (!idRe.test(ftsName) || !idRe.test(tableName) || !columns.every((c) => idRe.test(c))) {
     throw new Error(`Invalid identifier in ensureFTS: ${ftsName}, ${tableName}`);
   }
 
   const colList = columns.join(', ');
-  const newVals = columns.map(c => `new.${c}`).join(', ');
-  const oldVals = columns.map(c => `old.${c}`).join(', ');
+  const newVals = columns.map((c) => `new.${c}`).join(', ');
+  const oldVals = columns.map((c) => `old.${c}`).join(', ');
 
   // Column-aware (re)creation. An existing FTS table is never silently reused when its
   // indexed-column set has drifted from `columns`. Root cause of a silent-write bug class:
@@ -1244,8 +1500,15 @@ export function ensureFTS(db, ftsName, tableName, columns) {
   let recreated = false;
   if (ftsRow) {
     let existingCols = [];
-    try { existingCols = db.prepare(`PRAGMA table_info(${ftsName})`).all().map(c => c.name); } catch { /* unreadable → treat as drifted, recreate */ }
-    const drifted = existingCols.length !== columns.length || columns.some(c => !existingCols.includes(c));
+    try {
+      existingCols = db
+        .prepare(`PRAGMA table_info(${ftsName})`)
+        .all()
+        .map((c) => c.name);
+    } catch {
+      /* unreadable → treat as drifted, recreate */
+    }
+    const drifted = existingCols.length !== columns.length || columns.some((c) => !existingCols.includes(c));
     if (drifted) {
       db.exec(`DROP TRIGGER IF EXISTS ${tableName}_ai`);
       db.exec(`DROP TRIGGER IF EXISTS ${tableName}_ad`);
@@ -1255,7 +1518,9 @@ export function ensureFTS(db, ftsName, tableName, columns) {
     }
   }
   if (!ftsRow || recreated) {
-    db.exec(`CREATE VIRTUAL TABLE ${ftsName} USING fts5(${colList}, content='${tableName}', content_rowid='id')`);
+    db.exec(
+      `CREATE VIRTUAL TABLE ${ftsName} USING fts5(${colList}, content='${tableName}', content_rowid='id')`,
+    );
   }
 
   // Triggers created / recreated independently of FTS table existence so that
@@ -1289,7 +1554,9 @@ export function ensureFTS(db, ftsName, tableName, columns) {
     try {
       const cnt = db.prepare(`SELECT COUNT(*) AS c FROM ${tableName}`).get();
       if (cnt.c > 0) db.exec(`INSERT INTO ${ftsName}(${ftsName}) VALUES('rebuild')`);
-    } catch { /* non-critical — index repopulates lazily on next write */ }
+    } catch {
+      /* non-critical — index repopulates lazily on next write */
+    }
   }
 }
 
@@ -1309,8 +1576,17 @@ export function ensureEventsFTS(db) {
   let recreated = false;
   if (ftsRow) {
     let existingCols = [];
-    try { existingCols = db.prepare(`PRAGMA table_info(events_fts)`).all().map(c => c.name); } catch { /* unreadable → recreate */ }
-    const drifted = existingCols.length !== EVENTS_FTS_COLUMNS.length || EVENTS_FTS_COLUMNS.some(c => !existingCols.includes(c));
+    try {
+      existingCols = db
+        .prepare(`PRAGMA table_info(events_fts)`)
+        .all()
+        .map((c) => c.name);
+    } catch {
+      /* unreadable → recreate */
+    }
+    const drifted =
+      existingCols.length !== EVENTS_FTS_COLUMNS.length ||
+      EVENTS_FTS_COLUMNS.some((c) => !existingCols.includes(c));
     if (drifted) {
       db.exec(`DROP TRIGGER IF EXISTS events_fts_ai`);
       db.exec(`DROP TRIGGER IF EXISTS events_fts_ad`);
@@ -1351,6 +1627,8 @@ export function ensureEventsFTS(db) {
     try {
       const cnt = db.prepare(`SELECT COUNT(*) AS c FROM events`).get();
       if (cnt.c > 0) db.exec(`INSERT INTO events_fts(events_fts) VALUES('rebuild')`);
-    } catch { /* non-critical — index repopulates lazily on next write */ }
+    } catch {
+      /* non-critical — index repopulates lazily on next write */
+    }
   }
 }

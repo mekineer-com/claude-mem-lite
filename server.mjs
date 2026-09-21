@@ -5,26 +5,70 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { truncate, typeIcon, inferProject, fmtDate, debugLog, debugCatch, isPathConfined, stripPrivate } from './utils.mjs';
+import { truncate, typeIcon, inferProject, fmtDate, debugLog, debugCatch, stripPrivate } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
-import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
+import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, CODE_DIR } from './schema.mjs';
+// schema.mjs already imports this module for SCHEMA_SKEW_CODE, so it is in the graph before
+// the DB is touched — a static import here adds no cold-start cost.
+import {
+  isSchemaSkewError,
+  schemaSkewFromError,
+  schemaSkewRemedy,
+  formatSchemaSkewNotice,
+} from './lib/schema-skew.mjs';
 import { reRankWithContext, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
-import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
-import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
-import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import {
-  cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
-  recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
-  purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
-  hardDeleteCandidateCount,
-  OP_CAP, STALE_AGE_MS, resolveDefaultMaintainOps, DEFAULT_MAINTAIN_OPS,
+  deepSearch,
+  resolveDeepMode,
+  shouldEscalateToDeep,
+  autoDeepLlmReady,
+  deepDisclosureNote,
+} from './deep-search.mjs';
+import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
+import {
+  resolveAnchorToken,
+  formatAnchorError,
+  resolveQueryAnchor,
+  fetchRecentTimeline,
+  fetchTimelineWindow,
+} from './lib/timeline-core.mjs';
+import {
+  buildSearchFtsQuery,
+  parseDateBounds,
+  parseDuration,
+  coreRunSearchPipeline,
+  reachabilityNote,
+} from './lib/search-core.mjs';
+import {
+  runMaintainOps,
+  findDuplicates,
+  maintenanceStats,
+  OP_CAP,
+  STALE_AGE_MS,
+  resolveDefaultMaintainOps,
+  DEFAULT_MAINTAIN_OPS,
 } from './lib/maintain-core.mjs';
-import { snapshotDb } from './lib/db-backup.mjs';
+// snapshotDb left with maintain-core: the pre-maintain snapshot is part of the op ORDER
+// (it must see the pre-existing pending rows), so it moved into runMaintainOps (P1-5).
 import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
-import { fetchObsDetail, fetchPromptDetail, fetchEventDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, PROMPT_DETAIL_FIELDS, EVENT_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
-import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
+import {
+  fetchObsDetail,
+  fetchPromptDetail,
+  fetchEventDetail,
+  fetchSessionDetail,
+  OBS_FIELDS,
+  SESSION_DETAIL_FIELDS,
+  PROMPT_DETAIL_FIELDS,
+  EVENT_DETAIL_FIELDS,
+  supersededNotice,
+} from './lib/get-core.mjs';
+import {
+  collectBrowseTiers,
+  getActiveMemorySessionId,
+  BROWSE_TIERS,
+  BROWSE_TIER_LABELS,
+} from './lib/browse-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
@@ -34,8 +78,29 @@ import { recordHookError } from './lib/hook-telemetry.mjs';
 // The partial-export warning points the caller at the CLI twin, which exports the complete
 // set by default — the invocation has to be the one that actually works on this install.
 import { CLI_INVOKE } from './cli-path.mjs';
-import { neutralizeContextDelimiters, neutralizeSkillDelimiters } from './format-utils.mjs';
-import { memSearchSchema, memSearchFeedbackSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
+import { neutralizeContextDelimiters, neutralizeSkillDelimiters, queryLabel } from './format-utils.mjs';
+import {
+  memSearchSchema,
+  memSearchFeedbackSchema,
+  memRecentSchema,
+  memTimelineSchema,
+  memGetSchema,
+  memDeleteSchema,
+  memSaveSchema,
+  memStatsSchema,
+  memCompressSchema,
+  memMaintainSchema,
+  memOptimizeSchema,
+  memUpdateSchema,
+  memExportSchema,
+  memRecallSchema,
+  memFtsCheckSchema,
+  memBrowseSchema,
+  memDeferSchema,
+  memDeferListSchema,
+  memDeferDropSchema,
+  tools as TOOL_DEFS,
+} from './tool-schemas.mjs';
 
 // Lookup helper: all user-facing tool descriptions live in tool-schemas.mjs
 // (discouragement-style, Task 5). This keeps server.mjs from drifting.
@@ -46,28 +111,34 @@ function descriptionOf(name) {
   return d;
 }
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
-import { join, sep } from 'path';
-import { homedir } from 'os';
-import { ensureRegistryDb, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
-import { IMPORT_STRING_FIELDS, importResource, removeResource, reindexResources } from './lib/registry-core.mjs';
-import { searchResources } from './registry-retriever.mjs';
-import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
-import { saveObservation } from './lib/save-observation.mjs';
+import { join } from 'path';
+import {
+  probeOtherSources as probeIdSources,
+  bucketIdTokens,
+  splitDeferredTokens,
+} from './lib/id-routing.mjs';
+import { saveWithClosures, formatSupersedeSkipped, formatSupersededNote } from './lib/save-observation.mjs';
 import { applyObsUpdate } from './lib/observation-write.mjs';
-import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
-import { liveObsFilterSql } from './lib/inject-search-core.mjs';
+import { EXPORT_COLUMNS_SQL, buildExportWhere } from './lib/export-columns.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
+import { isFtsCorruptionError, FTS_CORRUPTION_REMEDY } from './lib/db-unusable.mjs';
 import { fetchRecent } from './lib/recent-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
-  insertDeferred, listOpenWithOrdinal, dropDeferred,
-  resolveDeferredIds, closeDeferredItems,
-  getDeferredByIds, formatDeferredDetail,
-  searchDeferredWork, formatDeferredSearchTrailer,
-  formatDeferListRow, countStaleOpen, formatDeferStaleHint,
+  insertDeferred,
+  listOpenWithOrdinal,
+  dropDeferred,
+  formatDropReasonHint,
+  resolveDeferredIds,
+  getDeferredByIds,
+  formatDeferredDetail,
+  searchDeferredWork,
+  formatDeferredSearchTrailer,
+  formatDeferListRow,
+  countStaleOpen,
+  formatDeferStaleHint,
 } from './lib/deferred-work.mjs';
 import { shouldQueueSaveEnrich, queueSaveEnrich } from './lib/save-enrich.mjs';
-import { _resetVocabCache } from './tfidf.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -75,7 +146,15 @@ const { version: PKG_VERSION } = require('./package.json');
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, chmodSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+  mkdirSync,
+  readdirSync,
+  chmodSync,
+} from 'fs';
 
 let db;
 try {
@@ -86,32 +165,69 @@ try {
     info: (m) => debugLog('INFO', 'server', m),
   });
 } catch (err) {
+  // Schema skew gets the same treatment as the CLI (mem-cli.mjs) and for the same reason:
+  // the raw message ends in `npm i -g claude-mem-lite@latest`, which repairs nothing on the
+  // plugin-cache install that actually hits this.
+  //
+  // This branch has to live HERE rather than in scripts/launch.mjs, which already knows how
+  // to format the notice. server.mjs opens the DB while it is being imported, so the throw
+  // is caught by this block and `process.exit(1)` runs before the launcher's own catch can
+  // ever see it — the launcher's handler is unreachable for this one error. Re-throwing
+  // instead would fix the plugin path and break the npm one, because install.mjs registers
+  // `claude mcp add ... -- node <SERVER_PATH>`, launching this file with no launcher above
+  // it to catch anything. Emitting from here covers both, and the launcher's copy stays as
+  // the handler for failures that happen before this module is reached.
+  if (isSchemaSkewError(err)) {
+    const skew = schemaSkewFromError(err) || { dbVersion: null, binaryVersion: null };
+    let shape = { managed: false, activePluginVersion: null };
+    let dev = false;
+    try {
+      const [shapeMod, updateMod] = await Promise.all([
+        import('./lib/install-shape.mjs'),
+        import('./hook-update.mjs'),
+      ]);
+      // CODE_DIR, not DB_DIR: `hasManagedCodeInstall` looks for server.mjs + hook.mjs inside
+      // whatever it is handed, and DB_DIR follows CLAUDE_MEM_DIR. Handing it the relocated DATA
+      // dir reports `managed: false` for a machine that has a managed install, so the remedy
+      // came out as "could not identify this install" or, with any plugin cache present, the
+      // plugin commands printed under a line naming ~/.claude-mem-lite. The three sibling call
+      // sites (mem-cli.mjs, hook.mjs, scripts/launch.mjs) all pass the CODE dir.
+      shape = shapeMod.detectInstallShape({ installDir: CODE_DIR });
+      dev = updateMod.isDevMode();
+    } catch {
+      /* shape unknown → schemaSkewRemedy answers 'unknown', which is its job */
+    }
+    const codeHome = process.env.CLAUDE_PLUGIN_ROOT || import.meta.dirname;
+    console.error(
+      formatSchemaSkewNotice({
+        dbVersion: skew.dbVersion,
+        binaryVersion: skew.binaryVersion,
+        remedy: schemaSkewRemedy({
+          managed: shape.managed,
+          activePluginVersion: shape.activePluginVersion,
+          dev,
+          root: codeHome,
+        }),
+        codeHome,
+      }),
+    );
+    process.exit(1);
+  }
   // Fatal: log and exit with descriptive message (Claude Code shows stderr)
   console.error(`[claude-mem-lite] FATAL: Database cannot be opened: ${err.message}`);
   if (err.walRecoveryAttempted) {
-    console.error(`[claude-mem-lite] Try: rm "${DB_PATH}-wal" "${DB_PATH}-shm" or reinstall with: node install.mjs install`);
+    console.error(
+      `[claude-mem-lite] Try: rm "${DB_PATH}-wal" "${DB_PATH}-shm" or reinstall with: node install.mjs install`,
+    );
   } else {
-    console.error(`[claude-mem-lite] Left WAL/SHM intact (not a corruption error). If this persists, retry or reinstall: node install.mjs install`);
+    console.error(
+      `[claude-mem-lite] Left WAL/SHM intact (not a corruption error). If this persists, retry or reinstall: node install.mjs install`,
+    );
   }
   process.exit(1);
 }
 // Server process uses longer busy_timeout for concurrent MCP requests
 db.pragma('busy_timeout = 5000');
-
-// ─── Registry Database (lazy-loaded on first mem_registry call) ─────────────
-
-let registryDb = null;
-
-function getRegistryDb() {
-  if (registryDb) return registryDb;
-  try {
-    registryDb = ensureRegistryDb(REGISTRY_DB_PATH);
-    registryDb.pragma('busy_timeout = 5000'); // match main DB + ensureRegistryDb (was 3000, overriding it back down)
-  } catch (e) {
-    debugLog('WARN', 'server', `Registry DB not available: ${e.message}`);
-  }
-  return registryDb;
-}
 
 // inferProject, typeIcon, truncate, fmtDate imported from utils.mjs
 
@@ -120,7 +236,15 @@ function getRegistryDb() {
 // "projects--mem" (parent--base from CWD). resolveProject() bridges this gap.
 // Implementation extracted to project-utils.mjs; local adapter closes over module-level `db`.
 
-function resolveProject(name) { return _resolveProjectShared(db, name); }
+function resolveProject(name) {
+  return _resolveProjectShared(db, name);
+}
+
+/** R10 P2-3: the WRITE variant. Exact matching only — a fuzzy guess on a write puts the
+ *  row in a project the caller never named and cannot find it under. */
+function resolveProjectForWrite(name) {
+  return _resolveProjectShared(db, name, { mode: 'write' });
+}
 
 // ─── Scoring Model Constants ────────────────────────────────────────────────
 //
@@ -150,9 +274,8 @@ function resolveProject(name) { return _resolveProjectShared(db, name); }
 // opts out. stderr doesn't pollute the MCP stdio protocol channel.
 const _quiet = effectiveQuiet();
 if (process.env.CLAUDE_MEM_QUIET_TRACE !== '0') {
-  const reason = process.env.MEM_QUIET_HOOKS === '1'
-    ? 'env:MEM_QUIET_HOOKS=1'
-    : _quiet ? 'adopted:steering' : 'none';
+  const reason =
+    process.env.MEM_QUIET_HOOKS === '1' ? 'env:MEM_QUIET_HOOKS=1' : _quiet ? 'adopted:steering' : 'none';
   const mode = _quiet ? 'BASE' : 'BASE+VERBOSE';
   process.stderr.write(`[mem] instructions: ${mode} reason=${reason}\n`);
 }
@@ -208,14 +331,28 @@ function applyArgAliases(args, pairs) {
   return next;
 }
 
-function defangResult(result) {
+/**
+ * @param {object} result Tool result.
+ * @param {object} [opts]
+ * @param {boolean} [opts.skillBlocks=true] Also neutralize `<skill-loaded>`. Default ON:
+ *   registry rows carry third-party text (a GitHub frontmatter name, or `import --name`,
+ *   which applies no charset filter), and every registry render used to interpolate it raw —
+ *   so a crafted name FORGED a whole skill block out of nothing in ordinary search/list
+ *   output (audit 2026-09-05 R6 P1-2; F7 on a third face). Enumerating mem_registry found
+ *   the same shape on seven branches plus the shared formatRegistryListLine, which is why
+ *   this is a chokepoint default rather than seven call-site patches. `mem_use` — the one
+ *   handler that must emit a REAL wrapper — turns it off explicitly and defangs its own
+ *   untrusted pieces per call site instead (R6 P1-1).
+ */
+function defangResult(result, { skillBlocks = true } = {}) {
   if (!result || !Array.isArray(result.content)) return result;
+  const scrub = skillBlocks
+    ? (t) => neutralizeSkillDelimiters(neutralizeContextDelimiters(t))
+    : neutralizeContextDelimiters;
   return {
     ...result,
-    content: result.content.map(c =>
-      c && c.type === 'text' && typeof c.text === 'string'
-        ? { ...c, text: neutralizeContextDelimiters(c.text) }
-        : c
+    content: result.content.map((c) =>
+      c && c.type === 'text' && typeof c.text === 'string' ? { ...c, text: scrub(c.text) } : c,
     ),
   };
 }
@@ -226,6 +363,12 @@ function defangResult(result) {
  * @param {boolean} [opts.verbatim=false] Skip the defang pass. Only for payloads that
  *   must round-trip byte-exact — `mem_export` feeds `restore`, so neutralizing it would
  *   silently corrupt backups of any memory that legitimately discusses these tags.
+ *
+ * There used to be an `emitsSkillBlock` opt-out here, for the one handler that
+ * legitimately emitted a real `<skill-loaded>` wrapper: `mem_use`. It went with the skill
+ * registry, so the chokepoint is now unconditional — every non-verbatim result is defanged
+ * for skill blocks. Do not reintroduce the opt-out for a handler that merely wants to emit
+ * a wrapper; R6 P1-1 was exactly the shape where one exempt face carried the whole risk.
  */
 function safeHandler(fn, { verbatim = false } = {}) {
   return async (args, extra) => {
@@ -233,9 +376,19 @@ function safeHandler(fn, { verbatim = false } = {}) {
       lastMcpRequestTime = Date.now();
       idleCleanupRan = false;
       const result = await fn(args, extra);
-      return verbatim ? result : defangResult(result);
+      return verbatim ? result : defangResult(result, { skillBlocks: true });
     } catch (err) {
-      return defangResult({ content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true });
+      // A damaged FTS5 index arrives here as SQLITE_CORRUPT_VTAB from the first MATCH.
+      // Without this the model got SQLite's own sentence and nothing else, on a fault it
+      // could have had fixed in one command — and mem_recent / mem_recall / mem_browse
+      // keep answering, so the dead end reads as "nothing matched". Both channels carry the
+      // same string here, deliberately: unlike the file-level remedy this one is lossless
+      // (see FTS_CORRUPTION_REMEDY in lib/db-unusable.mjs).
+      const hint = isFtsCorruptionError(err) ? `\n${FTS_CORRUPTION_REMEDY}` : '';
+      return defangResult({
+        content: [{ type: 'text', text: `Error: ${err.message}${hint}` }],
+        isError: true,
+      });
     }
   };
 }
@@ -251,7 +404,14 @@ function safeHandler(fn, { verbatim = false } = {}) {
 // searchObservations / searchSessions / searchPrompts were consolidated into the
 // shared coreRunSearchPipeline (lib/search-core.mjs). This surface is now a thin
 // adapter (runSearchPipeline below); only output formatting stays local.
-function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFallbackFired = false, isDeepSearch = false) {
+function formatSearchOutput(
+  paginatedResults,
+  args,
+  ftsQuery,
+  totalCount,
+  orFallbackFired = false,
+  isDeepSearch = false,
+) {
   if (paginatedResults.length === 0) {
     const hint = [];
     if (isDeepSearch) {
@@ -259,15 +419,22 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
       // "query was filtered" hint below would be misleading — the LLM rewrite ran
       // N variants and simply found nothing (F9).
       hint.push('No results — deep search rewrote the query into variants and still found nothing.');
-      hint.push('This is a recall miss (the rewrite ran), not a query-syntax issue; the memory likely has no related observations.');
+      hint.push(
+        'This is a recall miss (the rewrite ran), not a query-syntax issue; the memory likely has no related observations.',
+      );
     } else if (args.query && !ftsQuery) {
-      hint.push(`Query "${args.query}" was filtered (FTS5 keywords/special chars only).`);
+      hint.push(`Query "${queryLabel(args.query)}" was filtered (FTS5 keywords/special chars only).`);
       hint.push('Tip: use content words instead of operators (AND, OR, NOT, NEAR).');
     } else {
       hint.push('No results found.');
       if (args.query) {
         const expanded = ftsQuery || args.query;
-        if (expanded !== args.query) hint.push(`Searched as: ${expanded}`);
+        // Bounded like the other two echo sites. This one is the worst of the three: it
+        // prints the EXPANDED query, and synonym expansion makes it LARGER than the input
+        // (measured 13,691 chars out for 10,329 in, 1.33x). The first pass of this fix
+        // skipped the branch on the reasoning that it "never renders the label" — true of
+        // the label, false of the echo.
+        if (expanded !== args.query) hint.push(`Searched as: ${queryLabel(expanded)}`);
         hint.push('Tip: check spelling, try broader terms, or use mem_stats to see available data.');
       }
     }
@@ -281,38 +448,51 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
   // The old isCrossSource gate predated countSearchTotal: back then single-source
   // totalCount was just results.length, so suppressing "of M" hid nothing. Now it hid
   // the real total, diverging from the CLI (mem-cli.mjs has no such gate). (#8217)
-  const countLabel = totalCount > paginatedResults.length
-    ? `${paginatedResults.length} of ${totalCount}`
-    : `${paginatedResults.length}`;
-  const hasMixed = paginatedResults.some(r => r.source === 'session' || r.source === 'prompt' || r.source === 'event');
+  const countLabel =
+    totalCount > paginatedResults.length
+      ? `${paginatedResults.length} of ${totalCount}`
+      : `${paginatedResults.length}`;
+  const hasMixed = paginatedResults.some(
+    (r) => r.source === 'session' || r.source === 'prompt' || r.source === 'event',
+  );
   // P2-6: empty/omitted query falls through to a "listing recent" path — label it explicitly
   // so callers don't mistake BM25-less results for relevance-ranked ones.
-  const qLabel = args.query ? ` for "${args.query}"` : ' (no query — listing recent)';
+  const qLabel = args.query ? ` for "${queryLabel(args.query)}"` : ' (no query — listing recent)';
   // Surface AND→OR fallback so callers (incl. Claude) know a strict multi-term
   // query actually matched only a subset of the terms. Suppressed when the caller
   // explicitly requested OR semantics — there's no "fallback" in that path.
   const fallbackHint = orFallbackFired && !args.or ? ' (relaxed AND→OR)' : '';
-  lines.push(`Found ${countLabel} result(s)${qLabel}${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt, E# event)' : ''}\n`);
+  lines.push(
+    `Found ${countLabel} result(s)${qLabel}${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt, E# event)' : ''}\n`,
+  );
 
   // `~Nt` = estimated tokens to fetch this row's full body via mem_get (attachBodyTokens).
   // Conditional so a result that skipped enrichment renders cleanly, not "~undefinedt".
-  const tok = r => (r.bodyTokens ? ` ~${r.bodyTokens}t` : '');
+  const tok = (r) => (r.bodyTokens ? ` ~${r.bodyTokens}t` : '');
   for (const r of paginatedResults) {
     if (r.source === 'obs') {
-      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`);
+      lines.push(
+        `#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`,
+      );
       if (r.snippet && r.snippet.length > 10 && r.snippet !== r.title) {
         lines.push(`     ${truncate(r.snippet, 100)}`);
       }
     } else if (r.source === 'session') {
-      lines.push(`S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`);
+      lines.push(
+        `S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`,
+      );
     } else if (r.source === 'prompt') {
       lines.push(`P#${r.id} 💬 ${truncate(r.text)} | ${fmtDate(r.date)}${tok(r)}`);
     } else if (r.source === 'event') {
-      lines.push(`E#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`);
+      lines.push(
+        `E#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`,
+      );
     }
   }
 
-  lines.push(`\nWorkflow: mem_timeline(anchor=ID) for context | mem_get(ids=[...]) for full details  ·  ~Nt = est. tokens to fetch full detail`);
+  lines.push(
+    `\nWorkflow: mem_timeline(anchor=ID) for context | mem_get(ids=[...]) for full details  ·  ~Nt = est. tokens to fetch full detail`,
+  );
   return { content: [{ type: 'text', text: lines.join('\n') }] };
 }
 
@@ -342,7 +522,8 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
 
   const bounds = parseDateBounds(args.date_from, args.date_to, args.date_since);
   if (!bounds.ok) {
-    if (bounds.bad === 'since') throw new Error(`Invalid date_since: "${bounds.value}" (use <N><unit>, e.g. 7d, 24h, 90m, 2w)`);
+    if (bounds.bad === 'since')
+      throw new Error(`Invalid date_since: "${bounds.value}" (use <N><unit>, e.g. 7d, 24h, 90m, 2w)`);
     throw new Error(`Invalid date_${bounds.bad}: "${bounds.value}" (use ISO 8601 or YYYY-MM-DD)`);
   }
   const { epochFrom, epochTo } = bounds;
@@ -357,7 +538,8 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
   // with CLI cmdSearch's emitDeferredTrailer; unfiltered first-page searches
   // only. Structured fields (results/total) stay untouched — the trailer is a
   // text affordance, not a result source.
-  const wantDeferredTrailer = !args.type && !args.obs_type && !args.branch && !args.tier && !args.importance && offset === 0;
+  const wantDeferredTrailer =
+    !args.type && !args.obs_type && !args.branch && !args.tier && !args.importance && offset === 0;
   const appendDeferredTrailer = (result) => {
     if (!wantDeferredTrailer) return result;
     try {
@@ -366,7 +548,9 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
       if (lines.length > 0 && result.content?.[0]?.type === 'text') {
         result.content[0].text += `\n\n${lines.join('\n')}`;
       }
-    } catch { /* trailer is best-effort; never break search */ }
+    } catch {
+      /* trailer is best-effort; never break search */
+    }
     return result;
   };
 
@@ -374,8 +558,22 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
   // keywords/special chars). Skipped for deep/auto (the LLM rewrite may still
   // produce variants) and for filter-only listings (date/obs_type/importance).
   // A pure "D#92" query lands here — the trailer still reaches the item.
-  if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance && deepMode === 'normal') {
-    return { ...appendDeferredTrailer(formatSearchOutput([], args, ftsQuery, 0)), escalated: false, results: [], total: 0, variants: null };
+  if (
+    args.query &&
+    !ftsQuery &&
+    !epochFrom &&
+    !epochTo &&
+    !args.obs_type &&
+    !args.importance &&
+    deepMode === 'normal'
+  ) {
+    return {
+      ...appendDeferredTrailer(formatSearchOutput([], args, ftsQuery, 0)),
+      escalated: false,
+      results: [],
+      total: 0,
+      variants: null,
+    };
   }
 
   // Source scoping. deep is observations-only (deepSearch fuses hybrid-obs lists). branch/tier are
@@ -391,7 +589,7 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
   } else if (args.type) {
     effectiveType = args.type;
   } else if (args.obs_type && !args.branch && !args.tier) {
-    effectiveType = undefined;   // cross-source gate open; obsTypeScoped narrows it to obs+events
+    effectiveType = undefined; // cross-source gate open; obsTypeScoped narrows it to obs+events
     obsTypeScoped = true;
   } else if (args.importance || args.branch || args.tier) {
     effectiveType = 'observations';
@@ -401,41 +599,91 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
 
   const r = await coreRunSearchPipeline(
     {
-      db, currentProject, env: process.env,
-      searchObservationsHybrid, deepSearch, shouldEscalateToDeep, autoDeepLlmReady,
-      reRankWithContext, llm, rerankLlm,
+      db,
+      currentProject,
+      env: process.env,
+      searchObservationsHybrid,
+      deepSearch,
+      shouldEscalateToDeep,
+      autoDeepLlmReady,
+      reRankWithContext,
+      llm,
+      rerankLlm,
     },
     {
-      query: args.query, ftsQuery, effectiveSource: effectiveType, deepMode, rerank,
-      limit, offset, project: args.project ?? null, obsType: args.obs_type ?? null,
-      importance: args.importance ?? null, branch: args.branch ?? null,
-      includeNoise: args.include_noise === true, epochFrom, epochTo,
-      sort: args.sort || 'relevance', tier: args.tier ?? null,
+      query: args.query,
+      ftsQuery,
+      effectiveSource: effectiveType,
+      deepMode,
+      rerank,
+      limit,
+      offset,
+      project: args.project ?? null,
+      obsType: args.obs_type ?? null,
+      importance: args.importance ?? null,
+      branch: args.branch ?? null,
+      includeNoise: args.include_noise === true,
+      epochFrom,
+      epochTo,
+      sort: args.sort || 'relevance',
+      tier: args.tier ?? null,
       // ── MCP surface policy ──
-      obsTypeScoped,                     // D#76: obs_type ⇒ obs+events (skip type-less sessions/prompts)
-      obsTypeFallback: true,             // list-recent-by-type when 0 matches
-      crossSourceEpochSortNoFts: true,   // epoch-sort cross-source with no ftsQuery
-      rerankPolicy: 'mcp',               // (ftsQuery||isDeep) gate; re-rank/re-sort on ftsQuery&&!reranked
+      obsTypeScoped, // D#76: obs_type ⇒ obs+events (skip type-less sessions/prompts)
+      obsTypeFallback: true, // list-recent-by-type when 0 matches
+      crossSourceEpochSortNoFts: true, // epoch-sort cross-source with no ftsQuery
+      rerankPolicy: 'mcp', // (ftsQuery||isDeep) gate; re-rank/re-sort on ftsQuery&&!reranked
       rerankProject: currentProject,
-      recentListingNoFts: true,          // recent-listing for explicit --source with no ftsQuery
+      recentListingNoFts: true, // recent-listing for explicit --source with no ftsQuery
       tolerateMissingFts: false,
-      tierPosition: 'late',              // tier filter after re-rank
+      tierPosition: 'late', // tier filter after re-rank
       tierProject: args.project || currentProject,
-    }
+    },
   );
 
   // Observability: announce auto-escalation on stderr (parity with CLI deep note).
-  if (r.escalated) process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${r.escalatedObsCount} hits)\n`);
+  if (r.escalated)
+    process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${r.escalatedObsCount} hits)\n`);
 
   const output = formatSearchOutput(r.page, args, ftsQuery, r.total, r.orFallbackFired, r.isDeep);
   // Surface the rewrite to the calling agent (F13) + the rerank signal (D#43).
   if (r.isDeep && r.variants && output.content?.[0]?.type === 'text') {
-    output.content[0].text += r.variants.length > 1
-      ? `\n\n[deep search: rewrote into ${r.variants.length} variants — ${r.variants.slice(1).map(v => JSON.stringify(v)).join(', ')}]`
-      : '\n\n[deep search: rewrite produced no usable variants; searched the original query only (== baseline)]';
+    output.content[0].text +=
+      r.variants.length > 1
+        ? `\n\n[deep search: rewrote into ${r.variants.length} variants — ${r.variants
+            .slice(1)
+            .map((v) => JSON.stringify(v))
+            .join(', ')}]`
+        : '\n\n[deep search: rewrite produced no usable variants; searched the original query only (== baseline)]';
   }
   if (r.reranked && output.content?.[0]?.type === 'text') {
     output.content[0].text += '\n\n[deep search: LLM-reranked the top candidates by relevance]';
+  }
+  // D#3. The stderr line above is for humans and logs; an MCP client reads the tool RESULT,
+  // so the escalation fact and the adjacency caveat have to land in the payload or the one
+  // caller running deep=auto by default never sees either.
+  if (r.isDeep && output.content?.[0]?.type === 'text') {
+    const disclosure = deepDisclosureNote({
+      escalated: r.escalated,
+      escalatedObsCount: r.escalatedObsCount,
+      variantCount: r.variants?.length ?? 0,
+      rowCount: r.page?.length ?? 0,
+    });
+    if (disclosure) output.content[0].text += `\n\n${disclosure}`;
+  }
+  // D#5. Same split as the deep note: an MCP client reads the tool RESULT, not stderr,
+  // so a caller that pages past the candidate pool has to be told inside the payload or
+  // it reads "0 results" against a total it was just handed and concludes the corpus is
+  // empty. `reachable` is r.preFinalizeCount — the pre-slice candidate count — because
+  // perSourceLimit is PER SOURCE and a cross-source query fuses several of those pools.
+  if (output.content?.[0]?.type === 'text') {
+    const reachNote = reachabilityNote({
+      total: r.total,
+      reachable: r.preFinalizeCount,
+      offset,
+      postFilterDropped: r.postFilterDropped,
+      isDeep: r.isDeep,
+    });
+    if (reachNote) output.content[0].text += `\n\n${reachNote}`;
   }
   appendDeferredTrailer(output);
 
@@ -473,14 +721,20 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
   }
 
   // Expose structured fields for tests + the MCP content blob.
-  return { ...output, results: r.page, total: r.total, escalated: r.escalated, variants: r.variants, reranked: r.reranked, search_id: searchId };
+  return {
+    ...output,
+    results: r.page,
+    total: r.total,
+    escalated: r.escalated,
+    variants: r.variants,
+    reranked: r.reranked,
+    search_id: searchId,
+  };
 }
 
 function mcpClientIdentity() {
   const client = server.server.getClientVersion?.();
-  return client?.name
-    ? `${client.name}${client.version ? `/${client.version}` : ''}`
-    : 'unknown-mcp-client';
+  return client?.name ? `${client.name}${client.version ? `/${client.version}` : ''}` : 'unknown-mcp-client';
 }
 
 server.registerTool(
@@ -492,7 +746,7 @@ server.registerTool(
   safeHandler(async (args) => {
     const result = await runSearchPipeline(db, args, { clientIdentity: mcpClientIdentity() });
     return { content: result.content };
-  })
+  }),
 );
 
 export function handleSearchFeedbackForTest(db, args, { clientIdentity = 'test-client' } = {}) {
@@ -513,8 +767,12 @@ server.registerTool(
   },
   safeHandler(async (args) => {
     const count = handleSearchFeedbackForTest(db, args, { clientIdentity: mcpClientIdentity() });
-    return { content: [{ type: 'text', text: `Recorded relevance for ${count} result(s) from search ${args.search_id}.` }] };
-  })
+    return {
+      content: [
+        { type: 'text', text: `Recorded relevance for ${count} result(s) from search ${args.search_id}.` },
+      ],
+    };
+  }),
 );
 
 // ─── Tool: mem_recent ────────────────────────────────────────────────────────
@@ -539,7 +797,8 @@ async function runRecent(db, args) {
   let since = null;
   if (args.date_since !== undefined) {
     const d = parseDuration(args.date_since);
-    if (!d.ok) throw new Error(`Invalid date_since: "${args.date_since}" (use <N><unit>, e.g. 7d, 24h, 90m, 2w)`);
+    if (!d.ok)
+      throw new Error(`Invalid date_since: "${args.date_since}" (use <N><unit>, e.g. 7d, 24h, 90m, 2w)`);
     since = Date.now() - d.ms;
   }
 
@@ -553,7 +812,9 @@ async function runRecent(db, args) {
 
   const lines = [`Recent observations (${project || 'all'}):\n`];
   for (const r of rows) {
-    lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}`);
+    lines.push(
+      `#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}`,
+    );
   }
   lines.push(`\nWorkflow: mem_get(ids=[...]) for full details | mem_timeline(anchor=ID) for context`);
   return { content: [{ type: 'text', text: lines.join('\n') }] };
@@ -565,7 +826,7 @@ server.registerTool(
     description: descriptionOf('mem_recent'),
     inputSchema: memRecentSchema,
   },
-  safeHandler(async (args) => runRecent(db, args))
+  safeHandler(async (args) => runRecent(db, args)),
 );
 
 // ─── Tool: mem_timeline ─────────────────────────────────────────────────────
@@ -619,7 +880,9 @@ server.registerTool(
 
       const lines = [`Timeline (most recent ${rows.length}):\n`];
       for (const r of rows.reverse()) {
-        lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}`);
+        lines.push(
+          `#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}`,
+        );
       }
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
@@ -634,11 +897,13 @@ server.registerTool(
     const lines = [`Timeline around #${anchorId}${anchorNote ? ' ' + anchorNote : ''}:\n`];
     for (const r of all) {
       const marker = r.id === anchorId ? ' ◀' : '';
-      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}${marker}`);
+      lines.push(
+        `#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}${marker}`,
+      );
     }
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  })
+  }),
 );
 
 // ─── Tool: mem_get ──────────────────────────────────────────────────────────
@@ -659,9 +924,17 @@ server.registerTool(
     const { bySrc, invalid } = bucketIdTokens(rest, { explicit: args.source || null, defaultSource: 'obs' });
     if (invalid.length > 0) {
       // Should not happen — schema regex already rejected bad tokens — but guard defensively.
-      return { content: [{ type: 'text', text: `Invalid ID token(s): ${invalid.join(', ')}. Expected N, #N, P#N, S#N, E#N, or D#N.` }] };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Invalid ID token(s): ${invalid.join(', ')}. Expected N, #N, P#N, S#N, E#N, or D#N.`,
+          },
+        ],
+      };
     }
-    const totalRequested = bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length + deferredIds.length;
+    const totalRequested =
+      bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length + deferredIds.length;
     if (totalRequested === 0) {
       return { content: [{ type: 'text', text: 'No valid IDs provided.' }] };
     }
@@ -671,10 +944,12 @@ server.registerTool(
     let fieldsNote = '';
     let obsFieldFilter = null;
     if (args.fields?.length && bySrc.obs.length > 0) {
-      const invalidFields = args.fields.filter(f => !OBS_FIELDS.includes(f));
-      const validFields = args.fields.filter(f => OBS_FIELDS.includes(f));
+      const invalidFields = args.fields.filter((f) => !OBS_FIELDS.includes(f));
+      const validFields = args.fields.filter((f) => OBS_FIELDS.includes(f));
       if (validFields.length === 0) {
-        throw new Error(`No valid fields. Unknown field(s): ${invalidFields.join(', ')}. Valid: ${OBS_FIELDS.join(', ')}`);
+        throw new Error(
+          `No valid fields. Unknown field(s): ${invalidFields.join(', ')}. Valid: ${OBS_FIELDS.join(', ')}`,
+        );
       }
       if (invalidFields.length > 0) {
         fieldsNote = `Note: unknown field(s) dropped: ${invalidFields.join(', ')}. Valid: ${OBS_FIELDS.join(', ')}`;
@@ -699,21 +974,23 @@ server.registerTool(
         for (const f of renderFields) {
           const val = row[f];
           if (val === null || val === undefined || val === '') continue;
-          if (f === 'text' && row.narrative && typeof val === 'string' && val.startsWith(row.narrative)) continue;
+          if (f === 'text' && row.narrative && typeof val === 'string' && val.startsWith(row.narrative))
+            continue;
           // Shared formatter (cli/common.mjs) renders epoch-ms time fields as
           // `<ms> (<relative>)` — parity with the CLI `get` path so an LLM reader
           // gets a scannable hint instead of a bare millisecond integer.
           const display = formatObsFieldValue(f, val);
           const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
-          lines.push(`${obsFieldLabel(f)}: ${typeof display === 'string' && display.length > maxLen ? display.slice(0, maxLen) + '…' : display}`);
+          lines.push(
+            `${obsFieldLabel(f)}: ${typeof display === 'string' && display.length > maxLen ? display.slice(0, maxLen) + '…' : display}`,
+          );
         }
         sections.push(lines.join('\n'));
       }
     }
 
     if (bySrc.session.length > 0) {
-      const ph = bySrc.session.map(() => '?').join(',');
-      const rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.session);
+      const rows = fetchSessionDetail(db, bySrc.session);
       // SESSION_DETAIL_FIELDS (get-core, P2-12): shared full set — adds remaining_items
       // (searchable via FTS but previously unrendered on BOTH detail faces).
       const sessFields = SESSION_DETAIL_FIELDS;
@@ -724,7 +1001,9 @@ server.registerTool(
           const val = row[f];
           if (val === null || val === undefined || val === '') continue;
           const maxLen = 500;
-          lines.push(`${f}: ${typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val}`);
+          lines.push(
+            `${f}: ${typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val}`,
+          );
         }
         sections.push(lines.join('\n'));
       }
@@ -735,7 +1014,7 @@ server.registerTool(
         foundBySource.prompt.add(row.id);
         const lines = [`── P#${row.id} ──`];
         for (const f of PROMPT_DETAIL_FIELDS) {
-          if (f === 'id') continue;   // already in the header
+          if (f === 'id') continue; // already in the header
           const val = row[f];
           if (val === null || val === undefined || val === '') continue;
           lines.push(`${f}: ${typeof val === 'string' && val.length > 500 ? val.slice(0, 500) + '…' : val}`);
@@ -751,7 +1030,7 @@ server.registerTool(
         foundBySource.event.add(row.id);
         const lines = [`── E#${row.id} [${row.event_type}] ──`];
         for (const f of EVENT_DETAIL_FIELDS) {
-          if (f === 'id' || f === 'event_type') continue;   // already in the header
+          if (f === 'id' || f === 'event_type') continue; // already in the header
           const val = row[f];
           if (val === null || val === undefined || val === '') continue;
           lines.push(`${f}: ${typeof val === 'string' && val.length > 500 ? val.slice(0, 500) + '…' : val}`);
@@ -767,33 +1046,59 @@ server.registerTool(
     let deferredMissing = [];
     if (deferredIds.length > 0) {
       const dRows = getDeferredByIds(db, deferredIds);
-      const found = new Set(dRows.map(r => r.id));
-      deferredMissing = deferredIds.filter(id => !found.has(id));
+      const found = new Set(dRows.map((r) => r.id));
+      deferredMissing = deferredIds.filter((id) => !found.has(id));
       deferredSections = dRows.map(formatDeferredDetail);
       deferredFound = dRows.length;
     }
 
-    const totalFound = foundBySource.obs.size + foundBySource.session.size + foundBySource.prompt.size + foundBySource.event.size + deferredFound;
+    const totalFound =
+      foundBySource.obs.size +
+      foundBySource.session.size +
+      foundBySource.prompt.size +
+      foundBySource.event.size +
+      deferredFound;
 
-    if (totalFound === 0 && deferredIds.length > 0 && bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length === 0) {
+    if (
+      totalFound === 0 &&
+      deferredIds.length > 0 &&
+      bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length === 0
+    ) {
       // Deferred-only request, nothing found — the source-probe below is about
       // obs/session/prompt/event and would render an empty source list.
-      return { content: [{ type: 'text', text: `Deferred item(s) not found: ${deferredMissing.map(i => `D#${i}`).join(', ')}. List open items: mem_defer_list.` }] };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Deferred item(s) not found: ${deferredMissing.map((i) => `D#${i}`).join(', ')}. List open items: mem_defer_list.`,
+          },
+        ],
+      };
     }
 
     if (totalFound === 0) {
       // Probe other sources so callers can retry with the right prefix/source override.
-      const queried = new Set(Object.entries(bySrc).filter(([, v]) => v.length > 0).map(([k]) => k));
+      const queried = new Set(
+        Object.entries(bySrc)
+          .filter(([, v]) => v.length > 0)
+          .map(([k]) => k),
+      );
       const allNumericIds = [...bySrc.obs, ...bySrc.session, ...bySrc.prompt, ...bySrc.event];
       const probe = probeIdSources(db, allNumericIds, queried);
       const hints = [];
-      if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs — use source='obs' or bare #N)`);
-      if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session — use source='session' or S#N)`);
-      if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt — use source='prompt' or P#N)`);
-      if (probe.event.length > 0)   hints.push(`E#${probe.event.join(', E#')} (event — use source='event' or E#N)`);
+      if (probe.obs.length > 0) hints.push(`#${probe.obs.join(', #')} (obs — use source='obs' or bare #N)`);
+      if (probe.session.length > 0)
+        hints.push(`S#${probe.session.join(', S#')} (session — use source='session' or S#N)`);
+      if (probe.prompt.length > 0)
+        hints.push(`P#${probe.prompt.join(', P#')} (prompt — use source='prompt' or P#N)`);
+      if (probe.event.length > 0)
+        hints.push(`E#${probe.event.join(', E#')} (event — use source='event' or E#N)`);
       const hint = hints.length > 0 ? ` Try: ${hints.join('; ')}.` : '';
       const queriedList = [...queried].join(', ');
-      const deferredNote = deferredMissing.length > 0 ? ` Deferred item(s) not found: ${deferredMissing.map(i => `D#${i}`).join(', ')}.` : '';
+      const deferredNote =
+        deferredMissing.length > 0
+          ? ` Deferred item(s) not found: ${deferredMissing.map((i) => `D#${i}`).join(', ')}.`
+          : '';
       const msg = `No records found in source(s) [${queriedList}] for the given ID(s).${deferredNote}${hint}`;
       return { content: [{ type: 'text', text: fieldsNote ? `${msg}\n\n${fieldsNote}` : msg }] };
     }
@@ -801,12 +1106,12 @@ server.registerTool(
     // Missing-ID note per bucket (mirrors mem_delete). Show missing IDs with their bucket prefix
     // so callers can tell which source returned nothing.
     const missingHints = [];
-    const miss = (arr, found, prefix) => arr.filter(id => !found.has(id)).map(id => `${prefix}${id}`);
+    const miss = (arr, found, prefix) => arr.filter((id) => !found.has(id)).map((id) => `${prefix}${id}`);
     missingHints.push(...miss(bySrc.obs, foundBySource.obs, '#'));
     missingHints.push(...miss(bySrc.session, foundBySource.session, 'S#'));
     missingHints.push(...miss(bySrc.prompt, foundBySource.prompt, 'P#'));
     missingHints.push(...miss(bySrc.event, foundBySource.event, 'E#'));
-    missingHints.push(...deferredMissing.map(id => `D#${id}`));
+    missingHints.push(...deferredMissing.map((id) => `D#${id}`));
 
     const parts = [];
     if (fieldsNote) parts.push(fieldsNote);
@@ -816,7 +1121,7 @@ server.registerTool(
     }
 
     return { content: [{ type: 'text', text: parts.join('\n\n') }] };
-  })
+  }),
 );
 
 // ─── Tool: mem_delete ────────────────────────────────────────────────────────
@@ -829,7 +1134,7 @@ server.registerTool(
   },
   safeHandler(async (args) => {
     // Shared preview body (lib/delete-core, P2-12) — single source with CLI delete.
-    const { rows, lines: previewLines } = previewDeleteRows(db, args.ids);
+    const { rows, lines: previewLines, missing } = previewDeleteRows(db, args.ids);
 
     if (rows.length === 0) {
       return { content: [{ type: 'text', text: 'No observations found for given IDs.' }] };
@@ -837,6 +1142,8 @@ server.registerTool(
 
     if (!args.confirm) {
       const lines = [`Preview: ${rows.length} observation(s) will be deleted:\n`, ...previewLines];
+      if (missing.length > 0)
+        lines.push(`\nNote: ID(s) ${missing.join(', ')} not found and will be skipped.`);
       lines.push(`\nCall mem_delete(ids=[...], confirm=true) to execute.`);
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
@@ -846,12 +1153,12 @@ server.registerTool(
     // with the CLI `delete` path (was inlined + kept in sync by parity comments).
     const result = deleteObservations(db, args.ids);
 
-    const missing = args.ids.filter(id => !rows.some(r => r.id === id));
     const msg = [`Deleted ${result.deleted} observation(s).`];
-    if (result.recoveredChildren > 0) msg.push(`Recovered ${result.recoveredChildren} merged/compressed child observation(s) to live.`);
+    if (result.recoveredChildren > 0)
+      msg.push(`Recovered ${result.recoveredChildren} merged/compressed child observation(s) to live.`);
     if (missing.length > 0) msg.push(`Note: ID(s) ${missing.join(', ')} not found.`);
     return { content: [{ type: 'text', text: msg.join(' ') }] };
-  })
+  }),
 );
 
 // ─── Tool: mem_save ─────────────────────────────────────────────────────────
@@ -894,14 +1201,17 @@ server.registerTool(
     // `obs_type` → `type`: the sibling read tools all name it obs_type (see the schema
     // comment). Without this, an unknown key was dropped and the row saved as `discovery`.
     args = applyArgAliases(args, { obs_type: 'type' });
-    if (args.project) args = { ...args, project: resolveProject(args.project) };
+    if (args.project) args = { ...args, project: resolveProjectForWrite(args.project) };
     const project = args.project || inferProject();
 
-    let closesIds = null;
-    let result;
+    let closesIds, result;
     try {
-      result = db.transaction(() => {
-        const r = saveObservation(db, {
+      // The transaction body — dedup short-circuit BEFORE the resolver, and D#195's
+      // allowStatuses — is lib/save-observation.mjs's (audit 2026-09-02 P1-6). Both faces
+      // used to write it out and each carried a "kept in sync with the other" comment.
+      ({ result, closesIds } = saveWithClosures(
+        db,
+        {
           // Size ceiling applied here rather than in lib/save-observation.mjs so the
           // shared pipeline keeps its "caller validates" contract (see its header).
           content: clampSaveText(args.content, SAVE_TEXT_LIMITS.content),
@@ -912,16 +1222,11 @@ server.registerTool(
           files: args.files || [],
           lesson_learned: clampSaveText(args.lesson_learned, SAVE_TEXT_LIMITS.lesson_learned),
           supersedes: args.supersedes,
-        });
-        if (r.kind === 'duplicate') return r; // dedup short-circuits BEFORE resolver — replay is idempotent
-        // Resolve INSIDE tx + after dedup check so duplicate replays don't throw on
-        // already-closed items. Mirrors mem-cli.mjs cmdSave shape.
-        if (args.closes_deferred && args.closes_deferred.length > 0) {
-          closesIds = resolveDeferredIds(db, project, args.closes_deferred);
-          closeDeferredItems(db, closesIds, r.id);
-        }
-        return r;
-      })();
+          // Opt-in only — the near-duplicate window stays the default. CLI parity: `--force`.
+          force: args.force === true,
+        },
+        { closesTokens: args.closes_deferred, project },
+      ));
     } catch (e) {
       if (args.closes_deferred && args.closes_deferred.length > 0) {
         // Re-throw with a clearer prefix so MCP error response names the
@@ -929,27 +1234,37 @@ server.registerTool(
         // closesIds is closure-scoped and may not have been assigned before throw.
         throw new Error(`mem_save with closes_deferred failed: ${e.message}`, { cause: e });
       }
-      throw e;  // unwrapped — preserves original message + stack
+      throw e; // unwrapped — preserves original message + stack
     }
 
     if (result.kind === 'duplicate') {
-      return { content: [{ type: 'text', text: `Skipped: similar to existing #${result.existingId} in project "${project}". Use mem_get(ids=[${result.existingId}]) to review.` }] };
+      // D#201: this branch returns before the note below, so it renders its own.
+      const dupSkip = formatSupersedeSkipped(result.supersedeSkipped);
+      const dupText = `Skipped: similar to existing #${result.existingId} in project "${project}". Use mem_get(ids=[${result.existingId}]) to review.`;
+      return { content: [{ type: 'text', text: dupSkip ? `${dupText}\n${dupSkip}` : dupText }] };
     }
 
     const lessonNote = result.lessonCaptured ? ` 💡lesson captured` : '';
-    const closedNote = closesIds && closesIds.length > 0
-      ? ` Closed deferred: ${closesIds.map(i => `D#${i}`).join(', ')}.`
-      : '';
-    const supersededNote = result.supersededIds && result.supersededIds.length > 0
-      ? ` Superseded: ${result.supersededIds.map(i => `#${i}`).join(', ')}.`
-      : '';
-    const nudge = buildLessonNudge({ type: result.type, id: result.id, lessonCaptured: result.lessonCaptured, surface: 'mcp' });
+    const closedNote =
+      closesIds && closesIds.length > 0
+        ? ` Closed deferred: ${closesIds.map((i) => `D#${i}`).join(', ')}.`
+        : '';
+    const supersededNote = formatSupersededNote(result);
+    const nudge = buildLessonNudge({
+      type: result.type,
+      id: result.id,
+      lessonCaptured: result.lessonCaptured,
+      surface: 'mcp',
+    });
     // G1+G2: detached backfill worker (lesson for obligated types + aliases for
     // every save) — fill-only-empty, so an agent acting on the nudge still wins.
-    const enrichNote = shouldQueueSaveEnrich(result) && queueSaveEnrich(result.id)
-      ? ' (background enrichment queued)' : '';
-    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}${supersededNote}${enrichNote}${nudge}` }] };
-  })
+    const enrichNote =
+      shouldQueueSaveEnrich(result) && queueSaveEnrich(result.id) ? ' (background enrichment queued)' : '';
+    // D#201: on its own line rather than inside the success sentence.
+    const skipNote = formatSupersedeSkipped(result.supersedeSkipped);
+    const savedText = `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}${supersededNote}${enrichNote}${nudge}`;
+    return { content: [{ type: 'text', text: skipNote ? `${savedText}\n${skipNote}` : savedText }] };
+  }),
 );
 
 // ─── Tool: mem_defer ────────────────────────────────────────────────────────
@@ -961,7 +1276,7 @@ server.registerTool(
     inputSchema: memDeferSchema,
   },
   safeHandler(async (args) => {
-    if (args.project) args = { ...args, project: resolveProject(args.project) };
+    if (args.project) args = { ...args, project: resolveProjectForWrite(args.project) };
     const project = args.project || inferProject();
     const r = insertDeferred(db, {
       project,
@@ -973,10 +1288,16 @@ server.registerTool(
     // Compute the ordinal for the freshly-inserted row so the response is
     // immediately actionable ("ok, I deferred this as item 1").
     const open = listOpenWithOrdinal(db, project, 50);
-    const ord = open.find(o => o.id === r.id)?.ordinal ?? null;
-    return { content: [{ type: 'text', text:
-      `Deferred as D#${r.id} (item ${ord ?? '?'}) in project "${project}" — surfaces in next SessionStart banner.` }] };
-  })
+    const ord = open.find((o) => o.id === r.id)?.ordinal ?? null;
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Deferred as D#${r.id} (item ${ord ?? '?'}) in project "${project}" — surfaces in next SessionStart banner.`,
+        },
+      ],
+    };
+  }),
 );
 
 // ─── Tool: mem_defer_list ───────────────────────────────────────────────────
@@ -1003,7 +1324,7 @@ server.registerTool(
     // Affordance for the detail field — list stays title-only by design.
     lines.push(`Full detail: mem_get ids=["D#<id>"]`);
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  })
+  }),
 );
 
 // ─── Tool: mem_defer_drop ───────────────────────────────────────────────────
@@ -1024,8 +1345,12 @@ server.registerTool(
     if (r.changed === 0) {
       return { content: [{ type: 'text', text: `D#${realId} was not in 'open' status — drop is a no-op.` }] };
     }
-    return { content: [{ type: 'text', text: `Dropped D#${realId} in project "${project}". Reason: ${args.reason}` }] };
-  })
+    // D#195 (c): same advisory as the CLI's `defer drop`, so an agent reaching
+    // this through MCP gets the same steer toward `mem_save(closes_deferred)`.
+    const hint = formatDropReasonHint(args.reason);
+    const dropText = `Dropped D#${realId} in project "${project}". Reason: ${args.reason}`;
+    return { content: [{ type: 'text', text: hint ? `${dropText}\n${hint}` : dropText }] };
+  }),
 );
 
 // ─── Tool: mem_stats ────────────────────────────────────────────────────────
@@ -1050,9 +1375,23 @@ server.registerTool(
     }
 
     const {
-      obsTotal, sessTotal, promptTotal, obsRecent, sessRecent,
-      types, projects, daily, tokenEst, avgImp, lowVal, lowSignalTitle,
-      noiseRatio, lowSignalRatio, compressedCount, supersededOnlyCount, tierMap,
+      obsTotal,
+      sessTotal,
+      promptTotal,
+      obsRecent,
+      sessRecent,
+      types,
+      projects,
+      daily,
+      tokenEst,
+      avgImp,
+      lowVal,
+      lowSignalTitle,
+      noiseRatio,
+      lowSignalRatio,
+      compressedCount,
+      supersededOnlyCount,
+      tierMap,
     } = computeStatsFeed(db, { project: args.project || null, days });
 
     const lines = [
@@ -1064,12 +1403,12 @@ server.registerTool(
       `Last ${days}d: ${obsRecent.c} observations | ${sessRecent.c} sessions`,
       '',
       'Type distribution (recent):',
-      ...types.map(t => `  ${typeIcon(t.type)} ${t.type}: ${t.c}`),
+      ...types.map((t) => `  ${typeIcon(t.type)} ${t.type}: ${t.c}`),
       '',
-      ...(projects.length ? ['Top projects:', ...projects.map(p => `  ${p.project}: ${p.c}`)] : []),
+      ...(projects.length ? ['Top projects:', ...projects.map((p) => `  ${p.project}: ${p.c}`)] : []),
       '',
       'Daily activity (last 7d):',
-      ...daily.map(d => `  ${d.day}: ${d.c} observations`),
+      ...daily.map((d) => `  ${d.day}: ${d.c} observations`),
       '',
       'Data Health:',
       `  Est. tokens: ${tokenEst.t ?? 0}`,
@@ -1077,7 +1416,9 @@ server.registerTool(
       `  Low-value (imp≤1, never used, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`,
       `  Low-signal titles (Modified/Error/Worked on…): ${lowSignalTitle.c} (${(lowSignalRatio * 100).toFixed(1)}%)`,
       `  Compressed: ${compressedCount.c}`,
-      ...((noiseRatio > 0.6 || lowSignalRatio > 0.3) ? ['  ⚠️ High noise ratio — consider running mem_compress / maintain'] : []),
+      ...(noiseRatio > 0.6 || lowSignalRatio > 0.3
+        ? ['  ⚠️ High noise ratio — consider running mem_compress / maintain']
+        : []),
       '',
       // Tier counts only live (uncompressed, non-superseded) observations — surface
       // the full decomposition so live + compressed + superseded = Total adds up cleanly.
@@ -1086,7 +1427,7 @@ server.registerTool(
     ];
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  })
+  }),
 );
 
 // ─── Tool: mem_compress ──────────────────────────────────────────────────────
@@ -1123,7 +1464,9 @@ server.registerTool(
           const [proj, week] = key.split('::');
           const types = {};
           for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
-          const typeStr = Object.entries(types).map(([t, c]) => `${c} ${t}`).join(', ');
+          const typeStr = Object.entries(types)
+            .map(([t, c]) => `${c} ${t}`)
+            .join(', ');
           return `  ${proj} ${week}: ${obs.length} obs (${typeStr})`;
         }),
         '',
@@ -1142,8 +1485,15 @@ server.registerTool(
     });
     compress();
 
-    return { content: [{ type: 'text', text: `Compressed ${totalCompressed} observations into ${compressableGroups.length} weekly summaries.` }] };
-  })
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Compressed ${totalCompressed} observations into ${compressableGroups.length} weekly summaries.`,
+        },
+      ],
+    };
+  }),
 );
 
 // ─── Tool: mem_maintain ──────────────────────────────────────────────────────
@@ -1179,8 +1529,8 @@ server.registerTool(
         formatPendingPurgeLine(stats.pendingPurge),
       ];
       if (duplicates.length > 0) {
-        const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
-        const manualReview = duplicates.filter(d => parseFloat(d.similarity) < AUTO_MERGE_THRESHOLD);
+        const autoMergeable = duplicates.filter((d) => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
+        const manualReview = duplicates.filter((d) => parseFloat(d.similarity) < AUTO_MERGE_THRESHOLD);
 
         if (autoMergeable.length > 0) {
           lines.push('', `Auto-mergeable pairs (similarity >= ${AUTO_MERGE_THRESHOLD}):`);
@@ -1188,21 +1538,29 @@ server.registerTool(
             // Keep the higher-importance or newer observation
             const keep = d.a.importance >= d.b.importance ? d.a : d.b;
             const remove = keep === d.a ? d.b : d.a;
-            lines.push(`  [${keep.id}] "${truncate(keep.title, 40)}" <-> [${remove.id}] "${truncate(remove.title, 40)}" (${d.similarity})`);
+            lines.push(
+              `  [${keep.id}] "${truncate(keep.title, 40)}" <-> [${remove.id}] "${truncate(remove.title, 40)}" (${d.similarity})`,
+            );
           }
           // Build ready-to-use merge_ids for auto-mergeable pairs
-          const mergeIds = autoMergeable.map(d => {
+          const mergeIds = autoMergeable.map((d) => {
             const keep = d.a.importance >= d.b.importance ? d.a : d.b;
             const remove = keep === d.a ? d.b : d.a;
             return [keep.id, remove.id];
           });
-          lines.push('', `Ready-to-use command:`, `  mem_maintain(action="execute", operations=["dedup"], merge_ids=${JSON.stringify(mergeIds)})`);
+          lines.push(
+            '',
+            `Ready-to-use command:`,
+            `  mem_maintain(action="execute", operations=["dedup"], merge_ids=${JSON.stringify(mergeIds)})`,
+          );
         }
 
         if (manualReview.length > 0) {
           lines.push('', 'Needs review:');
           for (const d of manualReview.slice(0, DUPLICATE_DISPLAY)) {
-            lines.push(`  [${d.a.id}] "${truncate(d.a.title, 40)}" <-> [${d.b.id}] "${truncate(d.b.title, 40)}" (${d.similarity})`);
+            lines.push(
+              `  [${d.a.id}] "${truncate(d.a.title, 40)}" <-> [${d.b.id}] "${truncate(d.b.title, 40)}" (${d.similarity})`,
+            );
           }
         }
       }
@@ -1210,15 +1568,21 @@ server.registerTool(
     }
 
     if (action === 'execute') {
-      const ops = args.operations && args.operations.length > 0
-        ? args.operations
-        : resolveDefaultMaintainOps();
+      const ops =
+        args.operations && args.operations.length > 0 ? args.operations : resolveDefaultMaintainOps();
       // T2-P1-A: reject explicit empty array (vs. omitted → defaults above). Empty-array
       // callers are almost always mistakes; silently running only FTS5 optimize hides the error.
       if (args.operations && args.operations.length === 0) {
-        return { content: [{ type: 'text', text: `operations array is empty. Pass a non-empty list (e.g. ${JSON.stringify(DEFAULT_MAINTAIN_OPS)}) or omit operations to use the default set.` }], isError: true };
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `operations array is empty. Pass a non-empty list (e.g. ${JSON.stringify(DEFAULT_MAINTAIN_OPS)}) or omit operations to use the default set.`,
+            },
+          ],
+          isError: true,
+        };
       }
-      const results = [];
       const staleAge = Date.now() - STALE_AGE_MS;
       const mctx = { projectFilter, baseParams, staleAge, opCap: OP_CAP };
 
@@ -1234,122 +1598,44 @@ server.registerTool(
       // runs unconfirmed on either surface now or before).
       const purgeConfirmed = args.confirm === true;
 
-      // MED-2: snapshot the DB before the irreversible cleanup/purge hard-deletes —
-      // only when rows will actually be removed, and OUTSIDE the transaction below
-      // (VACUUM cannot run inside one). Best-effort; snapshotDb never throws.
-      if (hardDeleteCandidateCount(db, mctx, { cleanup: ops.includes('cleanup'), purge: ops.includes('purge_stale') && purgeConfirmed }) > 0) {
-        snapshotDb(db, { tag: 'pre-maintain' });
-      }
-
-      db.transaction(() => {
-        // PURGE FIRST — matches the auto-maintain hook order (hook.mjs:766) and the CLI
-        // cmdMaintain. Running decay BEFORE purge in one transaction marked a stale row
-        // pending-purge AND deleted it in the SAME call (zero grace), while the pre-txn
-        // snapshot guard counts only PRE-EXISTING pending rows so it skipped the backup →
-        // permanent loss of notable imp-2/3 memories (audit HIGH-1). Purging first deletes
-        // only rows a PRIOR run marked (backed up); rows decay marks below wait one cycle.
-        if (ops.includes('purge_stale')) {
-          const retainDays = args.retain_days ?? 30;
-          const retainCutoff = Date.now() - retainDays * DAY_MS;
-          if (!purgeConfirmed) {
-            // Dry-run preview (parity with CLI `maintain` without --confirm): the other
-            // requested non-destructive ops still run below.
-            const previewRow = purgeStalePreview(db, mctx, retainCutoff);
-            const lines = [
-              'purge_stale preview (confirm=false):',
-              `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`,
-            ];
-            if (previewRow.candidates > 0) {
-              lines.push(`  Oldest: ${new Date(previewRow.oldest).toISOString().slice(0, 10)}`);
-              lines.push(`  Newest: ${new Date(previewRow.newest).toISOString().slice(0, 10)}`);
-            }
-            lines.push('  Nothing was deleted. To delete, re-run with confirm=true:');
-            lines.push(`  mem_maintain(action="execute", operations=${JSON.stringify(ops)}, confirm=true${args.retain_days ? `, retain_days=${args.retain_days}` : ''}${args.project ? `, project="${args.project}"` : ''})`);
-            results.push(lines.join('\n'));
-          } else {
-            const purged = purgeStale(db, mctx, retainCutoff);
-            results.push(`Purged ${purged} stale observations (retained last ${retainDays} days)` + (purged >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
+      // The op ORDER, the pre-transaction snapshot and the three post-transaction ops all
+      // live in maintain-core (audit 2026-09-02 P1-5) — this face keeps only what is
+      // genuinely MCP-shaped: how `merge_ids` is spelled in a warning, and what the purge
+      // preview tells the caller to type next. Before the extraction this block rendered
+      // `inj>=8` as a literal while the CLI twin interpolated PINNED_INJ_THRESHOLD.
+      const results = runMaintainOps(db, mctx, ops, {
+        retainDays: args.retain_days ?? 30,
+        retainCutoff: Date.now() - (args.retain_days ?? 30) * DAY_MS,
+        confirmed: purgeConfirmed,
+        mergeGroups: args.merge_ids || null,
+        mergeIdsProvided: Boolean(args.merge_ids),
+        mergeIdsFlagName: 'merge_ids',
+        onError: debugCatch,
+        renderPurgePreview: (previewRow, retainDays) => {
+          const lines = [
+            'purge_stale preview (confirm=false):',
+            `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`,
+          ];
+          if (previewRow.candidates > 0) {
+            lines.push(`  Oldest: ${new Date(previewRow.oldest).toISOString().slice(0, 10)}`);
+            lines.push(`  Newest: ${new Date(previewRow.newest).toISOString().slice(0, 10)}`);
           }
-        }
-
-        if (ops.includes('cleanup')) {
-          const deleted = cleanupBroken(db, mctx);
-          results.push(`Cleaned up ${deleted} broken observations` + (deleted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
-          // Self-heal legacy orphans (keeper hard-deleted pre-recoverChildrenOf):
-          // resurface unreachable children. Non-destructive — un-hide only, no delete.
-          const orphans = recoverOrphanedChildren(db, mctx);
-          if (orphans > 0) results.push(`Recovered ${orphans} orphaned compression children`);
-          // Heal lesson rows citation-decay buried at importance 0 (pre floor=1). 0→1 on
-          // lesson-bearing rows only; idempotent no-op once none remain.
-          const lessonsHealed = recoverBuriedLessons(db, mctx);
-          if (lessonsHealed > 0) results.push(`Healed ${lessonsHealed} lesson rows buried at importance 0`);
-          // Heal deferred_work rows whose closing obs / source prompt was deleted while FK was
-          // OFF (dangling ref foreign_key_check flags). Applies the ON DELETE SET NULL the FK would.
-          const deferredHealed = sweepDeferredWorkOrphans(db, mctx);
-          if (deferredHealed > 0) results.push(`Healed ${deferredHealed} deferred-work rows with dangling references`);
-        }
-
-        if (ops.includes('decay')) {
-          // injection_count>0 protected (maintain-core; unifies with CLI + hook —
-          // the MCP copy previously lacked this clause and decayed/purged injected memories).
-          const { decayed, idleMarked } = decayAndMarkIdle(db, mctx);
-          results.push(`Decayed ${decayed} stale observations, marked ${idleMarked} idle as pending-purge` + ((decayed >= OP_CAP || idleMarked >= OP_CAP) ? ' (cap reached, re-run for more)' : ''));
-        }
-
-        if (ops.includes('boost')) {
-          const boosted = boostAccessed(db, mctx);
-          results.push(`Boosted ${boosted} frequently-accessed observations` + (boosted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
-        }
-
-        if (ops.includes('demote_pinned')) {
-          const demoted = demotePinned(db, mctx);
-          results.push(`Demoted ${demoted} pinned-but-uncited observations (inj>=8, cited=0; no lesson → importance 1, lesson → 2)` + (demoted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
-        }
-
-        if (ops.includes('dedup') && args.merge_ids) {
-          const totalMerged = mergeDuplicates(db, args.merge_ids);
-          results.push(`Merged ${totalMerged} duplicate observations`);
-        }
-
-        if (!ops.includes('dedup') && args.merge_ids) {
-          results.push('Warning: merge_ids provided but "dedup" not in operations — merge_ids ignored');
-        }
-      })();
-
-      // FTS5 optimize (outside transaction)
-      db.exec("INSERT INTO observations_fts(observations_fts) VALUES('optimize')");
-      results.push('FTS5 index optimized');
-
-      // rebuild_vectors: outside main transaction (maintain-core, shared with CLI).
-      if (ops.includes('rebuild_vectors')) {
-        try {
-          const r = rebuildVectors(db);
-          results.push(r.ok
-            ? `Vectors: rebuilt vocabulary (${r.terms} terms), updated ${r.updated}/${r.total} vectors`
-            : `Vectors: ${r.reason}`);
-        } catch (e) {
-          debugCatch(e, 'rebuild_vectors');
-          results.push(`Vectors: rebuild failed — ${e.message}`);
-        }
-      }
-
-      // vacuum: reclaim freelist dead space left by DELETEs. Whole-DB, outside any
-      // transaction. maintain-core, shared with CLI.
-      if (ops.includes('vacuum')) {
-        try {
-          const v = vacuum(db);
-          results.push(`VACUUM: reclaimed ~${v.reclaimedMB}MB (freelist ${v.freeBefore} → ${v.freeAfter} pages)`);
-        } catch (e) {
-          debugCatch(e, 'vacuum');
-          results.push(`VACUUM failed — ${e.message}`);
-        }
-      }
+          lines.push('  Nothing was deleted. To delete, re-run with confirm=true:');
+          lines.push(
+            `  mem_maintain(action="execute", operations=${JSON.stringify(ops)}, confirm=true${args.retain_days ? `, retain_days=${args.retain_days}` : ''}${args.project ? `, project="${args.project}"` : ''})`,
+          );
+          return lines.join('\n');
+        },
+      });
 
       return { content: [{ type: 'text', text: results.join('\n') }] };
     }
 
-    return { content: [{ type: 'text', text: `Unknown action: ${action}. Use "scan" or "execute".` }], isError: true };
-  })
+    return {
+      content: [{ type: 'text', text: `Unknown action: ${action}. Use "scan" or "execute".` }],
+      isError: true,
+    };
+  }),
 );
 
 // ─── Tool: mem_optimize ────────────────────────────────────────────────────
@@ -1365,9 +1651,7 @@ server.registerTool(
 
     if (action === 'preview') {
       const preview = optimizePreview(db, { project: args.project, detail: args.detail === true });
-      const lines = [
-        `🔍 LLM Optimization Preview:`,
-      ];
+      const lines = [`🔍 LLM Optimization Preview:`];
       if (args.project) lines.push(`  Project filter: ${args.project}`);
       lines.push(
         `  Re-enrich candidates: ${preview.reenrich}`,
@@ -1381,13 +1665,18 @@ server.registerTool(
           lines.push('', '─── Cluster-merge details ───');
           for (const [i, cluster] of preview.mergeClusters.entries()) {
             lines.push(`  Cluster ${i + 1} (${cluster.length} obs, project=${cluster[0]?.project || '?'}):`);
-            for (const obs of cluster) lines.push(`    #${obs.id} [${obs.type || 'change'}] ${truncate(obs.title || '(untitled)', 100)}`);
+            for (const obs of cluster)
+              lines.push(
+                `    #${obs.id} [${obs.type || 'change'}] ${truncate(obs.title || '(untitled)', 100)}`,
+              );
           }
         }
         if (preview.reenrichSamples && preview.reenrichSamples.length > 0) {
           lines.push('', '─── Re-enrich sample (first 20) ───');
           for (const obs of preview.reenrichSamples) {
-            lines.push(`  #${obs.id} [${obs.type || 'change'}] (project=${obs.project || '?'}) ${truncate(obs.title || '(untitled)', 100)}`);
+            lines.push(
+              `  #${obs.id} [${obs.type || 'change'}] (project=${obs.project || '?'}) ${truncate(obs.title || '(untitled)', 100)}`,
+            );
           }
         }
       }
@@ -1406,311 +1695,27 @@ server.registerTool(
     });
 
     const lines = ['🔧 LLM Optimization Results:'];
-    if (results.reenrich) lines.push(`  Re-enrich: ${results.reenrich.processed || 0} processed, ${results.reenrich.skipped || 0} skipped`);
+    if (results.reenrich)
+      lines.push(
+        `  Re-enrich: ${results.reenrich.processed || 0} processed, ${results.reenrich.skipped || 0} skipped`,
+      );
     if (results.normalize) {
       if (results.normalize.skipped) lines.push(`  Normalize: skipped (${results.normalize.reason})`);
-      else lines.push(`  Normalize: ${results.normalize.processed || 0} updated, ${results.normalize.groups || 0} synonym groups`);
+      else
+        lines.push(
+          `  Normalize: ${results.normalize.processed || 0} updated, ${results.normalize.groups || 0} synonym groups`,
+        );
     }
-    if (results.clusterMerge) lines.push(`  Cluster-merge: ${results.clusterMerge.merged || 0} merged of ${results.clusterMerge.processed || 0} clusters`);
-    if (results.smartCompress) lines.push(`  Smart-compress: ${results.smartCompress.compressed || 0} compressed of ${results.smartCompress.processed || 0} clusters`);
+    if (results.clusterMerge)
+      lines.push(
+        `  Cluster-merge: ${results.clusterMerge.merged || 0} merged of ${results.clusterMerge.processed || 0} clusters`,
+      );
+    if (results.smartCompress)
+      lines.push(
+        `  Smart-compress: ${results.smartCompress.compressed || 0} compressed of ${results.smartCompress.processed || 0} clusters`,
+      );
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  })
-);
-
-// ─── Tool: mem_registry ─────────────────────────────────────────────────────
-
-server.registerTool(
-  'mem_registry',
-  {
-    description: descriptionOf('mem_registry'),
-    inputSchema: memRegistrySchema,
-  },
-  safeHandler(async (args) => {
-    const rdb = getRegistryDb();
-    if (!rdb) {
-      return { content: [{ type: 'text', text: 'Registry DB not available. Run install first.' }], isError: true };
-    }
-
-    const action = args.action;
-
-    if (action === 'search') {
-      if (!args.query) {
-        return { content: [{ type: 'text', text: 'search requires a query parameter' }], isError: true };
-      }
-      let results = searchResources(rdb, args.query, {
-        type: args.type || undefined,
-        limit: args.category || args.quality ? 20 : 10, // fetch more for post-filtering
-      });
-      // Apply category/quality filters if provided
-      if (args.category) results = results.filter(r => r.category === args.category);
-      if (args.quality) results = results.filter(r => r.quality_tier === args.quality);
-      // Prioritize directly invocable resources (with invocation_name) over community resources
-      results.sort((a, b) => {
-        const aInvocable = a.invocation_name ? 1 : 0;
-        const bInvocable = b.invocation_name ? 1 : 0;
-        if (aInvocable !== bInvocable) return bInvocable - aInvocable;
-        return 0; // preserve FTS5 ranking within same tier
-      });
-      results = results.slice(0, 5);
-      if (results.length === 0) {
-        return { content: [{ type: 'text', text: `No matching resources for: "${args.query}"` }] };
-      }
-      const home = homedir();
-      const toPortable = (p) => p && p.startsWith(home) ? '~' + p.slice(home.length) : (p || '');
-      const lines = results.map(r => {
-        const qualityBadge = r.quality_tier === 'installed' ? '[✓]' : r.quality_tier === 'verified' ? '[★]' : '[○]';
-        const categoryLabel = r.category ? ` [${r.category}]` : '';
-        const isManaged = r.local_path && r.local_path.includes(join(DB_DIR, 'managed') + sep);
-        const portablePath = isManaged ? toPortable(r.local_path) : '';
-        let howToUse;
-        if (isManaged) {
-          // Managed: use Read(path) or mem_use — Skill() won't work for managed resources
-          // Agents always have complete .md paths (e.g., agents/group/agents/name.md)
-          // Only skills can be directory paths (9 cases) — resolve to /SKILL.md
-          const resolvedPath = portablePath.endsWith('.md') ? portablePath : `${portablePath}/SKILL.md`;
-          howToUse = `Read("${resolvedPath}") or mem_use(name="${r.name}"${r.type === 'agent' ? ', type="agent"' : ''})`;
-        } else if (r.invocation_name) {
-          // Native plugin/user skill: Skill() with full invocation name
-          howToUse = r.type === 'skill'
-            ? `Skill("${r.invocation_name}")`
-            : `Agent(subagent_type="${r.invocation_name}")`;
-        } else {
-          howToUse = `mem_use(name="${r.name}"${r.type === 'agent' ? ', type="agent"' : ''})`;
-        }
-        const pathLine = portablePath ? `\n  Path: ${portablePath}` : '';
-        return `${qualityBadge} ${r.type === 'skill' ? 'S' : 'A'} **${r.name}**${categoryLabel} — ${truncate(r.capability_summary || '', 80)}${pathLine}\n  Use: ${howToUse}`;
-      });
-      return { content: [{ type: 'text', text: `Found ${results.length} resource(s) for "${args.query}":\n\n${lines.join('\n\n')}` }] };
-    }
-
-    if (action === 'list') {
-      // Shared ranked query + row line (registry.mjs, P2-12) — single source with CLI list.
-      const resources = listResourcesRanked(rdb, { type: args.type });
-      if (resources.length === 0) return { content: [{ type: 'text', text: 'No resources found.' }] };
-      const lines = resources.map(formatRegistryListLine);
-      return { content: [{ type: 'text', text: `Resources (${resources.length}):\n${lines.join('\n')}` }] };
-    }
-
-    if (action === 'stats') {
-      // Shared collection (registry.mjs collectRegistryStats, P2-12) — single
-      // source with the CLI registry stats action.
-      const s = collectRegistryStats(rdb);
-      const lines = [
-        `Registry Stats:`,
-        `  Total active: ${s.total}`,
-        ...s.byType.map(t => `  ${t.type}: ${t.c}`),
-        `  User-added: ${s.userAdded}`,
-        `  Zero adoption (recommended but never adopted): ${s.zeroAdopt}`,
-      ];
-      if (s.topAdopted.length > 0) {
-        lines.push('', 'Top adopted:');
-        for (const r of s.topAdopted) {
-          lines.push(`  ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
-        }
-      }
-      return { content: [{ type: 'text', text: lines.join('\n') }] };
-    }
-
-    if (action === 'import') {
-      if (!args.name || !args.resource_type) {
-        return { content: [{ type: 'text', text: 'import requires name and resource_type' }], isError: true };
-      }
-      // Provenance preservation + the 'installed' tier grant live in lib/registry-core.mjs,
-      // shared with the `registry import` CLI twin (audit 2026-08-22 P1-3). Before that
-      // extraction this side wrote its own SQL and silently skipped the tier grant.
-      const fields = {};
-      for (const f of IMPORT_STRING_FIELDS) fields[f] = args[f] || '';
-      const { id } = importResource(rdb, {
-        name: args.name, type: args.resource_type, source: args.source, fields,
-      });
-      return { content: [{ type: 'text', text: `Imported: ${args.resource_type}:${args.name} (id=${id})` }] };
-    }
-
-    if (action === 'remove') {
-      if (!args.name || !args.resource_type) {
-        return { content: [{ type: 'text', text: 'remove requires name and resource_type' }], isError: true };
-      }
-      const { removed } = removeResource(rdb, { name: args.name, type: args.resource_type });
-      return { content: [{ type: 'text', text: removed ? `Removed: ${args.resource_type}:${args.name}` : 'Not found.' }] };
-    }
-
-    if (action === 'reindex') {
-      const { activeCount } = reindexResources(rdb);
-      return { content: [{ type: 'text', text: `FTS5 reindexed. ${activeCount} active resources.` }] };
-    }
-
-    if (action === 'import_url') {
-      if (!args.url) {
-        return { content: [{ type: 'text', text: 'import_url requires a url parameter' }], isError: true };
-      }
-      const { importFromGitHub } = await import('./registry-importer.mjs');
-      try {
-        const results = await importFromGitHub(rdb, args.url);
-        if (results.length === 0) {
-          return { content: [{ type: 'text', text: `No skills/agents found in: ${args.url}` }] };
-        }
-
-        let enrichMsg = '';
-        if (args.enrich) {
-          const { enrichResource } = await import('./registry-enricher.mjs');
-          let ok = 0;
-          for (const r of results) {
-            const row = rdb.prepare('SELECT local_path FROM resources WHERE id = ?').get(r.id);
-            if (!row?.local_path) continue;
-            try {
-              const content = readFileSync(row.local_path, 'utf8');
-              if (await enrichResource(rdb, r.name, r.type, content)) ok++;
-            } catch {}
-          }
-          enrichMsg = `\nEnriched: ${ok}/${results.length}`;
-        }
-
-        const lines = results.map(r => `${r.type === 'skill' ? 'S' : 'A'} ${r.name} (id=${r.id})`);
-        return { content: [{ type: 'text', text: `Imported ${results.length} resource(s) from ${args.url}:\n${lines.join('\n')}${enrichMsg}` }] };
-      } catch (e) {
-        return { content: [{ type: 'text', text: `Import failed: ${e.message}` }], isError: true };
-      }
-    }
-
-    if (action === 'enrich') {
-      if (!args.name) {
-        return { content: [{ type: 'text', text: 'enrich requires a name parameter' }], isError: true };
-      }
-      const row = rdb.prepare("SELECT name, type, local_path FROM resources WHERE name = ? AND status = 'active'").get(args.name);
-      if (!row) {
-        return { content: [{ type: 'text', text: `Resource not found: ${args.name}` }], isError: true };
-      }
-      if (!row.local_path) {
-        return { content: [{ type: 'text', text: `No local_path for ${args.name}` }], isError: true };
-      }
-      // Confine to the env-aware data dir (managed/ relocates with CLAUDE_MEM_DIR, D#29);
-      // === homedir when the env is unset, so non-relocated confinement is unchanged.
-      const enrichBase = DB_DIR;
-      if (!isPathConfined(row.local_path, enrichBase)) {
-        return { content: [{ type: 'text', text: `Access denied: path outside managed directory` }], isError: true };
-      }
-
-      const { enrichResource } = await import('./registry-enricher.mjs');
-      try {
-        const content = readFileSync(row.local_path, 'utf8');
-        const ok = await enrichResource(rdb, row.name, row.type, content);
-        return { content: [{ type: 'text', text: ok ? `Enriched: ${args.name}` : `Enrichment failed for ${args.name}` }] };
-      } catch (e) {
-        return { content: [{ type: 'text', text: `Enrich error: ${e.message}` }], isError: true };
-      }
-    }
-
-    return { content: [{ type: 'text', text: `Unknown action: ${action}. Valid: search, list, stats, import, remove, reindex, import_url, enrich` }], isError: true };
-  })
-);
-
-// ─── Tool: mem_use ──────────────────────────────────────────────────────────
-
-// Cap on the caller-supplied name echoed back in a miss message. Well past any real
-// skill/agent name (the longest registered one here is 23 chars), short enough that an
-// unbounded argument cannot pad the response — the echo appears twice.
-const ECHO_NAME_MAX = 80;
-
-server.registerTool(
-  'mem_use',
-  {
-    description: descriptionOf('mem_use'),
-    inputSchema: memUseSchema,
-  },
-  safeHandler(async (args) => {
-    const rdb = getRegistryDb();
-    if (!rdb) {
-      return { content: [{ type: 'text', text: 'Registry DB not available.' }], isError: true };
-    }
-
-    const name = args.name.trim();
-    const type = args.type || 'skill';
-
-    // 1. Exact match by name or invocation_name — the ONLY path that loads content.
-    const row = rdb.prepare(`
-      SELECT id, name, type, local_path, invocation_name, capability_summary
-      FROM resources
-      WHERE status = 'active' AND type = ?
-        AND (name = ? OR invocation_name = ?)
-      LIMIT 1
-    `).get(type, name, name);
-
-    // 2. Name miss → SUGGEST, never substitute. The FTS5 search still runs (it is what
-    // produces the candidate list), but its result is only ever rendered as names: loading
-    // the top hit under the caller's requested name shipped a different skill's body inside
-    // <skill-loaded> plus "Follow the instructions above to execute this <type>." — with
-    // nothing marking the swap, so an agent that asked for A executed B (audit F1,
-    // 2026-08-14: with only `deploy-rollback-runbook` registered, `deploy-notes` /
-    // `rollback-checklist` / `runbook-index` each returned its full body). Loading stays an
-    // exact-name decision the caller makes.
-    if (!row) {
-      let candidates = [];
-      try { candidates = searchResources(rdb, name, { type, limit: 5 }).map((r) => r.name).filter(Boolean); }
-      catch { /* a suggestion is best-effort; the miss message below still stands */ }
-      // Every echo of the caller's own name below is bounded + delimiter-inert (audit F7):
-      // raw interpolation let a crafted `name` forge a <skill-loaded> block and the execute
-      // imperative inside this message, and the handler-wide defangResult cannot catch it —
-      // <skill-loaded> is off CONTEXT_DELIMITER_RE precisely so the real load path can emit
-      // it. `truncate` also folds newlines, so a multi-line name cannot fake block structure.
-      // Registered names are defanged too (a crafted one can be imported), but NOT truncated:
-      // the suggestion tells the caller to load one by its exact name, so it must stay exact.
-      const echoed = neutralizeSkillDelimiters(truncate(name, ECHO_NAME_MAX));
-      const echoedCandidates = candidates.map((n) => neutralizeSkillDelimiters(n));
-      const head = `No ${type} found for "${echoed}".`;
-      const browse = `mem_registry(action="search", query="${echoed}")`;
-      if (candidates.length === 0) {
-        return { content: [{ type: 'text', text: `${head} Try ${browse} to browse.` }] };
-      }
-      const list = echoedCandidates.map((n) => `  - ${n}`).join('\n');
-      return { content: [{ type: 'text', text:
-        `${head} Closest ${type}s by search (NOT loaded — none matched the name you asked for):\n${list}\n\n` +
-        `Load one deliberately with its exact name, e.g. mem_use(name="${echoedCandidates[0]}"${type === 'skill' ? '' : `, type="${type}"`}), or browse with ${browse}.` }] };
-    }
-
-    // 3. Resolve path: directory skills → SKILL.md (agents always have full .md paths)
-    let skillPath = row.local_path || '';
-    if (skillPath && !skillPath.endsWith('.md')) {
-      for (const candidate of [
-        join(skillPath, 'SKILL.md'),
-        join(skillPath, `skills/${row.name}/SKILL.md`),
-      ]) {
-        if (existsSync(candidate)) { skillPath = candidate; break; }
-      }
-    }
-
-    // 4. Path confinement check — prevent reading arbitrary files via crafted local_path.
-    // Base is the env-aware data dir (D#29): managed/ relocates with CLAUDE_MEM_DIR and
-    // equals homedir when unset, so this does not weaken the non-relocated confinement.
-    const managedBase = DB_DIR;
-    if (skillPath && !isPathConfined(skillPath, managedBase)) {
-      return { content: [{ type: 'text', text: `Access denied: path "${skillPath}" is outside managed directory` }], isError: true };
-    }
-
-    // 5. Read content
-    let content;
-    try {
-      content = readFileSync(skillPath, 'utf8');
-    } catch {
-      const msg = skillPath.endsWith('.md')
-        ? `Found ${type} "${row.name}" but cannot read file: ${skillPath}`
-        : `Found ${type} "${row.name}" but no .md file in: ${skillPath}`;
-      return { content: [{ type: 'text', text: msg }], isError: true };
-    }
-
-    // 5. Record invocation
-    try {
-      rdb.prepare(`
-        INSERT INTO invocations (resource_id, session_id, trigger, adopted, outcome)
-        VALUES (?, ?, 'user_explicit', 1, 'success')
-      `).run(row.id, process.env.CLAUDE_SESSION_ID || 'unknown');
-    } catch { /* non-critical */ }
-
-    const _home = homedir();
-    const portablePath = skillPath && skillPath.startsWith(_home) ? '~' + skillPath.slice(_home.length) : (skillPath || '');
-    const pathAttr = portablePath ? ` path="${portablePath}"` : '';
-    const reloadHint = portablePath ? ` Reload: Read("${portablePath}")` : '';
-    return { content: [{ type: 'text', text: `<skill-loaded name="${row.name}" type="${row.type}"${pathAttr}>\n${content}\n</skill-loaded>\n\nFollow the instructions above to execute this ${row.type}.${reloadHint}` }] };
   }),
 );
 
@@ -1726,57 +1731,80 @@ server.registerTool(
     // `obs_type` → `type`, same alias mem_save takes — see the schema comment.
     args = applyArgAliases(args, { obs_type: 'type' });
     const obs = db.prepare('SELECT id, title FROM observations WHERE id = ?').get(args.id);
-    if (!obs) return { content: [{ type: 'text', text: `Observation #${args.id} not found` }], isError: true };
+    if (!obs)
+      return { content: [{ type: 'text', text: `Observation #${args.id} not found` }], isError: true };
 
     // Shared mutation (lib/observation-write applyObsUpdate, P2-12): scrub + UPDATE +
     // derived-column rebuild in one transaction — single source with CLI cmdUpdate.
     const updatedCols = applyObsUpdate(db, args.id, {
-      title: args.title, narrative: args.narrative, type: args.type,
-      importance: args.importance, lesson_learned: args.lesson_learned, concepts: args.concepts,
+      title: args.title,
+      narrative: args.narrative,
+      type: args.type,
+      importance: args.importance,
+      lesson_learned: args.lesson_learned,
+      concepts: args.concepts,
     });
-    if (updatedCols.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
+    if (updatedCols.length === 0)
+      return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
 
-    return { content: [{ type: 'text', text: `Updated observation #${args.id}: ${updatedCols.join(', ')}` }] };
-  })
+    return {
+      content: [{ type: 'text', text: `Updated observation #${args.id}: ${updatedCols.join(', ')}` }],
+    };
+  }),
 );
 
 // ─── Tool: mem_export ────────────────────────────────────────────────────────
 
 // In-process test seam (mirrors handleRecentForTest, #8743): threads an injected db
-// through the SAME body the registered handler runs. NOTE: a `project` arg is still
-// resolved via resolveProject() against the MODULE db, not the injected one.
+// through the SAME body the registered handler runs — INCLUDING the project resolution,
+// which uses `runExport`'s own `db` parameter. (A note here used to say the resolution ran
+// against the module db instead; it was false before this release too. Corrected while
+// rewriting the block below, since a stale note three lines above a rewrite is the one a
+// reader trusts.) This seam bypasses the zod layer, which is why `runExport` screens a
+// non-string `project` itself rather than relying on `memExportSchema`.
 export async function handleExportForTest(db, args) {
   return runExport(db, args);
 }
 
 async function runExport(db, args) {
-  const wheres = [];
-  const params = [];
-  // Composed, not hand-written: the CLI twin (mem-cli.mjs cmdExport) already
-  // routes through liveObsFilterSql, and a hand-rolled copy here is how the
-  // live-row predicate drifted apart on other surfaces (P2-11/D#123). With
-  // include_compressed the compressed half is dropped but retractions still
-  // are not — tombstone export is opt-in, supersession is never exported.
-  wheres.push(args.include_compressed ? 'superseded_at IS NULL' : liveObsFilterSql(''));
-  if (args.project) { wheres.push('project = ?'); params.push(_resolveProjectShared(db, args.project)); }
-  if (args.type) { wheres.push('type = ?'); params.push(args.type); }
-  // T3-P1-A: surface invalid dates instead of silently dropping the filter — mirrors
-  // mem_search, which threw. A dropped filter can quietly expand the export blast radius.
+  // PARSE + VALIDATE here; the SQL predicate comes from buildExportWhere (P2-5), shared
+  // with mem-cli.mjs cmdExport. This face THROWS where the CLI prints a usage message —
+  // T3-P1-A: surface invalid dates instead of silently dropping the filter (mirrors
+  // mem_search). A dropped filter can quietly expand the export blast radius.
+  let fromEpoch = null;
+  let toEpoch = null;
   if (args.date_from) {
-    const epoch = new Date(args.date_from).getTime();
-    if (isNaN(epoch)) throw new Error(`Invalid date_from: "${args.date_from}" (use ISO 8601 or YYYY-MM-DD)`);
-    wheres.push('created_at_epoch >= ?');
-    params.push(epoch);
+    fromEpoch = new Date(args.date_from).getTime();
+    if (isNaN(fromEpoch))
+      throw new Error(`Invalid date_from: "${args.date_from}" (use ISO 8601 or YYYY-MM-DD)`);
   }
   if (args.date_to) {
     const d = args.date_to.length === 10 ? args.date_to + 'T23:59:59.999Z' : args.date_to;
-    const epoch = new Date(d).getTime();
-    if (isNaN(epoch)) throw new Error(`Invalid date_to: "${args.date_to}" (use ISO 8601 or YYYY-MM-DD)`);
-    wheres.push('created_at_epoch <= ?');
-    params.push(epoch);
+    toEpoch = new Date(d).getTime();
+    if (isNaN(toEpoch)) throw new Error(`Invalid date_to: "${args.date_to}" (use ISO 8601 or YYYY-MM-DD)`);
   }
-
-  const where = wheres.length > 0 ? 'WHERE ' + wheres.join(' AND ') : '';
+  // Same policy as the two date checks: refuse rather than silently drop a filter.
+  //
+  // This replaces a `_resolveProjectShared(db, x) || x` fallback that could not do what
+  // its comment claimed. `resolveProject` returns a falsy value on exactly one input —
+  // a truthy NON-STRING, which it deliberately maps to null so that `true.includes('--')`
+  // stops crashing every project-filtered command at the root helper. Through MCP that
+  // input cannot arrive (`memExportSchema.project` is `z.string().optional()`, validated
+  // before the handler); through `handleExportForTest` it can. So the fallback's only
+  // reachable effect was to hand the non-string straight back, undoing that guard and
+  // trading a wide export for a bind error. Neither is the documented behaviour, and the
+  // other project-resolving sites (server.mjs:326/465, and every cmd* in mem-cli.mjs)
+  // carry no such fallback — this one was the outlier.
+  if (args.project !== undefined && args.project !== null && typeof args.project !== 'string') {
+    throw new Error(`Invalid project: expected a string, got ${typeof args.project}`);
+  }
+  const { params, where } = buildExportWhere({
+    includeCompressed: Boolean(args.include_compressed),
+    project: args.project ? _resolveProjectShared(db, args.project) : null,
+    type: args.type || null,
+    fromEpoch,
+    toEpoch,
+  });
   // No clamp (audit 2026-08-14 A2): `Math.min(args.limit ?? 200, 1000)` made an MCP-driven
   // backup of a >1000-row store impossible, on the tool whose own description says "USE
   // when: Backing up memory before a migration or reinstall" — while the CLI twin exported
@@ -1789,15 +1817,17 @@ async function runExport(db, args) {
   // EXPORT_COLUMNS_SQL: shared with CLI cmdExport — the full round-trippable set restore
   // reads back (v3.42 HIGH-2: this handler used to carry a narrower 16-col SELECT, silently
   // dropping text/aliases/citation-signals on the advertised MCP backup→restore flow).
-  const probed = db.prepare(`SELECT ${EXPORT_COLUMNS_SQL} FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT ?`).all(...params, exportLimit + 1);
+  const probed = db
+    .prepare(`SELECT ${EXPORT_COLUMNS_SQL} FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT ?`)
+    .all(...params, exportLimit + 1);
   const rows = probed.slice(0, exportLimit);
   const moreAvailable = probed.length > exportLimit;
 
-  if (rows.length === 0) return { content: [{ type: 'text', text: 'No observations found matching the criteria.' }] };
+  if (rows.length === 0)
+    return { content: [{ type: 'text', text: 'No observations found matching the criteria.' }] };
 
-  const output = args.format === 'jsonl'
-    ? rows.map(r => JSON.stringify(r)).join('\n')
-    : JSON.stringify(rows, null, 2);
+  const output =
+    args.format === 'jsonl' ? rows.map((r) => JSON.stringify(r)).join('\n') : JSON.stringify(rows, null, 2);
 
   // A truncated backup is the failure mode this tool must never produce quietly: the old
   // note ("Results capped at N … increase limit (max 1000)") never said how much was
@@ -1816,7 +1846,8 @@ async function runExport(db, args) {
   let cap = '';
   if (moreAvailable) {
     const total = db.prepare(`SELECT COUNT(*) AS c FROM observations ${where}`).get(...params).c;
-    cap = `\nWARNING — PARTIAL EXPORT, NOT A COMPLETE BACKUP: capped at ${exportLimit} of ${total} matching observations; ${total - exportLimit} rows are missing from this payload and restoring it would lose them.` +
+    cap =
+      `\nWARNING — PARTIAL EXPORT, NOT A COMPLETE BACKUP: capped at ${exportLimit} of ${total} matching observations; ${total - exportLimit} rows are missing from this payload and restoring it would lose them.` +
       `\nFor a complete backup, write it to a FILE instead of pulling it through this conversation: \`${CLI_INVOKE} export --format jsonl > backup.jsonl\` (the CLI exports the complete set by default). Narrowing with date_from/date_to also works.` +
       `\nRaising \`limit\` here is the last resort, not the first: this result is model context, so all ${total} rows would be loaded into the transcript.`;
   }
@@ -1831,10 +1862,9 @@ server.registerTool(
   },
   // verbatim: the export payload feeds `restore` — defanging it would silently
   // rewrite backed-up rows whose text legitimately contains these tags.
-  safeHandler(
-    async (args) => runExport(db, applyArgAliases(args, { from: 'date_from', to: 'date_to' })),
-    { verbatim: true },
-  )
+  safeHandler(async (args) => runExport(db, applyArgAliases(args, { from: 'date_from', to: 'date_to' })), {
+    verbatim: true,
+  }),
 );
 
 // ─── Tool: mem_recall ────────────────────────────────────────────────────────
@@ -1853,17 +1883,23 @@ server.registerTool(
     });
 
     if (rows.length === 0) {
-      return { content: [{ type: 'text', text: `No history for "${filename}". This file hasn't been observed yet.` }] };
+      return {
+        content: [
+          { type: 'text', text: `No history for "${filename}". This file hasn't been observed yet.` },
+        ],
+      };
     }
 
     const lines = [`History for ${filename} (${rows.length} observation${rows.length !== 1 ? 's' : ''}):\n`];
     for (const r of rows) {
       const lesson = r.lesson_learned ? `\n     Lesson: ${truncate(r.lesson_learned, 100)}` : '';
-      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}${lesson}`);
+      lines.push(
+        `#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}${lesson}`,
+      );
     }
     lines.push(`\nWorkflow: mem_get(ids=[...]) for full details`);
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  })
+  }),
 );
 
 // ─── Tool: mem_fts_check ─────────────────────────────────────────────────────
@@ -1877,7 +1913,7 @@ server.registerTool(
     description: descriptionOf('mem_fts_check'),
     inputSchema: memFtsCheckSchema,
   },
-  safeHandler(async (args) => handleMemFtsCheck(db, args))
+  safeHandler(async (args) => handleMemFtsCheck(db, args)),
 );
 
 // ─── Tool: mem_browse ────────────────────────────────────────────────────────
@@ -1897,7 +1933,10 @@ server.registerTool(
 
     // Shared collection (lib/browse-core, P2-12) — single source with CLI browse.
     const { showTiers, tierData, tierCounts, grandTotal } = collectBrowseTiers(db, {
-      project, tierFilter, limit, now,
+      project,
+      tierFilter,
+      limit,
+      now,
       currentSessionId: getActiveMemorySessionId(db, project),
     });
     const tiers = BROWSE_TIERS;
@@ -1914,26 +1953,33 @@ server.registerTool(
         continue;
       }
 
-      if (count === 0) { lines.push(''); continue; }
+      if (count === 0) {
+        lines.push('');
+        continue;
+      }
 
       for (const r of rows) {
-        lines.push(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${fmtDate(r.created_at)}`);
+        lines.push(
+          `  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${fmtDate(r.created_at)}`,
+        );
       }
       if (count > rows.length) lines.push(`  ... and ${count - rows.length} more`);
       lines.push('');
     }
 
     if (grandTotal === 0) {
-      return { content: [{ type: 'text', text: 'No observations found. Start a coding session to build memory.' }] };
+      return {
+        content: [{ type: 'text', text: 'No observations found. Start a coding session to build memory.' }],
+      };
     }
 
     if (!tierFilter) {
-      const parts = tiers.map(t => `${t[0].toUpperCase() + t.slice(1)}: ${tierCounts[t] ?? 0}`);
+      const parts = tiers.map((t) => `${t[0].toUpperCase() + t.slice(1)}: ${tierCounts[t] ?? 0}`);
       lines.push(`Totals: ${grandTotal} observations | ${parts.join(' | ')}`);
     }
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  })
+  }),
 );
 
 // ─── Hidden tool filter ─────────────────────────────────────────────────────
@@ -1943,8 +1989,8 @@ server.registerTool(
 // context small while preserving the contract that the plugin dogfoods (see
 // the CLAUDE.md managed block + adopt-content.mjs detail doc).
 // Surface counts: 10 core (mem_search/search_feedback/recent/timeline/get/save/
-// recall + mem_defer/mem_defer_list/mem_defer_drop) + 11 hidden (maintenance/
-// admin/specialized) = 21 registered; tests/tool-schemas.test.mjs is the
+// recall + mem_defer/mem_defer_list/mem_defer_drop) + 9 hidden (maintenance/
+// admin/specialized) = 19 registered; tests/tool-schemas.test.mjs is the
 // authoritative count.
 //
 // Safe because:
@@ -1953,9 +1999,7 @@ server.registerTool(
 //   - `enabled` stays true, so `tools/call` keeps routing normally — per
 //     mcp.js line 106, a `disabled` tool would reject calls too.
 
-const HIDDEN_TOOL_NAMES = new Set(
-  TOOL_DEFS.filter((t) => t.hidden === true).map((t) => t.name),
-);
+const HIDDEN_TOOL_NAMES = new Set(TOOL_DEFS.filter((t) => t.hidden === true).map((t) => t.name));
 
 // Opt-out: setting CLAUDE_MEM_ALL_TOOLS=1 restores pre-v2.34.0 behavior where
 // every registered tool is visible in `tools/list`. Users who relied on Claude
@@ -1993,7 +2037,11 @@ if (!effectiveQuiet()) {
 // Checkpoint WAL every 5 minutes to prevent unbounded growth
 const WAL_CHECKPOINT_INTERVAL = 5 * 60 * 1000;
 const walTimer = setInterval(() => {
-  try { db.pragma('wal_checkpoint(PASSIVE)'); } catch (e) { debugCatch(e, 'walCheckpoint'); }
+  try {
+    db.pragma('wal_checkpoint(PASSIVE)');
+  } catch (e) {
+    debugCatch(e, 'walCheckpoint');
+  }
 }, WAL_CHECKPOINT_INTERVAL);
 walTimer.unref(); // Don't keep process alive just for checkpoints
 
@@ -2028,15 +2076,24 @@ idleTimer.unref();
 function shutdown(exitCode = 0) {
   clearInterval(walTimer);
   clearInterval(idleTimer);
-  try { if (db) db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
-  try { if (db) db.close(); } catch {}
-  try { if (registryDb) registryDb.close(); } catch {}
+  try {
+    if (db) db.pragma('wal_checkpoint(TRUNCATE)');
+  } catch {}
+  try {
+    if (db) db.close();
+  } catch {}
   process.exit(exitCode);
 }
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
-process.on('uncaughtException', (err) => { debugCatch(err, 'uncaughtException'); shutdown(1); });
-process.on('unhandledRejection', (err) => { debugCatch(err, 'unhandledRejection'); shutdown(1); });
+process.on('uncaughtException', (err) => {
+  debugCatch(err, 'uncaughtException');
+  shutdown(1);
+});
+process.on('unhandledRejection', (err) => {
+  debugCatch(err, 'unhandledRejection');
+  shutdown(1);
+});
 
 // ─── Runtime Dir Retention + Permissions ────────────────────────────────────
 
@@ -2068,13 +2125,17 @@ export function pruneSpawnLog(path, nowMs = Date.now()) {
       try {
         const { ts } = JSON.parse(l);
         return typeof ts === 'string' && ts >= cutoffIso;
-      } catch { return false; }
+      } catch {
+        return false;
+      }
     });
     if (kept.length > SPAWN_LOG_MAX_LINES) kept = kept.slice(-SPAWN_LOG_MAX_LINES);
     if (kept.length === lines.length) return 0;
     writeFileSync(path, kept.length ? kept.join('\n') + '\n' : '', { mode: 0o600 });
     return lines.length - kept.length;
-  } catch { return 0; }
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -2095,10 +2156,17 @@ export function hardenRuntimeFiles(dir) {
     let touched = 0;
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isFile()) continue;
-      try { chmodSync(join(dir, entry.name), 0o600); touched++; } catch { /* per-entry, silent */ }
+      try {
+        chmodSync(join(dir, entry.name), 0o600);
+        touched++;
+      } catch {
+        /* per-entry, silent */
+      }
     }
     return touched;
-  } catch { return 0; }
+  } catch {
+    return 0;
+  }
 }
 
 // ─── Start Server ───────────────────────────────────────────────────────────
@@ -2116,19 +2184,22 @@ export function hardenRuntimeFiles(dir) {
 if (process.env.MEM_DISABLE_SPAWN_LOG !== '1') {
   try {
     if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
-    const line = JSON.stringify({
-      ts: new Date().toISOString(),
-      pid: process.pid,
-      ppid: process.ppid,
-      argv1: process.argv[1] || '',
-      version: PKG_VERSION,
-    }) + '\n';
+    const line =
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        pid: process.pid,
+        ppid: process.ppid,
+        argv1: process.argv[1] || '',
+        version: PKG_VERSION,
+      }) + '\n';
     const spawnLog = join(RUNTIME_DIR, 'mcp-spawns.log');
     appendFileSync(spawnLog, line, { mode: 0o600 });
     // Lazy GC on append, mirroring lib/hook-telemetry.pruneOldShards. Single-file
     // sink (not day-sharded) so retention is applied line-wise instead.
     pruneSpawnLog(spawnLog);
-  } catch { /* never block startup on telemetry failure */ }
+  } catch {
+    /* never block startup on telemetry failure */
+  }
 }
 
 // Owner-only for the whole runtime dir. Sibling aux files carry captured file

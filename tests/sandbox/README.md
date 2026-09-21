@@ -6,15 +6,36 @@ real `npm install` inside a fake plugin cache, and a real MCP server over stdio,
 full pass takes minutes and needs network.
 
 ```bash
-node tests/sandbox/phaseA-plugin.mjs   # /plugin install …            43 checks
-node tests/sandbox/phaseB-npm.mjs      # npm i -g + claude-mem-lite install   45 checks
-node tests/sandbox/phaseC-update.mjs   # /plugin update version swap  15 checks
+SBX_BASE=/tmp/claude/sbx node tests/sandbox/phaseA-plugin.mjs   # /plugin install …    47 checks
+SBX_BASE=/tmp/claude/sbx node tests/sandbox/phaseB-npm.mjs      # npm i -g + install   56 checks
+SBX_BASE=/tmp/claude/sbx node tests/sandbox/phaseC-update.mjs   # version swap         15 checks
 ```
 
-Each exits non-zero if any check fails and prints a `PASS`/`FAIL` line per check.
-Sandboxes are created under `$TMPDIR` (override with `SBX_BASE=/some/dir`) and are
-**left on disk** so a failure can be inspected — delete them when you are done. Phase B
-alone leaves ~50 MB (a real `npm i -g` tree).
+Each exits non-zero if any check fails and prints a `PASS`/`FAIL` line per check. **The
+counts above are also asserted** — each phase carries an `EXPECTED_CHECKS` constant and
+`summary()` fails the run when the tally does not match. That is not tidiness: phase B's
+whole self-heal section sat behind an `if (existsSync(bindingPath))` whose path went stale
+with better-sqlite3 13, so eight checks silently stopped running and the only witness was a
+run printing 37 where this file said 45 — a number nobody diffs. Change the constant when
+you add or remove a check on purpose, never to quiet a mismatch.
+
+**Never name the native addon's path.** `loadedBindingPath()` in `lib.mjs` asks
+better-sqlite3's own `lib/binding.js` which file it would load; 12 compiled
+`build/Release/better_sqlite3.node` and 13 ships `prebuilds/<platform>.node`, so the
+literal both phases used to carry pointed at a file that no longer exists and the self-heal
+checks were vacuous from v4.0.0 to v5.1.0.
+Sandboxes are created under `SBX_BASE`, falling back to `$TMPDIR`, and are **left on
+disk** so a failure can be inspected — delete them when you are done. Phase B alone
+leaves ~50 MB (a real `npm i -g` tree).
+
+**`SBX_BASE` is in every command above on purpose.** `os.tmpdir()` reads `$TMPDIR`, and
+in a Claude Code session `$TMPDIR` is `~/.claude/tmp/claude-<uid>` — under `$HOME`,
+which is exactly what the "Do not put the sandbox under `$HOME`" convention below
+forbids, for the reason given there. That is not a hypothetical: on a machine where
+`~/node_modules` holds `better-sqlite3` and `claude-mem-lite`, the run measures the home
+tree and passes. `tests/sandbox/sbx-base.mjs` now refuses such a base outright rather
+than leaving the rule to a reader — `tests/sandbox-base-guard.test.mjs` drives the
+refusal, and it is in `vitest run` even though the harness itself is not.
 
 **Run them one at a time.** Chaining `phaseA … ; phaseB …` in a single shell crashed
 phase B once, while phase B on its own passed 45/45 immediately after. Not attributed —
@@ -44,7 +65,7 @@ cache populated the way Claude Code populates one (a git checkout, **no**
 | Phase | Covers |
 |---|---|
 | A | marketplace add → cold `setup.sh` (real `npm install`) → all six hook events → MCP `initialize`/`tools/list`/`tools/call` → bundled CLI → auto-update in plugin mode → stale-ABI self-heal → uninstall residue |
-| B | `npm pack` → `npm i -g` → `claude-mem-lite install` → settings.json hooks actually firing → MCP from the managed install → `self-update` → self-heal with the CLI's own tree healthy and the managed one broken → `uninstall` and `--purge` |
+| B | `npm pack` → `npm i -g` → `claude-mem-lite install` → settings.json hooks actually firing → MCP from the managed install → `self-update` → self-heal with the CLI's own tree healthy and the managed one broken → **plugin-cache launch.mjs sync (R10-P2-11)** → **an in-place install under live hook traffic (R10-P2-12)** → `uninstall` and `--purge` |
 | C | a new cache version dir arriving without `node_modules`, a hook firing from it before its deps exist, `setup.sh` provisioning it, memory surviving the version swap, cache pruning to the latest 3 |
 
 ## Conventions worth keeping
@@ -62,3 +83,13 @@ cache populated the way Claude Code populates one (a git checkout, **no**
 - **A control per destructive check.** Before asserting "doctor goes red", assert the
   thing is genuinely broken (the MCP server really fails to start) and that the tree
   doctor runs from is genuinely healthy — otherwise a red verdict proves nothing.
+- **A premise check per SHAPE the section needs.** B9 and B10 each cost a run to learn
+  this. B9's first version built a plugin cache and no marketplace clone, so the block it
+  targets (`if (existsSync(pluginDir))`) never ran and the section reported "install left
+  the old version alone" — the friendly answer, from code that had not executed. B10's
+  first version logged **0 of 400** hook fires inside the install window and read as a
+  clean run; two causes, both the probe's: `date +%s%3N` prints 19-digit nanoseconds on
+  this machine (the width is ignored), so every comparison was false by arithmetic, and
+  the loop's node cold start was longer than the 449 ms install it was supposed to
+  overlap. A stress probe that did not overlap is not a negative result, it is no result —
+  so both now assert the overlap and the shape before asserting the outcome.

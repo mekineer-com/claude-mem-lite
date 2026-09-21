@@ -2,7 +2,5022 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v6.9.1 — three things a real user hits, found by using the product instead of reading it
+
+**Upgrade note.** No schema change, no migration, nothing to do. Downgrading is clean:
+`npm i claude-mem-lite@6.9.0` (or pin the plugin to that version) needs no data-directory
+work, because nothing in this release touches the database format.
+
+Three fixes, all from an end-to-end QA round that drove the CLI, the hooks and the MCP
+server the way a user does rather than auditing the source.
+
+**`claude-mem-lite <anything> | head` printed a Node stack trace.** Closing the read end of
+the pipe — `| head -1`, `| grep -q`, quitting `less` — made the CLI die on an unhandled
+EPIPE instead of ending quietly. Measured 20 trials per command before the fix: `search`,
+`export`, `recent`, `stats`, `doctor`, `timeline` and `citation-stats` crashed 20/20 at
+`head -1`, `browse` 19/20. The fix drops EPIPE at the `bin` entry and rethrows everything
+else. It deliberately does **not** force-exit: doing so would have made `doctor | head -1`
+report success under `pipefail` while the same doctor exits 1 unpiped, quietly breaking the
+`claude-mem-lite doctor || alert` contract the installer documents.
+
+**`status` told you to reinstall a symlink that already existed.** When
+`~/.local/bin/claude-mem-lite` is present and working but that directory is not on PATH —
+the common case on a non-login shell — `status` printed "run install again to create
+symlink". Re-running the installer recreates the link, reports ✓, and leaves `status` saying
+the same thing. It now names the directory and the `export PATH=…` line, and tells a missing
+symlink, a dangling one, a directory of that name, and an on-PATH command that fails apart.
+`status --json` gains a `linked` field on the `cli` check.
+
+**A single `get` undid what `maintain` had just done.** `maintain execute --ops
+demote_pinned` floors a heavily-injected, never-cited observation so it stops crowding out
+better memories — and one read promoted it straight back, on that op's own target
+population. Reads no longer re-promote a row the pinned-but-uncited rule would floor.
+Ordinary low-importance rows still gain importance when you keep coming back to them, and a
+lesson-bearing row still reaches importance 2, which is the floor that rule sets for it.
+
+Known and not fixed: an explicit `update <id> --importance 1` is reverted by the next read
+the same way. Telling "1 because nobody set it" from "1 because a human said so" needs a
+column the schema does not have, so it is a design decision rather than a patch.
+
+## v6.9.0 — the silent dropped filter, and a round of checks whose criteria were right and whose populations were not
+
+**Upgrade note.** No schema change, no migration, nothing to do. Downgrading is clean:
+`npm i claude-mem-lite@6.8.3` (or pin the plugin to that version) needs no data-directory
+work, because nothing in this release touches the database format.
+
+Three things change what you see.
+
+- **A selection flag a command does not read now says so.** Previously `claude-mem-lite
+  browse --type bugfix` silently returned the unfiltered dashboard: `--type` is real on
+  `search`, `save` and `export`, so it cleared the known-flag check, and `browse` simply
+  never looked at it. You got a wider answer than you asked for with no signal. There is
+  now one stderr line naming every dropped flag. It goes to stderr, leaves stdout and the
+  exit code untouched, and stays quiet when the command failed for another reason or when
+  the command reads its own argv.
+
+- **`doctor` tells you the deeper checks exist.** A plain `claude-mem-lite doctor` audits
+  the install and prints "All checks passed!" — while `--benchmark`, `--metrics` and
+  `--session-audit` audit the database and retrieval layers, and nothing ever mentioned
+  them. If your install is healthy but recall is poor, that wording ended your search.
+
+- **A search result no longer echoes your whole query back.** A long query produced output
+  that scaled with it: 50,000 characters in, 50,024 out on the CLI, and the MCP face has no
+  argv ceiling, so it carried the lot into the model's context. Labels are now bounded and
+  report the real length alongside the prefix. The worst of the three sites was the
+  no-results branch, which printed the SYNONYM-EXPANDED query and so returned more than it
+  received (measured 1.32x).
+
+Fixes, each with a prior failing state:
+
+- **`setup.sh` used one variable for three different locations**, so after relocating a
+  data directory the legacy-database check, the dependency-broken flag and the migration
+  each asked about the wrong one. Two separate defects; both had survived twelve audit
+  rounds because every guard that hunts this shape sweeps `.mjs`/`.js` and the shipped
+  bash hooks are outside that population.
+- **`post-tool-use.sh` wrote its captured Read paths where the Node side does not read
+  them** whenever `CLAUDE_MEM_RUNTIME_DIR` was set — so those file paths were dropped from
+  every episode, and the file itself sat outside the reaper's directory and grew forever.
+- **`doctor` prescribed a repair binary that was itself one of the missing files**, and
+  separately reported an install as never deployed while forty of its files were present,
+  withdrawing the `repair` that would have worked.
+- **`get D#<missing>` printed "not found" twice**, the second a superset of the first.
+- **`optimize --project` reported the filter as ignored** while applying it.
+
+One LLM-visible change: an example inside the memory-extraction prompt said "FTS5 porter
+stemmer doesn't tokenize CJK". This index does not use the Porter tokenizer, so the example
+stated something false about the system the model was describing. It now reads "FTS5's
+default tokenizer doesn't split CJK", which is true of the index and teaches the same
+thing. Nothing about your stored memories changes.
+
+## v6.8.3 — a managed block that could eat the prose around it, and a search that dead-ended on a repairable fault
+
+**Upgrade note.** No schema change, no migration, nothing to do. Two behaviour changes
+worth knowing:
+
+- **`adopt` can no longer delete text around a damaged managed block.** If your project's
+  `CLAUDE.md` has an unpaired `<!-- claude-mem-lite:begin … -->` or `:end` sentinel — a hand
+  edit, a merge resolution, an editor that trimmed a line — earlier versions could match
+  from that orphan across your own prose to the next `:end` and replace the whole span. Your
+  text is now safe, but **an orphan already in your file is left in place on purpose**: where
+  the block it opened was meant to end is not knowable, so `unadopt` now reports it and names
+  the file instead of guessing a range to delete. Search your `CLAUDE.md` for
+  `claude-mem-lite:begin` and `claude-mem-lite:end`; if the counts differ, delete the odd one
+  out and the text it was wrapping by hand.
+- **`unadopt` gained a third outcome, `partial`.** It used to answer `absent` after deleting
+  the detail doc and state sidecar and leaving a block behind. Scripts that test for the
+  literal string `removed` are unaffected; scripts that treat "not removed" as "nothing
+  happened" should now distinguish `partial`.
+
+### Fixed
+
+1. **An unpaired sentinel let the managed-block regex span arbitrary user text, and `adopt`
+   deleted it.** The block is found by one non-greedy regex over the whole file, and
+   `[\s\S]*?` will happily cross a second `begin` marker. Delete the `:end` line by hand and
+   the next adopt appends a second block below whatever you have written since; the adopt
+   after that matches from the orphaned begin, lazily, to the only remaining `:end` — now
+   past your text and past the second begin — and replaces all of it. Measured: a
+   "## Deployment runbook" section appended after adoption was gone after two further
+   adopts, silently, both runs reporting success. Four damage shapes measured over 40
+   iterations each, counting adopts after the damage: two never return to one well-formed
+   block, one converges on the SECOND such adopt by destroying user text, one was already
+   fine. The body may no longer contain another
+   sentinel of the same slug, so a match is always exactly one block.
+
+2. **`unadopt` reported success over a file it had not cleaned.** With one sentinel missing
+   the pair regex matched nothing, so `removeManaged` returned `absent` — while having
+   already deleted the detail doc and the state sidecar and left ~1.3 KB of managed steering
+   text in `CLAUDE.md`, which is then loaded into every session. It now reports three
+   outcomes and names what is left. Residue is reported only where the plugin can prove it
+   wrote — a well-formed block, the detail doc, or the state sidecar — because an unpaired
+   sentinel is text, and a project that merely documents the marker in prose has one.
+
+3. **A damaged FTS5 index dead-ended `search` and `mem_search` with no way forward.** The
+   classifier and the lossless repair both already existed, but were wired only at database
+   OPEN time; damage inside the index opens fine and throws at the first `MATCH`. Both faces
+   passed SQLite's own sentence through with no next step, while `recent` / `recall` /
+   `browse` / `context` / `stats` kept answering — which reads as "search found nothing"
+   rather than "search is broken". Both now name the fix: `claude-mem-lite fts-check
+   rebuild`, which re-derives every index from its content table without touching a stored
+   row. `doctor` already did this unprompted.
+
+### Notes
+
+- The `SQLITE_NOMEM` shape of index damage deliberately gets no remedy. Measured over 100
+  trials per mode: damaging the FTS structure record yields 98/100 `SQLITE_CORRUPT_VTAB` and
+  2/100 `SQLITE_NOMEM`; leaf-only damage yields 100/100 `SQLITE_CORRUPT_VTAB`. The
+  classifier is shared with the file-corruption path, so admitting `SQLITE_NOMEM` would
+  answer a real out-of-memory with a full index rebuild.
+- Two pre-ship reviewers on disjoint lenses: 0 P1 / 4 P2 / 2 P3 from the defect lens, all
+  four P2s repaired before the tag; 33 claims re-measured by the claims lens, 5 false, all
+  corrected in the commit bodies before anything was pushed. Reports in `docs/audits/`.
+
+## v6.8.2 — five shared-state fixes, and the pre-ship review that found what four of them broke
+
+**Upgrade note.** No schema change. Two behaviour changes worth knowing:
+
+- **File paths are now redacted before they are stored.** `observation_files.filename`,
+  `observations.files_modified` / `files_read`, `events.file_paths` and `deferred_work.files`
+  used to hold the raw path while the title derived from that same path was scrubbed. New
+  writes are scrubbed element-wise; **existing rows are not rewritten**, so a store that
+  already recorded a credential-bearing path still holds it until a later backfill. On the
+  maintainer's store that is 3 values out of 2,340.
+- **A lesson about a file whose NAME is itself a credential** (`/repo/ghp_….mjs`) and which
+  was recorded before this release is no longer reachable by that raw name, because the query
+  key is now derived the same way the stored one is. A credential in a *directory* segment is
+  unaffected — 4 of 5 measured shapes still reach their old rows.
+
+### Fixed
+
+1. **SessionStart emitted nothing at all when a project had one or two observations.**
+   The selection query and the cross-project fallback use windows that do not contain each
+   other, and both consumer sites switched between them wholesale, so at 1-2 selected rows the
+   selection was discarded for a set that can be empty. Measured: two real observations, both
+   selected, 0 bytes of context; three rows emitted 241. Output was non-monotonic in corpus
+   size, and the projects it hit are the thin and new ones the 60-day tier exists for. The
+   fallback now tops the selection up instead of replacing it.
+
+2. **Path columns stored raw credentials.** Five columns held paths, one call site followed
+   the element-wise pre-scrub the code prescribes, and four did not — then pre-ship review
+   found a sixth column nobody had counted (`deferred_work.files`, reachable through
+   `mem_defer` and `defer add --files`). All six scrub now, and the READER derives its key the
+   same way, so the writer and the recall path cannot drift apart.
+
+3. **The path scrub ate filenames.** Eight credential patterns have a value class that does
+   not exclude `/`, so `/repo/token=<secret>/notes.mjs` was stored as `/repo/token=***` —
+   filename destroyed at write time, and every file under that directory collapsed onto one
+   recall key, returning another file's lessons. Scrubbing is per path segment now.
+
+4. **A notebook edit built no file edge.** The PostToolUse path extractor knew three spellings
+   of the edited path and not `NotebookEdit`'s, while the significance test did know it — so a
+   notebook edit was captured, marked important, and left unreachable to every file-keyed
+   recall.
+
+5. **One hook spent another hook's injection budget.** The per-session injection cap was
+   charged against a counter that every hook bumps, so a session that touched fifteen
+   lesson-bearing files exhausted the prompt face's budget before it injected anything. The
+   cap also outlived its own window, because it was judged before freshness and the reset only
+   happens on a write that never comes. The budget is now charged to, and timed by, the face
+   that owns it — including the deferred-item leg, which read the cap without paying into it.
+
+6. **One prompt erased the other hook's memory of what it had shown.** The prompt face wrote
+   its dedup marker wholesale, discarding everything the PreToolUse face had accumulated, so
+   that face re-injected lessons it had already shown. It now replaces its own slice. The
+   marker is also capped at 32 ids: replacing it wholesale was the only thing that ever shrank
+   it, and without a cap the set grew for the life of the session (measured 520 ids), which
+   starves the very face it exists to dedup.
+
+7. **A tuned default was documented as its pre-v2.41 value** in two comments and two test
+   names, and neither test asserted the number it was named after. They recover the multiplier
+   by ratio now, which reads 0.4000 exactly.
+
+## v6.8.1 — corrections to what v6.8.0 claimed, and a property test that asserted a falsehood
+
+No behaviour change. v6.8.0's code was right; three things it SAID were not, and one test was
+asserting a property that does not hold.
+
+1. **`scrubSecrets` is not idempotent, and the test claiming it was could not have noticed.**
+   `tests/property.test.mjs` asserted `scrub(scrub(x)) === scrub(x)` over a generator that
+   produces no credentials — measured 0 of 100,000 draws changed by the scrubber at all, so
+   it asserted `x === x` and could never fail. The property is false by two independent
+   mechanisms, both about ordering inside the pattern table: a length-floored rule sits before
+   a rewrite whose replacement is longer than what it replaces (`AccountKey=https://a:b@h`
+   declines at 12 characters, then fires at 16 on the next pass), and a replacement can
+   destroy the letter a prose lookbehind keys on (`--token ghp_… secret: v` is prose on pass 1
+   and config on pass 2). The test now pins the real behaviour with a premise assertion, and
+   records why the old generator never reached the substitution path. Making the scrubber
+   idempotent means reordering the table and owes a re-measured pass over the corpus, so it is
+   deferred rather than rushed.
+
+2. **v6.8.0's import fix was load-bearing, not cosmetic.** Its own comments said no input was
+   known where the double-scrub mattered. One exists: at the pre-fix code a single transcript
+   with a `ghp_` token in the command imported three rows for three runs. The fix that shipped
+   is correct; the reasoning printed next to it was not, and there is now a behavioural case
+   for it rather than only a source scan.
+
+3. **The backfill does not reach `NotebookEdit` rows imported before v6.7.2.** Those were
+   stored with an empty modified-files list (the pre-v6.7.2 importer read `file_path`, which
+   NotebookEdit never sets), and the backfill selects on that column being non-empty —
+   measured: an `Edit` row gains its edge, such a notebook row gains none. For that subset the
+   repair is a re-import, which v6.7.2 made possible by changing their title. v6.8.0 said
+   re-importing could never repair them; that is true of the `Edit` case it was written about
+   and false of this one.
+
+## v6.8.0 — the machine face of `doctor`, and an import that re-imported itself
+
+**Upgrade note.** No schema change and no version bump. Two things to know:
+
+- **The first database open after upgrading backfills the file junction**, once, for any
+  observation that carries a modified-files list and has no edge. On a store that never ran
+  `import-jsonl` that query matches nothing and costs nothing.
+- **`doctor --json` output changes shape.** Checks with repair instructions gain a `details`
+  array, and four checks change the `level` they report from `warn` to `fail` while still
+  rendering ⚠ on screen (a new `glyph` field carries that). A wrapper filtering
+  `checks.filter(c => c.level === 'fail')` now sees four findings it used to miss; the
+  `issues` count, the summary line and the exit code are unchanged.
+
+**This supersedes two sentences in the v6.7.2 upgrade note below**, which is left as written
+because a changelog entry records what a release did.
+
+- That note said observations imported before v6.7.2 stay unreachable by file and that the
+  fix was forward-only. Item 6 makes them reachable by `recall` / `mem_recall` and by the
+  UserPromptSubmit leg. **Not** by the pre-tool recall leg, which gates on `importance >= 2`
+  against the `1` every imported row carries — that one needs a separate change and does not
+  get one here.
+- It also said a re-import matches "forever after". For titles the scrubber rewrites it did
+  not: the dedup key was built from the unscrubbed title while the stored one was scrubbed,
+  so that subset re-imported on every run. Item 4 is what makes "forever after" true, and
+  that defect pre-dates v6.7.2 rather than being introduced by it.
+
+1. **`--json` gave the diagnosis and none of the treatment.** Every repair line doctor prints
+   goes through one helper, and that helper was a no-op under `--json`. A CI wrapper or an
+   agent reading the structured output was told `Database: file is not a database` and never
+   told about the `mv …db …db.corrupt` the same run printed for a human — 7 of the 16 detail
+   sites carry a runnable command. They now attach to the check they belong to.
+
+2. **`issues` counted checks that reported themselves as warnings.** Four checks (dev drift,
+   managed files, and both hook-script branches) printed ⚠, pushed `level:'warn'`, and then
+   bumped the issue counter — so the documented contract that `issues` are ✗-level was false
+   in shipped code, and the one use `--json` exists for under-reported by exactly those four.
+   Severity and loudness are now separate fields rather than one field doing both jobs.
+
+3. **Two checks could vanish without a trace.** The disk-footprint and plugin-cache blocks
+   ended in a silent `catch`, so on the broken installs that are doctor's whole audience the
+   line did not go red or yellow — it disappeared, which reads exactly like a check nobody
+   wrote. Both now say what they could not do, like the four other "I could not look" exits
+   in the same file.
+
+4. **A scrubbed title made `import-jsonl` re-import the same row every run.** The stored
+   observation title is also the cross-run dedup key, and only one of the two sites that
+   build it ran through the secret scrubber. Any transcript whose title holds something the
+   scrubber rewrites — a bearer token in a `Bash` command, a path segment shaped like a key —
+   never matched itself, so each re-import added the row again, and since v6.7.2 a duplicate
+   row is also a duplicate file edge. One home for that raw string now, scrubbed exactly once
+   on each side. Rows already duplicated are not cleaned up by this fix — the SessionStart
+   auto-maintain pass supersedes near-identical observations. (An earlier draft of this line
+   credited `maintain`'s `dedup` op and said it was in the default set. Neither is right:
+   `DEFAULT_MAINTAIN_OPS` is `cleanup, decay, boost, demote_pinned`, and `--ops dedup` merges
+   only the ids the caller names rather than searching for near-identical rows.)
+
+5. **A `Read` carrying only `notebook_path` recorded a file it had not read.** Routing the
+   read column through the write column's path helper (v6.7.2) gave it a shape no tool emits.
+   An undeclared behaviour change, now reverted to `file_path`.
+
+6. **The file-junction backfill could only run on a database that had never stored an edge.**
+   It was gated on `COUNT(*) FROM observation_files === 0`, which answers "has this store
+   ever written an edge", not "has this backfill run" — so one real `mem_save` disabled it
+   forever, and everything imported before v6.7.2 stayed unreachable by file with no way to
+   repair it (re-importing skips the row at the dedup step, before the edge is written). It
+   now runs from the deferred-cleanup list, whose marker answers the question being asked and
+   whose failures retry on a later open. No schema-version bump: that would lock every older
+   code home out of the database permanently, which a derived table does not get to charge.
+
+## v6.7.2 — imported transcripts were unreachable by file, and file recall ranked by clock
+
+**Upgrade note.** No migration and no schema change. Two things to know if you use
+`import-jsonl` or `restore`:
+
+- **Notebook rows imported before this release re-import once.** The observation title is
+  also the cross-run dedup key, and it now includes the notebook path (it used to render as
+  a bare `NotebookEdit: `). The next import of the same transcript adds each old notebook
+  row once more and matches forever after. Nothing else is affected.
+- **Observations imported before this release stay unreachable by file.** The fix is
+  forward-only: the one-shot migration that backfills the file junction runs only on a
+  database that has never had a junction row, and re-running the import does not repair
+  them — the dedup skips the row before the edge is written. Recall by file still finds
+  everything saved normally.
+
+1. **Imported tool-uses built no file edge at all.** `import-jsonl` wrote the modified-files
+   list as a JSON column and never populated the junction table that `recall`, `mem_recall`
+   and the prompt-recall leg all join, so nothing you backfilled from a transcript could be
+   found by asking about a file. This was filed as a `NotebookEdit` spelling bug — that tool
+   reports `notebook_path`, never `file_path` — and the spelling was real, but a plain `Edit`
+   whose path was recorded correctly was equally unreachable. Both are fixed, and which key a
+   tool spells its path with now has one home instead of three.
+
+2. **File recall ordered by timestamp alone.** With imported edits now reachable, a file you
+   touched a dozen times in one session filled the default ten-row window and pushed out the
+   lesson about it — an importance-1 row evicting an importance-3 one, on the default call.
+   `recall`, `mem_recall` and the prompt-recall leg now order by importance first, then
+   recency, then id. The id term also fixes a real tie: two rows written in the same
+   millisecond used to come back oldest-first.
+
+**Guards.** `doctor`'s reporter-discipline check was one-directional: it asserted every ⚠ is
+counted and nothing asserted the same for ✗, which is the counter the exit code reads — so a
+check could print an error, report it in `--json`, and still exit 0. The new check counts
+rather than detects, and it knows the difference between a counter inside a loop and one
+after it.
+
+## v6.7.1 — two model-facing retrieval paths that were quietly dropping rows
+
+**Upgrade note.** No migration, no schema change, nothing to do. Two recall paths return
+more now; nothing that used to be shown is hidden.
+
+1. **The file leg of prompt recall probed the wrong candidates.** When a prompt named a
+   file, `user-prompt-search` probed only the first three filename-shaped tokens it found,
+   in the order they appeared in your text. Version numbers, timestamp fragments and
+   member expressions (`v4.0.1`, `39.602Z`, `JSON.stringify`) all match that shape, and
+   duplicates were not removed, so on a prompt like "after v4.0.1 and 4.0.2, look at
+   `lib/install-shape.mjs`" the file you actually named never got probed. Candidates are
+   now ranked by path-shape and de-duplicated before the cap, and the cap went 3 to 6.
+
+   Measured over 216 live prompts, on the 50 that name at least one file the store can
+   reach: prompts where EVERY reachable file was pushed out of the window went from 14
+   (28.0%) to 2 (4.0%); prompts losing at least one went from 34 (68.0%) to 25 (50.0%).
+   Neither change gets there alone — raising the cap with the old ordering reaches 14.0%.
+
+   Cost is up to three more indexed lookups per prompt, and the mean is 0.56 of them
+   (~31µs) because only 20.0% of prompts name more than three distinct candidates.
+
+2. **`### Key Context` could show degraded titles.** The SessionStart query feeding
+   `### File Lessons` / `### Key Context` was the one model-facing observations query
+   without the low-signal title filter, so hook-llm's fallback titles (`Modified X`,
+   `Worked on X`, a raw error line) could take the highest-priority slots while the
+   sibling `### Recent` table excluded them in the same block. Rows whose title is
+   degraded but which carry a real lesson are still shown — that exemption is deliberate
+   and now has its own test. The same query also gained the id tiebreaker its
+   `ORDER BY created_at_epoch DESC` was missing, so a millisecond tie no longer inverts.
+
+**Guards.** A new ledger (`tests/lowsig-surface-ledger.test.mjs`) asserts the low-signal
+rule on the OUTPUT of five model-facing faces rather than scanning source, because the
+rule is spelled three different ways in this codebase (SQL literal, SQL via a variable,
+and a JS post-filter) and a text scan sees one of them. Exemptions are declared per face
+with a reason and asserted in the opposite direction.
+
+## v6.7.0 — four surfaces that were running, and four that were not
+
+**Upgrade note.** No migration, no schema change, nothing to do. Nothing to revert either:
+no flag gated the old behaviour, because the old behaviour was not a choice anyone made.
+Three things change on surfaces you may be looking at.
+
+1. `doctor` no longer runs its FTS integrity check or prints a ✓ for DB stats when the
+   database is newer than **the install you are running** (it says "not checked" and which
+   of three reasons applies). A second, older code home on the same machine — a stale
+   plugin cache beside a current CLI — does not trigger this.
+2. Lesson recall now fires on `NotebookEdit`, where it had never fired at all.
+3. **Expect a non-zero hook-error count where you saw zero.** `doctor` and `stats` read
+   `runtime/hook-errors/`, and prompts over 64 KB were being dropped silently; they are now
+   recorded as `ups:stdin`. A count appearing there after this upgrade is that pre-existing
+   drop becoming visible, not a new fault.
+
+**Recall never ran on notebooks.** `NotebookEdit` is in the PreToolUse matcher, but its
+schema is `{notebook_path, cell_id, cell_type, edit_mode, new_source}` with
+`additionalProperties: false` — there is no `file_path`, and `file_path` is the only field
+the parser read. So every `.ipynb` edit took the "no path" exit. The probe written to catch
+exactly this — an upstream field rename silently zeroing injection — could not see it,
+because its whitelist of tools-we-handle doubled as its silence list, and a rename can only
+ever appear on a tool we handle. The whitelist is now a named constant pinned against the
+manifest, and each outcome gets its own telemetry scope.
+
+**The events leg of that same hook returned nothing on Windows.** It escaped `%` and `_` for
+its `ESCAPE '\'` clause and not the escape character, so SQLite ate every separator in a
+win32 path. The audit that found this prescribed escaping the backslash; measuring that fix
+showed it still reads zero rows. `events.file_paths` holds `JSON.stringify(paths)`, so a
+win32 separator is already two characters on disk and the two escapes have to compose in
+order — shipped 0 rows, LIKE-escape alone 0 rows, JSON-then-LIKE 1 row. POSIX hid it because
+`JSON.stringify` of a posix path is the identity.
+
+**The prompt that pastes a large log was the one prompt recall went dark on.** Past
+`MAX_UPS_PROMPT_BYTES` (64 KB) the read returns a truncated prefix, `JSON.parse` throws, and
+the catch returned. These were the only two swallows in that file that abandoned the whole
+face — twelve other bare catches remain, each skipping one row or one optional step — in a
+file that writes the rule out twice. Three arms measured back-to-back: 318 B injects,
+61 760 B injects, 72 000 B vanishes with exit 0 and an empty error log. Both catches now
+record.
+
+**`doctor` wrote to the database it had just declared unusable.** The schema-skew check
+exists because a DB written by a newer claude-mem-lite locks older code out permanently. It
+printed that verdict as a `fail` — and nothing downstream read it, so two checks later doctor
+opened the same file read-write for `checkFTSIntegrity` (an `INSERT`, needing a write lock)
+with `rebuildFTS` on the same ungated path, under a screen reporting "all indexes healthy".
+A verdict nothing reads is a sentence, not a gate. The victim is the machine this repo
+records this as routine for: a plugin cache running behind the code that wrote the store.
+
+**`doctor` and `repair` did not start on the install they exist to diagnose.** install.mjs's
+~13 static imports resolve before its first statement, so one missing module — a half-finished
+update, a trimmed tarball, a hand-deleted file — produced a bare `ERR_MODULE_NOT_FOUND` and
+zero bytes of stdout. Measured before the fix: 13 of 13 modules in that closure failed
+opaquely. A static import cannot be caught inside the module that declares it, so the catch
+now lives in `cli.mjs`, whose own static closure is exactly one file — itself. It answers the
+same way for the two shapes an interrupted write actually produces, which are more common
+than an absent file: a truncated module (a `SyntaxError` carrying no filename at all) and a
+truncated `install.mjs` (which loads fine and simply has no `main`). All three doctor
+remedies that named `install.mjs repair`, and both READMEs, now name `cli.mjs`: same route,
+an entry that survives the state the line describes. Invoking `node install.mjs doctor`
+directly is still a bare stack; guarding that means splitting install.mjs, and the value is
+in the path the tooling prints.
+
+Every fix ships with a mutation-verified guard and, where the negative could be confused for
+"the check never ran", a premise assertion and a control. One of those mutation runs found a
+defect in the probe harness rather than the code: `String.replace` expands `$&` in a
+replacement string, so an arm had been writing a syntax error into the file — which reads
+exactly like a guard that cannot discriminate. Arms now use a replacer function and must
+still parse.
+
+## v6.6.0 — a nag that fired 96% of the time was not telling you anything
+
+**Upgrade note.** No migration, no schema change, nothing to do. One user-visible default
+changes: the SessionStart cite-recall nag now judges — and reports — the lessons the *hooks
+injected*, at a threshold of 0.4 instead of 0.6. In practice it appears less often and means
+more when it does. Revert path: `CLAUDE_MEM_CITE_NUDGE_THRESHOLD=0.6` restores the old
+threshold and `CLAUDE_MEM_CITE_NUDGE_WIDE_DENOMINATOR=1` restores the old denominator. Both
+together restore the old GATING — not the old bytes: the nudge line still names which
+denominator it used, and the Stop-side payload carries the three `gate*` keys either way.
+Pinning `claude-mem-lite@6.5.0` is the byte-for-byte route.
+
+**The nag's denominator counted things nobody injected.** `computeCiteRecall` counts every
+`#NN`-shaped token in non-assistant text — tool_result bodies, file contents, CLI output,
+pasted reports. That is the right caliber for "which ids has the model seen at all" and it is
+not the question the nag asks, which is whether the model cited back the lessons the hooks put
+in front of it. Measured over all 69 transcripts on the development machine, read-only,
+2026-09-08: the wide ratio has median 0.125 while the hook-injected ratio has median 0.429, and
+the shipped 0.6 threshold fired on **46 of 48** qualifying sessions (96%). A gate that is 96%
+true carries almost no information — and because the self-silence streak only resets when the
+gate does *not* fire, it reached its limit of 3 within the first sessions of a project and the
+surface went quiet for good. Both numbers are now persisted; the gate, the streak and the
+printed line all read the same one, and the line names which denominator it used, so the change
+is visible without reading this file. A payload written by an older version has no
+hook-injected count, so it keeps being judged the old way at the new threshold.
+
+The deferred item this closes (D#19) recorded the problem as "the threshold is unsatisfiable,
+no session can exceed 0.5". That was **false** and is retracted: the maximum on the current
+corpus is 0.833 on both denominators AMONG THE SESSIONS THE GATE JUDGES (those clearing the
+volume floor); across all 69 transcripts the hook-injected side reaches 1.000. Which rows is a
+required field here, not a caveat. The corpus grew from 51 to 69 transcripts between the two
+readings — the project's own rule 2, this time inside the note that states it. The threshold is
+stamped, not calibrated: 14 sessions clear the volume floor under the new denominator, which is
+not enough to separate 0.35 from 0.45.
+
+## v6.5.0 — the surface the user is looking at was the only silent one
+
+Two rounds of end-to-end use as a real user — fresh npm install, seven hook events driven with
+real payloads, all 18 MCP tools over stdio, adopt/unadopt, export/restore, uninstall, plus
+adversarial input and a 24-way concurrency probe — then two independent pre-ship reviewers on
+disjoint lenses. Five user-facing defects and, from the reviewers, one destructive
+misclassification that never shipped.
+
+**Upgrade note.** No migration, no schema change, nothing to do. `mem_save` gains an optional
+`force` field and the CLI gains `save --force`; both default off, so existing callers are
+unaffected. `mem_timeline`'s advertised parameter bounds change from the safe-integer range to
+the real ones — a caller that was sending an out-of-range value was already being rejected at
+runtime, it just could not tell from the schema. Revert path: pin `claude-mem-lite@6.4.0`.
+
+**A corrupt database made memory stop working and said nothing.** Every other surface reported
+it correctly — the CLI exits 1, `status` says "exists but check failed", `doctor` prints the
+exact repair command — while the hooks returned null and ended SessionStart with empty stdout
+*and* empty stderr, writing one ~860-byte stack trace per fire, forever. The user whose memory
+had stopped learned nothing until they happened to run `doctor`. Now it is reported once per
+project per hour and SessionStart says so, with the repair command for the machine it is on.
+
+Two things the reviewers stopped from shipping with it. **SQLite reports a damaged FTS5 *index*
+over a perfectly healthy file with the same "database disk image is malformed" text a real
+file-level fault uses** — this repo has known that since R10 P3-9 and has a predicate for it —
+so the first cut would have offered `cp <old backup> <db>` over a database whose rows were all
+intact. And the repair command was being handed verbatim to the *model* channel as well as the
+human one; the skew notice it was modelled on can do that because its commands are `git pull`
+and `plugin update`, whereas this one overwrites the database. The human now gets the command,
+the model gets only the fact and a pointer to `doctor`.
+
+**`claude-mem-lite install` silently rewrote the `.mcp.json` of whatever repository you ran it
+in.** It removed project-scoped registrations as part of purging stale ones — but that file
+belongs to your repo, not to this installer. Running it from a clone of this project emptied
+the plugin's own tracked MCP manifest with no output at all. Install now leaves it alone and
+tells you the duplicate exists.
+
+**The SessionStart "Recent" table was not in time order.** It has a Time column and says
+"Recent", and it was rendered in the token budgeter's internal pick order — so the first row
+was not the newest. Rows now sort newest-first; which rows get chosen, and the budget that
+bounds them, are unchanged.
+
+**Every MCP tool advertised parameter bounds it did not enforce.** 20 of 36 constrained fields
+published the safe-integer range (±9007199254740991) while the runtime enforced something much
+narrower — `mem_compress.age_days` really wants ≥30, and `mem_delete`, a destructive tool,
+advertised no array bounds against an enforced 1..50. An agent plans its call from the
+published schema, so each of those was an invited round trip. Cause: zod renders a `.pipe()`'s
+input side. Runtime behaviour is unchanged — verified by 7240 differential parses, 0
+divergences.
+
+**A `P#`/`S#`/`E#` timeline anchor could jump you into another project.** Both surfaces
+document it as resolving to the nearest observation *in the same project*; it resolved
+globally, and because the before/after window then scopes to whatever project the anchor
+landed in, one mis-resolved anchor moved the entire rendered timeline somewhere else with
+nothing marking it.
+
+**Smaller things.** `get 1,2,999` now names the id it could not find instead of silently
+returning two of three — MCP `mem_get` and CLI `delete` both already did. `save` gains
+`--force` for the case where the five-minute near-duplicate guard refuses a genuinely
+different memory and the only workaround was to reword it until the similarity check passed.
+`uninstall` reports what it actually leaves behind: on a real install the database is 0.2 MB
+and the code plus `node_modules` it also keeps is ~56 MB, which "Data preserved" did not say.
+
+## v6.4.0 — the repair path could not run on the install it repairs
+
+A full-lifecycle QA pass (install → use → update → self-heal → uninstall) against a pristine
+clone in a sandboxed `HOME`, plus the five open items it left behind.
+
+**The one to read if you read one.** When a plugin-cache install lost its `node_modules`, the
+self-heal detected it correctly, then could not run: the signature-verified repair path
+imported two path constants from a module that imports the native database driver — the exact
+thing that was missing. So it fell through to telling you to `curl` an unverified tarball of
+the default branch. Both halves are fixed: the repair path no longer needs the driver, and the
+fallback it prints now pins to a release.
+
+**Nothing here changes your data or your database.** The user-visible changes are in
+`status`, `doctor` and `uninstall`, and they are described below.
+
+### The self-repair path could not run on the install it exists to repair
+
+- **fix: `repair` no longer needs `better-sqlite3` in order to replace a missing
+  `better-sqlite3`.** `hook-update.mjs` imported two PATH CONSTANTS from `schema.mjs`, and
+  `schema.mjs` statically imports the native driver — so on a tree with no `node_modules`
+  (what a plugin cache is until its first `npm install`), `install.mjs::repair()`'s
+  `await import('./hook-update.mjs')` threw `ERR_MODULE_NOT_FOUND`, the fail-closed catch
+  refused to auto-install unverified code, and the user was handed the manual tarball
+  one-liner instead. The Ed25519 signature check was therefore unreachable on the one state
+  the self-heal is for. The constants moved to `lib/data-paths.mjs`, a leaf module;
+  `schema.mjs` re-exports all three, so no importer changes. Measured: before, that import
+  fails naming `schema.mjs`; after, it loads with all five release functions present.
+- **fix: the manual fallback pinned to the DEFAULT BRANCH, not to a release.** All four
+  copies of it — `install.mjs`, `scripts/hook-launcher.mjs`, and both READMEs — fetched
+  `/tarball`, i.e. unreleased `main` HEAD, while the prose beside two of them promised "in
+  sync with the latest release". `repair()`'s own comment says running that unverified is the
+  behaviour it replaced. It now resolves the latest release tag first, and
+  `tests/manual-fallback-sync.test.mjs` pins all four surfaces to one constant and fails if a
+  fifth appears.
+- **fix: the 6h self-heal cooldown is now per code home.** The marker lived at one path under
+  a runtime dir that every install shape on a machine shares, so a failed heal attempt for
+  the plugin cache silenced the managed install's heal for six hours — and the two are
+  repaired by different commands. No migration: a pre-existing unsuffixed marker is ignored,
+  costing at most one extra attempt once.
+
+### Diagnostics that ended the reader's search without answering
+
+- **fix: `doctor` gives a remedy when the database will not open.** `✗ Database: file is not
+  a database` was the one ✗ on the screen with no next step, and the remedy already existed —
+  this project takes `VACUUM INTO` snapshots before every irreversible maintenance pass. It
+  now names the newest snapshot with a restore command (clearing the stale `-wal`/`-shm`
+  first, or the restore is re-corrupted by replay), says plainly when there is no snapshot,
+  and says *"could not read that directory"* as a third, separate answer. An error it cannot
+  classify still gets no invented fix.
+- **fix: on a plugin install, `status` no longer starts every MCP server on your machine.**
+  It shelled out to `claude mcp list` — which health-checks, i.e. launches, every configured
+  server (2.546s wall for three here, one of them a remote HTTP endpoint) — to ask one
+  question, and asked it with a substring test that matched inside
+  `plugin:claude-mem-lite:mem-lite:`. So a plugin user was reported as holding a bare-name
+  registration they do not have, and the branch written for them was dead code. A plugin
+  install now answers from the manifest without shelling out. **An npm / git-clone install
+  still shells out**, because for that shape the answer is not in any manifest.
+- **`doctor` now health-checks your MCP servers, which is new.** The exec moved there rather
+  than disappearing: it is the deep check, run rarely, and it is where the two checks below
+  need the data. So a `doctor` run launches every MCP server you have configured, including
+  remote endpoints. Both READMEs say so under their `doctor` sections.
+- **feat: `doctor` detects a duplicate MCP registration.** The README's "Mixed-install
+  residue" section has described this state for releases — a plugin user who once ran the
+  npx/git-clone installer keeps a bare-name registration alongside the manifest's — and
+  nothing detected it. Orphan hooks had a check; their MCP twin did not.
+- **feat: `doctor` reports whether the marketplace clone can still be fast-forwarded.**
+  Claude Code updates a git-source marketplace by pulling that clone; a dirty working tree
+  blocks the pull and the plugin stops updating with nothing saying so — which is the near
+  cause of the schema-skew lock-in v6.3.0 shipped a detector for the symptom of. The clone
+  gets dirty on its own: with a directory-source marketplace, `${CLAUDE_PLUGIN_ROOT}`
+  resolves inside it and `scripts/launch.mjs` runs `npm install` there.
+
+### Uninstall, and the manifest check
+
+- **fix: `uninstall` reclaims this plugin's cache even when a sibling plugin remains.** The
+  delete was gated on "no other plugin from this marketplace is installed", which is the
+  right rule for `cache/<marketplace>/` and the wrong one for
+  `cache/<marketplace>/claude-mem-lite/` — ours alone. Measured at 241 MB left behind on a
+  machine where the plugin was already gone. Both READMEs now also say that `/plugin
+  uninstall` does not touch the cache, and give the path, because after it the CLI may no
+  longer be on your PATH.
+- **feat: CI validates both manifests with the tool that loads them.** `npm run
+  validate:manifests` runs `claude plugin validate --strict --json` over the plugin AND
+  marketplace manifests against a pinned CLI, and grades three ways: any error fails, any
+  warning outside a short reasoned allowlist fails, and failure to RUN the validator fails
+  rather than skips.
+- **correction to the entry below.** The previous draft of this section said `claude plugin
+  validate --strict` "now exits 0". That was measured on `.` alone, which resolves to the
+  MARKETPLACE manifest; `.claude-plugin/plugin.json --strict` still exits 1, over a
+  CLAUDE.md-at-plugin-root warning that is deliberate and now carried explicitly in the
+  allowlist above. The marketplace fix itself stands.
+
+### What two independent pre-ship reviewers found in the above
+
+Both were given the same commit range and disjoint lenses (defects vs. are-the-author's-
+numbers-true). Between them: 2 P1, 6 P2, 7 P3. Every number in this changelog reproduced;
+the findings were in the code and the prose around them.
+
+- **fix: a LEFTOVER plugin-cache directory is no longer read as "the plugin is installed".**
+  This is the round's own new code, and the reviewer reproduced it end to end. `/plugin
+  uninstall` leaves version dirs behind — the very fact the README paragraph above adds — and
+  the install-shape probe falls back to "newest cache dir" when nothing recorded an install.
+  So a working npm-channel user with an old cache dir was told `the server is registered
+  twice` with a `Fix:` that would have removed their **only** registration, while `status`
+  printed a green line agreeing. Both surfaces now require an actual registration record
+  (`installed_plugins.json` or `enabledPlugins`), not a directory. Over-narrowing is safe here
+  by construction: the caller falls back to asking `claude mcp list`, which is the old
+  behaviour and the correct answer.
+- **fix: the duplicate-registration remedy dropped its `-s user` flag.** This repo's own
+  tracked `.mcp.json` registers a bare `mem-lite` at PROJECT scope, which `-s user` cannot
+  remove; `claude mcp remove` without a scope removes from whichever scope the entry is in.
+  It also names every bare registration now, not just the first.
+- **fix: the MCP server asked the schema-skew question of the DATA dir.** `server.mjs` passed
+  `DB_DIR` where its three sibling call sites pass `CODE_DIR`. With `CLAUDE_MEM_DIR` set, a
+  machine with a managed install was reported as having none — so the remedy came out as
+  "could not identify this install", or, with any plugin cache present, the plugin commands
+  printed under a line naming `~/.claude-mem-lite`. That is the exact failure v6.3.0 says it
+  fixed, reintroduced with the halves swapped.
+- **fix: the marketplace-clone check dropped a `node_modules` branch that could never fire.**
+  The clone is a clone of this repo, whose `.gitignore` carries `/node_modules`, so
+  `git status --porcelain` never sees it — the branch was reachable only from a fixture
+  missing the `.gitignore` the real clone always has. The dirt that actually blocks the
+  updater's pull is the TRACKED file `npm install` rewrites, `package-lock.json`, and that is
+  what the check now says and tests.
+- **fix: the native-binding heal cooldown stays machine-wide.** Making it per-code-home was
+  wrong for the command it gates: `rebuildBinding()` repairs every code home on the machine,
+  so one attempt covers them all. The comment justifying the change was false for the thing
+  it justified. The `repair` cooldown beside it is genuinely per-install and stays so.
+
+### From the original QA pass
+
+- **fix: the MCP server now prints the schema-skew remedy that actually works.** v6.3.0's
+  entry below claims "the MCP launcher report[s] the real cause"; for a forward-incompatible
+  database it did not. `scripts/launch.mjs` formats the shape-aware notice correctly, but
+  `server.mjs` opens the DB while being imported and catches that throw itself, printing
+  `err.message` and calling `process.exit(1)` — so the launcher's handler was unreachable for
+  this one error and users saw schema.mjs's raw text ending in `npm i -g
+  claude-mem-lite@latest`, which repairs nothing on a plugin-cache install. Measured against
+  the shipped v6.3.0 cache: it printed the `npm i -g` line; patched, the same shape prints
+  `/plugin marketplace update sdsrss` + `/plugin update claude-mem-lite@sdsrss`. Emitted from
+  `server.mjs` rather than by re-throwing, because the npm channel registers `claude mcp add
+  ... -- node <SERVER_PATH>` with no launcher above it.
+- **fix: three MCP tools advertised a required field as optional.** `mem_defer_drop.id` (a
+  core tool, listed in `tools/list`), `mem_delete.ids` and `mem_update.id`. zod 4's
+  `toJSONSchema({io:'input'})` reads a `ZodPipe`'s input side as accepting `undefined`, so the
+  `coerceInt.pipe(...)` idiom dropped the key from the published `required` array while the
+  runtime still rejected the call with `-32602`. An agent planning from the schema spent a
+  round trip discovering a requirement the schema was meant to state. Runtime behaviour is
+  unchanged — all six accept/reject cases per field are byte-identical.
+- **fix: the marketplace manifest passes `claude plugin validate --strict`.** `metadata`
+  carried a `homepage` key, which the runtime tolerates and `--strict` rejects as
+  unrecognized. The field moved to the plugin entry, where the reference documents it. (This
+  bullet originally claimed the whole repo exited 0 under `--strict`; see the correction
+  above.)
+
+## v6.3.0 — when the database is newer than the code, say so
+
+`schema.mjs` has refused a database written by a newer claude-mem-lite since v2.41, and the
+refusal is right: replaying old migrations over a newer layout would corrupt the store. What
+was missing is everything downstream of the throw. Until this release, hitting it meant your
+memory silently stopped working.
+
+Measured on a real machine, 2026-09-08: DB at schema v49, live plugin cache at 5.6.0 (which
+supports v48), because a newer install had opened the shared database first. The result was
+**over 648 identical lines in one day** in `runtime/hook-errors/`, still growing; the MCP
+server died before its handshake so the host reported only `-32000 Connection closed`; and
+SessionStart returned in silence. Nothing a user could see said memory was off.
+
+**What changes for you.** When any code home cannot open your database because something
+newer wrote it, you now get told, on surfaces you actually read:
+
+- **SessionStart** prints a notice naming both schema versions and the command that repairs
+  *your* install. It goes to the user-visible channel, not only into the assistant's context.
+- **`claude-mem-lite doctor`** grades each code home separately, so it names the tree that is
+  behind — a plugin cache, a managed install, or a checkout — rather than asserting something
+  global about "the install". This is the part that works today: doctor runs from whichever
+  copy you invoke, so newer code can diagnose an older cache.
+- **`claude-mem-lite <any command>`** and the **MCP launcher** report the real cause instead
+  of a raw exception or a bare connection error.
+- The hook-error log records the fault **once per project per hour** instead of once per
+  database open.
+
+**The repair command is now correct for your install shape.** The message this replaces
+always ended in `npm i -g claude-mem-lite@latest`, which does nothing for a plugin-cache
+install — and a plugin-cache install is exactly the shape that hits this, because the cache
+only moves when Claude Code's marketplace updater moves it. A plugin install is now told:
+
+```
+/plugin marketplace update sdsrss
+/plugin update claude-mem-lite@sdsrss
+```
+
+Both, in that order. The first matters more than it looks: Claude Code compares against your
+local marketplace clone, so a stale clone makes `/plugin update` a no-op that reports success.
+On the machine that motivated this release the clone was 22 commits behind.
+
+**Not a migration.** `CURRENT_SCHEMA_VERSION` is unchanged at v49, so upgrading to 6.3.0 does
+not touch your database and downgrading needs nothing special. If you want out of the new
+notice, pin the previous version (`npm i -g claude-mem-lite@6.2.0`, or hold the plugin at its
+current cache version); there is deliberately no switch to silence it, because a
+"your memory is off" message you can turn off is the silence this release exists to remove.
+
+**Known limit, stated plainly.** This cannot help a machine already running older code — the
+detection ships in the newer version, and the old binary is the one throwing. `doctor` is the
+exception, for the reason above.
+
+## v6.2.0 — the platform list was telling nobody anything, it was just blocking them
+
+**Fixes [#28](https://github.com/sdsrss/claude-mem-lite/issues/28). On Windows the MCP server
+never started: `/mcp` reported `CONNECTION_CLOSED` and the launcher named three causes, none
+of them the real one.**
+
+`package.json` declared `os: ["darwin", "linux"]`. That is an npm **install** gate, not a
+runtime check — npm exits `EBADPLATFORM` before resolving anything. `scripts/launch.mjs` runs
+`npm install --omit=dev` whenever `node_modules/better-sqlite3` is absent, and Claude Code
+materializes every new plugin-cache version *without* `node_modules`, so that install is on
+the path of the first MCP launch after every plugin update. It failed, the launcher exited 1,
+and the stdio server died before it said anything useful.
+
+The field was added in v5.1.0 for a stated reason: *"a Windows user should be told rather than
+handed a string of silent catch blocks."* Blocking the install is the opposite of telling —
+the user lost the server and learned nothing. So the block is gone and the telling is built:
+
+- **`os` now includes `win32`.** Nothing is compiled: `better-sqlite3` 13 ships `win32-x64`
+  and `win32-arm64` prebuilds. The MCP server, the CLI and the `node` hooks are Node-only.
+- **The launcher checks the platform list before running npm** and, when the current platform
+  is outside it, prints both sides of the mismatch, the `EBADPLATFORM` code and the
+  `--force` escape instead of guessing. npm's `os` semantics are reproduced including
+  negation (`["!win32"]`), so the message cannot be wrong in the direction that matters.
+- **`Likely cause: read-only directory, disk full, or network blocked`** asserted three causes
+  and could not contain this one. It now points at npm's own `npm error code` line, which
+  inherited stderr has already printed, and demotes the list to *common* causes.
+- **`doctor` gained a hook-interpreter check.** Hook commands that run under `bash`
+  (`setup.sh`, `post-tool-use.sh`, `pre-agent-inject.sh` in the plugin manifest; two of them
+  on an npm install) cannot fire without it, so when `bash` cannot be run doctor says so,
+  names Git for Windows / WSL, and states that the MCP server and the `node` hooks are
+  unaffected. It is a ⚠, not an error — doctor still exits 0 on that configuration. It reads
+  whichever hook registration is live for your install shape, and when it can read neither it
+  says *that*, rather than reporting a green "no hook needs bash" it has not earned.
+
+**What changes for existing Linux and macOS users: nothing.** Both platforms were already on
+the list; the gate only ever rejected platforms that were absent from it. There is no state to
+migrate and no flag to set.
+
+**What Windows users should know:** this is not a claim of Windows support. No GitHub Actions
+runner exercises Windows, so the platform rests on user reports rather than a green pipeline,
+and the three `bash` hooks need Git for Windows or WSL on `PATH` — which Claude Code on
+Windows generally already has, since it shells out to `bash` for its own Bash tool. `README`'s
+Platform Support table now says exactly this.
+
+## v6.1.0 — the daily normalize no longer lets one project rewrite another
+
+**Upgrade note — a user-visible default changes. The unattended `normalize` pass is now
+scoped PER PROJECT.**
+
+Until now the daily unattended optimize ran `normalize` unscoped: it took its concept
+vocabulary from every project's stored content, sent it to the model as one list, and wrote
+the answer back across every project. That made one observation's content able to steer
+synonym groups applied to rows in unrelated projects — reproduced end to end, with a victim
+project's row losing three of its five concepts to a term supplied by another project.
+
+**What changes for you:** cross-project synonym unification stops happening automatically, so
+`k8s` in one project and `kubernetes` in another are no longer folded together by the daily
+pass. Each project is still normalized, against its own vocabulary, in its own pass — at most
+8 per run, since each pass is a model call where the old shape was one, and the surplus is
+carried to the next run rather than dropped. If you have more than 8 projects the rotation
+means each is reached every ceil(N/8) runs rather than every run — and the run itself is
+behind a 7-day gate, so with 25 projects a given one comes round about every 28 days.
+
+**This fix is forward-only.** Concept terms that earlier cross-project runs already unified
+are not restored; the change stops it happening again rather than undoing what happened. The
+replaced term is kept on the row as a search alias, so such rows stay findable under the old
+wording — but nothing marks which unification came from another project, so there is no list
+to review.
+
+**To keep the old behaviour:** set `CLAUDE_MEM_NORMALIZE_CROSS_PROJECT=1`. It restores the
+single unscoped pass's SCOPE — not the pre-fix handling of the content: the shape gate on
+concept tokens and the check that the model's answer only uses terms the corpus already had
+run on that path too, and stay on. A foreground `optimize` run then prints a warning saying
+why the flag is not recommended; the daily unattended pass cannot print anything (its worker
+is spawned with stderr closed), so `claude-mem-lite doctor` reports the flag as a ⚠ instead.
+It is the ONLY route back: an explicit `claude-mem-lite optimize --run --task normalize`
+with no `--project` is an unscoped run too, so it fans out as well.
+
+Also in this change, all on the same path:
+
+- Concept tokens are now shape-gated before they can enter a model prompt (length 2..40, a
+  Unicode-category denylist plus an NFKC fold, and a per-row cap of 32 so one observation
+  cannot monopolise the prompt). A rejected token is dropped from the normalize prompt only —
+  never from the row, and never from search.
+- That prompt now uses the `{system, user}` split and carries `MEMORY_INPUT_GUARD`, the same
+  control episode extraction and session summary already used. The constant moved to
+  `lib/memory-input-guard.mjs` so its two consumers cannot hand-copy it apart.
+- The model's answer is checked against the project's own vocabulary before being applied.
+
+## v6.0.0 — the TF-IDF vector arm is removed, and the metric that retired it never measured it
+
+**Upgrade note — two published surfaces are gone and two tables are dropped. The DEFAULT
+search path does not change.**
+
+`CLAUDE_MEM_VECTORS` no longer does anything, `claude-mem-lite maintain execute --ops
+rebuild_vectors` now exits 1 with `Unknown operation(s): rebuild_vectors` and a list of the
+valid ops, and schema v49 DROPs `observation_vectors` and `vocab_state` on the next open.
+Nothing else about retrieval moves: the arm has been gated OFF by default since v3.17.0, so
+for every user who did not set that env var this release is behaviour-identical — verified,
+not asserted (see the baseline-neutrality reading below).
+
+**To keep the arm, pin `claude-mem-lite@5.6.0` BEFORE upgrading — this door only opens one
+way.** Once a v49 build has opened your database, 5.6.0 refuses it: `schema.mjs`'s
+forward-incompat guard throws *"DB schema is v49 but this claude-mem-lite binary supports up
+to v48"*. From there the only routes are re-upgrading or pointing `CLAUDE_MEM_DIR` at a fresh
+directory (or restoring a pre-upgrade backup). Verified with a probe, not inferred. There is
+no in-product warning for a still-set
+`CLAUDE_MEM_VECTORS`, deliberately: re-enabling always required a vector rebuild too, and
+that is the command that now fails loudly, so the one path that mattered is the one that
+tells you.
+
+**Why now — and a correction to the reason v3.17.0 gave.** v3.17.0 disabled the arm and kept
+the code "pending Phase-2 removal". Its headline evidence was
+`benchmark/ci-gate.mjs: hybrid_over_bm25 = 0`. **That metric never measured the vector arm.**
+`benchmark/benchmark.mjs:300` defines `hybrid` as the eight SCORING MULTIPLIERS over BM25 and
+`:676` diffs it against `bm25_only`; neither term executes a vector path, and
+`production_hybrid` — the only mode that drives the real `searchObservationsHybrid` — is not
+in the `:611` matrix at all. The word "hybrid" means two different things in this repo
+(multiplier-hybrid in the matrix, FTS+vector-hybrid in the function name) and the collision
+is what let a wrong citation read as a right one for two and a half months.
+
+**The verdict survived re-measurement anyway, which is why this is a removal and not a
+restart.** v3.17.0 also ran the correct instrument, and a same-tree back-to-back A/B
+reproduces it to the digit — `--production-hybrid` R@10 **0.8998 off / 0.8980 on** — plus two
+columns it never reported: P@10 **0.8497 → 0.7819** and, at the median of 5 runs per arm,
+P95 **2.2724ms → 3.9037ms (+72%)**. The
+deciding reading is the vocabulary-mismatch fixture, the arm's only reason to exist, where the
+ruler is nowhere near saturated (R@10 0.34) and therefore *can* say no: R@10 **0.3407 →
+0.3018 (−11.4%)**, P@10 0.1599 → 0.1458, nDCG 0.2988 → 0.2809, MRR 0.4250 → 0.4236, and P95
+median-of-5 **2.1243ms → 3.9904ms (+88%)**. Negative on every column. The latency figures are
+medians of 5 runs per arm because the first draft quoted single runs to four decimals and
+pre-merge review showed both were outside an eight-run envelope — in opposite directions. Premise asserted rather than assumed: both arms seed
+200 vectors at vocab `ba73c835cd40`, dim 512, so the only variable is the gate, and both arms
+re-run byte-identical. On the real corpus the arm held **0 rows** in `observation_vectors` and
+**0** in `vocab_state` against 26 live observations — a PRE-MIGRATION reading, taken read-only
+before v49 dropped the tables, and therefore one nobody can re-take. Recorded as measured on
+2026-09-07, not as a standing fact. Restarting it would have meant shipping a
+retrieval arm this machine cannot evaluate (D#14).
+
+**Baseline-neutral, verified not inferred.** After the removal `--production-hybrid` reads
+0.8998 / 0.8497 / 0.9712 / 0.9611 — identical to the pre-removal arm — so
+`benchmark/baseline.json` needs no recapture. `--production-hybrid` also stops calling
+`seedVectors` and its docstring stops claiming it drives "the real FTS+vector+RRF path"; both
+were already false in the shipped default, since the search returned before reading a vector.
+
+**What is NOT removed.** `tfidf.mjs` was never the vector arm: `porterStem` stays because
+`search-scoring.mjs` uses it for PRF term extraction on the default path, `tokenize` stays with
+it, and `RRF_K` moves to `lib/rrf.mjs` because `deep-search.mjs` still RRF-fuses. MinHash and
+the dedup constants were never coupled to this arm and are untouched — all 26 live rows carry
+a `minhash_sig`. `--vector-sweep` goes with the arm it swept.
+
+**Two consequences that are not no-ops.** `clusterForCompression` loses its cosine branch;
+production behaviour is unchanged because `getVocabulary` returned null with the arm off, so
+the 14-day-window branch was already the only reachable path — but that weak heuristic is now
+the only one, with `buildCompressPrompt`'s `should_compress` veto as its sole guard (D#16
+decided that on measured evidence: 6/6 refusals on unrelated clusters, 0/6 false refusals on
+related ones). And `findSmartCompressCandidates`' untiebroken `ORDER BY` — D#9's "eighth
+ordering" — was excused on the grounds that the branch it could damage needed a default-off
+flag. **That excuse is now void and its priority went up, not down**: the sub-cluster anchor
+survives a stable JS sort, so SQL order still decides membership, unconditionally. Still no
+failing case, so still unjudged.
+
+Suite 366 files / 5850 → **363 / 5782**, exit 0, the −68 attributed by name with the
+arithmetic closing exactly. eslint 0, `format:check` 0. knip **44** unused exports and 3
+unlisted binaries, unmoved — and the name set was diffed same-tree rather than trusted for
+agreeing, because a round that deletes 19 shipped-module exports and adds one is exactly where an unchanged
+count can hide a crossing: **zero entered, zero left**. Coverage 84.96 / 79.39 / 90.72 / 86.14,
+gate exit 0 — read the denominator, not the rise: statements 11639 → 11320 (measured on both
+trees; the first draft carried a stale pre-value). Less-covered code
+left the tree; nothing got better.
+
+## v5.6.0 — the audit of three areas no round had ever read, and the five things it found
+
+**Upgrade note — read this one, it contains the first irreversible step in a while.**
+
+- **Schema 47 → 48, additive and automatic.** One nullable column,
+  `observations.last_access_session_id`. It migrates on first open; no action needed, no
+  data is moved, and existing counters are untouched.
+- **It is ONE-WAY.** `claude-mem-lite` refuses to open a database written by a newer schema,
+  so once v5.6.0 has opened your store, **v5.5.1 and earlier will error on it** with
+  `DB schema is v48 but this claude-mem-lite binary supports up to v47`. Downgrading means
+  pointing `CLAUDE_MEM_DIR` at a fresh directory or restoring a pre-upgrade backup. There is
+  no env flag that reverts the migration, and adding one would only create a third behaviour
+  nobody has measured.
+- **`access_count` changes meaning, and old values are not corrected.** Values written before
+  v5.6.0 are an UPPER BOUND, not a count (see below). They are left as they are, because the
+  true count is not recoverable from the inflated one.
+- **The cite-`#NN` nudge will start speaking again on projects where it had gone quiet.** That
+  is the fix working — it had silenced itself in the first session of every project — but if
+  you do not want it, `CLAUDE_MEM_NO_CITE_NUDGE=1` mutes it and
+  `CLAUDE_MEM_CITE_NUDGE_SILENCE_AFTER` tunes how fast it gives up.
+- **Citation numbers before and after this release are different calibers.** Anything you
+  captured from `benchmark/cite-recall.mjs`, `benchmark/efficacy-observational.mjs` or
+  `benchmark/citation-live-replay.mjs` cannot be subtracted from a post-v5.6.0 reading.
+
+**`bumpCitationAccess` was crediting one citation once per TURN, not once per session.**
+`Stop` fires at the end of every assistant turn and re-scans the whole transcript, so a `#NN`
+written in turn 2 was credited again in turns 3, 4, 5 and so on. It was the only one of
+Stop's five writers without an idempotency key — `applyCitationDecay` carries two, the two
+funnel writers are idempotent by construction — and its single multi-call test asserted the
+accumulation as though that were the contract. Replayed over 51 real transcripts at true turn
+boundaries: **338 credits across 43 distinct (session, id) pairs, 7.86×**, worst single
+session 18.75×. That feeds `boostAccessed` (`access_count > 3` → `importance + 1`, unattended
+daily) and suppresses the noise penalty, whose predicate reads `injection_count >
+access_count * 3`. Fixed with a third per-row session key beside the two the decay channel
+already uses, deliberately separate from them: decay resolves a main-thread-only id set
+behind a text floor while this channel resolves the whole transcript including sidechains, so
+a shared key would let either channel silence the other. Exact for one session at a time; two
+same-project sessions interleaving turns flip the stamp between them, the same bound the decay
+keys already accept. D#206's "at most 3 rows could have crossed the threshold" is retracted in
+all four places it lived — it was computed on the premise this fixes, and no replacement bound
+has been measured. (R11-B-P1-1)
+
+**`mem_search` handed back memories from the branch you excluded, at the worst possible
+moment.** When a typed search matched nothing, the MCP face fell back to listing recent rows
+of that type — carrying the live, type, project, date and importance filters, and not
+`branch`. Nothing downstream compensated. Because the fallback fires exactly when the search
+found nothing, those rows were the only rows you saw, with no correct result beside them for
+contrast, and `total` clamped to them so the page read like a legitimate hit. Measured through
+the published face: asking for `feature/x` returned rows from `main` and `feature/x`. The CLI
+was never affected. (R11-A-P1-1)
+
+**Four orderings in the retrieval core said "newest first" and returned oldest-first on a
+tie.** SQLite falls back to ascending rowid when an `ORDER BY` is not a total order, and two
+inserts reading `Date.now()` land in the same millisecond about 90% of the time. The sharpest
+was `findFtsAnchor`: it takes `LIMIT 1`, so the tie decided CONTENT — `timeline --query` and
+`mem_timeline` anchored on the oldest row of a tied group and shifted the whole navigation
+window. The other three are the no-query recent listing, the type-list fallback, and the CJK
+LIKE fallback that is the only path by which CJK prompt rows are reachable at all. The
+remaining sites in that file set are enumerated in the audit report and left, because they
+move candidate-pool membership and owe a measurement first. (R11-A-P2-3)
+
+**The cite-recall nudge had silenced itself everywhere, by counting the wrong unit.** Its
+self-silence streak is documented as "consecutive qualifying SESSIONS" and was incremented
+once per Stop, so at a typical six turns per session the default of 3 was reached inside the
+first session and never recovered. The runtime file on the development machine read
+`lowStreak = 58` for a project with 26 transcripts on disk. Existing payloads self-heal rather
+than needing hand-editing. Deliberately NOT changed: the ratio threshold. Swapping the gate's
+denominator to the ids hooks actually injected was measured over the same 51 transcripts — it
+cuts the qualifying population from 37 sessions to 7 and changes the fire rate not at all,
+because real cite-recall never exceeds 0.5 here while the threshold is 0.6. A threshold no
+session can satisfy guarantees the silence whatever the denominator is; picking a new one is a
+judgment about how often the nudge should speak, not a measurement gap. (R11-B-P1-2)
+
+**`E#501` was being read as observation 501.** This project renders, and teaches you to type
+back, `E#N` for events, `P#N` for prompts, `D#N` for deferred items and `S#N` for sessions.
+Every injected-side extractor drops those by construction; the cited side matched a bare
+`#(\d{1,7})` and did not. On the development store, 26 of 26 live observation ids are also
+event ids and also prompt ids. The docblock argued a loose numerator was free "because a cited
+id only counts once it intersects an anchored injected set" — the exception is that the
+user-typed allow-list runs the same matcher over your own messages, so both sides of the
+intersection were unanchored. Same-tree A/B: 9 of 44 credited pairs came in through a
+namespace token. It does not catch `issue #1234` or `[link](#42)`, and is not meant to.
+(R11-B-P2-3)
+
+**The round that found all five is `docs/audits/20260907-113002.md`** — 13,647 lines across
+the retrieval core, `lib/citation-tracker.mjs` and the unattended LLM write paths, the three
+areas R10 closed by naming as never read. No P0. Its §5 records the `ORDER BY` name set those
+partitions own (19 harmful, 15 clean), its §6 records four conclusions that did not survive
+checking, including a prior finding whose stated ranking direction is measurably backwards.
+Five findings are deliberately open with their reasons written down, and a pre-ship review
+found three more before the tag: a retraction that had landed in two of its four copies, a
+migration shipping without a test, and this upgrade note.
+
+## v5.5.1 — the seventh pool a grep could not see, and three claims that did not survive review
+
+**Upgrade note:** one shipped behaviour changes and it is a fix, not a new default. No env
+var, no schema change, no migration. The daily background re-enrich pass now picks the rows
+its own `ORDER BY` always claimed to pick.
+
+**The `wide` re-enrich pool's ordering was never made total, in the file v5.5.0 declared
+complete.** D#9 added an `id DESC` tiebreaker to `hook-optimize.mjs` and recorded "all six
+sites". There are seven. The missed one is the `wide` pool, and it is the one that matters
+most: it is the scope the daily unattended pass supplies explicitly, on a budget of 6. Its
+`ORDER BY` leads with a multi-line `CASE type …` term, so a grep for the joined
+`created_at_epoch DESC, id DESC` spelling cannot see it, and the original boundary test drove
+`scope: 'narrow'` only, so nothing went red. Reproduced before the fix: five rows forced onto
+one epoch with limit 3 returned ids `[1,2,3]`, the three OLDEST, where the clause states
+newest-first `[3,4,5]` — on a tie SQLite returns ascending rowid. What it cost was priority
+inversion inside a tie group, not permanent starvation: `executeReenrich` stamps
+`optimized_at` in the same UPDATE as the enrichment, so a processed row leaves the pool and
+the delayed rows come up on the next run. (D#9 follow-up)
+
+**The gate baseline's expiry is hand-copied into three files and the rule named two.**
+`benchmark/baseline.json` carries the machine-readable `timestamp`; `ci.yml` and `CLAUDE.md`
+each restate the derived expiry for a human deciding whether to recapture before tagging. The
+v5.5.0 recapture moved the first two and left the third naming the previous sample — in a
+commit whose own message cites the lesson that a hand-copied stamp goes stale silently.
+`tests/baseline-stamp-sync.test.mjs` now derives the expiry from `baseline.json` plus the
+gate's own `BASELINE_STALE_AGE_DAYS`, read from source so retuning the window moves the guard
+instead of invalidating it, and asserts the CLAUDE.md **recapture row** carries it. Row-scoped
+on purpose: pre-ship review drove a whole-file version to a green false pass by corrupting the
+row and mentioning the real stamp in history prose.
+
+**Auto-escalation is invisible to both deep-search rulers, and the flood is not what the
+docblock said.** Deep search escalates when the plain search returns fewer than three rows —
+a COUNT — while the AND→OR fallback exists to make that count non-zero. It fires on 12/12
+queries in both populations of the benchmark fixture, so `shouldEscalateToDeep` is false
+12/12 and every number those rulers report describes explicit `--deep`, not `auto`. A planned
+A/B on the escalation constant would have read the same in both arms; that Δ=0 would have
+been a blind instrument. `benchmark/deep-search-holdout.mjs` now prints the plain-hit and
+escalation columns and carries three self-checks, and the reach is pinned so a fixture that
+gains an escalating query goes red. Two shipped claims were corrected with measurements
+rather than argued: the single-variant baseline returns mean 9.42 of 10 on the holdout
+negatives, not the 1-2 rows `deep-search.mjs` asserted, and a counterfactual shows the flood
+is the AND→OR fallback — disabling it takes mean FP@10 from 10.00 to 0.08. That is a
+mechanism probe, not a candidate fix: the same fallback is the vocab-mismatch recall win.
+
+**Pre-ship review found the completeness claims counted two different things.**
+`findReenrichCandidates` holds five pools; the file holds seven `ORDER BY … DESC` sites. An
+earlier draft called the seven "pools" and then told the reader to count `db.prepare` blocks,
+which returns five. An eighth ordering in the same file — `findSmartCompressCandidates`,
+ascending, no `id`, no `LIMIT` — is now named as deliberately unfixed rather than silently
+excluded: it feeds a clustering path whose vector branch is off by default, and no failing
+case has been built for it.
+
+## v5.5.0 — three rulers that can say NO, and the things they caught
+
+**Upgrade note:** three default behaviours change, all reversible by env var. `search` and
+`mem_search` now append a one-line note when the reported `total` exceeds what pagination
+can actually reach (`CLAUDE_MEM_REACH_DISCLOSURE=off`). The daily background optimize pass
+now does one more thing and one less: it backfills `concepts` on manual saves that no pool
+could previously reach, and smart-compress can now REFUSE a cluster instead of always
+summarising it. No data migration, no schema change. If a smart-compress model response
+omits the new `should_compress` field the cluster is skipped rather than compressed — that
+is deliberate, see below.
+
+**Search reported a `total` it could not paginate to.** `computePerSourceWindow` is
+offset-independent by design (D#30 — an offset-scaled pool re-ranks its own prefix under
+RRF, so pages overlapped and gapped), while `countSearchTotal` re-derives the full
+match+filter population. The two answer different questions and nothing said so. Measured on
+a 128-row corpus: the last non-empty offset is **59 / 59 / 89** for limits 10 / 20 / 30, so
+at `mem_search`'s default limit of 20, **60 of 128 rows (46.9%) are unreachable at any
+offset**. Both faces now disclose it through one shared helper, and the reachable count is
+`preFinalizeCount` rather than a re-derived formula — `perSourceLimit` is per SOURCE, so a
+cross-source query fuses up to four pools and a formula would understate its reach. Four
+mutations, four kills. (D#5)
+
+**The coverage gate could see 62.5% of the shipped tree, and the file's own comments named
+three exclusions out of twenty-four.** `coverage.include` was an allowlist, and an allowlist
+gives a new module no way to announce itself — absence reads identically to "deliberately
+out". This is the THIRD round to find code hiding there, and the first to remove the
+mechanism instead of the instance. **24 shipped modules, 10,137 lines against 30,305**, with
+no stated reason: `search-engine.mjs`, `scoring-sql.mjs`, `rerank.mjs`, `deep-search.mjs` —
+the retrieval core this project's whole measurement doctrine is about — plus all of `cli/**`
+(including the render layer `server.mjs` imports) and `server/fts-check.mjs`. `include` is
+now a denylist; staying out costs a named entry with a reason. `cli.mjs` is the one new
+exclusion, on measured grounds (zero in-process importers, ≥5 spawners, 0.0% over 63
+statements); `hook-precompact.mjs` was checked the same way and went IN at 58.3%. Population
+83 → 130 files. **Caliber break: the four coverage numbers are not comparable across this
+release.**
+
+**The scope guard had been modelling the wrong matcher for a whole major and nothing went
+red.** It described vitest 4 (absolute path, `{ contains: true }`) while vitest 5 matches the
+RELATIVE path with no `contains`; the old simple `include` made both semantics agree, so the
+staleness only surfaced when the config changed. It caught a real bug on the way past: under
+`contains: true` an exclude entry is a SUBSTRING test, so `'cli.mjs'` would also have
+excluded `mem-cli.mjs` — 3827 lines, the largest module in the gate — while the aggregate
+went UP. Model corrected, plus a tripwire that fails on the next vitest major.
+
+**The suite gave its hooks half the budget it gave its tests.** `hookTimeout` appeared
+nowhere in this repo: `testTimeout` was 20 s and setup/teardown silently kept vitest's 10 s
+default, in a suite where **153 of 362 files** run `mkdtemp` / `new Database` / `initSchema`
+/ `execFileSync` / `rmSync` inside `before*`/`after*`. Prompted by a CI red, deliberately not
+justified by it — that failure's cause is unproven and stays open. The archived attempt-1 log
+gives the magnitude the report was missing: the file ran **14736 ms** on the runner against
+**1.02 s** locally. (D#7)
+
+**Coverage is not deterministic, and one file is the whole of it.** Nine identical
+whole-suite runs on one unchanged tree: statements 9790/9791, branches 7362/7363/7364,
+functions and lines identical throughout. Localised by diffing per-file hit counts rather
+than subtracting totals — **exactly one file moves, `hook-optimize.mjs`**. The baseline row
+now carries a range and an explicit "do not attribute a ±0.01 movement"; several past rows
+tried to.
+
+**Manual saves never received concepts or facts, and the fix that closed P1-2 is what created
+the hole.** `save-enrich` fires on every successful manual save and writes `search_aliases` +
+`lesson_learned` + `scope` — exactly the four re-enrich pools' predicates — so a
+save-enriched row matched none of them, permanently. Its docblock's "the daily wide re-enrich
+stays the safety net" was true of `optimized_at` and false in effect. Measured on a real DB
+with a readonly handle: 16 live rows, 15 conceptless, **all four pools 0, the new pool 14**
+(the 15th is named, not subtracted: a 79-char narrative below the substantive gate). Fixed
+with a pool keyed on the column it fills, not by widening save-enrich's stated contract — a
+source-side fix cannot reach rows already on disk. Concepts are worth **+0.0846 R@10 /
++0.0579 nDCG** where they exist, against **+0.0002 R@10** for all eight scoring multipliers
+combined; that is what they are worth, NOT what backfilling recovers in production, which is
+still unmeasured. (D#6)
+
+**Two post-LLM writes R10 P3-3 never reached, and one of them destroys a pointer rather than
+staling a row.** A sweep of all 11 observation writes in `hook-optimize.mjs` found two
+siblings still bare. The importance:0 auto-hide sets `compressed_into = -1`, and
+`compressed_into` is the child → keeper link: if a concurrent merge or compress adopts the row
+during the 45 s call it holds a POSITIVE keeper id, and −1 over that destroys it, since
+orphan recovery filters `compressed_into > 0`. The paired write in `lib/maintain-core.mjs`
+already carried the predicate. Two of the eleven look bare and are not — they sit inside a
+transaction that re-checks liveness first. (D#12)
+
+**smart-compress had no way for the model to refuse, on the path that HIDES its inputs.** Its
+prompt asserted the premise it should have been testing ("Summarize these related …") and the
+only bail was a missing title, while its sibling `executeMergeCluster` has had `should_merge`
+all along. That mattered because the upstream relatedness check is not always on: measured
+with a control arm, three observations sharing only a project and an era, 12 days apart, form
+**0 clusters with `CLAUDE_MEM_VECTORS=1` and 1 cluster with the arm off** — the default, where
+`clusterForCompression` groups by a 14-day window alone. It now fails CLOSED, because refusing
+wrongly costs a skipped compression while proceeding wrongly hides real rows. Two existing
+mocks were updated rather than left asserting the old contract. (D#10)
+
+**And the veto was measured, not assumed.** `benchmark/compress-veto-rate.mjs`, two runs
+back-to-back with identical results: **veto 6/6 = 100% on unrelated clusters, false-refusal
+0/6 = 0% on related ones, 0 errors.** The bound belongs with the number — n=6 per arm, a
+hand-built fixture (the real corpus has zero eligible rows to sample), and the arms are
+separated by design at cohesion 0.1124 vs 0.0051, which a self-check asserts. So the veto
+handles the CLEAR case, which is exactly the shape found above; ambiguous clusters are
+unmeasured and are the named next step. The ruler classifies THREE ways on purpose:
+`executeSmartCompressCluster` returns `{compressed:false}` for a refusal and a dead API key
+alike, so a two-way ruler would have scored an outage as a perfect veto.
+
+**`benchmark:gate` cannot say NO about the eight scoring multipliers, and now something can.**
+Proven by mutating the real tree and reverting it: neutering `MULT_EXPR.importance` left the
+gate at exit 0 with all four checks passing and `hybrid_over_bm25` going UP; changing
+`MULT_EXPR.lesson`'s 0.3 to 0.5 left the output byte-identical. `multiplier-discrimination.mjs`
+recovers each multiplier's own ratio from tied-BM25 pairs, and **all eight are alive with
+their declared magnitude**. Wired into CI as its own gate.
+
+Suite **363 files / 5795**, 0 skipped (was 360 / 5744). Coverage 84.55 / 78.76 / 90.68 /
+85.87 over the new 130-file population, floors re-derived to 81 / 75 / 87 / 83 by the same
+~3-point rule that set the old ones. knip unmoved at 44 / 0 / 0 / 3.
+
+## v5.4.0 — two host facts the code had modelled backwards
+
+**Upgrade note:** SessionStart now emits a `Working State (from /clear)` block after
+`/clear` or `/compact`, and one memory "session" now spans a whole Claude Code session
+instead of a single turn. No action required, and no data migration — `session_summaries`
+and `sdk_sessions` simply stop counting turns. If your host fires `Stop` once per session
+rather than once per turn, `CLAUDE_MEM_LEGACY_STOP_UNLINK=1` restores the old behaviour;
+it re-breaks the `/clear` handoff by design, and a test asserts that it does.
+
+**The `/clear` handoff had never once fired.** `session_handoffs` on the maintainer's
+install held 4 `exit` rows and **0** `clear` rows across 21 sessions. Two host facts, both
+now measured rather than assumed, explain it. `Stop` fires at the end of every assistant
+*turn*, not once per session — and it deleted the session file that SessionStart reads to
+learn which session just ended, so the branch was unreachable, and every turn minted a new
+mem session (58 prompts over 16 host sessions produced **56** mem sessions and 56 summary
+rows, 0 of which carried the LLM-only fields). And Claude Code **rotates its session id
+across `/clear`**: of 21 real transcripts, 12 carry a `/clear` command record, and in
+**12/12** that record's timestamp precedes its own file's first record by ~0.1s — the
+command is issued in the old session and replayed into a new file under a new id. That was
+R10 §8's blocking prerequisite, and it needed no capture switch; the answer was already on
+disk. Stop now keeps the session file, SessionStart asks the host's `source`
+(`startup|clear|compact|resume`) instead of guessing from the file's presence, and the
+handoff's prompt lookup falls back to the unscoped set when the new session's id matches
+none. Five cases, each mutation-verified against the real revert. (R10-P1-1)
+
+**`install` was pushing HEAD's `launch.mjs` into older plugin-cache versions.** Entry point
+and library are versioned together, so an old cache dir ran the new entry point against its
+own `lib/` — HEAD destructures `nativeBindingRepairHint`, which v3.95.0's binding-probe does
+not export, and the swallowed TypeError takes with it the one message that tells a user how
+to repair a dead binding. R10 §8 said not to touch `install()` without reproducing this in
+the sandbox harness, so the reproduction landed first, as phase B §B9 (the `3.95.0` dir came
+back 9802 B with the symbol in it). The sync is now gated on dev mode or a version match,
+and writes atomically. One correction to the report's premise, found by running it: this is
+not "every install / repair" but every install/repair on a machine that also ran `/plugin
+marketplace add` — the block sits inside a check for the marketplace clone, and a first
+version of the repro built only the cache, measured nothing, and reported success.
+(R10-P2-11)
+
+**R10-P2-12 did not reproduce, and is recorded as such.** Four parallel launcher loops put
+**229 of 480** hook fires inside a 2524 ms window of five back-to-back in-place installs,
+with no `ERR_MODULE_NOT_FOUND`, no non-zero exit and no new `hook-errors` bytes. The
+mechanism is unchanged — `install()` still copies in place without the swap barrier
+`hook-update.mjs` takes — so this is a bounded negative, not an acquittal, and the bound is
+that an idempotent re-install deploys the same module set and cannot produce the
+version-transition shape the report names. `install()` was left alone.
+
+Sandbox harness: phase B 45 → **56** checks; 47/47, 56/56, 15/15 across all three phases.
+Suite **360 files / 5744**, 0 skipped (was 360 / 5736).
+
+## v5.3.1 — the fix that would have measured zero, and the one hard delete that could take a redirect
+
+Two defects that had both been argued about before and never measured to the end.
+
+**`cleanupBroken` could hard-delete a supersede tombstone.** Of the eleven sites carrying a
+bare `COALESCE(compressed_into,0) = 0`, this is the only HARD DELETE, and the only one whose
+exemption from `liveObsFilterSql` rested on a *likelihood* argument rather than an inertness
+proof: its rows have no title, narrative or lesson, so they are absent from every injection
+surface, so an id never injected is not one a `#NN` cites. Narrow, but a hand-typed `#NN` or
+a numeric `save --supersedes` chain later blanked by a degenerate cluster-merge both reach
+it — and the delete takes with it the `superseded_by` that `redirectSupersededIds` follows to
+credit a corrected memory's citation to its successor. Now guarded with `superseded_by IS
+NULL`. Deliberately not the full `liveObsFilterSql`: a retired row whose `superseded_by` is
+null hands that redirect nothing, so it stays reclaimable. (D#4)
+
+**A clean test run stopped leaving 30 directories in /tmp.** The interesting part is that the
+obvious fix would have measured zero. Instrumenting the `afterEach` recorded 71 invocations
+in which `rmSync` threw **zero** times and `existsSync` was false immediately after every
+one — yet 12 of those paths existed again when the file finished. Nothing failed to delete; a
+detached hook worker re-runs `resolveDataDir` against the HOME it was handed, which the test
+has since deleted, and recreates it. Retrying the `afterEach` cannot touch that. Disposal
+moved to `afterAll`, by identity, in the nine suites measured to leak. Residue per full run:
+**30 → 2-3** across four readings, which is what makes the §7 residue count usable as a gate.
+The remaining few are recreations landing after `afterAll`; `lib/tmp-fixture-sweep.mjs`'s 1h
+backstop still owns those. (D#2)
+
+Also: the sandbox harness's three phases were run for the first time since two dependency
+majors (**47/47, 45/45, 15/15**, all exit 0) and the self-heal sections finally measured
+something — both logged the prebuild quarantine that had been vacuous from v4.0.0 to v5.1.0.
+And `scripts/hook-launcher.mjs`'s swap-barrier comment no longer claims to cover the repair
+path: `hook-update.mjs:719` is the tree's only writer of that marker, so `install.mjs`'s
+in-place copy runs unguarded. That is R10 P2-12, still open — the comment just stops
+asserting the opposite.
+
+## v5.3.0 — deep search now tells you when the page may not be an answer
+
+The headline is a disclosure, not a retrieval change. `benchmark/deep-search-holdout.mjs`
+asks the benchmark's own queries of a corpus with their answers deleted, so the correct
+result is zero rows and every returned row is a false positive by construction. It reads
+**mean FP@10 = 10.00 across 12 of 12 queries**: deep search fills every slot, every time.
+`search "kubernetes helm chart"` correctly says *No results*; `--deep` on the same query
+returns 8 of 13 memories about an unrelated webshop.
+
+**This release does not fix that number.** Re-measured after the change: still 10.00,
+12/12, byte-identical, with the recall arm unmoved. The flood is the union across
+paraphrase variants, which is also where deep search's recall win comes from — three gates
+were tested against both arms and rejected, and suppressing OR-fallback on rewrites takes
+deep R@10 from 0.7383 to 0.3962 because the vocabulary-mismatch win *is* that fallback.
+`rrfFuseN` fuses by rank, so no magnitude signal survives the merge for a threshold to read.
+The discrimination is not available at that layer, so what ships is the honest alternative:
+tell the caller.
+
+**What changes for you**
+
+| Change | Was | Now |
+|---|---|---|
+| A deep result built from >1 query variant **that returned rows** | the caller saw `[deep search: rewrote into N variants]` and nothing about reliability | one added line: the rows may be **adjacent** to the query rather than answers, a corpus that cannot answer still fills the page, and "nothing here answers this" is a valid conclusion |
+| A deep search that returned **nothing** | — | unchanged: the existing zero-result message already says the rewrite ran and found nothing, so no caveat is appended (pre-ship review caught a draft that did) |
+| Auto-escalation (`deep` is AUTO by default on the MCP surface) | announced on **stderr only** — an MCP client reads tool results, so the caller running auto by default could never see it | in the result payload, with the pre-widening hit count |
+| `CLAUDE_MEM_SKIP_SUMMARY` | honoured at one of the two `llm-summary` spawn sites | honoured at both |
+
+**Upgrading**
+
+Nothing to do, and no data, schema, or config migration. The added line is the only
+user-visible difference; retrieval, ranking and the rows returned are unchanged. If it is
+noise for your setup, set `CLAUDE_MEM_DEEP_DISCLOSURE=off` — that suppresses the disclosure
+and nothing else. To defer the whole release, pin `5.2.0`. Minor rather than patch because
+output an agent reads changed by default.
+
+**Also in this release: five smaller things, four of them measurements**
+
+- **Test fixtures stopped leaking 9 of the 11 `/tmp` directories a suite run left behind.**
+  Two suites disposed the wrong path — one removed the `runtime` child of its `mkdtempSync`
+  root and leaked the parent on every test in the file, the other built a fresh directory
+  per helper call and kept no reference. Neither was a missing `afterEach`; all four leaking
+  suites had one. The remaining 2 per run are a different cause and stay deliberately:
+  removal succeeds, then a detached background worker recreates the data directory under the
+  HOME it was handed. `lib/tmp-fixture-sweep.mjs` reaps those at the next run past its 1h age
+  gate, so the residue was never unbounded — what it cost was the ability to count what a
+  task wrote to `os.tmpdir()`.
+- **The `/clear` half of cross-session handoff never fired, and the README now says so.**
+  `session_handoffs` on the maintainer's own install holds 4 `exit` rows and 0 `clear` rows:
+  SessionStart treats a surviving session file as the marker of a session that ended without
+  `Stop`, and `Stop` deletes that file. Documented rather than fixed — the fix depends on
+  whether Claude Code rotates its session id across `/clear`, which needs a real capture
+  first, and the two possible answers call for opposite changes.
+- **The `COALESCE(compressed_into,0)=0` question is judged for all 11 shipped sites** — no
+  code change was warranted, so none was made; the decision was already in
+  `lib/maintain-core.mjs` and the ledger carrying it as open was stale. Now pinned by a test.
+  Pre-ship review caught the write-up giving `cleanupBroken` the wrong reason: it is the one
+  **hard-delete** site in that set, so it is the only one where deleting a tombstone's
+  `superseded_by` is reachable, and it stays bare on a likelihood argument rather than the
+  inertness proof the other three have. Recorded as such, and filed as `D#4`.
+- **knip's worktree offset: the discriminating arm ran and did not reproduce it** (own
+  `npm ci`, 45 = 45, byte-identical name set, both arms stamped to one commit). The rule is
+  **not** retired: the historical gap's composition included `registry-retriever.mjs`, which
+  v5.0.0 deleted, so a non-reproduction against a different population does not establish the
+  cause. A draft of this release said it did, with a mechanism whose sign was backwards —
+  corrected in both `CLAUDE.md` and `docs/measurement/baselines.md`.
+- **A coverage row open since v3.99.0 is closed** as a recording omission rather than a
+  caliber change, from three facts checkable without re-running coverage.
+
+## v5.2.0 — four commands that reported success for work they did not do
+
+Found by using the CLI and the hooks as a user for two rounds — saving, searching,
+corrupting a database, running the maintenance commands — not by reading code. Every
+defect here has the same shape: the tool says it worked, the exit code agrees, and the
+thing you asked for did not happen.
+
+**What changes for you**
+
+| Change | Was | Now |
+|---|---|---|
+| `fts-check check` / `rebuild` on an unhealthy index | printed the failure, **exited 0** — so `fts-check rebuild && <next step>` ran the next step | exits 1 on an unhealthy or partial result; findings still on stdout |
+| `maintain scan --ops <typo>` (e.g. `purge-stale`) | flag ignored entirely: full report, exit 0, typo surfaced only on `execute` | rejected by name with the valid list, exit 1 — same as `execute` |
+| `maintain scan --ops <valid>` | looked scoped to that op; was not | says the report covers every category |
+| `delete <ids>` preview | listed found rows, silent about ids that do not exist | names them: `Note: ID(s) 99999 not found and will be skipped.` (CLI and `mem_delete`) |
+| `cleanup` | deleted **every** `ep-flush-*` / `pending-*`, including one written seconds ago — discarding an episode mid-summarization, silently | age-gated to 1h, matching the automatic sweep; reports how many it kept |
+
+**Upgrading**
+
+The three exit-code changes are the only ones that can affect an existing script. If you
+have automation that treated `fts-check` or `maintain scan` as "always exit 0", it will now
+see a non-zero status **when the operation actually failed** — that is the point, but it is
+a behaviour change, hence the minor bump rather than a patch. To defer it, pin `5.1.1`.
+Nothing else needs action; no data, schema, or config migration.
+
+**Also in this release: a ruler, and three fixes that it rejected**
+
+`deep search` answers questions the corpus cannot answer. `search "kubernetes helm chart"`
+correctly reports *No results*; `--deep` on the same query returns 8 of 13 memories about
+an unrelated project. `mem_search`'s `deep` is AUTO by default on the MCP surface and
+escalates exactly when the normal search was weak — precisely when the honest answer is
+"nothing".
+
+`benchmark/deep-search-holdout.mjs` is the missing precision arm; the existing suite
+measures recall only and is structurally blind to this. Its negatives are not hand-picked
+— they are the suite's own queries asked of a corpus with their answers deleted, so every
+returned row is a false positive by construction. It reads **mean FP@10 = 10.00, 12/12
+queries**.
+
+**No fix ships for it**, deliberately. Three were built and the two arms together rejected
+all three: suppressing the AND→OR fallback on rewrites takes R@10 from 0.7383 to 0.3962
+(the vocabulary-mismatch win *is* that fallback); an absolute score floor and a
+cross-variant convergence gate both fail because on several queries the holdout arm scores
+at or above the positive arm. The discrimination is not available at that layer, and a
+threshold fitted to a handful of points is how v3.61.0 shipped 0/8 injections on fresh
+installs. The ruler, the rejected set, and the reasoning are recorded so the next attempt
+starts from measurement.
+
+## v5.1.1 — the prebuild that shadows its own repair
+
+Found by playing a real user through the sandbox install harness
+(`tests/sandbox/phase{A,B,C}`) rather than by reading code. Two defects, one of them in
+the ruler.
+
+**What changes for you**
+
+| Change | Was | Now |
+|---|---|---|
+| A shipped better-sqlite3 prebuild that is present and will not load | unrepairable: `rebuild-binding` exited 1, `doctor` stayed red, the printed manual command could not fix it either | the heal moves the dead prebuild aside, compiles from source, and puts it back if that did not help |
+| The `Repair:` line in the degraded-hooks banner and in `doctor` | `npm rebuild … && npm run … build-release`, which cannot fix that shape | leads with `rebuild-binding`, which runs the whole chain; the npm pair stays as the no-CLI fallback |
+
+**The mechanism**
+
+better-sqlite3 13's `lib/binding.js` selects `prebuilds/<target>.node` on **existence
+alone** and prefers it over `build/`. So when the shipped prebuild is present but will not
+dlopen — a glibc older than the one it was built against, a truncated download, the wrong
+arch baked into an image — the addon the source-compile fallback produces is never the one
+loaded. Measured with a control: corrupt prebuild + healthy `build/Release` → `wrong ELF
+class`; prebuild moved aside → the DB opens; neither present → fails. v4.0.0 added the
+source build for "a platform 13 ships no prebuild for"; this is its neighbour, and nothing
+covered it.
+
+`ensureBetterSqlite3Working` now renames the shadowing prebuild to `<name>.node.unusable`
+before the source build, and restores it if the compile did not help either — an install
+that could not be repaired must not come back with one fewer file. The quarantine lives
+**only** in the source-build branch: doing it with no compile to follow turns "broken
+addon" into "no addon", and that branch is exactly what the 20 s SessionStart probe opts
+out of. `rebuild-binding` prints the move, because silently renaming a file inside
+someone's `node_modules` reads as corruption six months later.
+
+**The ruler was broken too**
+
+Both sandbox phases corrupted `build/Release/better_sqlite3.node` to simulate a dead
+addon. That is a better-sqlite3 **12** path. From v4.0.0 to v5.1.0 they were breaking a
+file no resolver loads: phase A left four "self-heal worked" checks vacuously green, and
+phase B's entire self-heal-and-doctor block sat behind an `if (existsSync(bindingPath))`,
+so eight checks silently stopped running — the only witness was a run printing 37 where
+the README said 45.
+
+- `loadedBindingPath()` asks better-sqlite3's own `getPrebuildPath()` which addon it would
+  load instead of naming one. The same literal has now gone stale twice on one dependency
+  bump.
+- Each phase asserts its own check count (`EXPECTED_CHECKS`, 47 / 45 / 15). A phase that
+  quietly shrinks has stopped measuring.
+- Phase B's "no orphan hook entries left behind" counted hook groups and then returned
+  `{ ok: true }` — unfailable, against a `settings.json` that had never held a foreign
+  hook. It now seeds one before install and asserts uninstall preserved it exactly.
+- Phase A's A10 stops asserting an unattended heal it was never owed: SessionStart refuses
+  the compile on purpose (~41 s against a 20 s hook cap, and a truncated `node-gyp clean`
+  leaves nothing). It now checks the contract that actually holds — degrade without
+  crashing, record `.deps-broken`, hand over a repair that works — by running the repair.
+
+Three phases green on the release tree: 47/47, 45/45, 15/15. Suite 5693 passed, 0 skipped;
+coverage 85.72 / 80.16 / 90.44 / 86.88 with the gate at 80/74/84/83; knip unchanged at
+45/0/0/3.
+
+## v5.1.0 — the R10 audit, fixed
+
+Whole-project audit round R10 (`docs/audits/20260906-173816.md`) landed as 18 commits.
+Eight of its nine P1s, 15 of 20 P2s and 14 P3s are fixed; every fix carries a test that
+was RED first, and every guard a `git revert` could walk past was mutation-verified
+against that revert.
+
+**What changes for you**
+
+| Change | Was | Now |
+|---|---|---|
+| `npm install` on Windows | installed, then failed silently in seven POSIX code paths | `EBADPLATFORM` — `package.json` declares `os: [darwin, linux]` |
+| `mem_delete` with a string id | `"1.5"` deleted #1; `"1,abc,3"` silently dropped `abc` | both rejected by the schema |
+| `mem_save` / `mem_defer` / CLI `save` / `defer` with `--project <short-name>` | fuzzy-resolved, so `api` could land in `mono--api-gateway` | exact match only: canonical name, the `%--name` suffix completion, or an existing bare name |
+| `install` with `MEM_NO_AUTO_ADOPT=1` | adopted anyway | honoured, like every other auto-adopt caller |
+| `install` / `uninstall` with an unparseable `settings.json` | replaced the whole file with `{}` | exits 1 and writes nothing |
+| `optimize --task` with no value | ran all four tasks | usage error |
+| CJK-only titles | never deduplicated (no MinHash signature) | signed and deduplicated; ASCII signatures are byte-identical |
+| SessionStart timeout, settings.json install shape | 10 s | 15 s, matching the plugin shape |
+
+**Data-loss and security fixes**
+
+- `deferred_work.title` / `detail` / `drop_reason` never passed the secret scrubber, and
+  every read surface replays them into model context. Scrubbed at the single choke point.
+- Six credential shapes walked through `scrubSecrets` untouched: a JSON `"Authorization"`
+  header, Azure `AccountKey=` and SAS `sig=`, `--token <value>`, `Cookie: session=`, and
+  driver-suffixed database URLs like `postgresql+psycopg2://`. Measured over 182,364 lines
+  of this repo's own text: nine disagreements, all of them lines that document a secret,
+  zero over-scrubs of real content.
+- The daily unattended `llm-optimize` run rewrote user content three ways: `wide` re-enrich
+  overwrote the title and cut the narrative at 500 characters (even when the model returned
+  nothing), the weekly normalize pass stamped `optimized_at` and evicted rows from a lesson
+  backfill they had never visited, and the re-enrich UPDATE had no live-row guard across a
+  45-second model round-trip.
+- `normalize-project-names` merged a root-directory project such as `workspace` into an
+  unrelated `workspaces--repo` across eight tables via a token-substring fallback, and any
+  primary-key collision rolled back every other project's rename and replayed the whole scan
+  on the next DB open, forever.
+- Two processes could hold `install.lock` at once. The steal was unlink-then-create, and
+  creation was `writeFileSync` with `wx` — two syscalls, so the file is briefly visible
+  empty and a peer judged it stale. Now a rename-tombstone steal plus `link`-based creation:
+  0 double acquisitions in 12,000 rounds, 8,000 of them under load.
+- `atomicWriteFileSync` widened permissions, measured 0600 to 0644, on targets that include
+  `~/.claude.json`.
+- `cleanup` deleted `.update-backup-*`, the only rollback copy of an in-flight update, with
+  no lock check — while `doctor` was telling the user to run it.
+- Every `claude -p` spawn ran with `cwd: /tmp`. Claude Code loads a project-level CLAUDE.md
+  from its cwd, so on a shared host any local account could steer every background
+  summarization call. Now a 0700 directory under the runtime dir.
+- `mergeDuplicates` accepted cross-project groups, hiding one project's row behind another's
+  keeper where no read surface could find it.
+- SECURITY.md pointed at GitHub private vulnerability reporting, which was switched off for
+  the repository, leaving reporters only the public issue that same paragraph forbids. It is
+  enabled, and the file no longer tells you to run `claude-mem-lite update` (which edits an
+  observation) to get a security fix.
+
+**Also**
+
+`Proxy-Authorization` is finally sent on CONNECT, so an authenticating proxy no longer
+degrades every call to the subprocess path while `doctor` says "unreachable".
+`self-update` / `doctor` / `status` / `rebuild-binding` now read
+`installed_plugins.json` to find the live plugin version instead of guessing the newest
+cached directory — the guess let `prunePluginCache` delete the tree the user's sessions
+load. The self-heal path no longer prints installer output onto the SessionStart JSON
+envelope. `commands/mem.md` and `commands/update.md` told the agent to run a purge without
+`confirm=true`, which previews instead of deleting and then reports success. Corrupt FTS
+indexes are rebuilt rather than "repaired" by deleting the WAL. Eleven smaller hook, CLI and
+hygiene defects, and roughly forty stale documentation claims, now pinned by a guard that
+derives the tool counts from `tool-schemas.mjs`.
+
+**Deliberately not fixed**, with reasons recorded in CLAUDE.md: the session-lifecycle
+finding (P1-1) needs a real `/clear` capture first, because the two possible host semantics
+require opposite fixes; the two install-path rewrites have a proven mechanism but no
+reproduced symptom; the FTS double-count fix collides with a guard that closes a data-loss
+bug.
+
+Suite 343 files / 5578 to **356 / 5687**, and the one permanently-skipped case is gone —
+it was a switched-off local pre-commit gate. Knip 48 to 45 unused exports with zero new
+ones. All retrieval quality metrics byte-identical across all 18 commits.
+
+## v5.0.0 — the second package manager, removed
+
+**BREAKING.** The skill/agent resource registry, the shadow skill-recommendation engine and
+the PreToolUse Skill bridge are gone. This is a `major` bump when it ships: three CLI
+commands and two MCP tools disappear.
+
+**What changes for you**
+
+| Removed | Was | Now |
+|---|---|---|
+| `claude-mem-lite registry <list\|stats\|search\|import\|remove\|reindex\|recommend-stats>` | managed the resource DB | named-removal message + exit 1 |
+| `claude-mem-lite import <github-url>` | imported skills/agents from a repo | named-removal message + exit 1 |
+| `claude-mem-lite enrich <name>` | Haiku capability summaries for registry rows | named-removal message + exit 1 |
+| MCP `mem_registry`, `mem_use` | hidden-but-callable by exact name | `Tool not found` |
+| Install step: 15 shallow clones, ~150 MB | seeded 186 preinstalled resources | not run |
+| `CLAUDE_MEM_RECOMMEND_MODE`, `CLAUDE_MEM_SKIP_REPOS`, `CLAUDE_MEM_REGISTRY_CONFINE`, `CLAUDE_MEM_IMPORT_MAX_{ITEMS,FILE_BYTES,TOTAL_BYTES}` | registry knobs | ignored |
+
+These three do **not** print `Unknown command` (R10 P2-19 corrected this table — it said
+they did). `cli.mjs` gives them a dedicated message that names the removal, points at the
+CHANGELOG migration note, and tells you to pin `claude-mem-lite@4.0.4` to revert; it is
+deliberately kept out of the edit-distance suggester, whose nearest match for `import` is
+`import-jsonl` — a different feature that takes a path, so a stale `import <github-url>`
+would have been pointed at something that could plausibly run.
+`tests/removed-registry-commands.test.mjs` pins the wording.
+
+`tools/list` is **unchanged** — both removed tools were already hidden, so an agent that
+discovers tools normally sees no difference. Memory retrieval, injection, citation tracking
+and every `mem_*` core tool are untouched.
+
+**Your data is not deleted.** `~/.claude-mem-lite/resource-registry.db`,
+`~/.claude-mem-lite/managed/` and the shadow log at `~/.claude-mem-lite/runtime/recommendations/`
+are simply no longer read or written. Remove them by hand if you want the disk space:
+`rm -rf ~/.claude-mem-lite/resource-registry.db ~/.claude-mem-lite/managed ~/.claude-mem-lite/runtime/recommendations`.
+
+**Revert path**: pin the previous release — `npm i -g claude-mem-lite@4.0.4`, or pin the
+plugin to `v4.0.4` in your marketplace config. Nothing in this release migrates the memory
+DB, so downgrading is safe.
+
+**If you installed via npm, your upgrade cleans up after itself.** This is the first hook
+*removal* this project has shipped, and the upgrade machinery only ever handled additions:
+`configureHooks()` strips stale entries but runs only from `install`, while auto-update
+replaces `scripts/` wholesale. Left alone, an upgrade would delete
+`scripts/pre-skill-bridge.js` and leave `~/.claude/settings.json` pointing at it — every
+`Skill()` call printing two `[claude-mem-lite]` lines for a file that is not coming back.
+Auto-update now reconciles settings.json against what it just installed and drops hook
+entries whose target is gone; `doctor` reports such an entry instead of passing it, which it
+had been doing because it only inspected quoted tokens and the dead script is the launcher's
+unquoted argument. Plugin-channel installs were never affected (`hooks/hooks.json` is
+replaced wholesale). Found by independent review, not by the test suite.
+
+**Why.** The registry was a second package manager competing with Claude Code's own plugin
+and marketplace system, and it had lost. Its manifest seeded 15 repos including
+`obra/superpowers` — which Claude Code installs and auto-updates itself, so the registry
+cloned a second, frozen copy and then injected it over the top of the real one.
+
+The evidence is in `docs/audits/20260906-145304.md`. The parts worth repeating here:
+
+- **The recommendation engine could not produce output.** Phase 2 (live injection) was never
+  built; `live` resolved to `shadow` with a warning. In 74 days of the author's own use it
+  logged **0** recommendation rows, because every runtime path gated on a
+  `resource-registry.db` that the plugin install channel never creates — only the npm
+  `install` path did, and it is not how the plugin ships.
+- **The metric it was waiting for was not computable.** `resource-discovery` named rows
+  `plugin/skill`; the Skill tool passes `plugin:skill`; the scanner never populated
+  `invocation_name`. So the session-matched precision that v3.12.1 "fixed" was still
+  name-vs-slug for every namespaced skill — sandbox-verified. A gate waiting on a number its
+  own instrumentation cannot produce is a deadlock.
+- **The Skill bridge matched nothing.** Same mismatch: `superpowers:brainstorming` → NO MATCH.
+  For the bare flat skills it could match, it re-injected a body Claude Code was about to load
+  anyway. It was also this project's only surface that auto-injected third-party repo content,
+  carrying the triple defang added for audit 2026-08-14 M-4; that attack surface goes with it.
+
+**Also removed**: `install-metadata.mjs` (2,193 lines of curated metadata for the 186
+preinstalled resources, consumed only by the deleted indexing step), the UserPromptSubmit L1
+skill-name pointer, and `utils.mjs:isPathConfined` — orphaned once its last consumer went,
+and deleted on the precedent its own neighbouring comment records for `basenameAnySep`.
+
+**Three things a green test suite did not catch**, found by sweeping for the names instead:
+`tool-schemas.mjs` still exported the two orphaned zod schemas (and `contract.test.mjs` went
+on testing them); `audit-fixes.test.mjs`'s T3-P2-A passed *vacuously*, its only assertion
+sitting behind an `if` the new error text can never satisfy; and `install.mjs` /
+`hook-update.mjs` still copied a `registry/preinstalled.json` that no longer exists.
+
+**Measurements** (all re-taken, none carried): tests 359 files / 5936 → **343 / 5578**,
+attributed in three steps by same-tree A/B name-set diffs rather than by subtracting counts.
+Knip 49 → **48** — and the count is the least interesting part: mid-removal it read 49, the
+same number as v4.0.4, while the name set had changed on both sides. Coverage
+85.87 / 80.15 / 90.28 / 87.05 is a **caliber break**, not an improvement: three modules left
+the `vitest.config.mjs` include allowlist, so the denominator is a different set of files. Net **−15,514** lines
+of product code, tests and manifest.
+
+## v4.0.4 — the audit finding a guard had already rejected
+
+R8's independent review left four items for this round. Two of them were wrong, and the
+repository said so within seconds of the change being applied.
+
+**One real fix: a velocity heuristic counted rows it then refused to look at.**
+`computeAdaptiveWindows` sized its 7-day observation count with `compressed_into` alone, but
+the windows it returns are handed to three recall queries that all filter `superseded_at` too.
+So a project whose recent rows are mostly tombstones read as high-velocity and was handed the
+*tightest* window — 12 hours instead of 48 — to find the few live rows it had left. Measured
+before the fix: 80 superseded rows returned `tier1` = 43,200,000ms; after, 172,800,000ms. The
+function's own docstring says "Low activity -> longer windows", so this restores documented
+behaviour rather than changing it. Nothing else in the injection path moves.
+
+**Two proposed fixes were rejected, and the reasoning is now in the source.** The same sweep
+flagged `hook-handoff.mjs`'s and `lib/fast-summary.mjs`'s `completed` queries for the same
+missing clause. Adding it to the first turned an existing guard red on the spot: audit
+2026-08-14 F4 had already ruled on that exact line, with a case whose comment reads `FAILS IF:
+the superseded filter is copied onto the 'completed' SELECT`. `completed` is the session's own
+history — a decision a later save overturned still happened, and erasing it from the record
+misreports the session that made it. Only `key_decisions`, which is re-presented to the next
+session as standing policy, filters superseded rows, and it always did.
+
+`lib/fast-summary.mjs` writes the sibling field and had no guard at all, which is exactly why a
+repo-wide sweep reached it. It has one now, plus a docblock on each of the two queries saying
+the single-clause filter is deliberate and naming the guard. The next sweep should stop at the
+code instead of at a test run.
+
+**A guard that could not fail.** `tests/install-ergonomics.test.mjs` asserted that setup.sh's
+repair line contains `npm rebuild better-sqlite3 --dangerously-allow-all-scripts` — which the
+*repaired* hint contains as its first half, so the assertion held for both shapes. Confirmed
+against the real revert rather than a hand-typed one: `git show cb00974:scripts/setup.sh` passes
+that command alone, and the old assertion is green against it. It now pins the full `&&` chain
+against the exported constants, and that `||` never appears.
+
+## v4.0.3 — the fourth heal path, and two guards that still could not fail
+
+Second pass on the independent review that produced v4.0.2. Everything here was reproduced
+before fixing; nothing changes behaviour you asked for.
+
+**Auto-update could never land again on a platform better-sqlite3 ships no prebuild for.**
+`hook-update.mjs` runs a post-install smoke gate with its own inlined rebuild chain — a
+fourth heal path that never got the v4.0.0 fix. Both of its `npm rebuild` attempts exit 0
+without compiling on better-sqlite3 13, the re-probe then threw, smoke failed, and the caller
+rolled the whole update back to the old install. Every time. It now falls through to the
+source build, which is safe *here* for the reason it is not safe on the SessionStart probe
+path: the binding is already unusable when this runs, so `node-gyp clean` destroys nothing,
+and a failure still rolls back to the previous working install.
+
+**Two more guards could not fail, both found by re-running the real revert rather than a
+hand-written one.** The symlink guard scanned a five-line window before `symlinkSync`, and a
+prettier-legal eight-line revert sits outside it — green suite, and `format:check` passes too.
+The identifier rule added in v4.0.2 missed it as well, because it matched `Link` and the
+variable is called `link`. And doctor's Node-floor guard read the printed line only, so
+comparing against `>= 18` while still printing the real floor would have passed.
+
+Also from the same review: `install.mjs` had an unreachable `catch` left over from v4.0.1,
+`ci.yml` carried a comment claiming a CI leg covers `hook-update` when it does not, and two
+docblocks understated what their code does — `clearLinkPath` can remove a real directory, not
+only a link to one, and the repair hint's second command discards the first command's output
+before rebuilding (`build-release` starts with `node-gyp clean`).
+
+*Correction to the v4.0.0 notes*: they say `doctor` inherits the heal fix. It does not —
+`doctor` probes through `probeRuntimeRoots` and never heals; what it inherited in v4.0.1 was
+the repair line it prints.
+
+## v4.0.2 — the self-heal that deleted the binding it was healing
+
+**Upgrade if you are on v4.0.0 or v4.0.1.** Found by an independent review of the v4.0.0
+commits, reproduced before fixing.
+
+**The source-compile fallback added in v4.0.0 could destroy a working binding, once per
+session.** That step is better-sqlite3's own `build-release`, which is
+`node-gyp clean && node-gyp rebuild` — it **deletes `build/` before it compiles**. The
+SessionStart hook probe runs the heal chain under a 20-second cap while a full compile takes
+about 41 seconds here, so the attempt was not merely useless, it was destructive. Measured on
+a tree whose compiled binding opened a database: 20 s cap, SIGTERM at 20.02 s, no `.node`
+left, `DB opens: YES` → `NO`. And it repeated on every SessionStart, because `setup.sh` only
+writes its success marker on success.
+
+The v4.0.0 guard meant to prevent exactly this looked at whether the caller injected its own
+`rebuild`. The one caller that is genuinely time-boxed injects `exec` — so the only caller
+with a budget was the only caller the guard missed. There is now an explicit
+`sourceBuild: false` opt-out and the hook path takes it; compiling from source belongs on a
+path with no cap (`claude-mem-lite rebuild-binding`, which is what the repair hints print).
+Nothing changes for the foreground paths — `install`, `rebuild-binding` and the CLI's
+heal-and-re-exec still compile.
+
+**Two guards from v4.0.1 could not fail.** The same review reverted the fixes and watched the
+suite stay green. The repair-hint guard skipped any file that had switched from the literal
+command to the constant — i.e. every file v4.0.1 had just fixed — and the symlink guard
+scanned only near `symlinkSync`, which never sees `uninstall`'s CLI-link removal (the site the
+v4.0.1 notes led with). Both holes are closed and both closures are verified by re-running the
+exact reverts that used to pass.
+
+Smaller, same review: repair hints now quote the directory, so they survive a path with spaces;
+`README.md` still said Node >= 20, which v4.0.0 raised to 22.
+
+## v4.0.1 — the repair that reported success, and three more half-checks
+
+Audit round R8 (`docs/audits/20260906-013350.md`) read the install/uninstall/repair and
+optimize-pool code R7 left uncovered. Four fixes, no behaviour anyone asked for changes —
+each one restores what the surrounding code already claimed to do.
+
+**The repair command we printed could not repair anything.** Every user-facing "Repair:" line
+— `doctor`'s included — printed `npm rebuild better-sqlite3 --dangerously-allow-all-scripts`.
+On better-sqlite3 13 that prints "rebuilt dependencies successfully", exits 0, and compiles
+nothing, so a user on a platform 13 ships no prebuild for followed the instructions, saw
+success, and still had a dead binding. Re-measured in a sandbox on npm 12.0.2 with the
+prebuilt binaries present and with them deleted: no `.node` produced either way. The command
+that *does* heal was added in v4.0.0 but lived inside the automated chain and was shown to
+nobody; every hint now prints both, sequenced with `&&` (never `||` — the first command exits
+0 whether or not it did anything, which is the entire trap). **This is the second time this
+defect has shipped**: the hints previously said `--build-from-source`, which no-oped the same
+way. That fix was right for better-sqlite3 12 and expired, silently, when the dependency was
+bumped — so the new guard is about the *shape* of a hint rather than one command string.
+
+*Correction to the v4.0.0 note below*: it says `--dangerously-allow-all-scripts` does not help
+"because there is no script to allow". The conclusion holds; the reason does not.
+`npm install-scripts ls` reports `better-sqlite3@13.0.3 (install: node-gyp rebuild)` as
+BLOCKED by allowScripts on npm 11.19.0 and 12.0.2 alike, for a package that declares no
+install script anywhere — npm synthesizes one. npm's script block does still reach this
+dependency; what saves a covered platform is the shipped prebuild.
+
+**`doctor` said your Node was fine when it was the fault.** Its floor was a `>= 18` literal of
+its own, so after v4.0.0 raised the real floor to 22 it printed `✓ Node.js: v20.x` — on the
+one runtime where npm refuses to install the package and better-sqlite3 ships no prebuild.
+The floor now comes from `package.json#engines`, and is printed, so the two cannot drift
+apart unnoticed.
+
+**Three optimize pools could pick up retracted rows.** A superseded observation keeps
+`compressed_into = 0`, so a predicate written as `COALESCE(compressed_into,0) = 0` alone
+admits tombstones — the finding audit 2026-09-02 P0-3 closed on one pool and left on three
+siblings in the same file: the default re-enrich scope, the normalize vocabulary, and
+normalize's own `UPDATE`, which wrote concepts and `search_aliases` onto rows every read face
+hides. All three now share `liveObsFilterSql`.
+
+**A broken CLI symlink survived both uninstall and reinstall.** `existsSync` follows a
+symlink, so a dangling one reads as absent: `uninstall` left a dead `claude-mem-lite` on your
+PATH, and — worse — `install` skipped the removal, `symlinkSync` threw `EEXIST`, and you were
+told "CLI symlink failed — run manually". Re-running `install`, the documented repair, could
+not repair it. Seven call sites now clear by `lstat`.
+
+## v4.0.0 — Node 22 floor, and better-sqlite3 13's prebuilt binaries
+
+**⚠️ BREAKING — this release requires Node >= 22.** Node 20 reached end of life in April
+2026, and better-sqlite3 13 declares `engines: {"node": ">=22"}`. Both queued major upgrades
+needed the floor raised, so it is raised once here rather than twice.
+
+- *What you must do*: run claude-mem-lite on Node 22 or newer. `npm install` prints an
+  `EBADENGINE` warning if you are below it.
+- *Revert path*: pin the previous release — `npm install claude-mem-lite@3.99.0` — which
+  keeps the `>=20` floor and better-sqlite3 12. No data migration is involved in either
+  direction; the SQLite file is untouched by this release.
+- CI now tests Node **22, 24 and 26** (26 is new, closing a deferred audit item).
+
+**The most common install failure is gone on every mainstream platform.** better-sqlite3 12
+carried `"install": "prebuild-install || node-gyp rebuild --release"`, so npm 12's
+default install-script block left it with no compiled `.node` and the server died before
+the MCP handshake (clients reported `-32000`). **13 has no install script at all** — it ships
+`prebuilds/<platform>.node` for linux, linuxmusl, darwin and win32 on x64 and arm64. Measured
+directly: `npm install --ignore-scripts better-sqlite3@13` lands 8 prebuilt binaries and opens
+a database; the same install of 12 lands none and cannot. If npm's script blocking was
+breaking your install, it no longer can.
+
+**And the repair path was rebuilt for the platforms that are still not covered.** Losing the
+install script also means `npm rebuild better-sqlite3` now exits 0 printing "rebuilt
+dependencies successfully" while compiling nothing — `--dangerously-allow-all-scripts` does
+not help, because there is no script to allow. On a platform 13 ships no prebuild for, that
+turned the entire self-heal chain into a silent no-op that reported success over a broken
+install. `ensureBetterSqlite3Working` now falls through to the package's own
+`build-release` (13 still ships `src/`, `deps/` and `binding.gyp`) and reports
+`action: 'compiled'`. `claude-mem-lite rebuild-binding` and `doctor` inherit the fix. CI pins
+both halves as separate legs: one asserts a blocked install script never reaches you, the
+other deletes the prebuilt binaries and requires the heal to compile from source.
+
+## v3.99.0 — the file we write into your repo, and the quote we counted as a citation
+
+Audit round R7 (`docs/audits/20260905-225651.md`) read the two write paths R6 named as the
+next entry: the adopt boundary that writes into every user's project tree
+(`memdir.mjs` / `claudemd.mjs` / `adopt-*.mjs`) and `lib/citation-tracker.mjs`. 3,254 lines,
+read end to end. All three findings are fixed here, each with a mutation-verified guard.
+
+**⚠️ Behavior change — the generated `.claude/plugin_claude_mem_lite.md` no longer contains
+an absolute path.** It used to embed the resolved CLI invocation
+(`node /home/<you>/.claude/plugins/cache/sdsrss/claude-mem-lite/<version>/cli.mjs`) **24
+times**. That path is machine-specific and version-pinned, so the file was rewritten on every
+plugin release, and any project that commits `.claude/` — the standard home for project-scoped
+settings, commands and agents — shipped teammates a `$HOME` path that exists on no other
+machine. Commands are now written as `claude-mem-lite <cmd>`, with a header note pointing at
+the MCP server instructions for the absolute form when the bare name is not on PATH.
+
+- *What you must do*: nothing. The file refreshes itself on the next SessionStart. If you
+  track it in git, expect one final diff that removes the paths.
+- *Why this is a `change:` and not a `fix:`*: the bytes written into your repository differ.
+
+**Citation metering no longer counts a quotation as an injection.**
+`extractInjectedFromSubagentPrompt` scanned every transcript entry, so a dispatched agent that
+merely quoted the memory block — reviewing this code, or summarizing what it was handed — had
+those `#NN` counted as injected, and `collectSubagentSurface`'s per-file `seen ∩ said`
+intersection then credited them as cited: 100% cite-rate off one self-reference. It now gates
+on `entry.type === 'user'`, the entry that actually carries a dispatched task prompt (measured
+against 11 real subagent transcripts, not assumed). This mattered past metering because
+`sub.injected` is a citation-decay entry gate and an allow-list for `bumpCitationAccess` →
+`access_count` → the `boost` op → `importance`. Aggravating factor now closed: the reader ran
+unconditionally while the writer (`CLAUDE_MEM_SUBAGENT_INJECT`) is default-off, so on a default
+install every id it found was a false positive by construction.
+
+**`unadopt` no longer deletes a symlinked `CLAUDE.md`.** When the managed block was the whole
+file, `removeManaged` unlinked it — deleting the LINK and orphaning the target when the path
+was symlinked into a dotfiles repo (chezmoi/stow/yadm). `writeManaged` deliberately writes
+THROUGH such a link (the 2026-09-02 P0-5 fix in `lib/atomic-write.mjs`); the removal side now
+matches, emptying through the link instead. A regular file is still removed, not left at
+0 bytes.
+
+## v3.98.0 — the one untrusted input, read end to end
+
+Audit round R6 (`docs/audits/20260905-214840.md`) read the third-party skill-import path end
+to end — the one untrusted input this project has: 9 modules, 3,149 lines. Everything below
+came out of that round. Minor, not patch: the import bounds change a released default.
+
+**⚠️ Behavior change — `registry import-url` is now bounded.** It used to have no limit on
+anything: a tree offering 500 `SKILL.md` entries of 2 MB each imported all 500 and wrote
+**1000 MB** in 20 s, from one command. Defaults are now **200 entries**, **2 MB per file**,
+**50 MB per run**. Entries past a bound are **refused, not truncated**, and the refusal is
+printed with the import result on both the CLI and the MCP tool.
+
+- *What you must do*: nothing, unless you import a repository larger than those bounds — in
+  which case the refusal line names how many entries were skipped and why.
+- *Opt out / revert*: set `CLAUDE_MEM_IMPORT_MAX_ITEMS`, `CLAUDE_MEM_IMPORT_MAX_FILE_BYTES`
+  or `CLAUDE_MEM_IMPORT_MAX_TOTAL_BYTES` to `0` for the previous unlimited behavior. An
+  unparseable or negative value keeps the default — a typo must never remove a bound.
+  To roll back entirely, pin the previous release.
+
+**Security — a third-party skill could forge a `<skill-loaded>` block in your context.**
+`<skill-loaded>` is deliberately outside the shared delimiter filter so `mem_use`'s load path
+can emit a real wrapper, which meant nothing neutralized it anywhere else:
+
+- `mem_use` interpolated the skill body, name and path raw. A body containing a literal
+  `</skill-loaded>` closed the real wrapper and opened a second block attributed to another
+  skill — with the tool's own "Follow the instructions above" landing after it. A `"` in the
+  name or path injected attributes into the wrapper tag.
+- `mem_registry search|list|stats|import|remove|import_url|enrich` rendered registry names
+  raw on **both** faces, so a crafted name fabricated a whole skill block out of nothing in
+  ordinary browse output — no wrapper to escape at all.
+
+Fixed at the two output chokepoints (`defangResult` on MCP, `out()` on the CLI) rather than
+at the individual call sites, with `mem_use` — the one legitimate emitter — exempted
+explicitly. No user action required; a skill whose text genuinely discusses `<skill-loaded>`
+now renders it bracket-stripped outside the load path.
+
+**Also fixed**
+
+- Import rejects a frontmatter `name` of `.` or `..`. Both survived the charset filter and
+  then passed the confinement check (`<managed>/skills/..` resolves to `<managed>` itself),
+  writing outside the one-directory-per-resource layout. Not a traversal — the write stayed
+  inside the managed dir — but two repositories declaring it clobbered each other.
+- GitHub URLs are percent-encoded per path segment. A branch name containing `#` (legal in
+  git refs) turned `…/git/trees/feat#x?recursive=1` into a URL whose query was **empty** and
+  whose fragment was `#x?recursive=1`, so GitHub answered a non-recursive tree and every
+  nested `skills/*/SKILL.md` went silently undiscovered.
+
+**Considered and declined**: capping `mem_use`'s load length to match the skill-bridge's
+16 000-character limit. The bridge truncates because it auto-injects on a hot path with a
+token budget; `mem_use` is an explicit load, where truncating a legitimately long skill would
+break the thing the user asked for.
+
+## v3.97.0 — four janitors that deleted or blocked things that were still in use
+
+One theme runs through this release: maintenance code that decided by AGE or by RANK where
+the real question was "is this still in use?". A lock sweeper that asked how old a lock was
+instead of whether its holder was alive. A cache pruner that asked which version was newest
+instead of which one was running. A self-heal that asked whether an import failed instead of
+whether this hook had the seconds to fix it. And, found while shipping the other three, a
+commit gate that had never once run past its first step.
+
+### Behaviour change — self-heal now runs at SessionStart only
+
+**What changes.** When a hook fires and a module of this install is missing,
+`scripts/hook-launcher.mjs` used to run `install.mjs repair` right there, on whatever event
+was firing. It no longer does. Hot-path events record the breakage and defer; the repair runs
+at the next SessionStart, which is also where a repair recorded by any OTHER entry now gets
+picked up.
+
+**Why.** That repair is a synchronous spawn with a 300s timeout, and `hooks/hooks.json` gives
+PreToolUse 3s, PostToolUse 3s, UserPromptSubmit 2s. Worse than being killed: the 6h cooldown
+is armed BEFORE the spawn — deliberately, it is the mutual exclusion between concurrent fires
+— so a repair the host killed at two seconds bought six hours of `Self-heal skipped`,
+including for the SessionStart fire that had the budget to finish it. The mechanism that was
+supposed to recover a broken install was reliably disabling itself.
+
+**What you do.** Nothing. A broken install still heals, one session later at worst, and it now
+also heals when the missing module is on an entry your session never touched.
+
+**How you will notice.** The deferring fire says so on stderr:
+
+```
+[claude-mem-lite] Broken install (lib/cite-back-hint.mjs) — self-heal deferred to the next
+SessionStart (this hook has a 2-5s budget; repair needs minutes).
+```
+
+**Revert path.** `npm i claude-mem-lite@3.96.1`, or pin `3.96.1` in your plugin marketplace
+entry. There is no env flag for this one: a switch that puts an npm run back on a 2s hook is
+not a setting worth shipping.
+
+### The lock sweeper deleted locks whose holder was alive
+
+`cleanStaleLockFiles()` ran on every SessionStart and unlinked any `*.lock` in the runtime dir
+older than 30s. It did consult the holder's pid — but only for locks YOUNGER than the
+threshold, which is to say only for the ones it was going to keep anyway. Anything older went,
+holder or no holder.
+
+`runtime/install.lock` is exactly such a lock, and its critical section is not 30 seconds:
+`install.mjs repair`, `install.mjs rebuild-binding`, `hook-update.installExtractedRelease` and
+`scripts/launch.mjs` all take it around a write phase whose npm steps are capped at 60s
+(staging install) and 120s (smoke rebuild). A second Claude Code window starting up inside
+that window deleted the lock, the next installer acquired it, and two processes renamed files
+into the same install directory — the torn `server vN + hook vN+1` install that
+`lib/proc-lock.mjs` exists to prevent. Reproduced in a sandbox: a live-pid lock aged 31s
+vanished across a real SessionStart; the 5s control survived.
+
+A live pid (including EPERM — someone else's process) is now kept until `ABANDONED_LOCK_MS`
+(10 min), deliberately longer than proc-lock's own 5-minute steal window so the sweeper is
+never the more aggressive of the two. A provably-dead pid is still swept at any age, and a
+lock with no usable pid still falls back to the old 30s rule.
+
+The codebase already knew about this hazard from one direction: the auto-maintain mutex is
+named `.proclock` specifically to stay out of this sweeper's way. `install.lock` never got the
+same treatment.
+
+### Both plugin-cache pruners deleted the version they were running from
+
+"Not in the newest 3" is not the same question as "not in use". After a marketplace rollback —
+a bad release withdrawn while three newer version dirs are still cached — `CLAUDE_PLUGIN_ROOT`
+is not among the newest three, and both pruners `rm -rf`'d it: the tree the running hooks and
+MCP server import from, mid-session.
+
+Reproduced on both paths, `hook-update.prunePluginCache()` and `scripts/setup.sh` step 8 (by
+running that step's own bytes, not a retyped copy). Both now skip the running root, compared by
+device+inode (`-ef` / `realpathSync`) rather than by string, so a trailing slash or a symlinked
+cache dir cannot defeat it. Pruning is otherwise unchanged: with the running root inside the
+keep window the surplus still goes.
+
+### The commit gate had never run
+
+`scripts/pre-commit.sh` exits 1 at step 1 with `Version mismatch: package.json=3.96.1 vs
+CLAUDE.md=3.96.1` — two values that look identical because the second line of a two-line
+variable falls off the end of the message. Its extractor was an unanchored
+`grep -oP '(?<=\*\*Version\*\*: )\S+'`, and CLAUDE.md contains that literal twice: the real
+value, and the `**Version**: <v>` inside the sentence describing the release guard.
+
+So the eslint, `format:check` and full-suite gates below it had never executed in any
+invocation. It went unnoticed because the script is not installed as a git hook and `ci.yml`
+only shellchecks it. The pattern is anchored now, and an extraction that does not yield exactly
+one line fails with the real cause instead of sending you to sync five already-synced files.
+
+### Measurement
+
+`scripts/audit-metrics.mjs` spelled its module-graph filter out in four places and two of them
+forgot the `*.config.mjs` half, so `--deps` printed 161 modules while `--md` printed 163 for
+what reads as the same set — and `eslint.config.mjs` was listed as a source module with no
+test. One predicate now, and `--self-check` fails if the reporters ever disagree again.
+Modules **163 → 161**, untested **24/163 → 23/161**; edges unchanged at 481 static + 48 lazy,
+0 cycles, because both config files have zero local imports.
+
+`benchmark/baseline.json` was recaptured on this tree (it expires 30 days after its own
+timestamp and both workflows pass `--strict`; on the release path that failure lands after the
+tag is pushed). All four quality metrics are bit-identical to the superseded baseline —
+recall 0.8998, precision 0.8497, nDCG 0.9712, MRR 0.9611 — which is the expected result for a
+release that does not touch retrieval.
+
+`docs/audits/` is no longer gitignored, so the report this release implements survives to the
+round that has to mark its items resolved. The plural directory is a second ledger path, not a
+typo for `docs/audit/`.
+
+### Verification
+
+353 test files, 5862 passed, 1 skipped. Coverage 84.34 / 78.88 / 89.26 / 85.44 against a
+80/74/84/83 gate. eslint 0/0, prettier clean, shellcheck clean. knip 50 unused exports, 0
+unused files, 0 duplicate exports, with the unused-export name set byte-identical to v3.96.1
+(same-tree A/B, not a count subtraction). Every fix carries a mutation-verified test: reverting
+the fix reddens exactly the cases that describe it, and each "the guard held" assertion is
+paired with a control proving the guarded code still ran.
+
+## v3.96.1 — four audit rounds that mostly repaired the instruments, and one 82,048-character regex
+
+No user-visible behaviour changes. Every shipped code change here is a refactor whose
+output was proved identical, plus a whole-tree reformat. What is worth reading is the
+other half: four of this repo's own measuring instruments were wrong, and three of them
+were wrong in the direction that produces a clean-looking number.
+
+The audit ledger — every finding, its evidence, and the four items deliberately left
+undone — is now tracked at `docs/audit/2026-09-05-audit.md`. It used to be gitignored,
+which is why the round that opened this series had to rebuild the previous round's status
+table out of CHANGELOG paragraphs and still lost nine of its items.
+
+### The cycle guard was reading an incomplete graph
+
+`tests/import-graph.test.mjs` is what keeps this repo at zero circular imports. It built
+its graph by regexing source text, so a comment reading ``this used to `await
+import('../hook-optimize.mjs')` `` counted as a live edge — a surplus edge in a cycle
+detector is a cycle nobody wrote, reproduced end to end:
+
+```
+one commented-out import line →
+  circular imports found: lib/time-constants.mjs -> lib/shard-gc.mjs -> lib/time-constants.mjs
+```
+
+The under-reporting is the half nobody looks for. The specifier pattern was
+
+```
+/(?:^|[\s;}])(?:import|export)\s+(?:[\s\S]*?\sfrom\s*)?['"]([^'"]+)['"]|…/g
+```
+
+and that lazy span sits inside an **optional** group. A bare `export { A, B };` with no
+`from` clause starts the branch, and the engine travels to the next ` from ` to satisfy the
+group — one match spanned **82,048 characters** (offset 30,401 → 112,449 in `mem-cli.mjs`),
+and the global scan's `lastIndex` skipped everything inside it. Eight real `await import()`
+edges were invisible, in `mem-cli.mjs` and `server.mjs`, because both files contain a bare
+`export { … };`.
+
+Both tools now walk the AST — comments and string literals are not nodes — with the regex
+kept only as a fallback for a file the parser rejects, and an assertion that the fallback
+list is empty. Returning no edges on a parse error is the worse failure: an edge-less
+module cannot participate in a cycle, so a parse error would read as a clean graph. The
+"does every relative import resolve" check deliberately keeps the text scan, because
+over-reporting a typo'd path is the safe direction there.
+
+Verified by diffing edge NAME SETS rather than counts: 1303 → 1308, a net +5 that hides
+"−3 phantoms, +8 real". `scripts/audit-metrics.mjs` had the same defect and was fixed
+first; its `--self-check` now carries both arms.
+
+"Zero import cycles" was true before this release. It was a statement about a graph
+missing eight edges.
+
+### The metrics ruler threw away the name of every test that failed
+
+`scripts/audit-metrics.mjs` kept only its summary regex and discarded vitest's output, so a
+red run reported `Tests 1 failed | 5830 passed` and the name was unrecoverable. That is why
+a single failure sat in the ledger for two rounds as "could not be reproduced". The ruler
+now parses the `FAIL` lines into the report row and saves the last 200 lines to
+`tmp/audit-vitest-<ts>.log`.
+
+It paid for itself in the same session: the failure recurred, named itself, and turned out
+to be `tests/binding-error-diagnosis.test.mjs:222` — a case that spawned a **real
+`npm install`** and waited up to 180 s for npm's own stderr. Under a full parallel run npm
+had not flushed its diagnosis before the timeout. `launch.mjs` resolves `npm` through PATH,
+so the test now puts a stub first on PATH; the whole assertion survives, including the one
+that fails if someone switches that `stdio` to `'pipe'`. The suite no longer starts an
+external npm process.
+
+### `format:check` was red on 525 of 531 files and had been since the day it was added
+
+`.prettierrc` was committed on 2026-09-03 and never applied, while `CLAUDE.md` listed
+`npm run format:check` as a project command. A permanently-red check is not a gate. The
+tree is formatted (`36f8c0f`, listed in a new `.git-blame-ignore-revs`), and
+`format:check` now gates `ci.yml` and `scripts/pre-commit.sh`.
+
+Two things surfaced while doing it. Seven structural guards pinned code shapes with literal
+spaces in their regexes and went red on reflow — each was restated to match across line
+breaks without dropping a term, in its own commit before the reformat. And prettier moves a
+trailing `// eslint-disable-line` onto the following line, where it covers the body instead
+of the signature, which introduced a real lint error on a tree whose baseline is 0/0.
+
+`npm run format` needs **two passes** to reach a fixed point — `tests/hook-update.test.mjs`
+still fails `--check` after the first.
+
+### Refactors, each proved to be a pure move
+
+- Three `db.prepare()` calls hoisted out of their loops. `search-engine.mjs` recompiled the
+  same SQL once per vector hit in both arms of the RRF/FTS-empty split — up to
+  `VECTOR_SCAN_LIMIT` (500) compilations per hybrid search, on the retrieval path. The two
+  arms are mutually exclusive, so one hoisted statement serves both. `denoise-ab` reads
+  NEUTRAL with every Δ exactly 0.000 and 30/30 behavioural probes passing.
+- `lib/shard-gc.mjs` — `lib/metrics.mjs` and `registry-recommend.mjs` shipped the same
+  12-line daily-shard GC line for line, so the 90-day retention rule had two homes.
+- `lib/llm-call.mjs`, `lib/quiet-scope.mjs`, `lib/handoff-constants.mjs` — `callLLM`, the
+  quiet/adoption predicates and the handoff constants left the hook layer. Two `lib/`
+  modules imported `hook-shared.mjs` for them and dragged its whole import graph along;
+  the direction guard had to carve out an exception by name. That exception is deleted:
+  `lib/` may now import no `hook-*.mjs` at all. `hook-shared.mjs` re-exports all nine
+  names, so no caller changed, and a new guard fails if any of them is ever redeclared
+  there instead of re-exported.
+- `handleStop` 470 → 40 lines and `handleUserPrompt` 364 → 26, each into named phases.
+  Both were verified by reducing the old and new regions to multisets of trimmed,
+  comment-free statements and diffing: nothing lost either time. The second split turned
+  up two parameters that had been in scope and never used.
+
+### Measured, then declined
+
+Merging the two `UserPromptSubmit` processes into one. At a 5,000-row corpus they cost p50
+53.7 ms and 109.2 ms; a merge removes at most one interpreter boot (p50 19.5 ms, 12.0% of
+the total), against ~150 LOC moved and the loss of the first hook's independent 2 s
+fast-path contract. Their p95 sum is 2.9% of the 7,000 ms `hooks.json` already allows them.
+
+### One caveat for anyone diffing numbers across this release
+
+The reformat re-calibrated four line-denominated metrics. No code was added or removed —
+prettier split one-line statements — so do not diff any of them across `36f8c0f`:
+
+| Metric | before | at v3.96.1 |
+|---|---|---|
+| source lines | 52,356 | 61,311 |
+| functions > 50 lines | 140 | 179 |
+| duplicate rate (any / cross-file) | 1.88% / 0.29% | 5.15% / 2.35% |
+| coverage **lines** | 87.67% | 85.44% |
+
+The coverage row is the trap. Statements (84.34%) and functions (89.26%) did not move at
+all, so nothing became uncovered; only the line denominator grew. The gate
+(80 / 74 / 84 / 83) passes. `CLAUDE.md`'s Baselines section carries this table — re-stamp
+from v3.96.1, never from a figure quoted before it.
+
+## v3.96.0 — v3.95.1 taught the checks to see the emptied manifest; this is the half that stops emptying it
+
+Found by driving the shipped v3.95.1 tree as a user for two rounds — fresh install, sandbox
+`CLAUDE_MEM_DIR`, all seven hook events fired by hand, every CLI family exercised — rather
+than by reading code. Six defects, ordered here by what they cost a user. One candidate fix
+was measured, came out worse than the behaviour it replaced, and was reverted; that note is
+at the bottom because it is the most useful part of the round.
+
+### 1. A dead `settings.json` entry made the plugin delete its own hooks, every session
+
+v3.95.1 closed the *detection* half of this: `pluginCacheHookEvents()` opens the cache
+manifest, so `status` and `doctor` can no longer read an emptied one as a healthy
+plugin-only install. It did not close the *cause*, and the cause is still reachable.
+
+`hasInstallManagedHooks()` answers a string question — does `settings.json` mention a path
+of ours. That is the right question for `install()`, which has just written those entries
+itself. It is the wrong question for the SessionStart self-heal, whose action is
+destructive. A user who installed globally, later switched to the plugin, and removed
+`~/.claude-mem-lite` by hand (or ran `npm uninstall -g` without our `uninstall`) is left
+with entries naming a launcher that no longer exists. They fire nothing. The string test
+still passes, so the self-heal read a dead registration as the live one and emptied the
+manifest that was actually working — on every SessionStart, silently, landing in exactly
+the end state v3.95.1 had just learned to recognise.
+
+Reproduced from a sandbox `HOME` before the fix:
+
+```
+stale settings entry, launcher deleted → hasInstallManagedHooks: true → cleared: ['3.95.1']
+                                       → pluginCacheHookEvents: { ok: false, reason: 'empty' }
+```
+
+`hasLiveInstallManagedHooks()` adds the liveness question and gates both destructive sites
+(`hook.mjs` session-start, `hook-update.clearCacheHookResidue()`; `hook-update.mjs` keeps
+its own inlined copy, preserving the "works when plugin-cache-guard.mjs is missing"
+property its header claims). Deliberately narrow: it returns `false` only when a managed
+command was parsed AND none of the paths it names exist. An unparseable or unfamiliar
+command shape keeps the old answer, so this can only ever remove the destructive branch
+from a case positively verified as dead — never add it to one.
+
+| settings.json shape | `hasInstallManagedHooks` | `hasLiveInstallManagedHooks` |
+|---|---|---|
+| stale entry, launcher deleted | true | **false** |
+| real global install | true | true |
+| plugin-only (nothing of ours) | false | false |
+
+`tests/hook-update.test.mjs`'s `writeManagedHooks` fixture now *creates* the launcher it
+names. It never did — which is why the suite was green over a settings.json that could not
+have run a hook, and is a small instance of the same defect: a fixture standing for an
+install by string alone.
+
+### 2. `export --limit` with a bad value silently truncated a backup to 200 rows
+
+The no-`--limit` default was changed to `-1` (complete) precisely because
+`export > backup.json` used to cap at 200 and lose rows on restore. The **invalid**-value
+branch was left on `parseIntFlag`'s `defaultValue: 200` — the right convention for `search`
+and `recent`, where the default is a display width, and the wrong one here, where the
+default is completeness. Same truncation, reached through the invalid door instead of the
+absent one:
+
+```
+export --limit "$N" > backup.json     # $N unset or typo'd
+250-row store → 200 rows exported, 50 lost
+warning on stderr (which the redirect discards), exit 0
+```
+
+Measured on a 250-row store: pre-fix 200/250, post-fix 250/250. Recovering to the complete
+set is the only direction that cannot lose a row on restore. Fixing it also exposed that
+the cap notice guards on `limitGiven` alone, and `rows.length >= -1` is always true — so
+the recovered path announced `Results capped at -1`, on the one path guaranteed not to be
+capped. Both halves are pinned, mutation-verified against the pre-fix source.
+
+### 3. `doctor` printed ⚠ and then said "All checks passed!"
+
+`buildDoctorSummary`'s docblock says that sentence must not lie about warnings, and
+`tests/doctor-summary.test.mjs` has pinned the 4-way contract at the pure-function level
+since it was written. The counter simply never reached it: the doctor body has two
+reporters, `warn` (prints ⚠, counts nothing) and `dwarn` (counts, then prints), and the
+stale-process check called the bare one. A run whose only finding was an old launcher
+printed the ⚠ and closed with "All checks passed!".
+
+One token. What is worth keeping is the guard that replaces the unit test's blind spot: a
+source scan asserting every bare `warn(` in the doctor body is accompanied by `warnings++`
+or `issues++`. It goes red against the pre-fix source and green after — verified both
+directions, because a scan that cannot fail is not a check (doctrine rule 5). `dwarn`
+raises `warnings` only, so `doctor` still exits 0 on a stale launcher, which is the
+behaviour the original comment argued for and got half right.
+
+### 4. `import-jsonl` wrote the protocol messages both live writers refuse
+
+`hook.mjs::handleUserPrompt` and `scripts/user-prompt-search.js` both return on
+`rawPrompt.startsWith('<task-notification>')` — it is Claude Code protocol, not user input.
+Cold-start backfill is the third input boundary into `user_prompts` and was the only one
+persisting them. Every read path then filters them back out (`prompt_text NOT LIKE
+'<task-notification>%'` in `lib/search-core.mjs`, `search-engine.mjs`, the UPS
+prompt-fallback), and the two that do not — `get P#N` and the timeline `P#` anchor — hand
+the agent protocol chatter as recalled context. Counted as `skipped`, which is what it is.
+(`<private>` redaction was checked at the same seam and was already correct on this path.)
+
+### 5. Searching a file path was a dead end
+
+`OBS_FTS_COLUMNS` indexes title / narrative / lesson / aliases / concepts. It does not index
+`files` — that association lives in the `observation_files` junction, which is `recall`'s
+table and only `recall`'s. So a save that named a path in `--files` and never mentioned it
+in prose is reachable by `recall` and invisible to `search`, and a user pasting the path
+they were just editing got a flat `No results`: true about the index, false about the
+store. It is the one zero-result shape the CLI can positively disprove, so it now does.
+
+```
+$ claude-mem-lite search "src/payments/webhook.ts"
+[mem] No results for "src/payments/webhook.ts"
+[mem] 1 observation(s) are linked to that file — search indexes text, not file paths.
+[mem] Try: claude-mem-lite recall "src/payments/webhook.ts"
+```
+
+One COUNT, only on a zero-result query that is a single whitespace-free token shaped like a
+path, silent when the count is 0 — an ordinary prose query never reaches the COUNT.
+`--json` output is unchanged. The count goes through a new `countRecallableByFile()` that
+shares `recallByFile`'s predicate and deliberately **not** its `access_count` bump: the hint
+answers a question the user did not ask, and a ruler must not pollute what it measures
+(doctrine rule 6). Pinned in-process as well as through the CLI, so v8 coverage can see it.
+
+### 6. `claude-mem-lite version` was an unknown command
+
+Far enough from every real command that the edit-distance suggester fell through to the
+generic "run help / run install" line — the CLI refusing a question it can answer. `version`
+and `-V` now join `--version` / `-v`.
+
+### Measured and rejected: `remind me` as a recall-intent trigger
+
+Recorded because the reasoning for it is seductive and the measurement says no.
+
+`hasExplicitSignal` admits a prompt only on an error signature, a file mention, a recall
+intent, a code identifier, or CJK. A plain English recall question carries none of those, so
+"remind me what we decided about session cookies" is dropped before FTS runs — while
+`remember` has been in the recall-intent list all along and `remind me` is its imperative
+twin. Adding it looks like closing an omission.
+
+Measured on a 10-row typed corpus in a sandbox install: the prompt does fire, and that arm
+carries `useRecent` + `limit 5`, so when topical FTS comes back empty (it does — the OR
+floor drops a long multi-topic prompt whose best row shares only "session"/"cookies") the
+recency fallback spends **five** injection slots on the five newest rows, and the
+session-cookies decision was not among them. Five noise rows and no answer is worse than
+the silence it replaced. Reverted byte-identically; the comment stays so the next reader
+does not re-derive it. Any future attempt needs `benchmark/citation-live-replay.mjs` on the
+`fyi` face — `denoise-ab` is structurally blind there (doctrine rule 9).
+
+The broader behaviour behind it — prose recall questions with no identifier, file or error
+signature get no injection — is the deliberate, benchmarked v2.57.x precision gate, with
+`CLAUDE_MEM_UPS_REQUIRE_SIGNAL=0` as its documented escape hatch. Untouched.
+
+### Not a defect (checked, so the next round does not re-check)
+
+Secret scrubbing over ten key shapes, FTS query fuzzing (21 hostile queries incl. SQL
+injection and bare FTS5 operators), exit codes on every usage error and on an unopenable
+DB, 12 concurrent writers, corrupt and read-only databases, mixed-prefix `get`
+(`#/D#/P#/E#/S#`), export→restore round-trip, and the `/clear` handoff. All behaved as
+documented. Two apparent bugs during the round were the tester's own project-name
+mismatches, not the system's.
+
+## v3.95.1 — the plugin cleared its own hook manifest, and every check we own called it healthy
+
+A plugin-only install could reach a state with **zero hooks registered** while `status` and
+`doctor` both printed green. Found by inspection on a live v3.95.0 install, not by a test,
+and the reason no test could have found it is the more useful half of this note.
+
+### The shape
+
+Claude Code registers a plugin's hooks from the version dir recorded in
+`installed_plugins.json` — `~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json`,
+not the marketplace checkout. An npm-shape install does not use that file at all:
+`install.mjs` writes the seven events into `~/.claude/settings.json`, then CLEARS the cache
+manifest, because leaving both populated fires every hook twice.
+
+`plugin-cache-guard.mjs` has stated the precondition for that clearing in its header since
+it was written — *only clear while settings.json also registers the hooks* — and
+`hook.mjs`'s session-start self-heal checks it. Two other sites did not:
+`hook-update.clearCacheHookResidue()` and `install.mjs::dedupePluginCacheAndHooks()`. On a
+plugin-only install there is no second registration, so the dedup is a **delete**: all seven
+events unregister at once, at the next session boundary, with no error anywhere.
+
+### Why every check we own said green
+
+`status` and `doctor` inferred "the plugin manifest serves the hooks" from two facts —
+settings.json holds none, and an active plugin version exists — and **never opened the
+manifest they were crediting**. From those two facts alone an emptied manifest and a
+healthy npm-shape install are the same observation.
+
+The sandbox harness could not see it either. `tests/sandbox/phaseA-plugin.mjs` fires the
+hook scripts directly rather than through Claude Code's registration layer, so it reports
+44/44 against a cache whose manifest is empty — doctrine rule 9 (a verdict from a
+structurally blind ruler says nothing) applied to a green rather than a NEUTRAL.
+
+### What the live install showed
+
+Same machine, same v3.95.0 cache, two consecutive sessions — the manifest was emptied
+14:46:33, 19 seconds into the first one:
+
+| | session started 14:46:14 | session started ~15:57 |
+|---|---|---|
+| `system` transcript entries (incl. `stop_hook_summary`) | **28** | **0** |
+| hook artifacts in `~/.claude-mem-lite/runtime/` after a timestamp baseline | present | **0** across 1 Read + 8 Bash calls |
+| `status` verdict | ✓ green | ✓ green |
+
+The second column is what a user gets from the second session onward. The third row is the
+defect this release is actually about.
+
+### Fixes
+
+1. **`pluginCacheHookEvents()`** (`plugin-cache-guard.mjs`) reads what a cache version
+   actually registers. `status` and `doctor` now open the manifest: green names the event
+   count (`hooks.json, 7 events`), and `empty` / `no-manifest` / `unreadable` go red with a
+   `cp` repair line, doctor exiting 1. Mutation-verified — stubbing the reader to return
+   healthy over an empty manifest turns all three new checks red.
+2. **Both unguarded clearers now require `hasInstallManagedHooks()`**, the precondition the
+   guard module already documented. `hook-update.mjs` inlines its own copy rather than
+   importing, keeping the "works when plugin-cache-guard.mjs is missing" property its
+   header claims.
+3. **`install()` runs `configureHooks()` before `dedupePluginCacheAndHooks()`.** The new
+   gate reads the settings.json that `configureHooks` writes; in the old order it would
+   read an empty one on a first install and skip the dedup the npm shape genuinely needs.
+
+Repair for anyone already in this state, without waiting for the update to land:
+
+```bash
+cp ~/.claude/plugins/marketplaces/<mp>/hooks/hooks.json \
+   ~/.claude/plugins/cache/<mp>/claude-mem-lite/<ver>/hooks/hooks.json
+# then restart Claude Code — hook manifests load at session start
+```
+
+### Not established
+
+**Which process emptied that manifest is not attributed.** The `_note` identifies the
+writer as `hook-update.clearCacheHookResidue()`, but both paths that reach it should have
+been blocked on this shape: `checkForUpdate` computes `canInstall = !pluginMode && …`
+(false under `CLAUDE_PLUGIN_ROOT`), and `syncDataDirFromCache` returns
+`no-existing-code-install` when the data dir has no `package.json` — that dir's birth time
+is 14:44:48 and it has never held one. `update-state.json` carries only `lastCheck`, the
+shape the fetch-failed branch writes, which does not support a completed install either.
+The tests stub `HOME` correctly, so suite pollution is ruled out. Per doctrine rule 10 the
+premise gets corrected before it is quoted: the gate below closes the *class* regardless of
+which caller fired, and this paragraph is here so nobody later cites a culprit that was
+never measured.
+
+### fix: `release` no longer eats CLAUDE.md's trailing annotation
+
+`syncVersions` replaced the whole `- **Version**: x.y.z` line, so the first release after
+that line grew its `— **this exact string is a release guard.**` suffix deleted it. Nothing
+could catch that: `publish.yml` greps the line's semver prefix and `install-e2e` asserts the
+same substring, and both survive a truncated tail. Extracted as the pure, exported
+`patchClaudeMdVersion(text, version)` — same "one testable point of truth per file shape"
+move `bumpJsonField` already made for the three JSON manifests — which replaces the version
+token and leaves the rest of the line alone. Caught on this release, on its own output.
+
+### From the pre-ship review
+
+An independent review of the diff returned SHIP with three repairs, all applied before the
+tag:
+
+- **The printed repair could be a silent no-op.** `install` empties the *marketplace*
+  manifest as well as the cache one, so after `install` + `cleanup-hooks` both files are
+  `{"hooks":{}}` and the prescribed `cp` copies empty over empty, exits 0, and leaves the
+  same red line. `hookManifestRepairHint()` now checks the source first and prescribes a
+  plugin reinstall when there is nothing usable to restore from.
+- **The install-side gate was unreachable-false, leaving call ORDER as the only
+  protection.** `configureHooks()` writes all seven events unconditionally one line
+  earlier, so a self-read of settings.json there is always true. It now returns that fact
+  and `install()` passes it in — the dependency is data, not sequence, and a future reorder
+  cannot silently disable the dedup.
+- **The gate was scoped too widely.** An early return skipped the whole function, including
+  the `launch.mjs` / `launch-preflight.mjs` sync into every cache version dir — issue #15's
+  dev-mode MCP routing fix, which is not hook dedup. It now wraps the two clearing blocks
+  only.
+
+The review also caught this file's Baselines table still stamped to v3.95.0 while the tree
+had moved, which is doctrine rules 1 and 7 in one line; it is re-measured below.
+
+### Verification
+
+Measured on the release tree, last, after those repairs. `npx vitest run` **350 files /
+5800 tests** (5799 passed, 1 skipped) — +13 over v3.95.0's 5787, all new here. `npx eslint .`
+clean. `knip` **52 unused exports / 0 unused files**, unchanged from the v3.95.0 baseline
+and with none of the three new exports in the unused set (name-checked, not inferred from
+the count). Coverage: statements **84.37%** · branches **78.88%** · functions **89.22%** ·
+lines **87.72%** — identical to v3.95.0, because the new code lives in `install.mjs` and
+`plugin-cache-guard.mjs`, both outside the gate's file set. `npm audit --omit=dev` found 0
+vulnerabilities; `benchmark/ci-gate.mjs --strict` passed all four matrix deltas;
+`scripts/smoke-tarball.mjs` installed the packed 3.95.1 tarball, rebuilt the native addon
+and opened a DB.
+
+One measurement note, since this repo's own rule is that a ruler must not pollute what it
+measures: two suite runs during this release reported failures that were **not** the diff —
+`package.json` / `CLAUDE.md` were being rewritten mid-run by the release tooling and by a
+concurrent reviewer, and this repo has CLAUDE.md-mutation detectors that correctly noticed.
+Both re-ran green on a settled tree. The numbers above are from runs with nothing else
+touching the tree.
+
+## v3.95.0 — a dependency release, and the one advisory the updater we installed structurally cannot reach
+
+No source change. Seven dependabot PRs merged plus one hand-written floor, and the reason
+this gets a release note rather than a line is that **the dev-tree advisory count and the
+shipped-tree advisory count moved in completely different ways**, and reporting the first
+number without the second would be the more flattering of the two readings.
+
+Measured as a same-caliber A/B — `npm audit --package-lock-only`, both arms in one session
+against one advisory database, only the lockfile swapped:
+
+| | v3.94.0 | v3.95.0 |
+|---|---|---|
+| whole tree | **4 high (9 GHSAs)** | **0** |
+| `--omit=dev`, i.e. what a user installs | **0** | **0** |
+
+So: six GHSAs closed in the dev tree (nanoid ×2, postcss ×2, vite ×2) by the grouped dev
+bump, three more by the brace-expansion floor below — and **nothing that ships to users got
+safer, because nothing that ships to users was unsafe**. The prod blast radius is exactly
+three packages, counted by diffing the two lockfiles' package/version maps rather than by
+counting PRs: `@modelcontextprotocol/sdk` 1.29.0 → 1.30.0, `better-sqlite3` 12.10.0 →
+12.11.1, `zod` 4.4.3 → 4.5.4, with zero prod additions and zero removals, and no entry
+flipping its `dev` flag. Everything else lands in the dev tree: **96 dev entries changed
+version, plus 5 added and 6 removed, all of them `dev: true`**. Those three figures are
+stated separately on purpose — a first draft of this note gave a single "106", which is not
+what any caliber returns (the nearest are 104 and 107, depending on whether the three
+packages that merely moved from nested to hoisted are counted once or twice), and this
+repo's own rule is that a population is a required field on a number, not a caveat.
+
+Suite on this tree, run after the pre-tag review's repairs were in: **350 files / 5787
+tests green**, `eslint` clean. Unchanged from v3.94.0, which is the expected result for a
+release with no source and no test-file changes — but the native binding underneath it did
+change, which is why it was re-run rather than carried.
+
+**Upgrade note (one thing genuinely changes for every user):** `better-sqlite3` 12.11.1
+pins into `npm-shrinkwrap.json`, which `publish.yml` generates from the lockfile at release
+time, so this is the version every fresh install compiles or downloads. It carries SQLite
+**3.53.2** (was 3.53.1). The three sandbox phases — the only harness that drives a real
+`npm pack` → `npm i -g` → real MCP stdio — were re-run for exactly this reason and are
+green: **A 44/44 · B 45/45 · C 15/15**. Phase A is 44 and not the 43 in the previous
+record; that is a check `c3cf6c9` added after v3.90.0, attributed with
+`git log v3.90.0..HEAD -- tests/sandbox/phaseA-plugin.mjs` rather than by subtracting two
+counts.
+
+### fix: brace-expansion floored at 5.0.9 — a transitive advisory sits outside everything we built to catch it
+
+Three high GHSAs (`GHSA-3jxr-9vmj-r5cp` / `GHSA-mh99-v99m-4gvg` / `GHSA-rgw5-rvv9-x895`,
+DoS via unbounded `{}` expansion), reached as `eslint@10.9.1 → minimatch@10.2.5 →
+brace-expansion`.
+
+Both of this repo's dependency safety nets have a hole in exactly this shape, and the hole
+is structural rather than a misconfiguration: `.github/dependabot.yml` drives *version*
+updates, which track **direct** dependencies only — a transitive package with a published
+fix is the job of Dependabot *security* updates, a repository setting that is not on. And
+CI's audit gate runs `npm audit --omit=dev`, correctly, because a dev advisory must not
+block a release — so it never saw this either. The dependabot config's own comment says it
+exists because dev advisories were "visible only to someone who happened to run `npm audit`
+WITHOUT `--omit=dev`". This one sat just outside the half that closed.
+
+Fixed with an `overrides` floor, joining the five already in that block. Worth stating
+plainly because it changes what a future reader should conclude: **`npm update` would also
+have worked today** — minimatch asks for `^5.0.5` and 5.0.9 is inside it, so only the
+lockfile pin held it back. The floor is preferred because it survives a future resolution
+walking back down, not because the range forbade the fix.
+
+The lockfile name-set diff for this change is exactly one line
+(`brace-expansion@5.0.6 → 5.0.9`): 338 entries on both sides, `@emnapi` lines 11 on both
+sides, so `scripts/pre-commit.sh`'s pruning guard has nothing to catch **in this commit**.
+That is a consequence of using `npm install --package-lock-only`, which lets the ideal tree
+write the lock instead of this linux-x64 machine's installed tree.
+
+The qualifier matters, because across the round as a whole that guard's premise failed:
+the grouped dev bump took `@emnapi` grep lines **13 → 11**, which is precisely the
+signature it exits 1 on — and it never ran, because a dependabot PR is merged server-side
+and no local pre-commit hook fires. The drop was benign (all three `@emnapi/*` entries
+survive; the two lost lines are references from upstream-removed wasm32-wasi bindings, not
+the single-platform prune signature), and the guard counts lines rather than entries, so it
+would have false-positived here regardless. `.github/dependabot.yml` no longer claims
+otherwise.
+
+**A trap this round produced, recorded because all three of its symptoms look like
+confirmation:** after the override, `npm install` reported `found 0 vulnerabilities`,
+`npm ls brace-expansion --all` reported `5.0.9`, and the lockfile said `5.0.9` — while
+`node_modules/brace-expansion/package.json` on disk still said **5.0.6**. The cause is the
+command that was used to write the lock: `npm install --package-lock-only`, chosen so the
+ideal tree rather than this linux-x64 machine's installed tree writes it, **does not touch
+`node_modules` by definition**. `npm ls` then answers from the tree npm computed, not the
+one that exists. `npm ci` is what moved the bytes.
+
+The pre-tag review refuted a stronger sentence this note first carried — "only `npm ci`
+moved the bytes", which reads as a claim about `npm install` in general. On two minimal
+`minimatch@10.2.5` projects on the same npm 12.0.1, a full `npm install` after the override
+did update both the lock and the disk to 5.0.9, while `--package-lock-only` reproduced all
+three misleading confirmations at once. The practical rule survives and the mechanism did
+not: verify a dependency fix by reading the installed `package.json`, never by reading
+`npm ls`.
+
+### chore: two GitHub Actions majors, and the half of their risk that could be checked without a tag
+
+`actions/checkout` v5.1.0 → v7.0.1, `actions/upload-artifact` v6.0.0 → v7.0.1,
+`softprops/action-gh-release` v3.0.0 → v3.0.3. All three pins re-resolved against the
+upstream repositories with `git ls-remote` rather than trusted from the trailing comment —
+each SHA is the commit its claimed tag points to today (`action-gh-release`'s is an
+annotated tag, dereferenced with `^{}`). That rules out a comment/SHA mismatch; it is not a
+claim that the commits are benign.
+
+checkout's two majors are both hardening: v6.0.0 persists credentials to a separate file
+instead of `.git/config`, and v7.0.0 blocks checking out a fork PR under
+`pull_request_target` / `workflow_run`. The second is free here and stays free — grep
+confirms no workflow in this repo uses either trigger; `ci.yml` runs on `pull_request`.
+
+Input schemas checked against the pinned versions rather than assumed: `checkout` is
+invoked with **no inputs at all** at all ten call sites, `upload-artifact` v7 still declares
+`name` and `path`, and `action-gh-release` v3.0.3 still declares `generate_release_notes`
+and `files`, still documents `fail_on_unmatched_files` as defaulting to false (the comment
+in `publish.yml` depends on that), and still leaves `make_latest` to the GitHub API default
+— which matters because `hook-update.mjs:243` asks `releases/latest` first. It is not the
+only path: `:259` falls back to the Tags API, so a `make_latest` regression would degrade
+rather than break auto-update. Stated because "resolves through `releases/latest`" reads as
+a single point of failure and is not one.
+
+**What this could not verify, stated rather than left implied:** `publish.yml` runs only on
+a tag push, so its two checkout call sites and the release action itself have never
+executed at these versions. This tag is their first run.
+
+### chore: dependabot npm PR limit 5 → 3
+
+The first run opened seven PRs 68 seconds apart end to end
+(`2026-09-03T19:29:12Z` → `19:30:20Z`). That is a backlog, not a rate — the config had
+landed as `25cd93d` about fifty minutes earlier, and a first draft of this line
+misattributed the 68-second span as the delay from that commit. The cap costs nothing at a
+steady state under three. Two changes
+were deliberately not made and the config now says why: grouping prod minor/patch would
+contradict the standing "attributable failure over a bisect" argument already written
+there, and `interval: monthly` is per-ecosystem, so slowing the dev tree would slow the
+prod deps with it — backwards, since the prod bumps are the ones that reach users through
+the shrinkwrap.
+
+### note on this release's review
+
+One independent pre-tag lens ran, a claims-verification pass, and it is the reason four of
+the paragraphs above read differently than they first did: the "106", the `npm install`
+mechanism, the eighty-seconds attribution, and the unqualified `@emnapi` sentence were all
+its findings, plus an untracked 2.1 MB `.fuse_hidden` leftover sitting one `git add -A`
+away from this commit — now covered by `/node_modules.stale-*` in `.gitignore`. It returned
+**zero BLOCKERs** and confirmed twenty-two separate claims by re-deriving them, including
+every figure in the audit table and all three action SHA-to-tag mappings.
+
+**A correctness lens did not run**, so nothing independently re-read the diff for
+behavioural risk. On a release with no source change that gap is small, and it is stated
+rather than left to be inferred.
+
+### unchanged, and re-verified because a patch release of SQLite would be the obvious place for it to change
+
+`SELECT 1 FROM x_fts WHERE rowid = ? AND x_fts MATCH ?` still drops the rowid constraint on
+SQLite 3.53.2 — probed with a two-row table where only rowid 2 matches, and the query
+returns a row for rowid 1. The rule this repo derived from it (pull each term's rowid set
+and test membership in memory) stands.
+
+## v3.94.0 — six silent degradations, and three claims the code was making that were false
+
+Six defects from the standing audit backlog, plus the two semantic adjudications it had
+deliberately left open. What ties them together is not a subsystem — it is that every one
+of them *reported nothing*: a typo that turned an injection face off, a save refused as a
+duplicate of a row that no longer existed, a comment describing a host contract that the
+host does not have, and a fallback branch whose comment described a case it could not
+reach.
+
+**Upgrade note (one thing can newly fail):** `claude-mem-lite doctor --session-audit` now
+counts `observations.importance IS NULL` and treats a non-zero count as unhealthy, so on a
+store carrying such rows that command exits 1 where it previously exited 0. It is an
+explicit diagnostic, not a hook or a hot path — nothing else changes behaviour because of
+it. The output names the one-line repair
+(`UPDATE observations SET importance = 1 WHERE importance IS NULL;`). Measured 0 rows on
+the maintainer's 3779-observation store; no new row can reach that state after this
+release. Nothing here needs an opt-out flag: every other change either preserves data that
+was being destroyed or replaces a silent failure with a stderr line, and neither has a
+direction a user would want to revert.
+
+### fix: `Number(process.env.X || DEFAULT)` has no failure mode — one typo took the UserPromptSubmit face dark
+
+`Number('abc')` is NaN, and NaN then propagated into whatever the constant fed. Nothing
+threw and nothing was logged, so the surface degraded silently and in a direction that
+depended on which consumer received it. Measured against the shipped code:
+
+| env | consumer | what NaN did |
+|---|---|---|
+| `CLAUDE_MEM_UPS_MAX_RESULTS` | `rows.slice(0, MAX_RESULTS)` | `slice(0, 0)` → **the whole FTS injection face emitted nothing** |
+| `CLAUDE_MEM_UPS_PROMPT_FALLBACK_LIMIT` | SQL `LIMIT ?` | `SqliteError: datatype mismatch` |
+| `CLAUDE_MEM_UPS_TOP_MIN` | `Math.abs(rel) < floor` | always false → **the set-level noise floor stopped firing** |
+| `CLAUDE_MEM_UPS_OR_BM25_MIN` | `orFloor > 0` | false → the OR-fallback floor stopped firing |
+
+So one typo either silences the face or disables the gates that keep it quiet, and from
+outside the two are indistinguishable. `lib/env-number.mjs` gives env overrides the
+contract `lib/cli-flags.mjs` has given CLI flags since #8277: warn once on stderr, fall
+back to the documented default, honour an explicit `0` when the range admits it. Twelve
+call sites converted (six in `scripts/user-prompt-search.js`, three in
+`lib/cite-back-hint.mjs`, one in `lib/relevance-floor.mjs`, two in the
+`benchmark/adoption-rankers.mjs` twin), plus a class-level source sweep so the idiom cannot
+return anywhere in the tree.
+
+`Number`, not `parseInt`: two of these floors are written `1e-5` and `5e-6`, and
+`parseInt('1e-5')` is `1` — a 10^5 misparse with no warning, i.e. the same defect wearing a
+different hat.
+
+**Two knobs turn out never to have worked through the environment at all**, and it is worth
+naming the idiom precisely because a draft of this entry — and one source comment — got it
+backwards. `process.env.X` is always a **string**, and `'0'` is truthy (only `''` is falsy),
+so `Number(env.X || D)` handles `0` correctly and always has. The shape that swallows a `0`
+is the other one, **parse first and then fall back**: `Number(env.X) || D`. That is
+`lib/cite-back-hint.mjs`, and the two knobs are `CLAUDE_MEM_CITE_NUDGE_THRESHOLD=0` ("never
+nag on ratio") and `CLAUDE_MEM_CITE_NUDGE_MIN_INJECTED=0` ("no volume requirement"). Both
+work now. `CLAUDE_MEM_UPS_TOP_MIN=0` was never broken — the suite has been green with `'0'`
+as `runScript`'s default all along, which is the running counterexample the pre-tag
+correctness review used to refute the draft.
+
+A range bound is a behaviour change, and this release learned it the expensive way. The
+first cut gave `CLAUDE_MEM_UPS_FLOOR_REF_CORPUS` a `min: 2`, reasoning that `maxIdf` is 0
+below n=2 so the corpus ramp would divide by zero. `corpusFloorScale` already handles that
+(`ref <= 1` returns 1, and so does `!(refIdf > 0)`), and `1` is the documented way to pin
+the ramp **off** — two cases in `tests/user-prompt-search.test.mjs` depend on it. `min: 2`
+silently replaced it with 584 and unfired both floor gates. The full suite caught it. Every
+bound is now read off its consumer, and the values these knobs are actually set to across
+the tree (`0 / 0.0000001 / 1 / 2 / 3 / 1e9`) were enumerated rather than assumed.
+
+### fix: the 5-minute write-side dedup window compared against retired rows and handed back their ids
+
+Every read path in the tree filters through `liveObsFilterSql`
+(`COALESCE(compressed_into,0) = 0 AND superseded_at IS NULL`). `saveObservation`'s
+near-duplicate window did not, so a save could be refused as a duplicate of a row that had
+already been retired — and the caller was handed that tombstone's id as `existingId`, an id
+no injection face will ever return and no `get` will show as current.
+
+Sharpest form: save something wrong, retire it, save the correction inside five minutes, and
+the correction is refused as a duplicate **of the row it corrects** — with its requested
+supersession dropped too, by the D#201 short-circuit one line down. Measured on the live DB:
+3 of the 31 superseded rows were retired 2.9 / 3.6 / 3.9 minutes after they were created,
+which is exactly this window.
+
+`hook-llm.mjs` runs its own three-tier dedup over the same table without the filter and is
+deliberately **not** changed. Its 7-day / 3-day low-signal tiers are *meant* to keep matching
+rows that auto-compress has retired — that is what stops "Modified package.json"
+re-accumulating — and it returns `null`, so no id escapes to a caller. Different
+consequence, not a twin.
+
+### fix: two maintenance passes queued retired rows for hard delete, destroying the citation redirect
+
+The 2026-09-02 audit filed this as a semantic question it would not answer alone (P3-13):
+should tombstones go through automatic GC? Measured per op, it has one answer per
+consequence rather than one answer:
+
+- `boostAccessed`, `demotePinned` and `decayAndMarkIdle`'s decay arm write `importance`
+  only — inert on a row every read path already hides. Including or excluding tombstones
+  there is a behavioural no-op, so they are **unchanged**, and a test now pins that the
+  decay arm still steps a tombstone down.
+- `cleanupBroken` hard-deletes rows with no title, no narrative and no lesson.
+  **Unchanged, and this one is a genuine remaining gap rather than a reasoned exemption.**
+  A tombstone reaching it loses its redirect exactly as `purgeStale` would — a draft of this
+  entry said "'broken' is true of a tombstone either way", which does not engage with the
+  argument the rest of this section rests on, and the pre-tag correctness review said so.
+  It is not a regression (`cleanupBroken` has always been able to delete a tombstone), its
+  reachable population is **0** today, and the adjudication that authorised this work was
+  scoped to the two `COMPRESSED_PENDING_PURGE` writers — so it is filed rather than widened
+  under cover of a release. The honest statement is: three paths can hard-delete an
+  observation, two are now guarded, and the third is open.
+- `decayAndMarkIdle`'s mark-idle arm and `search-scoring.runIdleCleanup`'s mark pass write
+  `COMPRESSED_PENDING_PURGE`, which `purgeStale` then hard-DELETEs. **That is the one path
+  with teeth**: deleting the row destroys `superseded_by`, and 27 of those 31 superseded
+  rows carry one. Three functions in the Stop citation loop route old ids through
+  `redirectSupersededIds` to reach the successor, so purging a tombstone silently ends a
+  `#NN` naming a corrected memory resolving to its correction.
+
+Both mark passes now use `liveObsFilterSql('')`, and `maintenanceStats`' `stale` forecast
+moved with them — only `stale`, because `boostable` and `pinned` forecast ops that
+deliberately still touch tombstones, and forecasting an exemption they do not have would
+break the scan-equals-execute invariant in the other direction. The precedent is one clause
+up in the same statement: lesson-bearing rows were exempted from mark-idle on exactly this
+reasoning, and an explicit `delete` still removes either.
+
+Exposure today is zero on all five ops, and that zero is not vacuous. Measured read-only
+2026-09-04T17:05Z (3781 observations, 31 superseded, **19 live tombstones**): all 19 pass
+the `compressed_into` conjunct, and it is the later ones that exclude them, narrowly — one
+sits at `injection_count = 12`, past `demotePinned`'s threshold of 8 and held out only by
+`cited_count`, and **13** are above `boostAccessed`'s access threshold, held out only by
+`importance = 3`, with the lowest of them at exactly `access_count = 4`. These figures are
+stamped because they walk: a draft written hours earlier read 3779 and 12.
+
+Using the shared predicate rather than an inline pair was not a style choice: the consumer
+ledger in `tests/inject-search-core.test.mjs` fired on `search-scoring.mjs` the moment the
+two clauses landed within its 200-character window. It did **not** fire on
+`lib/maintain-core.mjs`, where a long comment had pushed them apart — a scanner blind spot,
+not an exemption, so that site was converted too.
+
+### fix: `observations.importance` could be written NULL, and the two maintenance faces disagreed about what that meant
+
+`importance` is `INTEGER DEFAULT 1` but nullable, and the DEFAULT only applies when the
+column is omitted from the INSERT — which it never is, the column list being fixed. So a
+caller passing `importance: null`, or `importance: undefined` as an **own property** (which
+skips the defaults lookup), wrote a NULL. better-sqlite3 binds both to SQL NULL and throws
+on neither, so nothing upstream would have caught it.
+
+A NULL there is not cosmetic. `maintain-core.decayAndMarkIdle` reads
+`COALESCE(importance,1) = 1` and queues the row for purge; `search-scoring.runIdleCleanup`
+reads a bare `importance <= 1`, which is NULL and skips it. The row decays on one face and
+not the other.
+
+Aligning the two predicates was rejected — the alignment that closes the gap is the one that
+makes the MCP face **start** purging those rows — and so was a `NOT NULL` migration, which
+means rebuilding a table carrying FTS5 triggers and several indexes for a population
+measured at 0. Closed at the source instead: one normalizer in `lib/observation-write.mjs`,
+applied by **both** write cores, coerces a nullish `importance` to 1, so NULL is unwritable
+by construction rather than by luck. `doctor --session-audit` reports what got in another
+way (see the upgrade note above).
+
+The divergence itself is pinned rather than quietly aligned: a case drives a NULL-importance
+row through both faces and asserts they still disagree. Anyone who aligns them later does it
+on purpose.
+
+### docs: `lib/hook-stdout.mjs` asserted a host contract that would make `hook-precompact.mjs` dead code
+
+Its header said Claude Code drops a hook's plain-text stdout for every event except
+UserPromptSubmit — under which `hook-precompact.mjs`, which writes a bare
+`<claude-mem-context>` block, does nothing at all. Re-verified against the 2.1.260 bundle,
+that reading is wrong in two places, and a maintainer acting on it would have caused a
+regression.
+
+There are **three** channels, not one, and each event uses a different subset:
+
+1. **`additionalContext`**, off the stdout classifier's `answer` — built from plain text for
+   UserPromptSubmit and UserPromptExpansion **only**. SessionStart is not in that set,
+   contrary to the old comment.
+2. **`newCustomInstructions`**, off the result's `output` field, which is
+   `status === 0 ? stdout : stderr` — the raw stdout, whatever it is, quite apart from the
+   parsed answer. `executePreCompactHooks` reads exactly that and hands it to the compaction
+   summarizer; six read sites in the bundle.
+3. **the `hook_success` attachment**, emitted on the same status-0 branch with
+   `content = stdout.trim()`, which the attachment renderer turns into a real message for
+   SessionStart / UserPromptSubmit / UserPromptExpansion, prefixed
+   `<hookName> hook success: `.
+
+The first rewrite of this header found channel 2 and then asserted SessionStart was
+"dropped in silence" — false via channel 3, and the pre-tag correctness review caught it.
+Both the original error and that one have the same root: reading one channel and
+generalising to the event. The header now enumerates the channels instead of summarising
+them.
+
+So writing a bare block there is not merely allowed, it is the **only** correct form:
+routing it through the envelope would deliver literal `{"hookSpecificOutput":…}` to the
+summarizer as its instructions. `tests/precompact-stdout-shape.test.mjs` pins both the
+emitted shape and the absence of any envelope-writer import, so the consistency refactor
+cannot happen by accident.
+
+The rule both corrections share: *"the host drops plain text" is a claim about one channel.*
+Before believing it for an event, find which field that event's runner actually reads.
+
+### fix: `mem_export`'s project fallback undid the guard it was standing next to
+
+`_resolveProjectShared(db, x) || x` carried a comment about stopping a falsy resolution from
+dropping the project filter and exporting the whole store. It could not do that.
+`resolveProject` returns falsy on exactly one input a truthy `args.project` can be — a
+non-string, which it maps to `null` deliberately so `true.includes('--')` stops crashing
+every project-filtered command at the root helper. Unreachable over MCP
+(`memExportSchema.project` is `z.string().optional()`, validated before the handler);
+reachable through the exported `handleExportForTest` seam, where the fallback handed the
+non-string straight back.
+
+Reverting to the old shape and measuring what it actually did gives **three** outcomes and
+none of them is the wide export the comment feared: `true` gives
+`SQLite3 can only bind numbers, strings…`, `{}` gives `Too few parameter values were
+provided`, and `42` / `['a']` bind cleanly and silently return **zero rows**. (A draft of
+this paragraph put all three non-`{}` inputs in the bind-error bucket; the pre-tag
+correctness review re-ran them one at a time.) It is now screened explicitly, matching the policy the two date checks in the same
+function already state ("refuse rather than silently drop a filter"), and matching the two
+sibling sites in `server.mjs` and every `cmd*` in `mem-cli.mjs`, none of which carry the
+fallback. This one was the outlier.
+
+### Verification
+
+`env -u CLAUDE_MEM_DIR npx vitest run` → **350 files / 5787 cases**, green (v3.93.1 tag
+measured 344 / 5736; +6 files and +51 cases are this release's, of which one is generated —
+`tests/obs-id-caliber-sync.test.mjs` reacting to the new `lib/` module). `npx eslint .`
+→ no output. `./node_modules/.bin/knip` from the primary working tree → **52 unused
+exports, 0 unused files**, the same count as the v3.93.0 baseline with no new name in the
+set, so none of the release's **four** new exports is dead — `envNumber` plus three
+test-only helpers in `tests/env-number.test.mjs`; the other five new test files export
+nothing. (A draft said six, in a paragraph whose subject is counting.)
+
+Every guard added here was driven to fail before being trusted. The env sweep and the dedup
+suite were run **red against the real defect** before the fix. The rest were mutated:
+removing the superseded clause from all three maintenance sites reds exactly 3 of the 5
+tombstone cases; removing the importance coercion reds exactly the 3 write-core cases and
+leaves the doctor backstop green (correct — that case seeds its NULL with raw SQL);
+rewriting `hook-precompact.mjs` to emit an envelope reds the shape case, and adding an
+envelope-writer reference reds the source case; restoring `mem_export`'s old fallback reds
+all 4 non-string cases.
+
+### Pre-tag review
+
+Two independent fresh-context reviewers ran against the release diff before the tag, one on
+correctness and one on test effectiveness. Both returned SHIP-AFTER-FIXES. **Neither found a
+code defect** — 24 mutations between them, and every guard this release adds killed its own.
+Everything they found was a *claim* defect or a second-ring coverage gap, and all of it is
+repaired above rather than carried:
+
+- the **BLOCKER**: a draft credited the `0`-swallowing fix to `CLAUDE_MEM_UPS_TOP_MIN`, on
+  the false premise that `'0' || 50` is `50`. It is `'0'` — env values are strings and only
+  `''` is falsy. The suite has been green with `CLAUDE_MEM_UPS_TOP_MIN='0'` for releases,
+  which is the running counterexample. Corrected in the entry above, in
+  `scripts/user-prompt-search.js`, and in `lib/env-number.mjs`'s docblock.
+- the class-level env sweep was **blind over 346 lines of real code across 11 files**: its
+  block-comment stripper had no string awareness, so a glob or a URL replacement opened a
+  phantom comment. A banned idiom planted in one of those spans passed. The stripper is now
+  purely line-based, and the sweep also learned the two idioms it had been missing — the
+  trailing `Number(env.X) || D` and the `!== undefined ?` ternary — which is what let three
+  reverted `lib/cite-back-hint.mjs` sites go undetected. That module now has behavioural
+  cases of its own; reverting it reds four ways instead of zero.
+- `maintenanceStats`' `boostable` / `pinned` counters could gain the tombstone guard with
+  300 cases green, breaking scan-equals-execute in the direction the release's own comment
+  warns about. Both now pin forecast **and** execute.
+- one end-to-end case had only negative assertions and passed against a hook killed at
+  line 2. It now carries a deliberately-malformed knob whose warning must appear.
+- `CLAUDE_MEM_CITE_NUDGE_MIN_INJECTED` / `_SILENCE_AFTER` lost their `integer: true` — `2.5`
+  was a usable setting and a NaN guard should only screen NaN, which is this release's own
+  lesson applied to its own new code.
+
+**One finding is filed rather than fixed**, and it is named in the tombstone section above:
+`cleanupBroken` is a third hard-delete path a tombstone can reach. Not a regression, zero
+reachable rows today, and outside the scope the adjudication authorised — widening that
+under cover of a release is exactly what this project's process exists to prevent.
+
+## v3.93.1 — the repair for a writer/reader split moved the reader
+
+Two independent reviews of v3.93.0's own repairs — the twelve files that changed *after* that
+release's pre-tag reviews finished, and which therefore shipped unreviewed. They found three
+defects introduced by those repairs and one false rule published in the place designated to
+be followed. Everything here is inert on a default install: with `CLAUDE_MEM_RUNTIME_DIR`
+unset, `resolveRuntimeDir(dataDir)` and `join(dataDir, 'runtime')` are the same string, so
+the population affected is harnesses and `experiment/lib/arms.mjs` — which is precisely the
+population the original fix existed for.
+
+### fix: `hook-launcher-broken` — the repair moved doctor's READ side and left the only writer behind
+
+v3.93.0 made `install.mjs doctor` read the launcher's breakage marker from the override-aware
+directory. Its only writer, `scripts/hook-launcher.mjs`, still wrote it to
+`join(DATA_DIR, 'runtime')`. **Before that change the two matched in every configuration**, so
+the release closing a writer/reader split opened one, on the signal whose whole job is to make
+a silently-degraded install visible: under the override, `doctor` could not see a broken hook
+launcher.
+
+The direction of the fix is the point. By the rule that release wrote down, this marker is
+hook-written state another component reads back, so it MOVES — the writer was what was
+unfinished. That file is the one place that legitimately cannot import the resolver (it runs
+before the native binding is known to work and imports only `node:` builtins), and it already
+had an override-aware constant, `NB_RUNTIME_DIR`, applied to its native-binding markers and
+not to these. **One file, two markers, one line apart, and the rule was applied to half of
+them.** It is now `HOOK_RUNTIME_DIR`, covering all four; `RUNTIME_DIR` stays data-dir-relative
+and serves `swap-in-progress` alone, which is installation identity.
+
+### fix: `doctor`'s stale-temp scan and `cleanup()` disagreed about where `pending-*` lives
+
+Same shape, opposite half: v3.93.0 moved the deleter (`cleanup()`) to the override-aware
+directory and left the scanner eight hundred lines earlier reading the data dir. `doctor`
+reported `✓ Stale temp files: none` while the command it recommends removed two files. The
+scanner's other half — the `.update-staging-*` / `.update-backup-*` residue — reads
+`MEM_DATA_DIR` directly and is untouched: one block, both classes, which is exactly why the
+guard below had to change.
+
+### fix: `stats` counted hook errors in one directory and told you to tail another
+
+The count was moved to the resolver in v3.93.0; the `← tail <path>` hint beside it was not.
+Under the override it reported a non-zero count and pointed at an empty directory.
+
+### fix: the salvage regex could throw at the cap instead of returning null
+
+`salvageTruncatedHookEvent`'s capture was unbounded. On an 8 MB prefix whose `file_path`
+string is never closed, V8 exceeds its regexp backtrack limit and throws `RangeError` — past
+the caller's catch, into its top-level one. The process still exits 0, but it writes a
+`pre-recall:top` telemetry row: the same hook-error noise the v3.93.0 repair split
+`pre-recall:json` away from. Bounded to 4096 characters, above `PATH_MAX` on both platforms.
+**Not a ReDoS** — the review timed the historic backtracking shapes at 8 MB and the capture is
+the unrolled, unambiguous form; every input measured linear.
+
+### docs: `metrics/` was published as "moves with the override" in three places and it does not
+
+`lib/resolve-data-dir.mjs`'s docblock, README and the v3.93.0 CHANGELOG all listed `metrics/`
+in the MOVES column. `lib/metrics.mjs` is `join(dbDir, 'metrics')` and every shipped caller
+passes the data dir — it is a SIBLING of `runtime/`, not inside it, and setting the override
+moves none of it. The v3.93.0 *fix* was right: `join(RUNTIME_DIR, '..')` stopped equalling
+`DB_DIR` the moment the override was honoured, and deriving one directory out of the other is
+the defect. The one-word classification was wrong, **in the sentence that exists to stop the
+next person guessing** — a sweep obeying it literally would convert `recordMetric(DB_DIR, …)`
+back to a runtime-relative path and re-open what that release closed. The STAYS column now
+separates its two different reasons instead of implying one.
+
+### test: the guard's allowlist is per SITE, not per file — which is why it missed both fixes above
+
+v3.93.0's sweep allowlisted whole FILES. Three of its six entries hold both stays-put and
+moves-with-the-override sites, so **inside those files the guard was simply off** — reverting
+that release's own `install.mjs` repair was invisible to the entire suite, and both live
+splits above were sitting in allowlisted files. A file-level reason cannot express "this file
+has both kinds".
+
+A constructing line now carries `// runtime-dir:stays-put — <reason>`; eleven sites are
+annotated, and a marker on a line that no longer constructs, or with no reason, fails. Three
+blind spots the review found are closed with it: two levels of nested parens
+(`join(dirname(fileURLToPath(…)), 'runtime')` is a repo idiom that one level cannot cross),
+`resolve()` alongside `join()`, and template-literal / concatenation forms. A third sweep,
+`INVERSE_RE`, catches the other direction — deriving the data dir back out of the runtime dir,
+the `join(RUNTIME_DIR, '..')` shape that nothing guarded even though this release's own fix
+set removed seven of them. **Its first draft required a prefix before `RUNTIME_DIR`, so it
+matched `NB_RUNTIME_DIR` and missed the bare form — i.e. all seven sites it exists to catch.**
+
+Also fixed, each found by mutation: nothing asserted that `pre-tool-recall.js` actually
+*calls* the salvage helper (deleting the branch left 107 cases green, and the test file's own
+comment claimed the opposite); the import-proximity check used an 80-character window that a
+correct fourth import symbol would have turned red; the `VIA` ledger was still satisfiable by
+a commented-out import; a `filter(…).length >= 2` companion assertion passed under the exact
+collapse it named and was removed rather than kept as reassurance; and the workflow pin
+exemption covered `docker://` with a mutable tag, which is the supply-chain shape it exists
+to catch.
+
+Verification: 344 files / **5736** tests green, eslint 0/0, knip 52 unused exports / 0 unused
+files. Nine mutations this round, nine killed — including all four that survived the review
+(two-level nesting, template literal, a revert inside a formerly-allowlisted file, and the
+inverse derivation), each now naming its own `file:line`.
+
+## v3.93.0 — a DDL change unreachable from the version the DB reports is a no-op with a convincing diff
+
+**Upgrade note — two user-visible behaviour changes, both narrow.**
+
+1. **`CLAUDE_MEM_RUNTIME_DIR` now relocates hook-written runtime state instead of splitting
+   it.** Previous releases moved only part of the runtime, so the `fyi` and `pretool` faces
+   wrote their markers into the override while `ups` and `keyctx` read them from the real
+   directory — no error, no empty directory, nothing to notice. Four subsystems were split
+   that way: the cross-hook injected-ids marker and skill cooldown, hook-error telemetry, the
+   metrics sink and its GC, and the native-binding breakage marker (the self-heal trigger).
+   **Action:** none if you do not set the variable. If you do: state left in the override
+   directory by an older release is now read as well as written; an empty-string value is
+   treated as unset rather than resolving to the current working directory; and
+   installation-identity state — `install.lock`, `update-state.json`, update residue —
+   deliberately does NOT move with the override, because two installers pointed at different
+   override directories would each take their own lock and both proceed.
+2. **`registry search` no longer prints a `Path:` line for a resource outside the managed
+   directory.** The CLI and MCP copies of that renderer had drifted; the MCP semantics were
+   kept, so the CLI now matches it. The path was never actionable on those rows — their `Use:`
+   line names the resource — and printing it spelled out a home directory for no gain.
+
+**Revert path** for either: pin the previous release (`npm i -g claude-mem-lite@3.92.0`, or
+the equivalent plugin pin). **Schema:** this release adds migration **v47**, additive only —
+two indexes, no column or table change, applied automatically on the next DB open.
+
+Audit items **P1-7, P1-9, P1-14, P1-15, P2-4, P2-5, P2-6, P2-7, P2-11, P2-13, P2-17, P2-19**
+from the 2026-09-02 backlog, which closes every P0 and P1 that round opened except P0-1 —
+skipped by decision after its own premises were refuted (the host's `SessionEnd` has no
+`exit` reason, also fires on `resume`/`logout`, and runs inside a kill window the proposal
+did not account for).
+
+### chore: two indexes, and the version bump that makes them reachable (P2-11 + the previous round's ALGO-7)
+
+An index on `session_summaries.memory_session_id` — the only genuine full table scan among
+the 30 statements the audit put through `EXPLAIN QUERY PLAN`, on a probe both Stop and
+SessionStart make — and a partial index on `observations(project, created_at_epoch DESC)`
+over the same live-row predicate `liveObsFilterSql` uses.
+
+**The version bump is the fix, not bookkeeping.** `initSchema`'s fast path returns before the
+`CREATE INDEX IF NOT EXISTS` block, so on every install already reporting v46 a new index
+there is simply never created — the trap the FTS5 migration hit. A DDL change unreachable
+from the version the DB reports is a no-op with a convincing diff.
+
+The test for that took two cuts, and **the first one could not have caught the omission it
+was written for**: it stamped `CURRENT_SCHEMA_VERSION - 1`, a relative anchor that moves with
+the constant and is one behind by construction, so reverting the bump left it green. The
+literal `46` — the version v3.91.0 shipped — is what discriminates.
+
+### The two pre-tag reviews, and what they changed
+
+Both independent reviews of this batch found live defects, and one of them found that a fix
+in this very release was only half applied. Recording it here because the pattern is the
+useful part.
+
+**The correctness review's grep said the sweep was complete; the mutation review's probe
+said it was not, and the mutation review was right.** The grep looked for readers of
+`CLAUDE_MEM_RUNTIME_DIR` and found every one of them going through the resolver — which is
+necessary and not sufficient, because a module that builds `join(dataDir, 'runtime')` and
+never mentions the variable cannot appear in that grep at all. That is the shape both
+original offenders had. `scripts/user-prompt-search.js` was still doing it: it resolved its
+own `RUNTIME_DIR` here and then built the SHARED cross-hook marker from the data dir, so the
+release's headline claim was false when it was written.
+
+The guard has been rewritten to sweep for the defect FORM rather than for a re-derivation of
+the rule, which kills both of that review's surviving mutations at once — including
+`hook-optimize.mjs`, which the fix named and nothing covered. Its allowlist is a Map of
+file → reason with a reverse-guard: an entry whose file no longer builds the path fails, so
+the list cannot rot into a raised baseline. **Its first regex was itself wrong** — `[^)]*`
+cannot cross the inner `)` in `join(resolveDataDir(env), 'runtime', …)`, so it was blind to
+exactly the two files it was exempting. The reverse-guard is what caught that, which is the
+argument for having one.
+
+Five other assertions were found not to bind and are fixed here: `settles exactly once` was
+satisfied identically with and without the guard (a native promise ignores a `reject` after
+it has resolved, so the stated rationale was wrong — it now spies on teardown); the five
+stdin entry points were guarded on IMPORT, so keeping the import and bypassing the call with
+an unbounded `stdin.on('data')` accumulator stayed green; `doctor`'s two missing-file checks
+could collapse onto one message and still satisfy both regexes; the drift check's level was
+asserted as `['fail','warn']`, which cannot see the `fail`→`warn` downgrade it exists to
+catch (it emits `warn`, pinned as measured); and P2-6's semantics were pinned on the CLI face
+while the MCP face — whose semantics were the ones KEPT — had no assertion on its rendered
+output at all.
+
+**One of those fixes reproduced the defect it was written for, one line at a time.** The new
+MCP assertion first checked the whole search response for the absence of a `Path:` line —
+which the OTHER row in the same response satisfies, since both fixtures share query tokens.
+It now extracts the row block and asserts the managed and non-managed rows against each
+other, so the negative half cannot pass on a face that stopped rendering anything.
+
+### fix: `CLAUDE_MEM_RUNTIME_DIR` had eight hand-written homes and two modules that never heard of it (P1-14)
+
+The audit proposed deleting the variable from the five scripts. Measured before copying that
+down: it is load-bearing in ten test files, in `hook-launcher.mjs`, and in the experiment
+harness — a lot to spend removing a knob when the defect was never that the knob exists.
+`resolveRuntimeDir` in `lib/resolve-data-dir.mjs` is the one home.
+
+**Which sites call it is a decision, not a sweep, and that is written down at the resolver.**
+Hook-WRITTEN state that another component reads back moves with the override: the cross-hook
+marker and skill cooldown (`scripts/user-prompt-search.js`), hook-error telemetry
+(`mem-cli.mjs` was reading it from the data dir while every writer used the override, so
+`stats` would have reported zero hook errors), the metrics sink and its GC (`hook.mjs` derived
+the data dir as `join(RUNTIME_DIR, '..')` seven times — an identity that stopped holding the
+moment the override was honoured, so metrics were written to the override's parent and the
+real `metrics/` was never pruned), episode buffers, the shadow-recommendation log, and the
+native-binding breakage marker (`install.mjs` read it from the data dir while
+`lib/hook-telemetry.mjs` wrote it to the override — that marker is the self-heal trigger,
+the mechanism that was once dead for four days).
+
+Installation-identity state does NOT move: `install.lock`, `update-state.json`, the swap
+marker, the `.update-staging-*` residue scan. The lock exists to serialise concurrent
+installers, and two installers pointed at different override directories would each take
+their own and both proceed. Sweeping those into the resolver would have looked like finishing
+the job and would have broken it.
+
+`hook-launcher.mjs` keeps an inline copy and says why: it runs before the native binding is
+known to work and imports only `node:` builtins on purpose, so even an import-free module is
+a resolution it declines on the path whose job is surviving a broken install. It is the
+sweep's single declared exception, and **the sweep fails if that file stops carrying the
+rule**, so the allowlist cannot rot into a raised baseline.
+
+**The whole suite passed both before and after, which is why the new test file exists.**
+Nothing anywhere asserted the variable did what its name says, so the fix would have been
+invisible and the next regression silent. Reverting `hook-shared.mjs` to
+`join(DB_DIR, 'runtime')` turns it red.
+
+**Not fixed, and now documented instead of implied:** `CLAUDE_MEM_DB_PATH` has the same
+shape — the hook scripts honour it, `schema.mjs` does not, so a harness setting it aims the
+hooks at one database while the CLI and MCP server open the real one. Closing that changes
+which database a released CLI opens, which is a decision to take on its own rather than
+inside a refactor. The README now says so.
+
+### fix: the summary waited on every project's flushes, and three stdin readers had no bound (P1-7 + P1-9)
+
+`handleLLMSummary` waited for `readdirSync(RUNTIME_DIR)` to contain no `ep-flush-*` file at
+all — a condition about the whole machine, checked by a worker that only cares about its own
+session. `RUNTIME_DIR` is shared by every project, so one crashed `llm-episode` worker left a
+flush file nothing deletes, and from then on **every** project's summary burned its full 15 s
+on **every** Stop until a maintain run swept it — and orphan cleanup sits behind a 24 h gate.
+A flush spawned by an unrelated project mid-wait extended the wait for work the summary would
+never read.
+
+Now a defined set, snapshotted at entry and filtered to files young enough to belong to a
+live worker: a file that appears later is somebody else's, and one older than
+`ORPHAN_EPISODE_AGE_MS` is nobody's. Both were previously indistinguishable from work in
+progress. Not narrowed by project — the flush filename carries none, and widening it is a
+marker-format change with in-flight files across an upgrade.
+
+Six hook processes read the host payload off stdin six ways: three bounded at three different
+calibers, three as `for await (const chunk of process.stdin)` with no cap and no timeout.
+`lib/hook-stdin.mjs` owns the mechanism now — cap, timer, teardown, and settling exactly
+once. **The calibers are not unified:** a user prompt is not a tool response, and handing one
+caller another's limits is a behaviour change wearing a refactor's clothes.
+
+**The first cut of this got the caliber wrong on the face that mattered, and the pre-tag
+review measured it.** `pre-tool-recall` was given the 256 KB module default with the argument
+that a truncated payload "is what the host's 3 s fail-open did anyway". It is not:
+`JSON.parse` of a 5 MB payload takes **2.99 ms**, and 10 MB takes **10.8 ms** — three orders
+of magnitude inside the fail-open, so the old unbounded read was not timing out, it was
+working. The cap did not make an existing loss deliberate, it created one, on `pretool` — the
+highest-cite-rate injection face this project measures — and logged a `pre-recall:json` hook
+error for it, which `stats` and `doctor` read as an install-health signal. This repo's own
+`CHANGELOG.md` is 1 MB, so a `Write` to it was enough to trigger the whole sequence.
+
+Both halves are fixed. `TOOL_INPUT_FILE_MAX_BYTES` (8 MB) names the payload CLASS — a whole
+file — and is shared by the two entry points that see it, so they cannot drift apart; it is a
+memory backstop, not a functional gate. And past the cap the payload is now salvaged rather
+than dropped: `salvageTruncatedHookEvent` recovers `file_path` / `session_id` / `tool_name`
+from the truncated prefix, the same way `hook.mjs handlePostToolUse` already recovered
+`tool_name`. **Salvage can only add recalls, never remove one** — when the prefix does not
+carry the field it returns null and the caller takes exactly the path it took before.
+
+Settling once is the other property worth naming: each hand-written copy had four paths to
+get right, and `.destroy()` in the cap branch can itself emit `'error'`, so `settle()` really
+is entered twice. What that guard buys is **teardown running once** — not, as the first
+version of its test claimed, protection from an unhandled rejection; a native promise
+silently ignores a `reject` after it has resolved, which is why deleting the guard left all
+seventeen cases green.
+
+### chore: 20 action references pinned to SHAs, and a workflow that had no permissions block (P2-19)
+
+All 20 first-party action references pinned to commit SHAs, each carrying its version as a
+comment so the diff stays reviewable. **Pinned to the SHA of the major already in use**, not
+the latest release — upgrading majors is a separate change and mixing it into a security fix
+hides a behaviour delta inside it. `softprops` was already pinned; the `actions/*` were not,
+which is the more common half of this shape because first-party feels safe.
+
+`ci.yml` gains `permissions: contents: read`. It was the workflow without a block, and it is
+the one that runs on `pull_request` — a fork's branch, after several thousand dev
+dependencies' install scripts. `publish.yml`'s version-consistency check moves ahead of lint
+and the coverage suite: it gates a mistagged release, depends on nothing they produce, and by
+then the tag is already pushed either way.
+
+`.github/dependabot.yml`, because a pinned SHA with no updater is how a pin becomes an
+unpatched pin. Majors ignored, dev updates grouped — every lockfile change has to pass the
+`@emnapi` pruning guard that has regressed twice.
+
+### change: the registry `Use:` renderer had one rule and two implementations, already drifted (P2-6)
+
+    MCP   isManaged ? toPortable(local_path) : ''
+    CLI   isManaged && local_path.startsWith(home) ? '~'+… : (local_path || '')
+
+For a non-managed resource the CLI printed `Path: /home/<user>/…` — absolute, un-tilde'd — on
+a row whose `Use:` line never refers to the path. MCP printed nothing. **Nothing asserted
+either behaviour**, so the divergence was free to happen and free to stay.
+
+`resourceUseHint()` returns data, not a rendered line: the two faces genuinely differ in
+dialect (four spaces and `out()` vs two spaces and Markdown bold), and collapsing that would
+replace a real duplicate with a formatting flag.
+
+One test was pinning the old behaviour. Its sibling `enrich` case failed too, and **the cause
+is worth recording because it looked like a second regression**: the first case threw before
+its `registry remove` step, leaving a non-managed row behind for `enrich` to refuse.
+Confirmed by running the file against HEAD (28/28) before touching either.
+
+### refactor: one home for the plugin key, because "disabled" has to mean disabled (P2-7)
+
+`PLUGIN_KEY` and `isPluginExplicitlyDisabled` shipped twice in JS, and that duplication was
+load-bearing rather than untidy: `install.mjs` writes hooks directly into `settings.json`, so
+disabling the plugin in the UI does not remove them. This predicate is the only thing that
+makes "disabled" mean disabled, and a key drifting on one side leaves the user with a plugin
+they switched off and a hook set that never noticed. Now `lib/plugin-key.mjs`,
+zero-dependency because `hook.mjs` imports it at module scope on the hottest path in the
+system. The bash copy in `post-tool-use.sh` stays a copy — that path exists to never reach
+node — and its parity is tested, which is a different thing from two homes and a comment.
+
+**Its parity guard went red on the move, and that is the source-anchor shape exactly**: it
+grepped `hook.mjs` for `const PLUGIN_KEY = '…'`, an anchor that legitimately relocated. It is
+now anchored on the imported value, and additionally asserts `hook.mjs` has not re-typed a
+literal — an inline copy would have satisfied the bash comparison while being free to drift.
+The test also carried a third hand-written copy of the key; it imports the shipped one now,
+or the whole comparison was the test agreeing with itself.
+
+### refactor: the last two CLI/MCP twins (P2-4, P2-5)
+
+`get`'s session leg was the one detail source with no shared fetch. Its **field** set already
+came from `get-core`'s `SESSION_DETAIL_FIELDS`, so the twin was down to the query itself —
+**a shared field list sitting over two hand-copied SELECTs is the half-collapsed shape that
+lets a WHERE drift while the columns stay in step.**
+
+`export`'s columns have been shared since v3.42 HIGH-2 — found when the MCP handler was
+carrying a narrower 16-column SELECT and silently dropping text, aliases and citation signals
+from the advertised backup→restore flow. The predicate was still written twice. On the one
+command whose output people restore from, that is the same half-collapse.
+
+Every difference between the faces stays with them, because each is a decision rather than an
+accident: the CLI `fail()`s with a usage message where the MCP tool throws; the CLI defaults
+to the complete matching set (it is the documented backup half) where MCP defaults to 200 and
+probes `limit+1`, because an MCP result is model context and a bare exploratory call must not
+dump a store into a transcript.
+
+**A consumer ledger went red because the sharing got stronger**: it required every listed file
+to import the live-filter core, and `server.mjs` now reaches it *through* `buildExportWhere`.
+It accepts a declared intermediary now, then checks that intermediary actually imports the
+core, plus a second case that fails if an entry goes dead. Deleting the assertion would have
+been the wrong repair — the per-file pair scan passes trivially for a file that stopped using
+the live filter at all, which is the regression the import check exists to catch.
+
+### test: the coverage exclusion rationale was expired for one of three, not three (P1-15)
+
+The audit challenged the `exclude` rationale ("only exercised through subprocess E2E") for
+`install.mjs`, `server.mjs` and `registry.mjs`, on the grounds that 13 / 13 / 9 test files
+import each one in-process. Measured per file rather than argued, by temporarily adding each
+to `include`:
+
+| file | statements | lines | verdict |
+|---|---|---|---|
+| `install.mjs` | 11.67% | 10.22% | rationale **holds** |
+| `server.mjs` | 25.89% | 27.54% | rationale **holds** |
+| `registry.mjs` | 86.78% | 90.27% | rationale **expired** |
+
+**Importing a module is not exercising it**: the thirteen files importing `install.mjs` reach
+an eighth of it. `registry.mjs` is now in scope, which *raised* the totals — 84.32% → 84.38%
+statements — because a well-covered file had been invisible. Adding all three would have taken
+statements to 71.05% and blown every threshold, i.e. measured the harness exactly as the
+original comment claimed.
+
+**Worth knowing before anyone repeats the experiment**: those three were named in `exclude`
+while `include` is an explicit allowlist that never named them, so the `exclude` entries were
+belt-and-braces and removing one changes nothing. The first attempt measured a 152-statement
+delta that was entirely unrelated edits.
+
+Second half: `doctor` renders 26 check lines and 15 appeared nowhere under `tests/`. Three
+failure branches are now driven through the real `install.mjs doctor --json` against a fixture
+HOME, asserting the level rather than the ✗ glyph. **Each asserts a premise first** — the same
+fixture reports the check clean before the defect is introduced — because "the entry says
+fail" also passes on a fixture so broken that `doctor` never reaches the check.
+
+Two things kept as comments rather than smoothed over: `Object.values(parsed)` on
+`doctor --json` yields `[4, 3, "4 issue(s)…", [...]]`, so every `find()` returns `undefined`
+and all three cases fail claiming the branch never fired — the parser now asserts `checks` is
+an array. And `server.mjs` and `hook.mjs` are **not** independent checks: deleting `hook.mjs`
+makes doctor report `server.mjs` missing too, because `detectInstallShape` only calls a
+directory a managed install when both are present. A first draft asserted the opposite.
+
+### Measured and declined, with the enumeration as the deliverable
+
+**`no-shadow` (P2-17).** Enabled, measured, turned back off. 70 violations tree-wide: 16 in
+shipped source, 1 in `tests/sandbox`, 54 under `tests/`. The audit reported 17, matching
+shipped + sandbox exactly, so the disagreement was scope and not measurement. **The shape is
+what decides it:** `install.mjs:1530-1533` — `ok`/`warn`/`fail`/`log`, the audit's
+first-listed example — is the mechanism rather than a defect. `doctor()` shadows the
+file-level helpers on purpose so every existing call site records into `checks` instead of
+printing; that *is* how `--json` works. The rule would force a disable comment onto a
+documented design, or ~40 renames to undo it. A rule whose first hit is a deliberate mechanism
+gets disabled by the next person rather than obeyed. The one hit worth acting on was renamed
+by hand: `handleUserPrompt` bound `raw` to the stdin payload and rebound it ~120 lines later
+to a marker file's contents — now `keyCtxRaw`. Fixing it did not need the rule, and the rule
+would have buried it among sixteen renames nobody asked for.
+
+**The MinHash claim, half right (P2-13).** "MinHash pre-filter cuts the O(N²) scan" is false —
+the estimate is evaluated inside the inner loop of a full nested scan, so every pair is still
+visited; what it skips is the exact Jaccard behind it. Comment corrected. The other half, an
+allocation-free comparison, was **built, measured and rejected**: a `charCodeAt` loop replacing
+`slice()` gave identical results over all 124,750 pairs of a 500-title fixture (0 mismatches,
+so the rewrite was correct) and no time difference — 0.77× / 1.08× / 1.03× across three
+passes, the first pass *slower*. The whole pair pass is 0.6 ms. The negative result lives in
+the docblock so nobody re-proposes it.
+
+### docs: the test count belongs to a tree, and there are three of them
+
+`main` after the audit-backlog work reads 344 / 5726; the **v3.92.0 tag** is 337 / 5665 and
+v3.91.0 was 324 / 5524. The tag is the one a user installs, so quoting `main`'s number under
+the tag's name attributes post-release work to a release that does not contain it.
+
+## v3.92.0 — ten items from the 2026-09-02 audit backlog
+
+**Upgrade note — one user-visible behaviour change.** Registry *enrichment* now refuses to
+read a resource whose `local_path` lies outside `CLAUDE_MEM_DIR`, on all four legs instead of
+one (`enrich <name>`, `enrich --all`, `import --enrich`, `mem_registry(action="enrich")`).
+If you have resources registered outside the managed directory, those rows will report
+`Refused N: local_path outside the managed directory` instead of being enriched — the message
+is the discoverability signal, printed at the point of use rather than only here. **Action:**
+either re-register those resources inside `CLAUDE_MEM_DIR`, or set
+`CLAUDE_MEM_REGISTRY_CONFINE=off` (only `off` disables the gate, case-insensitively and
+ignoring surrounding whitespace; every other value — including a typo — leaves it on).
+**Revert path:** pin the previous release — `npm i -g claude-mem-lite@3.91.0`, or the
+equivalent plugin pin. Nothing else in this release changes a default.
+
+Audit items **P1-3, P1-4, P1-5, P1-6, P1-8, P1-12, P1-13, P1-16, P2-12, P2-15(d)**.
+Earlier batches from the same backlog (P0-2/3/4/5/6, P1-1, P1-2, P1-11, P2-1) landed in the
+four commits before this section and are not described here.
+
+Five of the ten are the same defect class — a rule that shipped in more than one place —
+and the reason they keep being worth closing is that **each one had already drifted**:
+`server.mjs` reported a demote threshold the code no longer used, `hook-optimize` wrote the
+vector row to a column name that did not exist, and `convert-commands` parsed a
+`description: |` block as the literal `|`.
+
+### refactor: the maintain execute SEQUENCE, once (P1-5)
+
+Every maintain OPERATION was already shared; the ORDER, the cap hint and the result strings
+were hand-copied into both faces. `runMaintainOps` in `lib/maintain-core.mjs` owns the
+snapshot, the transaction and the three post-transaction ops — all three are part of the
+ordering contract (the snapshot counts only PRE-EXISTING pending rows, so purge must precede
+decay; VACUUM cannot run in a transaction). Each surface keeps only its own dialect: how it
+spells `merge_ids`, and what its purge preview tells the caller to type.
+
+Found by the new guard rather than by reading: `maintain --help` also quoted `inj>=8` as a
+literal.
+
+### refactor: one save transaction, and the two policies inside it (P1-6)
+
+`mem_save` and `cmdSave` each wrote out the same transaction under a comment saying it was
+"kept in sync with" the other. The dedup short-circuit before the resolver (which is what
+makes a replayed save idempotent) and D#195's `allowStatuses: ['open', 'dropped']` are
+policy, not plumbing. `saveWithClosures` imports the resolver rather than taking it as a
+parameter, so a caller cannot reinstate the one-way gate D#195 closed.
+
+### refactor: one observation_vectors writer, and lib/ stops importing the hook layer (P1-4)
+
+The upsert shipped five times. Four now share one body; the fifth — maintain-core's bulk
+rebuild — stays a copy on purpose (own vocabulary, one reused statement, throw-aborts
+semantics). Separately, `lib/save-enrich.mjs`'s `await import('../hook-optimize.mjs')` was
+the only edge from `lib/` into a non-leaf hook module; the body moved into `lib/`, so the
+edge is gone and a guard now pins the direction with one named exception.
+
+**Correcting the audit on its own finding:** it reports the `vectorsEnabled()` gate as
+inconsistent across the five sites. It is inconsistent, but it is not a hole —
+`getVocabulary` returns null whenever the arm is off and every path guards on the vocab, so
+no site can write while disabled.
+
+### refactor: one frontmatter parser and one registry FTS5 DDL (P1-16)
+
+Three parsers, of which two were byte-identical and the third was a simplified cut with no
+`|` block support — so `description:`, the field the recommendation gate reads, came back as
+the literal `|` from whichever script ran last. Now `lib/frontmatter.mjs`. In the same file
+pair, `scripts/index-managed.mjs` also carried its own copy of registry.mjs's FTS5 table and
+trigger DDL, and that copy had drifted **in its documentation first**: its comment gave
+`trigger_patterns` a weight of five against a shipped `bm25(…, 3.0, 3.0, 3.0, 2.0, 2.0, 1.0,
+1.0, 1.0)`.
+
+### test: the sandbox harness was driving an entry point that does not exist (P1-13)
+
+Phase A's auto-update case ran `node hook-update.mjs --check` with
+`CLAUDE_MEM_FORCE_UPDATE_CHECK=1`. That file has no argv entry and nothing reads that env
+var, so the process imported a module, ran nothing and exited 0 — two of the 43/43 this
+harness reports were vacuous. It drives `hook.mjs update-check` now, and the premise took
+three cuts: "the state file exists" passed against the no-op too, "lastCheck advanced" went
+correctly RED because the 24h gate short-circuits, and backdating the gate first took it
+43/44 → 44/44.
+
+### change: registry enrichment is path-confined on all four legs, not one (P1-3)
+
+Enrichment reads the file at `resources.local_path` and hands it to an LLM. The confinement
+check guarded **one** of the four code paths that do this — `mem_registry(action="enrich")` —
+while `enrich <name>`, `enrich --all` and `import --enrich` (on **both** faces) read whatever
+path the row held. Counting the legs is what showed the MCP side was itself half-guarded: a
+CLI-only patch would have left the shape alive on both.
+
+All four now funnel through `enrichResourceRow` in `lib/registry-core.mjs`, and `confineTo`
+is a **required** argument — a fifth leg written without it throws instead of silently
+running ungated, and `tests/registry-enrich-confinement.test.mjs` catches it statically
+first. **Escape hatch:** `CLAUDE_MEM_REGISTRY_CONFINE=off`. Only `off` disables the gate —
+case-insensitively and ignoring surrounding whitespace (`OFF` and ` off ` open it too); every
+other value, a typo included, leaves the gate on.
+
+**This is a behaviour change on the CLI**: a resource registered outside `CLAUDE_MEM_DIR` now
+reports `Refused N: local_path outside the managed directory` instead of being read. Refusals
+are counted separately from failures, so `Done: N enriched, M failed` keeps its old meaning.
+
+### fix: abandoned per-project episode buffers are reclaimed at 7 days (P1-12)
+
+`runtime/ep-<project>.json` had no reclamation path at all — excluded from both marker-GC
+lists and never matched by `sweepOrphanEpisodeFiles`, which only ever looked at `ep-flush-`.
+Four of them were live on the machine that filed the audit, the oldest 53 days.
+
+Leaving them was not neutral: `readEpisode` has no staleness gate, so `handleSessionStart`
+flushes whatever it finds, and revisiting such a project injects months-old tool activity
+stamped with today's date. 7 days, because nothing legitimate keeps a buffer alive even one
+day (`EPISODE_TIME_GAP_MS` 5 min, `SESSION_EXPIRY_MS` 12 h); the margin is slack for a
+suspended laptop. The one deletion here that discards content rather than residue is named
+individually in the debug log.
+
+### fix: the cite-recall snapshot filename has one definition (P2-15(d))
+
+`handleStop` wrote `runtime/cite-recall-<project>.json` and `buildCiteRecallNudge` read it
+back, each deriving the name itself — the shape ARCH-2 collapsed for the cooldown file one
+round earlier. A writer and a reader disagreeing about a filename does not throw; the read
+misses, the catch swallows it, and the SessionStart nudge is silently gone. Now
+`lib/cite-recall-path.mjs`, with the marker GC matching the family by the same exported
+prefix.
+
+### perf: the transcript retention cap is derived from the heap instead of hardcoded (P2-12)
+
+Above the cap the parse memo is declined and every caller parses for itself, so `handleStop`
+— which asks `lib/transcript-scan.mjs` twelve questions — degraded to twelve full parses at
+exactly the size where one parse is already expensive.
+
+The audit proposed caching a projected subset of each entry. **Not taken:** the twelve
+scanners read arbitrary fields, so a projection is a hand-maintained field manifest, and a
+scanner reading a field nobody projected sees `undefined` and silently answers a narrower
+question. Measured before deciding: **112 transcripts on this machine, largest 4.9 MB, zero
+above the 24 MB cap** — the report's "50 MB ≈ 3.8 s" is an extrapolation from a 4.37 MB
+measurement, not an observation.
+
+Instead the cap is expressed against the thing it protects: a quarter of the process heap
+limit, ceilinged at 256 MB and floored at the old 24 MB constant. On an ordinary 64-bit Node
+that admits ~74 MB transcripts (one parse, not twelve); under a constrained limit it shrinks
+*below* 24 MB, which is the correct direction and is exactly what a fixed constant could not
+do. No caller sees a difference in what it gets.
+
+### perf: six modules load in the handler that needs them, not on every hook event (P1-8)
+
+`hook.mjs` is one entry point for seven events, so every static import is paid by every
+event. Six are now `await import()`ed inside their handler: `hook-update`, `hook-optimize`,
+`registry-recommend`, `adopt-cli`, `lib/upgrade-banner`, `lib/patha-exclude-meter`.
+**Deterministic result: hook.mjs's static import graph is 85 → 75 modules** (85 matches the
+audit's own count).
+
+**The cold-start saving is NOT established.** A back-to-back alternating wall-clock A/B read
+76 → 69 ms (min of 15 each), but a three-arm re-measurement the same minute put "eager
+hook-update only" at 68 ms against 70 ms for the shipped all-lazy build — the arms overlap
+and the direction reverses, so the effect is below this machine's noise. A heap-at-exit
+caliber read the wrong sign in all three runs. What is measured is the graph size; the
+milliseconds are not.
+
+Three modules the audit named are deliberately **not** converted: `hook-llm.mjs` (the largest
+at +16.3 ms) because the synchronous `flushEpisode` on the PostToolUse path calls
+`saveEpisodeImmediate` from it, and extracting that function does not pay — it reaches
+`saveObservation`, which pulls tfidf / observation-write / activity / maintain-core anyway;
+`lib/db-backup.mjs` and `lib/compress-core.mjs` (≤2.4 ms each) because their call sites sit
+in synchronous functions whose callers would all have to become async.
+
+### test: a dynamic import of a repo module must destructure its bindings
+
+Found while doing the above, and it is the same class as D#207. Written as
+`(await import('./hook-optimize.mjs')).handleLLMOptimize()`, knip's unused-export count fell
+**53 → 49** and the four names that LEFT the list were all exports of `hook-optimize.mjs` —
+still dead, now invisible, because knip cannot resolve a member access on the namespace and
+treats the whole module as consumed. **The count going down read like an improvement.**
+Rewriting the six sites with destructuring restored 53 with a byte-identical name set.
+`tests/no-url-module-paths.test.mjs` now carries both rules. Scope is relative specifiers
+only: `(await import('better-sqlite3')).default` is the idiom at five sites here and an
+external package has no exports for knip to report.
+
+### fix: two defects this release introduced, found by the pre-tag review
+
+Two independent reviewers ran the diff before the tag — one on correctness, one on test
+effectiveness (85 mutations, 78 killed). Neither found a BLOCKER. Both found defects **this
+round created**, which is the point of running them.
+
+**`retractPreSavedObs` un-hid the children of a row it then refused to delete.** Collapsing
+three bare `DELETE`s into one guarded helper put `recoverChildrenOf` *above* the liveness
+check. On the not-live branch the DELETE was correctly a no-op — and the children had
+already been un-hidden, so a dedup that had legitimately folded #M into #N was silently
+undone while #N survived and the debug line said "left in place" (true of #N, false of #M).
+None of the three pre-refactor sites called `recoverChildrenOf` at all, so this did not
+exist before. The check now precedes the recovery and both statements share a transaction.
+The new test file had a case on either side of this cell and none on it.
+
+**`atomicWriteFileSync` left its temp file behind on a failed rename.** The private twin in
+`hook-context.mjs` had a `catch { unlinkSync(tmp) }`; the shared writer never did, so the
+migration lost it. Several callers write into the *user's* project root, where nothing
+sweeps `CLAUDE.md.tmp-<pid>` and it surfaces in their `git status` — the silent-artifact
+class P0-5 was about. Fixed once in the shared writer rather than restoring one local catch.
+
+**And a claim that was wrong in four places, not three.** `CLAUDE_MEM_REGISTRY_CONFINE` was
+documented as disabled by "only the exact value `off`" against a
+`.trim().toLowerCase() !== 'off'`. The safety property held (every typo fails closed); the
+wording did not. The review named three sites; sweeping for the assertion rather than
+visiting the named ones found a fourth in `README.md`.
+
+### test: three guards enumerated yesterday's file names
+
+The review's structural finding, and it is one shape three times. `frontmatter-single-home`,
+`cite-recall-path-single-home` and `symlink-preserving-writes` each argued in their own
+header that a unit test of the shared thing is insufficient — then swept a **fixed list** of
+the files the duplicate had occupied that day. A fourth copy is invisible to all three, and
+the review demonstrated it three times with all cases staying green. Two of the headers say
+in as many words that "three copies existed because nothing stopped the third".
+
+All three now walk the tree with a stated allowlist, a "the walk found a plausible number of
+files" premise, and a check that each allowlisted file really does still carry the thing it
+is allowlisted for — so the rule cannot rot into an empty set. The walk itself lives in
+`tests/shipped-tree.mjs`, because three copies of a directory walk is the same defect again.
+
+The symlink sweep's predicate took a correction worth recording: `renameSync(` alone
+reported six files, none of which is this defect — they are file *moves* (data-dir
+migrations, the update version swap, the episode-claim rename), and a move cannot replace a
+user's symlink because it writes no temp first. The predicate is the `writeFileSync(tmp,…)`
+→ `renameSync(tmp,…)` **pair**, and the runtime-state writers that legitimately use it are
+allowlisted by name with a reason each, so a fourth means arguing for it in the open.
+
+Also from the review: `mergeDuplicates`' child arm had no test (dropping its live filter
+left all twelve cases green while the mutant wrote `compressed_into` onto a tombstone and
+reported an inflated count); `lib/frontmatter.mjs`'s `>` fold-block arm was untested while
+both docblocks named it; the bm25-weight assertion `toMatch`ed a file containing **three**
+identical calls, so two could drift silently; `tests/dedup-constants.test.mjs` asserted only
+ordering while its own comments named values nothing bound. Two assertions were deleted
+rather than repaired — `not.toMatch(/inj>=(?!\d*\b)/)`, which returns false for every
+realistic input, and a `body.length` comparison guarded by `body === canonical` — because
+neither can express what it was written to say.
+
+### test: the audit ruler carries a self-check that is proven able to fail
+
+`scripts/audit-metrics.mjs` produces the duplicate rate, long-function counts and cycle
+counts that `docs/audit/*.md` quotes as measurements, and it shipped with no guard at all.
+The failure mode is not a crash but a plausible wrong number — a detector that silently
+returns empty reports a clean, well-factored tree, and 0% duplication is the answer that
+gets believed. `--self-check` now drives the walk and both detectors in both directions, and
+`tests/audit-metrics-selfcheck.test.mjs` mutates the tool three times to show the mode goes
+non-zero. Its own first probe was invalid JS (a redeclared `const`), so acorn rejected the
+file and the check reported "longFunctions did not flag" — a probe defect wearing a detector
+defect's message, caught by checking the anchor before believing the result.
+
+## v3.91.0 — the write-guard quoted in the last release only ever covered one of the two sinks
+
+**Upgrade note. Nothing in the shipped runtime changes.** The diff touches
+`benchmark/rerank-pool-replay.mjs`, its test, a CI step and documentation. No hook, no CLI
+command, no schema, no configuration. **Revert path:** pin the previous release
+(`npm i -g claude-mem-lite@3.90.0`, or the equivalent plugin pin).
+
+### The ruler was writing to the series it exists to keep honest
+
+v3.90.0 shipped under the title *"the ruler ran at the read, then wrote to the thing it was
+measuring"*. It fixed that shape in `lib/patha-exclude-meter.mjs`, and it justified the fix
+by quoting a rule this repo had already written down for `benchmark/rerank-pool-replay.mjs`:
+*the handle must reject a write*. The rule was quoted accurately. It was also, at that
+moment, being violated by the very ruler it was quoted from.
+
+`searchRelevantMemories` has **two** sinks:
+
+1. `UPDATE observations SET injection_count` — a database write. The replay opens the DB
+   `readonly` and `assertCannotWrite()` executes the bump against the handle to prove it
+   fails. This half worked exactly as documented.
+2. `recordMetric(DB_DIR, { event: 'inject', … })` — an `appendFileSync` to
+   `$DB_DIR/metrics/YYYY-MM-DD.jsonl`. **A read-only *database* handle does nothing about a
+   file append.** Nothing in the file mentioned this sink, so nothing guarded it.
+
+On a machine with `CLAUDE_MEM_METRICS=1`, one whole-corpus run is 11,289 prompts × 2 arms,
+and `--cost` is six more passes over the same corpus. Measured on the shard:
+
+| day | `inject` rows |
+|---|---|
+| 2026-08-27 | 26 |
+| 2026-08-29 | 17 |
+| 2026-08-31 | 15 |
+| **2026-09-01** | **1,541,442** |
+
+Those are **pre-repair** figures: the shard was surgically repaired later in this same
+release (see *Also in this release*), so they are no longer reproducible from disk and the
+row above now reads 0. That one shard was **204,499,386 B / 1,543,630 lines**, peaking at
+48,478 rows/minute.
+`claude-mem-lite doctor --metrics` consequently reported `inject · n=1543363 · 2 / 8 / 19
+(ms)` over its 7-day window — a row that is at least 99.87% benchmark traffic, with three
+percentiles that are this replay's in-process timings rather than injection latency.
+`mem-cli stats` was unaffected **in its values, not in its cost** — a distinction worth
+keeping, because "the pollution had no reach into `stats`" would be wrong. It never displays
+`inject` (it reads `file_intel` / `reread_warn` / `pretool_recall` / `error_recall` /
+`enrich_save`), but `aggregateMetrics(DB_DIR, 7)` and `readMetrics(DB_DIR, 7)` walk every row
+in the window — so it was parsing a 204 MB file to print the same figures.
+
+**"At least" 99.87%, because a second day is contaminated by a different tool.** 2026-09-02
+read **1,863 at 15:5xZ and 1,864 minutes later** — two orders above the clean days, and still
+accruing, because 09-02 is the current day. **1,794** of them fall inside two UTC hours
+(11:00-12:59) that coincide with that day's ad-hoc D#215 measurement harness; that half is
+stable, because those hours are closed. That harness is not in the
+repository and no guard here can reach it. The rule that does: **any script that calls
+`searchRelevantMemories`, committed or not, passes `{ counterfactual: true }`.**
+
+### The fix, and why it is two changes rather than one
+
+`{ counterfactual: true }` is a shipped option on `searchRelevantMemories` — v3.90.0 added
+it for exactly this reason — and it skips both side effects. Every arm invocation in the
+replay now goes through one helper:
+
+```js
+export function callArm(fn, db, text, project) {
+  return fn(db, text, project, [], { counterfactual: true });
+}
+```
+
+That is not a style preference. The new self-check probes the sink *through this same
+helper*, so a probe that carried the flag while a loop had lost it would be a guard testing
+a proxy instead of the harm — the failure mode this project has recorded on three previous
+faces.
+
+`assertNoMetricWrite()` is the fifth self-check. It has three ways it could have looked
+green while seeing nothing, and each one is closed rather than noted:
+
+- **It could watch a filename it derived itself.** So it doesn't derive one: it calls
+  `recordMetric` into a throwaway directory, reads back whatever basename appeared there,
+  and watches *that* name in the real directory. The naming convention is never copied.
+- **It could run with the sink disabled** and pass on every machine that never set
+  `CLAUDE_MEM_METRICS`. So it forces the sink on for the duration and restores the previous
+  value on both the passing and the throwing path — leaking `=1` into the rest of the
+  process would have the guard create the condition it prevents.
+- **Its probe call could return without ever calling `_emit`.** `searchRelevantMemories` has
+  **three** such returns — `!db || !userPrompt`, the length floor, and an empty FTS query —
+  and only the first two are positionally above the block; the third sits below `_emit`'s
+  definition, inside the `try`, and simply never calls it. (A draft of this note said "two
+  early returns above the block": wrong count, and a phrasing that rots on any reorder.) So a
+  probe on a two-word prompt writes nothing whatever the flag says. The probe therefore has
+  to report that it reached the emit path, and a probe that did not **fails the run**.
+  Returning rows is a sufficient witness for that, not a necessary one — the empty-result
+  paths emit too — which is the safe direction for a guard.
+
+### The probe alone was not enough, and the review proved it with a running counterexample
+
+`assertNoMetricWrite` establishes that **`callArm` carries the flag**. That every arm
+invocation *goes through* `callArm` was left to a source-text case, and a regex only matches
+literal forms. The pre-tag correctness review broke it four ways — aliasing the handle
+(`const d = db; narrow(d, …)`), `narrow.call(null, db, …)`, aliasing the function inside
+`costCompare`'s timer, and adding an exported helper that calls an arm directly. **All four
+survived the suite.** One of them, replayed over 300 real prompts, appended **992 metric
+rows while the run printed a complete report and exited 0** — this release's own defect,
+reopened through a form the text guard cannot see.
+
+So the guarantee is re-stated at the level that matters: not *"the helper carries the flag"*
+but **"this run wrote nothing"**. `metricsDirSize` takes a whole-`metrics/`-directory
+baseline and a `process.on('exit')` handler re-checks it. Three properties of that shape,
+each chosen rather than fallen into:
+
+- **Registered on `exit`, not called before each `process.exit(0)`.** It therefore covers
+  every exit path, including two modes that exit early and any mode not yet written — the
+  `main()`-call-site blind spot this repo has recorded since v3.82.0 cannot reopen it one
+  mode at a time.
+- **It fires after the report has printed.** A false positive — a live hook writing during a
+  multi-minute run, which it genuinely cannot distinguish and says so — then costs a loud
+  message and a non-zero exit, not the run's output.
+- **Whole directory, not one shard.** This also closes a rollover hole nobody had noticed: a
+  run started at 23:59 UTC writes into *tomorrow's* shard, which a one-shard baseline misses
+  entirely.
+
+Re-measured on the same aliasing bypass: **exit 1, 992 rows named, report intact.** Before
+this gate the identical mutation exited 0 in silence.
+
+**One limitation, stated rather than discovered later:** with `CLAUDE_MEM_METRICS` unset a
+bypassing call writes nothing, so the run-level gate passes — correctly, since no harm
+occurred, but it is then silent about call *form*. The probe, which forces the sink on for
+its own duration, is what covers that case. The two guards are complementary, not redundant.
+
+Two smaller findings from the same review, both fixed: the guard set `CLAUDE_MEM_METRICS='1'`
+*before* `mkdtempSync`, so a throwing mkdtemp (TMPDIR gone, ENOSPC, EACCES) skipped the
+`finally` and **leaked `='1'` into the rest of the process** — the guard creating the exact
+condition its own comment warns about; and the shard-naming step now carries a *source*
+assertion that it contains no date formatting, because the "watch a self-derived filename"
+mutation only kills when the derived name is **wrong** — a mutation that re-derived the
+correct convention by hand would have survived every behavioural case while genuinely
+weakening the guard.
+
+**Ten mutations, ten killed**, including that correct-convention one. They were re-run in a
+quiet tree: the first round was taken while a reviewer was mutating the same file, its backup
+captured the *other* agent's mutated state, and neither harness could have detected the
+interference. A mutation round in a shared tree needs an exclusive owner per file.
+
+### What was swept, and what the sweep cannot cover
+
+Every metric emitter in the tree was enumerated and cross-referenced against what the
+benchmarks import. `rankImperativeCandidates` — used by `imperative-pool-replay.mjs` and
+`adoption-rankers.mjs` — has neither sink. `hook-context.mjs`, which `keyctx-pool-replay.mjs`
+drives, emits no metrics at all. `hook.mjs` and `scripts/pre-tool-recall.js` emit, but no
+benchmark imports them. `timed()` has zero production callers at all.
+
+**The sweep is over functions CALLED, not modules imported, and saying so matters**, because
+two committed benchmarks do import metric-emitting modules: `benchmark/patha-exclude-report.mjs`
+takes only the `PATHA_EXCLUDE_EVENT` constant from `lib/patha-exclude-meter.mjs` and only the
+read side from `lib/metrics.mjs`, and `benchmark/rerank-pool-replay.mjs` now imports
+`recordMetric` itself, deliberately, to name a shard in a throwaway directory. Both are
+benign; a reader re-deriving the sweep without that sentence hits those imports and has to
+redo the work to find out. So: `searchRelevantMemories` was the only production **function**
+with a metric sink reachable from a committed ruler.
+
+The sweep says nothing about uncommitted one-off harnesses, and 2026-09-02's burst is proof
+that those exist and do write. That is a discipline, not a guard, and it is stated as one.
+
+### The lesson, stated plainly
+
+This file's own docblock said **"IT CANNOT POLLUTE THE CORPUS, and proves it rather than
+promising it."** Every word of that was true. It was also read — by its author, in the next
+release — as a claim about the file. **A guard is only as wide as the sinks it enumerates,
+and a sentence that names one sink does not become a sentence about all of them by being
+confident.** The docblock now enumerates both and says which check covers which.
+
+### Also in this release
+
+- **A reader for `patha_exclude` (`benchmark/patha-exclude-report.mjs`).** The v3.90.0 meter
+  shipped with no consumer at all — nothing under `mem-cli` / `lib` / `benchmark` / `scripts`
+  filtered on that event, so every column had to be unpicked from raw JSONL by hand. The
+  reader takes no measurement of its own; both arms already ran at the read. Its three
+  pooling rules exist because each would otherwise produce a number that looks measured and
+  is not: rows written before the pre-tag B5 fix carry a superseded `inert` rule and cannot
+  be recomputed (their marker ids are not in the row), so they are bucketed as `legacy` on
+  the *absence* of a key and leave the denominator; `armB: 'error'` rows carry no `net` and
+  no `setChanged`, so a reader that `?? 0`s them would report a failed arm as "the repair
+  changed nothing"; and a zero in `suppressed` is a fact about the sample, so the verdict is
+  `NO-POPULATION`, kept distinct from `DECIDABLE`. Standing read (**2026-09-02T16:12Z**, 18 rows over
+  12:49Z-16:10Z): **NO-POPULATION** — 3 legacy, and of the 15 comparable rows, inert 0 /
+  working 8 / nothing-excludable 7, with 0 slots freed and 0 refilled. **Stamped, because the
+  reader walks a live corpus**: the same command read 8 rows (working 2 / nothing-excludable
+  3) three hours earlier. The verdict did not move; the population doubled. 23 cases, 11 mutations, 11 killed. One mutation survived the
+  first round and **the test was what was wrong**: deleting the `NO-POPULATION` caveat's
+  lead-in left it green, because `/NO-POPULATION/` + `/inert/` + `/sample/i` are each
+  satisfied by the verdict header and the regime table. An assertion another line can satisfy
+  is not an assertion about that line.
+- **A CI step that prints the knip count and name set** on every push and PR,
+  `continue-on-error` and gating nothing. It exists to answer, over a few rounds, which side
+  of the ~15-name worktree/working-tree gap a fresh CI clone lands on. Until that is
+  answered, a name-set guard would be a bet rather than a measurement. It writes its JSON to
+  `$RUNNER_TEMP` and never the workspace, because an untracked file at the repo root moves
+  the generated case count.
+- **The 2026-09-01 shard was repaired surgically, not deleted.** Its 1,541,442 `inject` rows
+  were filtered out and its 2,188 genuine rows (`episode_reads`, `pretool_recall`,
+  `file_intel`, …) kept: 204,499,386 B → 279,021 B, and the metrics directory 204 MB → 8.8
+  MB. **This does cost that day's real `inject` rows** — on the order of 15–25 by the
+  clean-day rate — because nothing in a metric row records which process wrote it. That is
+  stated rather than rounded away: the alternative was leaving a poisoned series in place
+  until the 90-day GC reached it around 2026-11-30.
+- **Two transitive production dependencies bumped in the lockfile**, which is what the tag
+  actually waited on. `npm audit --omit=dev` went red between v3.90.0's release run (green
+  at 13:59Z the same day, identical tree) and this one: four `fast-uri` advisories and two
+  `qs` advisories published in between. `fast-uri` 3.1.5 → 3.1.7 (via `ajv`) and `qs` 6.15.2
+  → 6.16.0 (via `express`), both under `@modelcontextprotocol/sdk@1.29.0` and both inside
+  the semver ranges their parents already declare — so `package.json` is untouched and only
+  `package-lock.json` moved. Production audit 2 → **0 vulnerabilities**; suite re-run against
+  the new tree, 324 files / 5524 green. Dev-side advisories (vite and friends) were left
+  alone: the release gate is `--omit=dev`, and moving the test runner's own dependencies to
+  unblock a tag is a change with no evidence behind it.
+
+- **D#215 was replaced by D#216** rather than edited, *including inside the new reader*,
+  whose header line printed `patha_exclude — D#215 reader` — a tool pointing at a ledger
+  entry retired because of that tool's own existence. `defer` has `add`/`list`/`drop` and no
+  update, and D#215's body claimed `patha_exclude` had no dedicated reader — which this
+  release makes false. A backlog entry describing already-completed work is actively
+  misleading, so the entry was re-filed with the corrected text and the standing
+  `NO-POPULATION` read folded into it.
+
+### Verification
+
+- `npx vitest run` — **324 files / 5524 tests green** (the count is partly generated; it was
+  re-measured on this tree, not carried).
+- `npx vitest run --coverage` — statements 83.73% (7183/8578) · branches 78.06% (5385/6898)
+  · functions 88.52% (918/1037) · lines 87.13% (6007/6894) — byte-identical to v3.90.0 on
+  every axis. **A draft of this line gave the wrong reason and the pre-tag review refuted it
+  with a counterexample.** It said the change lives in `benchmark/` and `tests/`, "neither of
+  which the glob covers, so 30 new cases could not move a single covered line". But `tests/**`
+  is never in the include glob — true of all 5,524 cases — and tests are precisely what
+  produces coverage of the files that ARE included. Run alone, this release's
+  `tests/patha-exclude-report.test.mjs` executes 91 lines of `lib/metrics.mjs`. **Acting on
+  that: coverage was re-measured after the five review-driven cases were added, not carried
+  from the earlier run** — same eight figures. The real
+  reason: those lines were already covered by `tests/metrics.test.mjs`, and the four
+  denominators (8578 / 6898 / 1037 / 6894) held because no file entered or left the glob. **A
+  new test CAN move these numbers; being in `tests/` is not what stops it.**
+- `./node_modules/.bin/knip` from the primary working tree — **53 unused exports / 0 unused
+  files**, unchanged, so `callArm` and `assertNoMetricWrite` both have real consumers.
+- End-to-end: a 500-prompt replay run under `CLAUDE_MEM_METRICS=1` grew the shard by
+  **0 bytes / 0 lines**.
+- Ten mutations against the new code, ten killed, re-run in a quiet tree.
+- `npx eslint .` clean; and `--no-ignore` on both changed benchmark files clean too, since
+  `benchmark/**` is eslint-ignored in this repo and "passes lint" would otherwise mean
+  "was never linted".
+- `./node_modules/.bin/knip` from the primary working tree — 53 unused exports / 0 unused
+  files, and none of the five new exports is in the list.
+
+## v3.90.0 — the ruler runs at the read, and four retired numbers that outlived the paragraphs retracting them
+
+**Upgrade note. Nothing changes by default.** The one new code path is a measurement that
+does not execute unless `CLAUDE_MEM_METRICS=1`, which is off unless you set it. No schema
+change, no migration, no new configuration. **Revert path:** pin the previous release
+(`npm i -g claude-mem-lite@3.89.0`, or the equivalent plugin pin).
+
+### A ruler that runs at the read instead of replaying a recording of it
+
+The path-A injected-ids exclude in `hook.mjs handleUserPrompt` is inert against string ids:
+the marker holds `'42'`, and both consumers test `new Set(excludeIds).has(r.id)` against a
+NUMBER out of SQLite. That has been known and deliberately unrepaired for two releases, for
+a stated reason — this path already has a suppressor that *works* (`shouldSkipByDedup`
+String-normalises both sides), so switching this one on adds a second, finer suppressor to
+an already-suppressed face in an unknown direction. What was missing was a price.
+
+The obvious way to get one — persist the marker at write time, replay it in a few weeks —
+was **rejected**, and the reason is a rule this repo already applies to three other faces:
+*never diff two runs taken at different times.* A recorded marker still has to be replayed
+against an `observations` table that has moved. So `lib/patha-exclude-meter.mjs` runs both
+arms **at the read**, in one process against one database state: arm A is the set just
+delivered, arm B is the same `searchRelevantMemories` call with the ids coerced to numbers.
+
+Three consequences worth stating because each one is a design decision, not a detail:
+
+- **`suppressed` is exact, not estimated — under a stated condition.** Arm A's exclude is
+  inert, so arm A's result IS the unexcluded search, and intersecting it with the coerced
+  marker names precisely the rows a working exclude would drop. That holds while no single
+  marker mixes coercible numbers with coercible strings; on a mixed marker arm A would
+  already have dropped the numeric half and the count would silently run low. No writer
+  produces one today, and the row carries `markerNumbers` beside `markerStrings` so the day
+  one does is visible in the data rather than only in a comment.
+- **The column that will decide the ledger entry is `refilled`, not `suppressed`.** The open
+  question is whether a freed slot gets refilled from the pool or is simply lost, and a
+  suppression count cannot answer it. `net` is recorded beside `setChanged` because a
+  one-for-one replacement is net zero while the delivered set has changed.
+- **`inert` is recorded per prompt, and on the right predicate.** A prompt's exclude is
+  inert when an id it *could* have matched arrives as a string — not merely when some
+  string is present. The looser rule shipped in a draft, resting on "only a PreToolUse
+  emission turns the union into strings", which the pre-tag review refuted from the writer
+  itself: `user-prompt-search.js` emits `P<id>` and `D<id>` on its own legs, and the
+  deferred leg merges `prevIds.map(String)`. Under the loose rule a marker holding nothing
+  but those namespaces counted as inert while having nothing excludable at all — inflating
+  the denominator in exactly the direction the column exists to prevent. `inert` now keys
+  on ids that are both coercible and string-typed, reported beside `markerCoercibleStrings`.
+
+Coerced ids are ADDED to `contextExclude` rather than replacing it, so the Key Context half
+— a different mechanism with its own history — is identical in both arms. Arm B also
+carries its **own** imperative pick: reusing arm A's put a choice the repaired system would
+not have made into arm B's exclude, so on any prompt where the pick changed, the delta
+described a system that exists in neither arm. `task_imperative` records
+`imperativeArm: 'off'` on a stock install rather than being dropped from the row.
+
+**The pre-tag review found this ruler writing production state, and it is the finding worth
+carrying out of this release.** `searchRelevantMemories` is not a read — every successful
+call ends with `UPDATE observations SET injection_count = injection_count + 1`. The first
+version of the meter handed that function the live writable handle for its counterfactual
+arm and ran it *after* the delivery, which the reviewer reproduced doing three things:
+rows never shown to anyone reached `injection_count = 1` (a column read by
+`noisePenaltyClause`, by `demotePinned`'s `injection_count >= N AND cited_count = 0`
+predicate, and as the `= 0` GC gate); the ruler manufactured its own delta, reporting
+`refilled: 1, setChanged: true` on a prompt whose honest answer was zero, because arm A's
+bump pushed a row across the `>= 4` noise gate before arm B scored; and the sibling
+`inject` meter counted two calls per prompt, on exactly the installs where this corpus
+gets gathered. **CLAUDE.md already carried this rule for `rerank-pool-replay` — "the handle
+must reject a write" — and the release note above quotes that ruler by name.**
+
+Both halves are now fixed and pinned. `searchRelevantMemories` takes an explicit
+`{ counterfactual: true }` that skips the bump and the metric emission, and arm B runs
+**before** the delivered search, so both arms see one store state by ordering rather than
+by hope. `tests/patha-meter-counterfactual.test.mjs` asserts the behaviour and the wiring —
+including the source-position ordering, because the flag with the wrong order still leaves
+the second defect intact. Six mutations were driven against it and all six turn the file
+red, among them moving arm B back below the delivery.
+
+**This ships the ruler, not a verdict.** There is no corpus yet; the ledger entry stays open
+(re-filed twice during this round — D#213 → D#214 → **D#215** — because a premise defines
+scope, and both the blocker and the missing-ruler premise changed under it).
+
+**One mutation survived that round, and the code was what was wrong.** An explicit `/^E/`
+skip for namespaced event ids sat above a `Number.isInteger` gate that already rejects
+everything reaching it (`Number('E42')` is NaN). Deleting the branch left all cases green,
+so it was deleted rather than given a test — the D#197 precedent. Five other mutations were
+killed. Self-review then found a twin: the metric row and the tests were about to assert on
+two copies of one filter; `measurePathAExclude` now calls the exported helper.
+
+### The install harness violated its own README, and the README already said so
+
+`tests/sandbox/README.md` has carried "Do not put the sandbox under `$HOME`" since v3.71.0
+— in its "Conventions worth keeping" section, forty lines *below* the quickstart line that
+says "sandboxes are created under `$TMPDIR`". In a Claude Code session those two are the
+same sentence: `os.tmpdir()` reads `$TMPDIR`, which is `~/.claude/tmp/claude-<uid>`.
+On a machine whose `~/node_modules` holds `better-sqlite3` and `claude-mem-lite`, the
+harness then resolves up the tree into the home install and measures the wrong one — and
+all 103 checks still pass. Found by running it, not by reading it.
+
+A README line could not fix this, because the README already said it. `tests/sandbox/sbx-base.mjs`
+refuses such a base outright, naming the resolved path rather than the variable, and
+`tests/sandbox-base-guard.test.mjs` drives the refusal in both directions — it is in
+`vitest run` even though the harness it guards is not.
+
+**The first version of that guard tested a proxy rather than the hazard, and the review
+drove a real path through the gap.** The stated hazard is an ancestor directory owning a
+`node_modules`; the check was "is it under `$HOME`". Those are different sets, and
+`<repo>/tmp/sbx` — a path this project uses — sits in the difference: nowhere near `$HOME`,
+and it resolves `better-sqlite3` and `claude-mem-lite` straight out of the package under
+test. The guard now checks the hazard itself (`ancestorWithNodeModules`) alongside the HOME
+rule, compares through `realpathSync` so a symlink into HOME cannot walk around it, and
+creates the base directory — because the README's own newly-documented command named
+`/tmp/claude/sbx`, which does not exist on a fresh machine, so the default threw by design
+and the documented override crashed with ENOENT, leaving no working invocation at all.
+
+All three phases measured green with an explicit base, before the guard change and again
+after it: **43/43 · 45/45 · 15/15**, run separately, and the documented command verified
+from a state where `/tmp/claude/sbx` did not exist. Sandboxes total ~351 MB and are left on
+disk by design; they were deleted afterwards.
+
+### Four sentences that were false, in the files this project steers itself with
+
+Each was verified false before being changed, and they share one shape: **a retired number
+outliving the paragraph that retired it.**
+
+- CLAUDE.md said nothing under `tests/` imports `benchmark/rerank-pool-replay.mjs`, so its
+  four self-checks could be deleted with a green suite. `tests/rerank-pool-replay.test.mjs`
+  imports them. The correction also states the half that is still open: deleting a
+  self-check *function* breaks the named import and goes red, but deleting its **call site
+  in `main()`** stays green, which is the exact shape found on `citation-live-replay.mjs`.
+- D#196 was recorded as "CLOSED v3.88.0-dev". Its fix commit lands after the v3.88.0 release
+  commit; it shipped in v3.89.0.
+- `tests/pathA-exclude-inert.test.mjs` still opened with 18%, twenty lines above its own
+  paragraph explaining that 18.0% is the mirror population and the figure is 9.0%.
+- v3.89.0's note that a dead export in the three `entry` files is invisible to knip is
+  literally true and still misleads, because **the hole is empty**. Re-running the same
+  binary against a copy of `knip.json` with `includeEntryExports: true` takes the report
+  53 → 66; all 13 extra names are in `benchmark/*` and `scripts/*`, and **zero** are in
+  `hook.mjs`, `server.mjs` or `install.mjs`. Both files now carry the qualifier.
+
+### A ledger entry closed on its own measurement rather than left hanging
+
+**D#211** (citation → importance via the `boost` maintain op) is closed as *measured, not
+worth changing* — not as non-existent. Re-verified on the live store, **and the denominator
+is named because a bare table count is the error this file already records twice**: the
+`boostAccessed` predicate selects **52 rows**, out of the **1425** it could ever select
+(`compressed_into = 0 AND importance < 3`, both clauses of its own `WHERE`) — 2332 rows are
+uncompressed and the table holds 3771, neither of which is the population. Of the 52,
+**24 are cited nowhere** in a 101-transcript corpus (re-derived independently at review
+time; the author's earlier pass over 98 transcripts read 25). At most 3 could have crossed
+the threshold on citations, under a bound that ignores the relevance gate entirely — two
+independent reconstructions during review put it at 1 and 2, both inside that bound, and
+no harness for it is committed. The mechanism is real and moves few rows. Leaving a
+fully-measured entry open makes the next reader think something is still unmeasured.
+
+**E#10524 retired** using v3.89.0's own `--supersedes E#<n>` path — the first real use of
+it. It carried `2.1×–3.8×` for Key Context pool cost, a range no measurement produced: the
+per-project figures are 1.54–1.61×, 1.96× and 2.66–2.74×, so the low end falls below its
+floor and nothing approaches its ceiling. As designed, `superseded_at_epoch` is set and
+`superseded_by_id` stays null (that column references `events` and cannot hold an
+observation id).
+
+### Verification
+
+`npx vitest run` **323 files / 5489 tests**, all passing (from 320 / 5445). The deltas
+account exactly: **+3 files** are `tests/patha-exclude-meter.test.mjs` (22),
+`tests/sandbox-base-guard.test.mjs` (13) and `tests/patha-meter-counterfactual.test.mjs`
+(8); **+44 cases** are those 43 plus **one** generated case, because
+`tests/obs-id-caliber-sync.test.mjs` emits one per `.mjs`/`.js` under `benchmark/`, `lib/`,
+`scripts/` and the repo root and this round added exactly one such file
+(`lib/patha-exclude-meter.mjs`; the two new files under `tests/` are outside the roots that
+generator walks). `npx eslint .` clean. `knip` **53** unused
+exports / **0** unused files, and the same-tree A/B per the CLAUDE.md measurement contract
+returned a **byte-identical name set (+0 / −0)**. Coverage measured **on the tagged tree**,
+which is the correction the review asked for — a first draft quoted the pre-round run
+(320 files / 5445 cases) inside this release's verification block, and `lib/patha-exclude-meter.mjs`
+matches the coverage `include` glob, so it was inside the shipped scope and outside the
+measured one: statements **83.73%** (7183/8578) · branches **78.06%** (5385/6898) ·
+functions **88.52%** (918/1037) · lines **87.13%** (6007/6894), against a gate of
+80 / 74 / 84 / 83 — 3.7–4.5pp of headroom, and the gate is deliberately left where it is.
+
+## v3.89.0 — a ledger of measurements, two of which were taken on the wrong side of the thing they describe
+
+**Upgrade note.**
+
+**The SessionStart Key Context block gets fuller on most projects.** Its two sections —
+File Lessons and Key Context — draw from one pool of ten rows but each capped at five, so
+a pool that is all one shape emitted five lines and left the sibling section empty. Each
+section now keeps its guaranteed half and may take what the other cannot use; the combined
+ceiling is unchanged at ten. Measured before the change over the 11 projects here with ≥20
+live rows: **10 of them were losing rows, 28 of 110 pooled rows (25.5%) fetched and then
+discarded**. You will see up to five more lines on a lopsided project and no change at all
+on a balanced one. The same block is emitted by SessionStart, PreCompact and
+`claude-mem-lite context`.
+
+**`save --supersedes` accepts `E#<n>`.** Until now it could only retire an observation, so
+a conclusion carried by an `events` row had no retirement path — the column existed and
+both injection readers filtered on it, but nothing user-facing ever wrote it. `E#` is the
+prefix those rows are already rendered with, so you retire one by typing back what you
+read. The observation half is linked (`superseded_by`); the events half is not, because
+`events.superseded_by_id` references `events` and cannot hold an observation id.
+
+**Revert path:** pin the previous release (`npm i -g claude-mem-lite@3.88.0`, or the
+equivalent plugin pin). No schema change, no migration, no new configuration.
+
+### Two measurements were taken on the wrong side of their own mechanism
+
+Both were caught by the pre-tag review, both reproduce exactly, and that exactness is what
+identifies them as caliber errors rather than drift.
+
+- **The D#193 exclude number described the marker's WRITER, not its reader.** The
+  cross-hook marker is written by `user-prompt-search.js` (the `fyi` face) and
+  `pre-tool-recall.js` (`pretool`), and read in `hook.mjs handleUserPrompt` — which is the
+  `ups` face. So the gated population is `ups ∩ (fyi ∪ pretool)`. The first measurement
+  took the mirror image and published 18.0%. Correct figure, same walk, 99 transcripts,
+  2026-09-02T12:12Z: **23 of 256 (session, id) pairs — 9.0% — over 14 of 71 sessions**, and
+  3 of 24 (12.5%) on `task_imperative`; by attachments, 29 of 332 (8.7%).
+
+- **`hook.mjs` was never made visible to knip and could not have been.** The `new URL`
+  blind spot was **six** modules, not seven. `hook.mjs` is invisible for a second,
+  independent reason this round did not touch: it is in `knip.json`'s `entry` array, and
+  knip's `includeEntryExports` defaults to false. Probe-verified both ways. The same holds
+  for `server.mjs` and `install.mjs`, so a dead export in any of the three entry files is
+  still invisible today. *(Added after the tag, because the sentence above is literally
+  true and still misleads: the hole is EMPTY. Re-running the same binary against a copy of
+  `knip.json` with `includeEntryExports: true` takes the report 53 → 66, and all 13 extra
+  names are in `benchmark/*` and `scripts/*` — zero in `hook.mjs`, `server.mjs` or
+  `install.mjs`. Nothing is hidden there today.)*
+
+### knip: the blind spot is removed rather than compensated for
+
+`new URL('<relative>.mjs', import.meta.url)` anywhere in the analysed tree makes knip drop
+that module from its unused-export report entirely — the whole file, not the one export,
+and the count goes DOWN, which reads like an improvement. Six modules were affected.
+Converting every site to `join()` took the report **46 → 57**: eleven dead exports that had
+been hidden, in `search-engine.mjs` (7), `hook-llm.mjs` (2) and `hook-context.mjs` (2). The
+seven `search-engine` names are the ones CLAUDE.md's category (a) has always *claimed* were
+in the list — they were not; the module was invisible, so the note described a membership
+nobody could have observed. Four were then made module-private rather than carried as a
+raised baseline: **53** unused exports, 0 unused files.
+
+The guard is now on the cause — `tests/no-url-module-paths.test.mjs`, no allowlist. Two
+things it earned immediately: it found three sites `grep` had missed (including
+`tests/install-bsqlite-probe.test.mjs` blinding `lib/binding-probe.mjs`, which no list had
+ever recorded), and the pre-tag review defeated its first version with a line-wrapped
+`new URL(` — green suite, knip blinded — so it now scans whole files with offsets mapped
+back to line numbers, and the wrapped form is a fixture.
+
+`tests/knip-blindspot-guard.test.mjs`, the hand-written stand-in from D#194, is deleted.
+Stated plainly rather than as a pure win: `knip` runs from an npm script only — no CI job,
+no pre-commit hook, no test — so those two modules moved from an automated check to a
+manual one, exactly as the other ~90 always were.
+
+### Also
+
+- **CI: the UPS subprocess tests stopped riding their timeout**, without the timeout moving.
+  The discriminator was the matrix inside one failing run — identical code at 3792ms on
+  Node 20, 30173ms on Node 24 and 67527ms on Node 22 — so the stall is the runner and no
+  fixed budget survives a multiplier. The base cost was cut instead: `saveObservation`
+  commits per call, so a 600-row seed paid 600 fsyncs. In CI after the change those two
+  files run **957–1848ms and 893–2544ms**, against a 3.1–4.1s / 5.1–7.5s green baseline
+  before.
+- **`citation-stats` reported on what the decay loop still writes.** "Recently promoted"
+  gated on `importance >= 3` after v3.88.0 stopped that column being written by citation,
+  so it had gone structurally empty; both covering tests seeded the end state directly and
+  could not see it.
+- **`save --supersedes` no longer tombstones a row you did not name.** The CLI parsed with
+  `parseInt`, which reads `1abc` as `1`.
+- The path-A exclude is **pinned, not repaired**: `tests/pathA-exclude-inert.test.mjs`
+  turns red at both sites where a repair would plausibly be written, so the 9.0% cannot
+  change by accident. It stays open because this path already has a working suppressor
+  (`shouldSkipByDedup` normalises both sides) and adding a second, finer one needs an A/B
+  whose ruler does not exist — reconstructing per-prompt exclude sets needs the marker
+  file, which rotates and is never persisted.
+
+### Verification
+
+320 test files / 5445 tests pass (`npx vitest run`); `npx eslint .` clean; knip 53 unused
+exports / 0 unused files from the primary working tree. Both pool replays run end-to-end
+against the now-private constants. The pre-tag review's mutation round: six attempted, six
+red; the one guard that survived a mutation is the one fixed above.
+
+## v3.88.0 — five times over, the case that motivated the rule fell outside the rule
+
+**Upgrade note — read this one, it changes what your memories do on their own.**
+
+**Citing a memory no longer moves its `importance`.** Until this release
+`applyCitationDecay` ran at every Stop hook and rewrote `importance` in both directions: a
+memory you cited went up, a memory that was injected and not cited went down. It no longer
+writes that column on any branch. Nothing is migrated and no stored value changes — the
+column keeps whatever it holds today; only the citation-driven rewriting stops.
+
+**This is not a claim that `importance` stops changing**, and the scoping word matters
+because the injection pools gate on that column. Ordinary maintenance still moves it on its
+own: `decay`, `boost` and `demote_pinned` are all in the default auto-maintain set, and
+`demote_pinned` in particular selects rows on `injection_count >= 8 AND cited_count = 0`,
+i.e. precisely rows these blocks have been injecting. A first draft of this note said "rows
+stop migrating between importance tiers on their own" and the pre-tag review refuted it by
+enumerating five automatic writers (`recoverBuriedLessons`, `decayAndMarkIdle`,
+`boostAccessed`, `demotePinned`, and `autoBoostIfNeeded` on every `mem_get`). What stops is
+one input to that movement, not the movement.
+
+One **citation → importance** path does remain, and it is open as **D#206**: cited ids
+credit `access_count`, and the `boost` maintain op raises `importance` by 1 above
+`access_count > 3`. Two things bound it, both established rather than assumed. It is *not*
+ungated — since v3.84.0 `bumpCitationAccess` credits only an id that was injected this
+session on one of the seven faces, or that you typed yourself (`CLAUDE_MEM_CITATION_RELEVANCE_GATE=off`
+reverts that); what the gate does not ask is whether you *acted* on the lesson. And the
+effect is small: measured 2026-09-02T10:2xZ against the live DB and 98 transcripts, 52 rows
+are currently `boost`-eligible, **25 of them are cited nowhere in the corpus**, and **at
+most 3 could have crossed `access_count > 3` on citations** even under an upper bound that
+ignores the gate entirely. The leg was left deliberately — `access_count` has other writers
+(explicit `recall` / `get` / `timeline`) and also feeds the noise-penalty denominator — so
+cutting it is a different blast radius and a separate decision.
+
+**Event ids now render as `E#123`** in the `[mem] Lessons for <file>:` block. If you cite
+an event, cite it with the prefix. This is not cosmetic: those ids fed the citation-decay
+denominator and were resolved against `observations` alone, so an event id colliding with a
+live same-project observation credited an unrelated memory. Measured 2026-09-02T10:55Z,
+5548 injectable events, under the decay `SELECT`'s own `WHERE` (`superseded_at IS NULL`,
+which is all it filters on): **2222 (40.1%) share an id with a live observation and 263
+(4.7%) with one in the same project**. The same-project figure is the operative one because
+that `SELECT` also matches on `project`. A first draft published 1406 (25.7%) / 198 (3.6%)
+under a sentence claiming the decay `SELECT`'s `WHERE` while actually measuring
+`liveObsFilterSql`, which additionally excludes compressed rows — and a compressed
+observation is still `UPDATE`-able by that loop, so the stricter filter under-counted the
+mis-attribution by about a quarter. Correct table, wrong sentence: the exact defect this
+release is named after, caught by the pre-tag review.
+
+**Revert path:** pin the previous release — `npm i -g claude-mem-lite@3.87.0`, or the
+equivalent plugin pin. Neither change is env-overridable, deliberately: a knob here would
+be a config surface none of the measurements below model. No schema change, no migration,
+no new configuration.
+
+### The shape this round kept finding
+
+Five of this release's fixes are the same defect: a rule was written from a motivating
+case, and the motivating case did not satisfy the rule. A sixth turned up in the pre-tag
+review — see below, where a caption was corrected on one section and not its sibling.
+
+- The **drop-reason hint** exists to catch the six v3.86.0 items that were `defer drop`ped
+  when they should have been closed. Those six carry the reason `closed this round; fix +
+  mutation-verified binding test landed`. The first pattern anchored on `fixed` and
+  `closed by` — neither string is in it. Every `fires` case in its test was a synonym
+  invented at authoring time rather than the datum. The real string is now a test case,
+  and the positive arm gains `closed` / `landed` while bare `fix` stays out ("waiting for
+  an upstream fix" is a legitimate rejection). Widening to `closed` makes ordinary
+  rejections reachable, so the veto arm gains waiting / obsolete / superseded / duplicate
+  / irrelevant / refuted plus CJK equivalents, three of which are pinned as must-stay-quiet.
+
+- The **`E#` convention already existed**, in `lib/events-injection.mjs`, whose header
+  explains why the prefix is needed and lists the extractors it protects. It does not list
+  `scripts/pre-tool-recall.js` — which builds its own merged obs+event rows and printed a
+  bare `#` for both. An invariant asserted in one file about faces living in others, with
+  the offending face never enumerated. On the live metrics log (4227 firings,
+  2026-07-18 → 2026-09-02T09:3xZ) 2376 of 5291 injected rows (44.9%) were event-sourced and
+  40.2% of firings injected events only, so this face was not a corner. That log grows —
+  the review re-derived 4277 / 5371 / 45.1% / 40.3% an hour later. Note also what the guard
+  is: the `E#` prefix is pinned by ONE source-text assertion over the renderer. The three
+  behavioural cases beside it feed hand-written lines to the extractor, so they pass at
+  v3.87.0 too; the file says so itself rather than counting four guards where there is one.
+
+- The **file-overlap penalty** in `hook-context.mjs` had a comment saying it affects
+  ordering. It did not: `penalizedValue` was read by exactly one `continue`, order was
+  fixed upstream by the raw-`valueDensity` sort, and the greedy loop never re-sorts. It
+  also could not fire — firing needed a title costing >122500 tokens against a
+  longest-in-table of 171 chars, which this code's own `estimateTokens` prices at 43.
+  Deleted rather than implemented, along with
+  the comment. Its test asserted only `observations.length === 3` under the label "applies
+  diversity penalty", so it passed with or without the block; it now pins the order on a
+  fixture built so the two behaviours emit different sequences, and is mutation-verified.
+
+- The **cite-widening probe** was filed as evidence of a term in `FULL_SCORE` that does not
+  scale with `citeFactor`. There is none. The two arms each seed a fresh corpus and so
+  compute their own integer-millisecond `age`, giving a linear response of 2.0052e-10 per
+  millisecond; the CI value `3.0000000010026033` is exactly 5 of those units, i.e. 5ms of
+  scheduling skew, and the 1e-9 tolerance admitted only ±4ms. Fixed by freezing the clock
+  across both arms and tightening the tolerance to 1e-12 — deleting the drift rather than
+  widening the gate to hide it. The regression test needed an *accelerating* clock: an
+  equal-step stub shifts both arms alike and reports ALL PASS on the unfixed code.
+
+- The **UPS test timeout** had already been raised once for exactly the cause that blew it
+  again (D#203, run 33605998984). The discriminator was the matrix inside that single run:
+  identical code, `ups-cold-start-injection.test.mjs` at 3792ms on Node 20, 30173ms on
+  Node 24 and 67527ms on Node 22. Code cannot get 18× slower on one leg, so the stall is
+  the runner and no fixed budget survives a multiplier. The base cost was addressed
+  instead — `saveObservation` commits per call, so a 600-row seed paid 600 fsyncs. Across
+  five measurements on three harnesses (mine plus both reviewers'), unwrapped 2.1–2.3s vs
+  0.22–0.28s wrapped: **7.5×–9.6×**, quoted as a range because a single point estimate is
+  what the first draft published. The ratio is load-bearing on a pragma the fixture does
+  not set — under `journal_mode = WAL` it collapses to 1.3–1.4×. Rows are byte-identical
+  through the same production write path (one reviewer byte-compared all 22 columns, the
+  FTS rows and the vectors in both seed shapes, including the 1-minute-step shape that
+  sits inside the dedup window); only the commit boundary moves. Both files together:
+  6.06s → 1.13s wall, 9.20s → 1.57s cumulative (5.9×), 10/10 still pass. Timeout stays 60s.
+
+### Also in this release
+
+- **`save --supersedes` says when it superseded nothing.** It filtered requested ids down
+  to eligible ones and dropped the difference silently, printing the `Superseded:` note
+  only on a non-empty result — so "requested 4, superseded 0" and "requested nothing" were
+  byte-identical output on both faces. Now returns one entry per unlanded id, classified:
+  `malformed-id` / `no-such-observation` / `other-project` / `already-superseded` /
+  `duplicate-save`. Classified rather than lumped because `already-superseded` is a benign
+  idempotent replay that must not read as an error. `duplicate-save` covers the worst
+  instance of the same sentence: a dedup short-circuit swallows the supersession whole, so
+  a correction you write in the five minutes after a near-duplicate never happens and the
+  rows you meant to retire stay live.
+
+- **`defer close` accepts a mis-dropped item.** `resolveDeferredIds` took only `open` rows,
+  so the six items above were unrecoverable short of editing the live DB. It now takes an
+  `allowStatuses` policy — defaulting to open-only, so the drop verb and every existing
+  caller are unchanged — and the close call sites pass `['open','dropped']`. `done` stays
+  rejected under both, since re-closing would overwrite an existing `closed_by_obs_id`.
+  The `drop_reason` is kept and rendered as `previously_dropped:`, because the mis-drop is
+  the part a later reader needs. Ordinals stay open-only under every policy; recovery uses
+  the explicit `D#N` form.
+
+- **A stand-in knip guard** for `hook-context.mjs` and `hook-memory.mjs`, which knip cannot
+  see. It resolves real import edges (named imports plus `ns.NAME` reads through a
+  namespace import) rather than searching text — deliberately, because `KEYCTX_POOL_OBS` /
+  `KEYCTX_POOL_SESS` *do* appear in `benchmark/keyctx-pool-replay.mjs`, as a regex over the
+  file's source, which a grep-based guard would miscount as a consumer. Those two sit in an
+  explicit allowlist, and the guard fails if an allowlisted name gains an importer so the
+  list cannot rot into a raised baseline. Scope is those two modules; the other ~90 remain
+  knip's job.
+
+- **The `new URL('../X.mjs', import.meta.url)` form costs knip coverage of whatever it
+  names**, and this round tripped it live: adding a test that read three source files that
+  way dropped `lib/citation-tracker.mjs:extractInjectedFromSubagentPrompt` out of knip's
+  name set (46 → 45) — one test file blinding knip to a module it has nothing to do with.
+  Rebuilt with `dirname()` + `join()`; same-tree A/B back to +0 / −0 and the count back to
+  46. Both guard tests now follow that rule.
+
+### Found by the pre-tag review, fixed before the tag
+
+Two independent reviewers read the diff and the release note. The correctness lens returned
+no blocker but two real defects; the claims lens returned one blocker against this note.
+
+- **`citation-stats`'s "Recently promoted" section had gone structurally empty.** Its query
+  was `WHERE importance >= 3 AND cited_count >= 1`. The sibling "demoted" caption ten lines
+  below was re-worded when the decay loop stopped writing `importance`; this one was not —
+  the same "the copy I fixed was not the only copy" shape the round's own sweeps exist to
+  prevent. A row cited in ten sessions now has `cited_count = 10` and whatever importance it
+  was saved with, so the section degenerated into "rows that were already at 3" under a
+  caption saying "promoted". It now keys on what the promote branch actually writes
+  (`cited_count >= 1 AND uncited_streak = 0`) and is captioned "Recently cited … importance
+  unaffected". Both tests that covered it seeded `importance = 3` directly, so neither could
+  observe the loop had stopped producing it; the replacement uses two rows the old gate and
+  the new one disagree about in opposite directions, and is mutation-verified.
+
+- **`save --supersedes` could tombstone an observation you never named.** The CLI parsed its
+  tokens with `parseInt`, which reads `1abc` as `1` — so a typo (`875x` for `8754`) retired
+  an unrelated memory and printed a clean `Superseded: #1.` The same lenience made the
+  `malformed-id` class this release added unreachable from the CLI, which is the exact face
+  whose silence motivated D#201. Tokens now reach `saveObservation` unparsed, so the
+  classifier decides: `--supersedes 1abc,2` supersedes only `#2` and reports
+  `#1abc (not a positive integer id)`. The MCP face was never affected (Zod rejects it).
+
+- Smaller, same round: the drop-reason veto missed `wontfix` (no word boundary after `wont`,
+  so the positive arm's `resolved` won); the `E#` sweep matched its own `import` line and so
+  stayed green under a mutation that dropped the prefix from the renderer — mutation-verified
+  in both directions now; the knip guard's `statSync` walk could throw on a file that
+  disappeared mid-run, which is not hypothetical, it happened during this review.
+
+- **Five stale mechanism sentences** left behind by the decay change were swept, all of them
+  citing `IMPORTANCE_FLOOR`, a constant this batch deleted: `hook-memory.mjs` (the paragraph
+  directly below the one that *was* rewritten), two in `lib/citation-tracker.mjs` — including
+  one that described a row promoting itself by being written about, which can no longer
+  happen — `hook.mjs`'s stated justification for the promotion-only Key Context policy (the
+  policy survives on its other ground), and `lib/maintain-core.mjs`. Corrections are written
+  in place with the superseded reading kept and marked, not edited to read as if it had
+  always said this.
+
+### Verification
+
+319 test files / 5429 tests pass (`npx vitest run`); `npx eslint .` clean; knip 46 unused
+exports / 0 unused files, unchanged from the recorded baseline and measured per the
+CLAUDE.md contract (primary working tree, name-set diff rather than count subtraction).
+The test count is partly generated and moves when source files are added — re-measure it
+rather than carrying it forward.
+
+## v3.87.0 — the fifth D#172 surface is closed on the bound that mattered, and the two bounds behaved oppositely
+
+One constant moves: `KEYCTX_POOL_OBS` in `hook-context.mjs`, **50 -> 200**. Its sibling
+`KEYCTX_POOL_SESS` stays at **10**, deliberately. This is the SessionStart Key Context
+face, so it is a user-visible default-behaviour change to a released artifact and got its
+own round with its own pre-tag review.
+
+**Upgrade note.** After upgrading, the `<claude-mem-context>` block may contain different
+observations for projects whose candidate pool exceeds 50 rows — more of them, and not
+always the same ones. That block has **three** emitters, all of which change, because all
+three call the same `buildSessionContextLines`: **SessionStart** (`hook.mjs`),
+**PreCompact** (`hook-precompact.mjs`, which re-emits it before an automatic compaction),
+and **`claude-mem-lite context`** (including `--json`, whose `sections` gains rows). A
+draft of this note named only SessionStart and claimed "no CLI change"; the CLI *surface*
+is unchanged — no new flag, no new subcommand — but `context` output is not, and on a
+change this project's own spec classifies as a user-visible default-behaviour change to a
+released artifact, the affected faces belong in the note. No schema change and no new
+config. To revert, pin the previous release
+(`npm i -g claude-mem-lite@3.86.0`, or the equivalent plugin pin); the constant is not
+env-overridable and deliberately so — an env knob would be a config surface that none of
+the measurements below model.
+
+### Why a LIMIT here was never a ranking bound
+
+The obsPool `SELECT` orders by `created_at_epoch DESC` and nothing else. The selector
+underneath it then re-sorts every candidate by `valueDensity` = recency x typeQuality x
+impBoost x lessonBoost / sqrt(cost), and recency enters that product **compressed into
+(1,2]** by `1.0 + exp(...)`, against impBoost alone spanning 1.0-2.0 with typeQuality and
+lessonBoost multiplying on top. So the key the SQL sorted on barely participates in the
+final order, and a row past the LIMIT was unreachable however well it scored. This is the
+D#172 shape and the **fifth** surface it has been found on; it is also the purest, since
+`rerank-pool-replay`'s face at least orders its pool by one factor of the final composite.
+
+### What the ruler measured, before the change
+
+11 projects with >=20 live rows, budget 2000, **2026-09-02T06:11Z, against the 50/10
+tree**. Since shipped is now 200, the bare command no longer reproduces any of this and a
+reader who runs it gets `0/11` with nothing explaining why — so the reproducing commands
+are, precisely:
+
+```
+node benchmark/keyctx-pool-replay.mjs --population --ref-obs 50 --ref-sess 10
+node benchmark/keyctx-pool-replay.mjs --wide-obs 50 --wide-sess 10     # runs BACKWARDS
+```
+
+The second inverts the arms — the shipped 200 becomes the "narrow" side — so every column
+reads in reverse. Both flags were added in this release for exactly this reason.
+
+Every absolute here is a snapshot — `selectWithTokenBudget` reads
+`Date.now()` for its adaptive windows, so these pools SLIDE and decay with the wall clock
+even while the store grows. The tool stamps its own output and says so.
+
+- Truncation: obsPool over LIMIT 50 in **3 of 11** projects (mem 107, ubuntu-sec 63,
+  code-graph-mcp 58); sessPool over LIMIT 10 in **5 of 11**.
+- Lifting obs alone (50 -> 200, sess held at 10): the injected block differs in **2 of
+  11** projects, the first observation differs in **0 of 11**, **8 rows newly reachable
+  against 2 displaced**, for +81 tokens (mem 570 -> 651) and +16 (code-graph-mcp
+  596 -> 612).
+- **Truncation count is not harm, for the second round running.** `ubuntu-sec`'s pool is
+  63 — over the bound — and lifting it changed nothing there: 14 observations before,
+  14 after, 0 gained, 0 displaced.
+
+### The two displaced rows, named
+
+D#192 required this individually rather than as a count, because selection here is **not
+monotone** — a wider pool can evict a row a narrower one kept. Both displaced rows were
+dropped by the **3-per-type diversity cap**:
+
+| row | type | why it lost its slot |
+|---|---|---|
+| #10855 | discovery | `typecap:discovery` — the wider pool offered that type a denser member |
+| #10780 | bugfix | `typecap:bugfix` — same |
+
+Measured by patching the shipped source's text at its three `continue` points and running
+both arms in one process — the same twin technique the ruler uses, so the scoring formulas
+cannot drift from production. That is no longer a throwaway script: `--why-displaced` and
+`--cost` are now modes on `benchmark/keyctx-pool-replay.mjs`, because the two claims this
+entry argues individually were both measured with scripts that did not exist by the time
+two reviewers tried to check them, and both had to rebuild them. The attributions
+reproduced; a claim only its author can re-derive is still a claim on trust.
+
+**"Both by the type cap" is not a three-way discrimination, and the review was right to
+say so.** The other two stages could not have fired. The token budget does not bind on
+this corpus — the widest arm's largest project uses 651 of 2000 tokens. And the
+file-overlap penalty's `continue` is **unreachable**: it needs `valueDensity < 0.001/0.7`,
+while `value` has an analytic floor of 0.5 (recency > 1 x the lowest `TYPE_QUALITY` 0.5 x
+`impBoost` >= 1 x `lessonBoost` >= 1), so tripping it takes a title costing more than
+122,000 tokens against a longest-title-in-the-table of 171 characters. Worse, the
+`penalizedValue` it computes is never applied to anything: the ordering was fixed at sort
+time, so the block's only live effect is `selectedFiles.add(f)` and the comment promising
+to "reduce value for file overlap" describes something that has never happened. That is a
+pre-existing defect, filed as **D#197** and deliberately not fixed here.
+
+**A third drift mechanism, found by the pre-tag claims review, and worth more than the
+list it corrects.** This entry's first draft named the seven rows that became reachable in
+that project and asserted they were all `importance = 3`. Eleven minutes later that was
+false: the review re-derived the set and got six of the seven, with **#10656** replaced by
+**#10431**, and #10656 reading `importance = 2` — a value at which, being 16.4 days old,
+it satisfies no arm of the pool's `WHERE` at all.
+
+The draft was correct when taken and the review was correct when taken. `#10656` carries
+`demoted_at = 2026-09-02T06:23:24Z` — **ten minutes after the first measurement and
+thirteen seconds before the second**. `applyCitationDecay` demoted it 3 -> 2 in between,
+and an `importance = 2` row must clear the 14-day tier2 window where an `importance = 3`
+row gets 60 days, so the demotion did not lower its rank: it removed it from the
+population. `#10431` is also type `change` and took the freed 3-per-type slot.
+
+So the store does not merely GROW under a receding window — the two drift mechanisms this
+project already had written down. **It rewrites the very column the pool's `WHERE` gates
+on.** Citation decay moves `importance` at every Stop hook, in both directions, including
+on the rows a release note is naming while it names them. No wall-clock caveat covers
+that, and it is the same self-reference D#179 exists to describe.
+
+**One instant, stamped, and not re-derived again — because re-deriving is itself an
+intervention.** At **2026-09-02T06:35:25Z** the set was #9166, #10416, #10417, #10431,
+#10609, #10622, #10717. Every one `importance = 3` with a lesson *at that instant*, which
+is a fact about mutable state and not a property of those rows. By 06:51Z it was the
+draft's original seven again — `#10431` out, `#10656` back — because the review had spent
+half an hour writing `#10656` in prose. The set flipped 3 → 2 → 3 in 28 minutes with our own
+text on both ends of it, so **naming ids in user-visible text is an intervention on the
+population, not an observation of it**, and each publish-then-re-derive cycle perturbs what
+it measures. The instant above stands as the published one.
+
+Two facts that bound how long even that instant means anything: `#9166` was created
+2026-07-04T08:02:39Z and leaves the 60-day window at **2026-09-02T08:02:39Z**, so a tag
+landing after that makes the seven six. And all seven sit in the 14–60 day band (the
+youngest, `#10717`, at 14.60 days), so **every one of them** — not just `#10656` — is a
+single 3 -> 2 demotion away from eviction.
+
+**Generalised, this is the sixth surface of a shape the project already catalogued — and
+it is a live defect, filed as D#198.** The pool's `WHERE` is
+`(age<tier1 AND imp>=1) OR (age<tier2 AND imp>=2) OR (age<tier3 AND imp>=3)`, so a row in
+the tier2–tier3 band qualifies **only** through the `imp >= 3` arm. `updateDemote` steps
+importance by −1. Therefore, for every row older than tier2, **a `3 -> 2` demotion is an
+eviction from the candidate pool, not a down-rank** — precisely what D#172 / v3.82.0
+established for the imperative pool, recurring here. Measured on `projects--mem`
+(2026-09-02T06:52Z): **45 of ~106 pool rows are `importance = 3` aged 14–60 days**, so
+roughly 42% of the pool sits one demote step from disappearing rather than from ranking
+lower. Repo-wide, 56 rows were demoted in the last 24 hours and 104 in the last 7 days.
+
+Not fixed here: it shares `applyCitationDecay` with D#179, and whether that demotion
+should have fired at all is exactly D#179's open question. Fixing the pool side first
+would be treating the symptom.
+
+**And the second-order effect, which is the part with no clean answer.** `#10656`'s
+`last_decided_session_id` is the id of the session that built and reviewed this release.
+Twenty rows across the table carry that id as last decider; nine of them were demoted in
+the last 24 hours. Reviewing this face perturbs the population under review, so
+"re-derive at tag time" is not an escape — it is another perturbation. The reviewer's
+counts (44 / 55 / 103 / 19 / 10) and mine (45 / 56 / 104 / 20 / 9) differ by one in every
+column, taken an hour apart.
+
+**Then `#10656` closed the loop, and this is the clearest evidence for D#179 the project
+has.** Watch one row across ninety minutes of writing about it:
+
+| time | state | what happened |
+|---|---|---|
+| 06:12:50Z | `importance = 3`, in the pool | measured, published in the draft |
+| 06:23:24Z | `importance = 2`, `demoted_at` set, **out of the pool** | `applyCitationDecay` demoted it; the review read it here and filed a BLOCKER |
+| 06:54:54Z | `importance = 3`, `demoted_at` cleared, `cited_count` 5 -> 6, **back in the pool** | this session wrote `#10656` into a report and a CHANGELOG; decay scored those as citations |
+
+`last_cited_session_id` on that row is now this release's own session. **Writing the
+release note about a row being evicted un-evicted it.** Nobody applied that memory;
+nobody acted on it. It was discussed — and `extractCitationsFromTranscript` cannot tell
+discussion from use, which is exactly D#179, recurring here on the very row a reviewer
+used to file a BLOCKER against this release. The measured scale of that confusion is
+already on record: 76.4% of the `pretool` face's citation numerator is prose-only mention.
+Left open deliberately — narrowing the citation predicate would move every cite-rate
+number this project has, and that is its own round.
+
+### 200 is a headroom choice, and the ruler cannot tell it from 500
+
+`--wide-obs 500` reads **identically** to `--wide-obs 200` on this corpus, in selection
+and in cost, because the largest pool is 107 and every bound at or above the largest pool
+is one arm. So the ruler has nothing to say about 200 vs 500; the value was picked as
+~2x the largest observed pool.
+
+**Three drafts tried to justify that headroom with a mechanism, and all three were wrong
+in the same way** — a correct per-project table with a sentence generalising *why* the
+numbers came out that way, written without checking the table's own rank order. The tables
+were never the problem.
+
+1. "The pool grows with a project's velocity, not with the size of the store." Backwards:
+   `computeAdaptiveWindows` makes windows **shorter** as velocity rises (tier3
+   60d -> 30d -> 14d at the 3/day and 10/day band edges), so activity *counteracts* pool
+   growth. The largest pool here belongs to the lowest-velocity high-volume project (mem,
+   1.14 obs/day, pool 107) while the only project a band up has 2.9x the velocity and 29%
+   of the pool (daagu, 3.29 obs/day, pool 31).
+2. "The pool tracks accumulated live rows inside a window that narrows as the project gets
+   busier." Also unearned, and this one the review wrote and I adopted. `pool ÷ live`
+   spans 0% to 76.5% across the eleven projects, and the rank order breaks in both
+   directions: `ubuntu-sec` is 6th by live rows and 2nd by pool; `daagu` is 3rd by live
+   rows and 6th by pool. Two rows out of order is enough to kill "tracks".
+3. The cost paragraph below made the identical move a third time.
+
+**What survives is a bound with a stated crossing point, plus the shape that defeats it.**
+A *steady* project in the low band (v < 3/day, tier3 = 60d) holds at most ~3 x 60 = 180
+rows in the widest window — under 200 with no empirical claim needed; the medium band
+(tier3 = 30d) crosses 200 only above ~6.7 obs/day and the high band (14d) only above
+~14.3 obs/day.
+
+**But "steady" is doing all the work, and no project here is steady.**
+`computeAdaptiveWindows` measures velocity over a trailing **7 days** while admitting rows
+from up to **60**, so a project that bursts and goes quiet reads as low-velocity, keeps the
+60-day window, and carries far more than the steady-state figure. The review named this as
+a theoretical hole and guessed no project here exhibited it. Measured, **every one does**:
+against what its own trailing-7-day velocity predicts for a 60-day window, mem holds
+**2.38x** (163 rows against 69 predicted), ubuntu-sec **6.88x** (118 against 17), and
+super-skill reads 0.00 obs/day while holding **51**. So the analytic bound does not hold
+here and must not be leaned on. The honest headroom claim is empirical and dated: the
+largest pool observed is 107 against a bound of 200, nothing is close, and this is a number
+to re-measure with `--population`, not to reason about.
+
+**Cost is per-project, and two drafts got it wrong in two different ways.** The first
+published `0.465 -> 1.23 ms per call, 2.65x` as a point estimate. The second replaced it
+with `2.1x - 3.8x`, which the review then caught as a range no measurement produces — it
+was assembled from hand harnesses on one project and was simultaneously too wide at the top
+and too narrow at the bottom.
+
+Measured on the committed `--cost` (200 iterations/arm, arm order reversed across two
+passes, one process, 2026-09-02T07:00Z):
+
+| project | obsPool | pool ÷ bound | cost of widening 50 -> 200 | reviewer's harness |
+|---|---|---|---|---|
+| projects--mem | 107 | 2.14x | **2.66x - 2.74x** | 2.56x - 2.63x |
+| projects--code-graph-mcp | 59 | 1.18x | **1.96x** | 1.82x |
+| projects--ubuntu-sec | 62 | 1.24x | **1.54x - 1.61x** | 1.49x - 1.59x |
+| the other 8 projects | <= 50 | 1.00x | unchanged (**inferred**, not measured) | — |
+
+So: **~1.5x to ~2.7x for the three projects whose pool exceeded 50, and nothing for the
+other eight.** Once per SessionStart. Both arms stay in the low single-digit milliseconds
+per call on every project measured — stated as a bound rather than a figure, because the
+absolutes drift by more than the effect.
+
+**A draft of this paragraph said the ratio "tracks how much each project's pool actually
+grows — which is the mechanism, not noise", and two of its own three rows refute it.**
+`code-graph-mcp` grows *less* than `ubuntu-sec` (1.18x against 1.24x) and costs *more*
+(1.96x against ~1.57x), and both harnesses reproduce the inversion, so it is not
+between-harness noise. The likely reason is that cost is not only rows-scored: the SQL
+fetch, `estimateTokens` per row, `JSON.parse(files_modified)` and the whole unchanged
+session-summary half are fixed work, so a project with a higher fixed baseline turns the
+same added work into a smaller multiple. What the data supports is the weaker claim: the
+ratio is largest where the pool grows most, by a clear margin, and the two mid-sized
+projects do not order consistently with pool growth. That is still ample reason to publish
+a per-project table instead of a global range — it was the causal wording that outran n=3.
+
+The reviewer's independent harness is in the last column. An early unstamped run on `mem`
+alone read 3.75x, outside everything either of us later measured (ceilings 2.96x and
+2.74x); it is retired here rather than carried. This is why the absolute milliseconds are
+not quotable on this face at all — the rule CLAUDE.md already carries for the sibling
+ruler, whose six runs on one machine spread 3.04 -> 1.80 ms/prompt while the ratio held.
+
+### Why `KEYCTX_POOL_SESS` did not move
+
+The discriminator is **`sessDisplaced = 0` in 11 of 11 projects**: widening it 10 -> 40
+displaces no summary at all, so it is purely additive and that LIMIT is a **volume cap,
+not the D#172 shape**. That — not the observation column — is what establishes it does not
+need lifting. (A draft led with "changed zero observations in every project", which only
+says the obs side is unaffected and would be equally true of a bound that *was* distorting
+the summary order.) What widening does buy is 130 newly injected summaries, roughly
+tripling the emitted block on the largest projects. It truncates *more* projects than the
+obs bound, 5 of 11 against 3 of 11, which is what made the original review propose it
+first. The two bounds behave oppositely.
+
+### The sibling query, enumerated and ruled out
+
+`buildSessionContextLines` holds a second pool-shaped query — `keyObs`, `ORDER BY
+o.created_at_epoch DESC LIMIT KEY_CONTEXT_LIMIT` (10). It is **not** this defect class,
+and the discriminator is specific: the JS underneath it preserves SQL order, partitioning
+the rows into File Lessons and Key Context and slicing each to 5. No re-scoring happens,
+so no row past position 10 could outrank one inside it. The bound is a ranking bound
+there, and it stays.
+
+That enumeration did surface something else, which is **filed and not fixed** (D#196):
+the two sections draw from one pool of 10 and each renders at most 5, so a session whose
+10 newest `importance >= 2` rows all carry a file-lesson shape emits 5 rows and leaves the
+other section empty, rather than emitting 10. That is an under-fill, not a
+reachability-vs-ranking defect, and folding it into this round would have been an
+unmeasured second change to the same block.
+
+### Evidence
+
+`tests/hook-context.test.mjs` gains one test that pins the **property**, not the number:
+a high-value row in a synthetic corpus is placed past position 50 by `created_at` and must
+still be selected. It is deliberately **not** a ranking test — a draft called the target
+the "densest" row in three places and the review refuted it by computing the shipped
+formula (control **3.4883**, target **3.3590**; the control shares its type, importance and
+lesson and is newer, so recency makes it denser by construction). Any rule that fills the
+pool in any order turns this green, which is the correct scope for a reachability backstop. It carries a same-shaped control at position 1, so a red run
+distinguishes "this row shape cannot be selected" from "this row's position made it
+unreachable". Verified RED against the shipped bound before the change — `expected
+[ 'reachability control', ...(3) ] to include 'reachability target'`, with the control
+present — and green after. It pins any bound >= 57 on that fixture, which is the honest
+scope: it guards the property, and the ruler prices the value.
+
+`317` test files, `5390 -> 5404` cases: one for the pool bound (`hook-context.test.mjs`
+35 -> 36) and thirteen binding the ruler's new modes and guards
+(`keyctx-pool-replay.test.mjs` 11 -> 24).
+
+Every new guard was driven to FAIL before being kept. Gutting `inertNotice` to return
+`null` reddens exactly the two cases that assert it fires; each drop-point anchor was
+removed in turn to confirm `patchDropPoints` names the missing gate rather than reporting
+an attribution over a gate that can no longer fire; and the review ran nine further
+mutations across the new exports with **zero survivors**. The one that mattered most was
+not unit-reachable: mutating the pool-size input to `0` made the INERT notice fire above a
+report showing two projects changing, with all 54 cases green — so `main()` now refuses to
+start when projects clear the row floor while the largest pool measures 0, and
+`assertInertConsistent` throws on the contradiction. Verified by mutation: the run prints
+`SELF-CHECK FAILED: 11 projects cleared the 20-row floor but the largest candidate pool
+measured 0`, emits no report, and exits 1.
+
+One non-reproducing failure is recorded rather than explained, per this project's
+convention for them: a reviewer's first full-suite run reddened
+`tests/events-pipeline-probes.test.mjs` (`expected [ Array(1) ] to deeply equal []`); that
+file in isolation passed 3/3 and their second full run was 317/317 green. A second reviewer
+was working the same tree concurrently and CLAUDE.md documents that concurrent `vitest`
+runs manufacture failures — but that is a plausible cause, not an established one, and
+calling it a flake would be a claim about a mechanism nobody demonstrated.
+
+Lint clean. Knip **46 unused exports / 0 unused files**, unchanged: the four new exports
+are all consumed by `tests/keyctx-pool-replay.test.mjs`, and `largestObsPool` was made
+module-private rather than exported by habit (the v3.70.0 precedent). Per D#194 that
+evidence says nothing about `hook-context.mjs` itself, which is invisible to knip because
+a benchmark names it in a `new URL(...)` specifier; this round adds no exports there, so
+there is nothing for the blind spot to hide.
+
+## v3.86.0 — six deferred items closed; two of the three real defects were described, in writing, in the file that then ignored the description
+
+Three behaviour fixes, three test-hygiene closures, two new rulers, and the project's
+first CONTRIBUTING.md.
+
+**Ledger caveat, since the review found it and the CLI cannot undo it.** The six items
+are recorded as `status = 'dropped'` with a reason string, not as `done` with a
+`closed_by_obs_id` — which is this repo's convention for a fix (D#167 -> obs 10823,
+D#172 -> 10851) and leaves them indistinguishable from the two genuine dismissals
+(D#153 "refuted by measurement", D#189 "superseded"). `mem_save --closes-deferred`
+refuses a dropped row (`no corresponding open deferred item`), so `defer drop` turns out
+to be a one-way door that discards the observation linkage it exists to create. Filed as
+D#195 rather than repaired by writing to the live database mid-release. `315 -> 317` test files, `5337 -> 5390` cases; lint clean; knip 46
+unused exports with a **byte-identical name set** against HEAD under the same-tree A/B
+(with a blind spot in that evidence, documented under the reviews below).
+
+**A correction the pre-tag review forced, stated up front because it applies to half the
+numbers below.** The first draft of this entry published figures from live-corpus rulers
+as if they were fixed. They are not: the databases and the transcript corpus grow every
+session, and `selectWithTokenBudget` additionally reads the wall clock. Re-run six hours
+later, `829 -> 1880` became `652 -> 1863`, `9 gained / 2 displaced` became `10 / 3`, the
+id-space overlap moved 90.1% -> 91.6%, and the error-recall off-arm moved 39.8% -> 39.7%.
+Every such number below now carries a timestamp, and where a ratio is stable while its
+counts move, the ratio is what is quoted. Two useful sub-rules fell out: on a **date
+split** only the BEFORE arm is reproducible, since it is a closed past window; and a
+**frozen fixture** does not freeze the corpus it is replayed against.
+
+**The pattern, stated once because it is the whole release.** Two of the three real
+defects were sitting under a comment that names the exact hazard the code then walks
+into. `scripts/pre-tool-recall.js` filters its candidate rows against a seen-set of bare
+numbers, six lines under the end of a comment reading "events share the numeric id space
+with observations" — and the `src` tag that comment was written to justify is not
+consulted by the filter. (A draft said "three lines"; in a release about reading what is
+actually written, the count is worth getting right.) `lib/stats-quality.mjs` opens with a rule that ratios must divide by the LIVE
+observation count, and then three of its five queries read `FROM observations`
+unqualified. (A draft said "every query", which the file itself refutes: `topLessons`
+already excluded compressed rows, and `purgeRow` is unfiltered on purpose.)
+Writing the rule down is not the same as executing it.
+
+### D#188 — a UPS-injected observation #42 made event #42 unreachable
+
+The cross-hook injected-ids marker is a union across TABLES, and the convention for
+keeping them apart already existed: `user-prompt-search.js` writes `P<id>` for
+`user_prompts` rows and `D<id>` for `deferred` rows, with the comment "so obs ids can't
+collide in the shared injected-ids file". Observations are the incumbent namespace and
+stay bare. `events` — the one table that genuinely shares the id space, **91.6% of
+observation ids also existing as an event id** (3432 of 3747, 2026-09-01T19:56Z; it read
+90.1% six hours earlier, because both tables grow) — never got a prefix.
+
+The consequence: an observation injected at prompt time silently suppressed the
+same-numbered event on the PreToolUse face for the five-minute window, and vice versa.
+
+**A second consequence was claimed in the draft of this entry and is false**; it is
+recorded rather than quietly dropped, because the method this release advertises is
+enumerating a marker's readers and writers, and the draft got one of them wrong. The
+draft said bare event ids leaked into `hook.mjs`'s `pathAInjectedIds` and suppressed the
+same-numbered observation on the `fyi` face. They reach that list and suppress nothing:
+`mergeCrossHookInjected` writes every id as a **string**, and both consumers test
+`new Set(excludeIds).has(r.id)` against a **number** out of SQLite. Measured against the
+real functions — excluding `1` returns nothing, excluding `'1'` returns the row.
+
+What the pre-tag correctness review exposed by catching it is a separate and still-live
+defect: that exclude list is inert for **every** id the marker holds as a string,
+observations included, so the `<memory-context>` dedup and the task-imperative exclude
+both silently do nothing whenever `pre-tool-recall.js` wrote the marker last. Filed as
+**D#193** with the probe, deliberately not fixed here — making an exclude list start
+working changes what gets injected, and this release has no measurement of that.
+
+Also unclaimed and real, found by the same review: `shouldSkipByDedup` *does*
+String-normalise both sides, so before this fix a bare event id colliding with a
+candidate observation id could push its overlap ratio past 0.8 and skip an entire UPS
+injection. Namespacing fixes that too — a third consumer the draft's two-bullet list
+missed in the other direction.
+
+Measured by replaying every real session's UPS-injected id set against the injectable
+events of the project **the session ran in**: **14 collisions across 11 of 60 sessions
+(18.3%)**, 2026-09-01T20:17Z.
+
+**The draft measured the wrong population, in the paragraph where it was arguing about
+populations.** `pre-tool-recall.js` calls `inferProject()` once and hands that one value
+to both the marker file and the events `WHERE project = ?`, so the session's project is
+the only scoping that exists in the code. The draft scoped by the injected observation's
+own `project` column — a different question, because the `ups`/`fyi` faces do inject
+cross-project rows — and published 9 in 9 (15.5%). That understated the defect. The
+pre-tag claims review reconstructed the session-scoped reading independently at 12 in 10,
+filed it as a blocker, withdrew the blocker when the draft's own number reproduced under
+the draft's own predicate, and then made the sharper point: reproducing exactly is not the
+same as measuring the right thing. The remaining gap between its 12 and the 14 here is its
+stand-in directory→project mapping plus an hour of growth.
+
+Dropping the project condition entirely reports 72 in 41 — a population the project-scoped
+query can never reach, so which population a figure came from is part of the figure. The
+14 is still an upper bound: it does not additionally require the blocked event to match
+the file being read. The full predicate is recorded in `CLAUDE.md` and in
+`lib/injected-ids.mjs`, because no harness is committed for it and "their own project's
+injectable events" turned out to be ambiguous between the two readings that produce 9
+and 14.
+
+Fixed with `injectedIdKey(id, src)` in `lib/injected-ids.mjs` (`E<id>` for events).
+Legacy in-flight markers keep their old meaning for at most `DEDUP_STALE_MS` and then
+rotate; deliberately no format version, because a five-minute window of the pre-existing
+behaviour is cheaper than a schema every reader must branch on.
+
+### D#187 — `claude-mem-lite update` turned a plugin-only install into a hybrid
+
+v3.84.1 fixed the version read for hook and MCP processes, where `CLAUDE_PLUGIN_ROOT` is
+always set. It is not set in a terminal, and there a plugin-only user fell off both
+plugin paths at once: `getCurrentVersion()` returned `0.0.0` (so every release compares
+as newer, forever) and `isPluginMode()` was false, so `allowInstall` defaulted to true and
+`downloadAndInstall` laid a full managed tree into `~/.claude-mem-lite` — converting a
+plugin-only install into exactly the hybrid whose two trees D#184 documents drifting
+apart.
+
+Same root cause as PR #17: the process ENVIRONMENT was the only install-shape evidence
+consulted. Both reads now fall back to `detectInstallShape()`, which asks the filesystem
+and answers the same in a hook, in a terminal, and in a subprocess. Memoised per process,
+because `installExtractedRelease()` calls `isPluginMode()` *after* writing the managed
+tree and a live re-probe would flip the answer mid-run.
+
+### D#191 — the quality dashboard described a store 20x noisier than the one retrieval searches
+
+`stats --quality` rendered every ratio over all rows, compressed and superseded included,
+under labels naming no population. Numerator and denominator were paired, so each ratio
+was internally consistent; what was wrong was the population it described. On the live
+store (3742 rows, 2284 live): all-time Lesson rate read **59.6%** where the live store is
+**92.9%**, all-time LOW_SIGNAL read **22.9%** where the live store is **1.1%** —
+compression retires precisely the low-signal, lesson-less rows. That LOW_SIGNAL pair is
+a factor of **20.8x** — a draft of this paragraph called it "roughly three decades of
+quality worse", which is 1000x and was an adjective standing in for a number that is
+already striking on its own (pre-tag claims review S1).
+
+The review proposed filtering the two all-time queries. The window and per-type queries
+have the same defect and `--days` is user-settable, so all three are filtered and the
+header now names the population once. `purgeRow` is deliberately left alone; compressed
+rows are its entire subject.
+
+### D#185 / D#186 / D#190 — test hygiene, one of which an outside contributor hit first
+
+* **D#185**: four injection-budget assertions measured strings containing the absolute
+  `CLI_PATH`, so they were partly measuring how deep the reader's install prefix is. PR
+  #17's contributor reported one failing while all 12 cases passed here. Reddening
+  thresholds, measured: detail doc at `CLI_PATH >= 104` chars, instructions-full 129,
+  instructions-BASE 140 — so the DOC reddens first, not the instructions. Budgets now
+  normalise `CLI_PATH` to a fixed reference path, with a self-check that the
+  normalisation still finds it and that the number does not move with the prefix.
+* **D#186**: inside the 24h throttle window `state.updateAvailable` is the only thing
+  between the cached banner and silence, and flipping that read left all 68 cases green.
+  Both polarities now asserted, with `fetch` proven uncalled so the assertions are about
+  the cached path.
+* **D#190**: nothing under `tests/` imported `benchmark/rerank-pool-replay.mjs`, so the
+  four self-checks the release notes vouch for could all be deleted with a green suite —
+  the same shape v3.82.0 found in `citation-live-replay.mjs`. The checks are now exported,
+  throw instead of `process.exit` so they can be driven in-process, and are covered by
+  `tests/rerank-pool-replay.test.mjs`; each of eight mutations was watched to fail.
+
+### Two new rulers
+
+**`benchmark/keyctx-pool-replay.mjs`** — the SessionStart Key Context face
+(D#192, formerly D#189), the fifth surface of the "SQL LIMIT upstream of a JS relevance
+filter" shape and the purest: both SELECTs order by `created_at_epoch DESC` alone while
+the selector re-sorts by a composite into which recency enters compressed to (1,2]. No
+existing ruler imports `hook-context.mjs`. Nothing about the shipped selection changed
+this release — the two bounds are only extracted to `KEYCTX_POOL_OBS` / `KEYCTX_POOL_SESS`
+so a twin can patch them.
+
+What it found refutes the premise the item was filed on. Truncation says `sessPool` is
+the worse offender (over LIMIT in 5/11 projects against `obsPool`'s 3/11). Decomposed,
+widening them does opposite things: `obs 50->200` alone changes the injected block in
+2/11 projects, makes **more rows reachable than it displaces**, and costs a few dozen
+tokens; `sess 10->40` alone changes **no observation at all** and adds 130 session
+summaries, roughly tripling the emitted block on the largest projects. Truncation count is
+not harm.
+
+**Those are the directional findings, and they are the only kind this ruler can support.**
+`selectWithTokenBudget` takes no clock — it reads `Date.now()`, derives adaptive windows
+from it, and weights candidates by recency — so its pools SLIDE and every absolute it
+prints is a snapshot. Not because the corpus grows, which was the first and half-right
+diagnosis: on `projects--mem` the obs pool read **113 -> 112 -> 108** across three runs
+the same evening while its live row count went **776 -> 777** with nothing superseded.
+Growth cannot lower a count; a receding window can. The first draft of this entry published `829 -> 1880`
+and `9 gained / 2 displaced` as if they were fixed; the pre-tag claims review re-ran the
+same commands hours later and got `652 -> 1863` and `10 gained / 3 displaced`, which is
+correct and the draft was not. Both arms still run in one process against one database
+microseconds apart, so the comparison holds while the numbers move. The tool now stamps
+its output with an ISO timestamp and says this in its own report. Snapshot at
+**2026-09-01T19:55Z**: obs-only 10 newly reachable / 3 displaced, `mem` 652 -> 733 and
+`code-graph-mcp` 696 -> 726; sess-only 0 observations changed, 130 summaries, `mem`
+652 -> 1863 and `code-graph-mcp` 696 -> 1838.
+
+Two of its own defects are recorded because they are the interesting part. Scoring only
+`observations` printed "selection differs 0/11" for the arm that had just tripled the
+emitted block. And its displacement self-check survived mutation until a negative arm was
+added — its structural sibling already had one, which is the tell.
+
+**`citation-live-replay.mjs --mentions`** — D#179's prerequisite. It re-splits each
+face's numerator into ids named in a model response that also called a tool and ids named
+only in prose, keyed by `requestId`. Over 79 injection-bearing sessions
+(2026-09-01T20:24Z): **`pretool` is 76.4% mention-only (420/550)**, fyi 61.9%, ups 61.5%,
+task_imperative 66.7%, error_recall 42.9%.
+
+Read the ratio, not the counts: three runs the same evening gave `pretool` **75.3% ->
+75.6% -> 76.4%** as the corpus grew under them. The corpus grows partly *because of this
+work* — the session writing these notes is itself a transcript the next walk will read,
+which is the self-reference D#179 is about. Put in one
+currency, because a share of hits and a change in a rate are not comparable and a draft set
+them side by side as if they were: **403 of pretool's hits are prose-only, against 149 hits
+contributed by the ten document-shaped sessions**, so the contamination is not confined to
+the release-note/audit sessions the pollution block already flags. Neither column
+is a bound, and the first draft of that docblock wrongly called one a floor: acting in one
+response and citing in a later summary lands in `mentionOnly`. `subagent` is declared
+unavailable rather than omitted.
+
+### A measurement debt settled halfway, and said so
+
+v3.79.0's error-recall rerank, re-measured over the frozen 2026-08-25 shapes with both
+arms on the same file and the switch flipped rather than the code edited (both arms run
+back to back, 2026-09-01T19:58Z): rows matching no error term **39.7% -> 21.7%**, TOP-1
+such rows **38.8% -> 20.5%**, with **2413 injected rows in both arms** and identical
+per-project row counts in all 15 projects. Equal totals alone would be necessary and not
+sufficient — a transform that drops one row and admits another keeps the count — so the
+per-project agreement is the part that carries the "reorders, never removes" claim, and
+even that is counts rather than set identity. The shapes are frozen but the corpus they
+are replayed against is not, so the off-arm read 39.8% / 38.9% six hours earlier; the
+on-arm was identical to the digit. The mechanism is confirmed.
+
+The outcome is not. `citation-live-replay --split` at the v3.79.0 boundary (one walk, two
+arms) reads `error_recall` cite-rate **9.0% [6.0, 13.2]% (22/245) before -> 5.2%
+[3.4, 7.9]% (20/383) after**. Note which half of a date split is reproducible: the BEFORE
+arm is a closed past window and read identically across runs six hours apart, while the
+after arm grew 374 -> 383 pairs.
+
+Two reasons that reads as "not established" rather than "worse", and the shorter one is
+the robust one: **the two intervals overlap** (`[6.0, 13.2]` and `[3.4, 7.9]` share
+6.0-7.9), so the difference is not significant however the period is treated. Separately,
+`pretool` moved 34.0% -> 39.9% across the same boundary, so a period effect is present and
+a date split cannot attribute either direction to the rerank.
+
+One clause the hedge owes in the other direction, from the review: the only outcome
+evidence available points AGAINST the rerank, not nowhere — a difference-in-differences
+across those two faces would read about -11pp. Declining to compute it is right, since
+nothing supports parallel trends between faces with different content, but "neither
+demonstrated nor refuted" should not be read as "uninformative". It is adverse and
+confounded. Mechanism confirmed; cite-rate benefit unestablished.
+
+### What the two pre-tag reviews changed
+
+Both ran before the tag and both are the reason several paragraphs above read differently
+from their drafts. Recorded because the corrections are more informative than the
+release: a **BLOCKER** (the false `pathAInjectedIds` consequence, retracted in all four
+places it had been copied to, with the real defect filed as D#193), the live-corpus
+snapshot class described at the top, and the fork-CI duration claim.
+
+Four coverage gaps they found, all now closed with the mutation watched to fail:
+
+* `topLessons`' new superseded arm was unpinned — reverting it to the old
+  compressed-only filter left the suite green. That is the superseded-invariant class
+  this project has re-broken repeatedly, so it now has a decoy-bearing case.
+* the transcript → `applied` computation behind the `--mentions` headline was unpinned;
+  `applied: 0` hardcoded passed everything. `--mentions` is now exposed in `--json` and
+  driven end to end through the subprocess over its own transcript root.
+* `classifyCitationContext`'s key-fallback test exercised the `uuid` arm, which
+  production never reaches, while the `message.id` arm that does run had no case.
+* the `installShape()` memo's stated reason was traced and found unreachable; the
+  docblock now says what the memo actually buys.
+
+And one measurement worth more than the release it came from: **`knip` reports no unused
+exports at all for a module named in a `new URL('../X.mjs', import.meta.url)`.** Probing
+`hook-episode.mjs` / `utils.mjs` / `tier.mjs` lists the probe; probing `hook-context.mjs`
+/ `hook-memory.mjs` does not, and those two are exactly the modules the pool-replay
+benchmarks patch by text. Parking the benchmark alone leaves them blind; parking its test
+alone leaves them blind; parking both restores visibility. So the standing knip baseline
+is blind to two files, and its "+0 / −0 name set" says nothing about `KEYCTX_POOL_OBS` /
+`KEYCTX_POOL_SESS` — which a draft of `CLAUDE.md` had wrongly credited to an importer
+that is really a regex. Filed as D#194.
+
+### CONTRIBUTING.md
+
+The project has outside contributors now. It documents the thing PR #17 discovered: a
+fork's CI run sits at zero jobs until a maintainer approves it. Measured on that run —
+created `2026-09-01T01:29:25Z`, zero jobs, marked `failure` twelve hours later. All ten
+same-repo pull-request runs in project history started their jobs and finished inside
+three minutes (the five that passed took 2m21s–2m34s, the five that failed 12s–1m51s), so
+the distinguishing symptom is **zero jobs and a multi-hour wall-clock**, not the
+conclusion — a first draft said "every same-repo run finished in about two and a half
+minutes", which is true only of the passing half and was corrected by the pre-tag review. The gate stays on deliberately (approving a fork run executes
+that fork's code); what was missing was anyone saying so.
+
+## v3.85.1 — the gate added to stop a regression riding out was comparing against evidence it had already judged unreliable
+
+No behaviour change to the memory system. One CI gate is made real, and six statements
+v3.85.0 shipped — three of them in code comments, which is how this project's wrong
+explanations propagate — are replaced with measurements.
+
+**The gate.** v3.85.0 added a benchmark gate to `publish.yml` (ENG-2) because `ci.yml`'s
+benchmark job gates the *branch*, not the tag. The gate ran. It compared against
+`benchmark/baseline.json`, timestamped `2026-07-24`, **39 days old against
+`ci-gate.mjs`'s own `BASELINE_STALE_AGE_DAYS = 30`** — and because the step did not pass
+`--strict`, the run printed the stale-baseline warning and continued. `ci-gate.mjs`'s
+docblock names release/CI as exactly the context `--strict` exists for.
+
+The race it was added to close is also confirmed on v3.85.0 itself, at job granularity
+(`gh run view`, UTC): Release's `publish` job **completed 15:53:53Z**; main CI's
+`benchmark` job **started 15:54:35Z**. The package was on npm 42 seconds before the branch
+gate began. So the in-release gate is the one that matters, and it was the one comparing
+against a baseline it had already flagged.
+
+Both fixed. `benchmark/baseline.json` recaptured (`--production-hybrid`, the path the gate
+runs); `publish.yml` passes `--strict`, and `ci.yml` passes it **on push only** — PRs stay
+advisory so an outside contributor is never blocked by the calendar. Verified binding in
+both directions: `--strict` exits 0 on the new baseline and exits 1 on the same file with
+the old timestamp restored.
+
+**That arms a dated failure, and saying so is the point.** The age test is
+`floor((now − timestamp) / DAY) ≥ 30` and the baseline is stamped `2026-09-01T16:29:45Z`, so
+**main goes red from 2026-10-01 16:29 UTC** — that morning's pushes are still green — until
+someone recaptures. Intended: recapture is a one-line commit and a red main is the cheapest
+reminder available. Nothing automates it.
+
+**The consequence on the release path is worse than a red main, so it gets its own
+sentence.** `publish.yml`'s gate is strict too, and it lives in `validate` — which runs
+*after* the tag has been pushed. Tagging more than 30 days after a recapture therefore fails
+the release with the tag already on the remote, and a stranded tag is expensive here (see
+the v3.69.0/v3.69.1 note in `publish.yml`; this project's rule is that a failed tag cannot
+simply be reused). Main going red first, at day 30, is what stops anyone reaching that state
+unaware — which is the actual reason `ci.yml` is strict on push and not merely advisory.
+
+**What the stale baseline was hiding, attributed rather than called drift.** `recall_at_10`
+0.8998, `ndcg_at_10` 0.9712, `mrr_at_10` 0.9611 all unchanged; `precision_at_10`
+**0.8597 → 0.8497 (−1.16%)** and tokens 106 → 108 — and **all of it is one query**. q15
+("WebSocket") returns 10 results where it returned 5, finding the same 3 relevant ids
+(recall and nDCG stay at 1.0); −0.3 ÷ 30 queries is exactly the −0.01 overall. The pre-tag
+review bisected it across five detached worktrees to a single commit, **v3.57.0
+(`564e63b`)**, whose single-match-clamp fix stopped applying `SINGLE_MATCH_BANDS` to
+vector-scale rows — the "strong single hit clamped down" item from the 2026-07-17 audit. A
+known consequence of admitting more fused rows, not a stealth regression, and not from
+v3.85.0's four fixes (the benchmark drives `search-engine.mjs`, which none of them touch).
+
+**And the sharper fact, which is worse than "39 days old":** the old baseline's timestamp
+(`2026-07-23T20:17−07:00`) predates v3.57.0 by about two hours. It was captured at v3.56.1
+and **never described any released version** — the gate has been comparing every release
+since v3.57.0 against a pre-v3.57.0 tree. That is why the drop went unpriced for six weeks.
+p95 latency moved 1.7385 → 1.9501 ms; a first capture read 3.068 on a loaded machine and was
+discarded, which is why two captures were taken.
+
+**Six claims, re-measured.** All numbers below come from one back-to-back walk of the whole
+`user_prompts` table (n = **11289**, 2026-09-01) through the committed
+`benchmark/rerank-pool-replay.mjs`, so the arms share a denominator. The corpus grows
+daily — v3.85.0 quoted n = 11279 — which is exactly why the three arms were re-run
+together rather than differenced across time.
+
+| v3.85.0 said | measured |
+|---|---|
+| the headlined `LIMIT 10 → 30` carries the change | the **cross-project `LIMIT 5 → 15` does**: 12.6% changed sets / 5.3% top-1 / **214** of the 225 empty→non-empty prompts, against 3.6% / 1.4% / **9** for same-project alone |
+| the composite "spans 281×" | 281× is the **table** bound; realised over the rows the pool can actually return (`liveObsFilterSql`, n = **2284**) it is **60.0×** (0.1125 … 6.750). `citeFactor = 0.4` needs `uncited_streak ≥ 3`, which citation-decay resets — **0 rows** are there. Over the raw table it reads 86.5×, but 39% of that table is compressed or superseded and unreachable — see below |
+| "cost stays flat" | **+5% to +16% across calibers, +6% to +10% with `--cost`**: six whole-corpus `--cost` runs on one machine gave 1.058–1.102 (same code, same corpus), against 1.054–1.065 with arm order fixed and 1.063–1.156 arm-alone. The run-to-run spread is comparable to the effect and the absolute ms/prompt moved 3.04 → 1.80 across those runs, so this is a range and the ms are not quotable. Its own parenthetical ("the pool is the expensive term") predicted the direction |
+| ALGO-2 is "strictly additive" | true of the bypass **set**, false of the **output**: the merge appends `fileRows` after `ftsRows` (dedup by id) then slices to `MAX_RESULTS`, and deep rows sort last within `ftsRows` — so a deep row takes a slot ahead of a file-recall row whenever `\|head\| + \|deep\| + \|fileRows\| > MAX_RESULTS` |
+| "the injected set is still `MAX_MEMORY_INJECTIONS = 3`" | true, and delivered rows still rise **9650 → 10895 (+12.9%)** — the cap did not move, the average fill did (size-3 sets 1966 → 2521) |
+| "every composite factor already has a SQL clause" | **three of seven** do. The 1.5× lesson bonus and the `importance ≥ 2` step do not — the SQL forms that exist encode different weights (`1.0 + 0.3·lesson`, `0.5 + 0.5·importance`) |
+
+The last one matters beyond bookkeeping: it was the argument for declining the deeper fix
+(ordering by the composite, which would make `LIMIT` a true ranking bound). The conclusion
+survives — both are trivially expressible — but it is a small piece of work, not zero.
+
+**The spread row above was itself wrong first, and the way it was wrong is the point.** The
+draft of this entry replaced v3.85.0's 281× with a "realised 86.5×" computed over
+`SELECT COUNT(*) FROM observations` while calling it "live rows". 1458 of 3742 rows (39.0%)
+are compressed or superseded; `liveObsFilterSql` is in the `WHERE` of **both** SELECTs, so
+none of them can enter the pool, be scored, or be an endpoint of a range describing what the
+`LIMIT` cuts. The row supplying the 0.0780 minimum is `id 10239`, `compressed_into = 10713`.
+Over the population the pool can return the spread is **60.0×** — the draft overstated by
+44%. `CLAUDE.md` already carried the instruction ("count that population with the pool's own
+`liveObsFilterSql`, never a bare `WHERE importance = 3`") because v3.82.0 shipped the same
+error and overstated a project by a third. Written down, told to itself, repeated anyway,
+and caught only by the independent review below — which is the argument for the review, not
+for the note in `CLAUDE.md`.
+
+**Two comments whose premise was false, not merely imprecise.**
+`CROSS_HOOK_DEDUP_SLACK_MAX`'s docblock and its use site both said the cross-hook seen-set
+"is bounded by UPS's own per-prompt budget in practice (MAX_RESULTS 3)". It is a **union**
+across hooks and calls inside the staleness window — `mergeCrossHookInjected` unions new
+ids into the old — so nothing holds it at 3. Measured over this machine's
+`runtime/.claude-mem-injected-*` markers: id counts `1×9, 2×1, 3×2, 16×1` over n=13, and
+`1×11, 2×1, 3×1, 15×1` over n=14 an hour later. **Read that as "3 is not a bound", not as a
+distribution** — one developer machine, the tail entry is a single long agent session (on
+the re-measure the top entry was the measuring session itself), and it counts ids in the
+file while `readCrossHookInjected` returns an empty set for a payload outside
+`DEDUP_STALE_MS`. The consequence is not a crash; it is that the sentence hid a failure mode
+that is reachable by arithmetic and has not been observed in the wild. At a seen-set
+of 16 the slack still caps at 5, so a Read fetches `obsLimit = 6`, and if all six are in
+the seen-set the face goes silent — the exact failure ALGO-4 exists to fix. The cap stays
+(an unbounded number off disk must not size a query); the reassurance is gone.
+
+**The ruler gained what the corrections needed**, rather than the numbers being published
+without one — the mistake v3.85.0's own pre-tag review filed as a blocker.
+`benchmark/rerank-pool-replay.mjs` now reports delivered rows and a set-size histogram in
+the default mode, adds `--cost` (whole function, both arms, alternated order — timing the
+SELECT alone reads 1.00× and misses the JS scoring the widened pool feeds), and **counts
+the counterexample to its own superset argument**: a prompt that injects under the narrow
+pools and nothing under the wide ones would refute monotonicity, so `nonEmptyToEmpty` is
+reported and a non-zero value exits 1. Currently **0 across 11289 prompts**. `emptyWide ≤
+emptyNarrow` does not establish this — two prompts moving off empty hide one moving onto
+it — and the check is verified able to fire (relaxing its predicate to `>= 0` makes the run
+exit 1). The gate is suppressed under a widening sweep such as `--baseline-cross 50`, where
+the twin is the wider arm and monotonicity runs the other way.
+
+**Two independent pre-tag reviews ran on this entry after it was written**, and this
+paragraph replaces one saying none had.
+
+The **claims** lens reproduced 29 figures to within corpus growth and rejected one — the
+86.5× population error above, graded a BLOCKER because a wrong replacement reads as measured
+and is therefore worse than the wrong original. It also refuted the cost figure's
+reproducibility across five calipers, bisected the precision drop to `564e63b`, and found
+the dated red-main event this entry had not disclosed.
+
+The **correctness** lens did not block, and independently re-derived the 60.0× correction to
+the digit. Its finding was that the three real logic changes in this release — both
+`--strict` wirings, `costCompare`, the counterexample gate — had **no test binding at all**:
+it deleted `--strict` from both workflows, deleted the gate, and gutted `assertCannotWrite`
+in one pass, and 315 files / 5335 tests stayed green. Dropping `--strict` from `publish.yml`
+restores the exact v3.85.0 defect with nothing in the repo making a sound. That is now
+pinned by `tests/source-files-sync.test.mjs`, anchored to **active** `run:` lines — verified
+red against four mutations including commenting the line out. It also found that
+`ci-gate.mjs` silently ignored unknown flags (`--strict` exit 1, `-strict` exit 0, `--Strict`
+exit 0), so a one-character typo in either workflow downgraded the gate while CI stayed
+green; unknown flags now exit 1. And it found `--baseline-same foo` producing a complete,
+exit-0, conclusive-looking report with every number meaningless — `NaN` pools now refuse to
+run. Reports: `tasks/review-claims-v3.85.1.md`, `tasks/review-correctness-v3.85.1.md`.
+
+The reason both mattered is narrow and worth naming: every number in this entry is the
+author re-measuring the author, usually to contradict someone else's figure. That is the
+weakest possible evidence chain — and the one BLOCKER it produced was in the number this
+entry was proudest of having corrected.
+
+Not fixed here, recorded instead: **D#191** (`lib/stats-quality.mjs` computes its all-time
+Lesson/LOW_SIGNAL rates over the raw table on a shipped user surface — 59.6% vs 92.9% and
+22.9% vs 1.1% against the live population — while that file's own docblock is the rule
+forbidding it; numerator and denominator are paired, so the ratios are self-consistent and
+only the population label is wrong, and the watchdog gate reads the 30-day window where
+223 of 224 rows are live, so the gate is not distorted), **D#190** (nothing under `tests/` imports
+`rerank-pool-replay.mjs`, so all four self-checks can be deleted with a green suite — the
+review confirmed they work today by mutation, and this project has the receipt for that
+failure mode in `citation-live-replay.mjs`), **D#189** (the same reachability bound on
+`hook-context.mjs`'s SessionStart face — SessionStart injects on every start, so it is a
+released-artifact default-behaviour change and gets its own round) and **D#188** (cross-hook
+dedup compares bare numeric ids while events and observations share an id space).
+
 ## v3.85.0 — the bound we closed in v3.82.0 was alive on four more surfaces
+
+> Six statements in this entry were corrected in v3.85.1 after re-measurement — the causal
+> attribution between the two pool clauses, the 281× spread, "cost stays flat", "strictly
+> additive", the delivered-row volume, and "every composite factor already has a SQL
+> clause". The table in v3.85.1 above has the measured values; the text below is left as
+> published.
+
 
 D#172 established that **a SQL `LIMIT` upstream of a JS-side relevance filter is a
 reachability bound, not a ranking bound** — whatever the SQL orders by, a row outside the

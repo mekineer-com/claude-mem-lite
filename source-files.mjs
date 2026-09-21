@@ -6,35 +6,61 @@
 
 export const SOURCE_FILES = [
   // Entry points and top-level modules
-  'cli.mjs', 'cli-path.mjs', 'server.mjs', 'search-scoring.mjs', 'search-engine.mjs', 'deep-search.mjs', 'rerank.mjs', 'tool-schemas.mjs',
-  'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
-  'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs',
-  'hook-update.mjs', 'hook-optimize.mjs', 'hook-precompact.mjs',
+  'cli.mjs',
+  'cli-path.mjs',
+  'server.mjs',
+  'search-scoring.mjs',
+  'search-engine.mjs',
+  'deep-search.mjs',
+  'rerank.mjs',
+  'tool-schemas.mjs',
+  'hook.mjs',
+  'hook-shared.mjs',
+  'hook-llm.mjs',
+  'hook-memory.mjs',
+  'skip-tools.mjs',
+  'hook-semaphore.mjs',
+  'hook-episode.mjs',
+  'hook-context.mjs',
+  'hook-handoff.mjs',
+  'hook-update.mjs',
+  'hook-optimize.mjs',
+  'hook-precompact.mjs',
   'plugin-cache-guard.mjs',
-  'haiku-client.mjs', 'utils.mjs', 'schema.mjs',
-  'package.json', 'package-lock.json', 'skill.md',
-  'registry.mjs', 'registry-scanner.mjs',
-  'registry-retriever.mjs', 'resource-discovery.mjs',
-  // registry-recommend.mjs: statically imported by hook.mjs (PostToolUse adoption probe)
-  // and scripts/user-prompt-search.js (UserPromptSubmit shadow recommendation).
-  'registry-recommend.mjs',
-  // registry-enricher/-github/-importer are dynamically imported by server.mjs
-  // (mem_registry tool) and mem-cli.mjs (registry CLI subcommands). Missing
-  // them from SOURCE_FILES silently broke those code paths prior to this fix.
-  'registry-enricher.mjs', 'registry-github.mjs', 'registry-importer.mjs',
+  'haiku-client.mjs',
+  'utils.mjs',
+  'schema.mjs',
+  'package.json',
+  'package-lock.json',
+  'skill.md',
   // Shared SOURCE_FILES manifest — self-reference so `~/.claude-mem-lite/` can
   // re-run install.mjs (which imports this module) after an auto-update.
   'source-files.mjs',
-  'install.mjs', 'install-metadata.mjs', 'mem-cli.mjs',
-  'tier.mjs', 'tfidf.mjs',
-  'nlp.mjs', 'synonyms.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
-  'secret-scrub.mjs', 'format-utils.mjs', 'hash-utils.mjs', 'bash-utils.mjs',
+  'install.mjs',
+  'mem-cli.mjs',
+  'tier.mjs',
+  'tfidf.mjs',
+  'nlp.mjs',
+  'synonyms.mjs',
+  'scoring-sql.mjs',
+  'stop-words.mjs',
+  'project-utils.mjs',
+  'secret-scrub.mjs',
+  'format-utils.mjs',
+  'hash-utils.mjs',
+  'bash-utils.mjs',
   // Single source of truth for the CLAUDE_MEM_DIR → data-dir resolver (rejects a
   // stringified "undefined"/"null"/relative env instead of creating a stray dir).
-  // Statically imported by schema.mjs / cli.mjs / install.mjs / registry-recommend.mjs
-  // AND hook scripts (pre-tool-recall / post-tool-recall / pre-skill-bridge) — ship it
+  // Statically imported by schema.mjs / cli.mjs / install.mjs
+  // AND hook scripts (pre-tool-recall / post-tool-recall) — ship it
   // or auto-update leaves schema + every hook with ERR_MODULE_NOT_FOUND on each fire.
   'lib/resolve-data-dir.mjs',
+  // DB_DIR / DB_PATH / CODE_DIR. Statically imported by schema.mjs (which re-exports all
+  // three) and by hook-update.mjs, which takes them from HERE so the verified repair path
+  // stays loadable without better-sqlite3. Missing from the manifest → auto-update leaves
+  // schema.mjs and the repair path with ERR_MODULE_NOT_FOUND on every fire.
+  'lib/data-paths.mjs',
+  'lib/doctor-modes.mjs',
   // lib/ — statically imported by hook-llm.mjs (activity) + hook-handoff.mjs (git-state, task-reader);
   // dynamically imported by hook.mjs (startup-dashboard) + mem-cli.mjs (doctor-benchmark, plan-reader).
   'lib/activity.mjs',
@@ -63,6 +89,8 @@ export const SOURCE_FILES = [
   'lib/cite-back-hint.mjs',
   // The one definition of the pre-recall cooldown path — shared by its writer
   // (scripts/pre-tool-recall.js) and both readers (cite-back-hint, edge-attribution).
+  'lib/cite-recall-path.mjs',
+  'lib/frontmatter.mjs',
   'lib/cooldown-path.mjs',
   // v2.85: stale test-fixture sweeper. Imported by install.mjs (cleanup) + cli.mjs.
   // Missing from manifest → tarball ships install.mjs that ERR_MODULE_NOT_FOUND on cleanup.
@@ -71,7 +99,7 @@ export const SOURCE_FILES = [
   'lib/id-routing.mjs',
   'lib/err-sampler.mjs',
   // v2.76.x: unsampled hook-script failure log. Imported by
-  // scripts/pre-tool-recall.js + scripts/pre-skill-bridge.js (recorder)
+  // scripts/pre-tool-recall.js (recorder)
   // and mem-cli.mjs (countRecentHookErrors for `stats`). Missing from
   // manifest → tarball ships hooks that ERR_MODULE_NOT_FOUND on every fire.
   'lib/hook-telemetry.mjs',
@@ -81,7 +109,11 @@ export const SOURCE_FILES = [
   // source-files-sync.test.mjs is what keeps these from being dropped on bump.
   'lib/file-intel.mjs',
   'lib/reread-guard.mjs',
+  'lib/handoff-constants.mjs',
+  'lib/llm-call.mjs',
   'lib/metrics.mjs',
+  'lib/quiet-scope.mjs',
+  'lib/shard-gc.mjs',
   // v3.6.x: bind-salience producer — extracts identifiers a lesson names that
   // are present in the pre-edit file (component 2). Imported ONLY by
   // scripts/pre-tool-recall.js; kept here for the same reason as file-intel.mjs.
@@ -105,15 +137,30 @@ export const SOURCE_FILES = [
   // Missing from the manifest → an updated install ships a doctor that throws
   // ERR_MODULE_NOT_FOUND on the command users run when something is already wrong.
   'lib/install-shape.mjs',
+  'lib/schema-skew.mjs',
+  'lib/db-unusable.mjs',
+  'lib/record-once.mjs',
   // Single-envelope stdout for hook processes — imported by hook.mjs. Claude Code
   // parses hook stdout as ONE JSON document; missing from the manifest → an updated
   // install throws ERR_MODULE_NOT_FOUND on every hook fire.
+  'lib/hook-stdin.mjs',
+  'lib/plugin-key.mjs',
   'lib/hook-stdout.mjs',
   // audit P0/P1: inter-process install lock + atomic config writes — imported by
   // install.mjs (settings.json + install lock) and hook-update.mjs (.claude.json
   // + auto-update lock). Must ship or a partial install/update skips them.
   'lib/proc-lock.mjs',
   'lib/atomic-write.mjs',
+  // Dynamically imported by scripts/launch.mjs BEFORE `npm install` runs, to answer
+  // EBADPLATFORM with both sides of the mismatch instead of a guessed cause (issue #28).
+  // The import is guarded, so omitting this file would not crash the launcher — it would
+  // silently restore the wrong diagnosis, which is the failure this shipped to fix.
+  'lib/platform-gate.mjs',
+  // Shared settings.json hook classification + dangling-entry reconciliation.
+  // Statically imported by install.mjs AND dynamically by hook-update.mjs's
+  // post-swap step — missing it from the manifest would break auto-update's
+  // hook reconcile on the very release that needs it.
+  'lib/hook-prune.mjs',
   'lib/proxy-fetch.mjs',
   'lib/llm-provider-probe.mjs',
   // P1 supply-chain: shared release-signing core (sha256 manifest + Ed25519
@@ -141,6 +188,7 @@ export const SOURCE_FILES = [
   // scripts/user-prompt-search.js + scripts/pre-tool-recall.js. Under lib/ for
   // the same scripts-dir-rename reason as mem-override.mjs above.
   'lib/injected-ids.mjs',
+  'lib/patha-exclude-meter.mjs',
   // P2-13 (narrowed): millisecond time units, single-sourced from the four
   // modules that each declared their own DAY_MS. Leaf module, zero imports.
   'lib/time-constants.mjs',
@@ -168,8 +216,7 @@ export const SOURCE_FILES = [
   // (scripts/user-prompt-search.js and hook.mjs user-prompt via hook-memory.mjs).
   'lib/ups-query.mjs',
   // P2-12 twin cores: get/browse shared data collection for the CLI/MCP pairs
-  // (update lives in observation-write, delete-preview in delete-core, registry
-  // stats/list in registry.mjs — all already listed).
+  // (update lives in observation-write, delete-preview in delete-core).
   'lib/get-core.mjs',
   'lib/browse-core.mjs',
   // v2.61 dedup refactor: shared "save one observation" pipeline used by both
@@ -182,10 +229,6 @@ export const SOURCE_FILES = [
   // auto-update. Same single-source-of-truth pattern (see #8217).
   'lib/observation-write.mjs',
   'lib/recall-core.mjs',
-  // Shared registry write core (import/remove/reindex + the 'installed' tier grant).
-  // Statically imported by mem-cli.mjs AND server.mjs — missing it from the manifest
-  // would break `registry import|remove|reindex` and mem_registry on auto-update.
-  'lib/registry-core.mjs',
   // Shared timeline core (anchor resolution + before/after window) and shared
   // cross-source search core (sessions/prompts FTS, CJK fallback, normalization,
   // pagination math). Statically imported by mem-cli.mjs AND server.mjs — same
@@ -199,7 +242,7 @@ export const SOURCE_FILES = [
   // missing it from the manifest would break `recent` and mem_recent on auto-update.
   'lib/recent-core.mjs',
   // Reciprocal Rank Fusion core (D#42 single source-of-truth); transitively
-  // reached via tfidf.mjs (rrfMerge) and deep-search.mjs (rrfFuseN).
+  // reached via deep-search.mjs (rrfFuseN).
   'lib/rrf.mjs',
   // Shared "compress old low-value observations into weekly summaries" core.
   // Statically imported by mem-cli.mjs (cmdCompress), server.mjs (mem_compress),
@@ -210,6 +253,10 @@ export const SOURCE_FILES = [
   // Statically imported by mem-cli.mjs (cmdMaintain), server.mjs (mem_maintain),
   // and hook.mjs (handleAutoMaintain) — missing it would break maintain on auto-update.
   'lib/maintain-core.mjs',
+  // Shipped-prompt security control shared by hook-llm.mjs (episode + summary) and
+  // hook-optimize.mjs (concept normalization). A bare string with no imports; it lives in
+  // lib/ so the two faces cannot hand-copy it apart from each other (R10-P3-21).
+  'lib/memory-input-guard.mjs',
   'lib/fast-summary.mjs',
   'lib/transcript-scan.mjs',
   // Pre-maintenance VACUUM INTO snapshot (MED-2). Statically imported by mem-cli.mjs,
@@ -246,6 +293,11 @@ export const SOURCE_FILES = [
   // hook-optimize.mjs, mem-cli.mjs, server.mjs, and the save/maintain cores;
   // missing it from the manifest would break those paths on auto-update.
   'lib/dedup-constants.mjs',
+  // Numeric env-override parsing with an explicit failure mode. Statically imported
+  // by scripts/user-prompt-search.js (a HOOK entry point — a missing manifest entry
+  // kills the UserPromptSubmit face outright on auto-update), lib/relevance-floor.mjs
+  // and lib/cite-back-hint.mjs.
+  'lib/env-number.mjs',
   // v2.70 deferred-work: carry-forward TODO primitives. Statically imported by
   // server.mjs (mem_defer family) and mem-cli.mjs (defer subcommand).
   'lib/deferred-work.mjs',
@@ -281,7 +333,7 @@ export const SOURCE_FILES = [
  * Single source of truth for both install.mjs (initial install) and
  * hook-update.mjs (auto-update): pre-v2.55 hook-update copied the entire
  * scripts/ tree from the GitHub Releases tarball, which silently shipped
- * dev-only files (mock-claude.mjs, extract-repos.mjs, p0-forward-probe.mjs…)
+ * dev-only files (mock-claude.mjs, extract-repos.mjs…)
  * to every user's data dir on the first auto-update.
  */
 export const HOOK_SCRIPT_FILES = [
@@ -290,7 +342,6 @@ export const HOOK_SCRIPT_FILES = [
   'prompt-search-utils.mjs',
   'pre-tool-recall.js',
   'post-tool-recall.js',
-  'pre-skill-bridge.js',
   // The Agent|Task hook command in BOTH registration sites is now the .sh prefilter,
   // which execs the .js only when CLAUDE_MEM_SUBAGENT_INJECT is on (audit P2-5). Both
   // must be materialized: shipping the prefilter without its target turns every
@@ -323,19 +374,14 @@ export const HOOK_SCRIPT_FILES = [
 // listing them here changes ONLY what is signed/verified, not what install materializes.
 // Module-internal (spread into RELEASE_SIGNED_FILES below); not exported — no external
 // consumer, and the signing test asserts coverage via the built manifest, not this list.
-const LAUNCHER_SCRIPT_FILES = [
-  'launch.mjs',
-  'launch-preflight.mjs',
-  'setup.sh',
-  'binding-probe-cli.mjs',
-];
+const LAUNCHER_SCRIPT_FILES = ['launch.mjs', 'launch-preflight.mjs', 'setup.sh', 'binding-probe-cli.mjs'];
 
 // Plugin/marketplace DECLARATION files (audit 2026-08-14 P-2). Not executable
 // themselves, but they NAME what gets executed: hooks/hooks.json declares the
 // command lines Claude Code runs on every hook fire, .mcp.json declares the MCP
 // server launch command, plugin.json/marketplace.json steer the install source,
-// commands/*.md are model-visible skill bodies, registry/preinstalled.json seeds
-// the resource registry. All ship in the tarball; none were signed — the same
+// commands/*.md are model-visible skill bodies. All ship in the tarball; none
+// were signed — the same
 // shape as the two closed RCE gaps (hook scripts v3.40, launch.mjs v3.42): a
 // release published without the signing key could swap hooks.json to point a
 // hook event at an arbitrary command while every signed hash still matched.
@@ -346,11 +392,9 @@ const PLUGIN_DECLARATION_FILES = [
   '.mcp.json',
   '.claude-plugin/plugin.json',
   '.claude-plugin/marketplace.json',
-  'registry/preinstalled.json',
   'commands/mem.md',
   'commands/memory.md',
   'commands/update.md',
-  'commands/tools.md',
   'commands/adopt.md',
   'commands/unadopt.md',
   'commands/lesson.md',
@@ -370,7 +414,7 @@ const PLUGIN_DECLARATION_FILES = [
 // verifyReleaseFiles hashes against.
 export const RELEASE_SIGNED_FILES = [
   ...SOURCE_FILES,
-  ...HOOK_SCRIPT_FILES.map(name => `scripts/${name}`),
-  ...LAUNCHER_SCRIPT_FILES.map(name => `scripts/${name}`),
+  ...HOOK_SCRIPT_FILES.map((name) => `scripts/${name}`),
+  ...LAUNCHER_SCRIPT_FILES.map((name) => `scripts/${name}`),
   ...PLUGIN_DECLARATION_FILES,
 ];

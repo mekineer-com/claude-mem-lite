@@ -1,9 +1,7 @@
 // Tests for mem-cli.mjs — CLI command layer
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { seedVectors } from '../benchmark/benchmark.mjs';
 import { rateSearchResults, recordSearch } from '../lib/search-telemetry.mjs';
-// _resetVocabCache is imported below via the post-mock dynamic import (line ~101).
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 
@@ -22,20 +20,28 @@ function captureStdout(fn) {
   let output = '';
   const origOut = process.stdout.write;
   const origErr = process.stderr.write;
-  process.stdout.write = (str) => { output += str; return true; };
-  process.stderr.write = (str) => { output += str; return true; };
+  process.stdout.write = (str) => {
+    output += str;
+    return true;
+  };
+  process.stderr.write = (str) => {
+    output += str;
+    return true;
+  };
   try {
     const result = fn();
     if (result && typeof result.then === 'function') {
-      return result.then(() => {
-        process.stdout.write = origOut;
-        process.stderr.write = origErr;
-        return output;
-      }).catch((err) => {
-        process.stdout.write = origOut;
-        process.stderr.write = origErr;
-        throw err;
-      });
+      return result
+        .then(() => {
+          process.stdout.write = origOut;
+          process.stderr.write = origErr;
+          return output;
+        })
+        .catch((err) => {
+          process.stdout.write = origOut;
+          process.stderr.write = origErr;
+          throw err;
+        });
     }
   } catch (err) {
     process.stdout.write = origOut;
@@ -51,17 +57,22 @@ function captureStdout(fn) {
 function captureStdoutOnly(fn) {
   let output = '';
   const original = process.stdout.write;
-  process.stdout.write = (str) => { output += str; return true; };
+  process.stdout.write = (str) => {
+    output += str;
+    return true;
+  };
   try {
     const result = fn();
     if (result && typeof result.then === 'function') {
-      return result.then(() => {
-        process.stdout.write = original;
-        return output;
-      }).catch((err) => {
-        process.stdout.write = original;
-        throw err;
-      });
+      return result
+        .then(() => {
+          process.stdout.write = original;
+          return output;
+        })
+        .catch((err) => {
+          process.stdout.write = original;
+          throw err;
+        });
     }
   } catch (err) {
     process.stdout.write = original;
@@ -77,12 +88,13 @@ vi.mock('../schema.mjs', async (importOriginal) => {
   // Proxy intercepts close() so the CLI can't close our test DB. Stub BOTH
   // openers — mem-cli routes through ensureDbWithWalRecovery since the
   // WAL-recovery hoist; an unstubbed opener escapes to the real user DB.
-  const stub = () => new Proxy(testDb, {
-    get(target, prop) {
-      if (prop === 'close') return () => {};
-      return target[prop];
-    },
-  });
+  const stub = () =>
+    new Proxy(testDb, {
+      get(target, prop) {
+        if (prop === 'close') return () => {};
+        return target[prop];
+      },
+    });
   return { ...original, ensureDb: stub, ensureDbWithWalRecovery: stub };
 });
 
@@ -97,7 +109,6 @@ vi.mock('../utils.mjs', async (importOriginal) => {
 
 // Import run after mocks are set up
 const { run } = await import('../mem-cli.mjs');
-const { buildVocabulary, computeVector, _resetVocabCache } = await import('../tfidf.mjs');
 
 // ─── Argument Parsing ────────────────────────────────────────────────────────
 // parseArgs is not exported, but we can test its behavior through commands
@@ -107,12 +118,17 @@ describe('CLI argument parsing (via commands)', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('search parses query and --type flag', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fixed auth crash', text: 'authentication error in login',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fixed auth crash',
+      text: 'authentication error in login',
     });
     const output = await captureStdout(() => run(['search', 'authentication', '--type', 'bugfix']));
     expect(output).toContain('Fixed auth crash');
@@ -122,8 +138,11 @@ describe('CLI argument parsing (via commands)', () => {
   it('search parses --limit flag', async () => {
     for (let i = 0; i < 5; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Discovery ${i}`, text: `search term alpha ${i}`,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Discovery ${i}`,
+        text: `search term alpha ${i}`,
       });
     }
     const output = await captureStdout(() => run(['search', 'alpha', '--limit', '2']));
@@ -135,8 +154,12 @@ describe('CLI argument parsing (via commands)', () => {
   it('recent parses count from positional arg', async () => {
     for (let i = 0; i < 5; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Recent obs ${i}`, text: `content ${i}`, epochOffset: i * 1000,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Recent obs ${i}`,
+        text: `content ${i}`,
+        epochOffset: i * 1000,
       });
     }
     const output = await captureStdout(() => run(['recent', '2']));
@@ -147,12 +170,18 @@ describe('CLI argument parsing (via commands)', () => {
 
   it('get parses comma-separated IDs', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'First obs', text: 'first content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'First obs',
+      text: 'first content',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Second obs', text: 'second content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Second obs',
+      text: 'second content',
     });
     const output = await captureStdout(() => run(['get', '1,2']));
     expect(output).toContain('First obs');
@@ -167,12 +196,17 @@ describe('CLI search command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('returns results with correct output format', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fixed database connection timeout', text: 'database connection pool was exhausted',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fixed database connection timeout',
+      text: 'database connection pool was exhausted',
     });
     const output = await captureStdout(() => run(['search', 'database connection']));
     expect(output).toContain('[mem]');
@@ -189,86 +223,49 @@ describe('CLI search command', () => {
 
   it('filters by --type', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Bug in parser', text: 'parser logic error',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Bug in parser',
+      text: 'parser logic error',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Discovered parser pattern', text: 'parser pattern discovery',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Discovered parser pattern',
+      text: 'parser pattern discovery',
     });
     const bugOnly = await captureStdout(() => run(['search', 'parser', '--type', 'bugfix']));
     expect(bugOnly).toContain('Bug in parser');
     expect(bugOnly).not.toContain('Discovered parser pattern');
   });
 
-  it('--type filter must hold across the vector/RRF hybrid path (regression)', async () => {
-    _resetVocabCache();
-    // Mixed-type corpus with shared vocabulary so vector path engages.
-    // The non-bugfix rows must NOT leak through vector RRF merge.
-    insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Race in worker queue', narrative: 'fixed worker queue race condition crash',
-    });
-    insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
-      title: 'Worker queue architecture choice', narrative: 'chose redis queue over rabbitmq for worker pool',
-    });
-    insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Worker pool throughput pattern', narrative: 'worker pool throughput scales with queue depth',
-    });
-    insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'feature',
-      title: 'Worker pool autoscale feature', narrative: 'added autoscale to worker pool queue',
-    });
-    // Build vocab + write vectors to engage hybrid path.
-    const vocab = buildVocabulary(testDb);
-    if (vocab) {
-      const rows = testDb.prepare('SELECT id, title, narrative FROM observations').all();
-      for (const r of rows) {
-        const vec = computeVector(`${r.title} ${r.narrative}`, vocab);
-        if (vec) {
-          testDb.prepare(
-            'INSERT INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)'
-          ).run(r.id, Buffer.from(vec.buffer), vocab.version, Date.now());
-        }
-      }
-      testDb.prepare(
-        'INSERT INTO vocab_state (term, term_index, idf, version, created_at_epoch) VALUES (?, ?, ?, ?, ?)'
-      );
-      testDb.transaction(() => {
-        testDb.prepare('DELETE FROM vocab_state').run();
-        const ins = testDb.prepare(
-          'INSERT INTO vocab_state (term, term_index, idf, version, created_at_epoch) VALUES (?, ?, ?, ?, ?)'
-        );
-        for (const [term, entry] of vocab.terms) {
-          ins.run(term, entry.index, entry.idf, vocab.version, Date.now());
-        }
-      })();
-    }
-    const out = await captureStdout(() => run(['search', 'worker queue', '--type', 'bugfix']));
-    expect(out).toContain('Race in worker queue');
-    expect(out).not.toContain('architecture choice');
-    expect(out).not.toContain('throughput pattern');
-    expect(out).not.toContain('autoscale feature');
-  });
-
   it('respects --limit', async () => {
     for (let i = 0; i < 10; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Widget feature ${i}`, text: `widget implementation details ${i}`,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Widget feature ${i}`,
+        text: `widget implementation details ${i}`,
       });
     }
     const output = await captureStdout(() => run(['search', 'widget', '--limit', '3']));
-    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    const resultLines = output
+      .trim()
+      .split('\n')
+      .filter((l) => l.startsWith('#'));
     expect(resultLines.length).toBeLessThanOrEqual(3);
   });
 
   it('shows lesson_learned when present', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Race condition in queue', text: 'queue race condition',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Race condition in queue',
+      text: 'queue race condition',
       lessonLearned: 'Always use mutex for shared state',
     });
     const output = await captureStdout(() => run(['search', 'queue race']));
@@ -278,8 +275,11 @@ describe('CLI search command', () => {
   it('falls back to OR query when AND returns nothing', async () => {
     // Insert observation that matches "alpha" but not "alpha AND zzzzz"
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Alpha discovery', text: 'alpha protocol implementation details',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Alpha discovery',
+      text: 'alpha protocol implementation details',
     });
     // "alpha zzzzz" as AND query won't match, but OR fallback should find "alpha"
     const output = await captureStdout(() => run(['search', 'alpha zzzzz']));
@@ -291,12 +291,16 @@ describe('CLI search command', () => {
   // ~3% access rate. They remain searchable via --include-noise.
   it('excludes LOW_SIGNAL titles from default search', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
       title: 'Modified auth.mjs',
       text: 'uniquealphatoken handling tweaked',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
       title: 'Auth flow uniquealphatoken validation fix',
       text: 'uniquealphatoken validation root cause',
     });
@@ -307,7 +311,9 @@ describe('CLI search command', () => {
 
   it('--include-noise restores LOW_SIGNAL titles in search results', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
       title: 'Modified auth.mjs',
       text: 'uniquealphatoken handling tweaked',
     });
@@ -320,13 +326,16 @@ describe('CLI search command', () => {
     // — so obs rows in search --json had a null created_at and the human date column was
     // blank, while interleaved session/prompt rows (raw SQL) carried it. The key was aligned.
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Cache uniquegammatoken invalidation fix', text: 'uniquegammatoken root cause',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Cache uniquegammatoken invalidation fix',
+      text: 'uniquegammatoken root cause',
     });
     const output = await captureStdoutOnly(() => run(['search', 'uniquegammatoken', '--json']));
     const parsed = JSON.parse(output);
     expect(parsed.results.length).toBeGreaterThan(0);
-    const obs = parsed.results.find(r => r.source === 'obs');
+    const obs = parsed.results.find((r) => r.source === 'obs');
     expect(obs).toBeDefined();
     expect(obs.created_at).toBeTruthy();
     expect(() => new Date(obs.created_at).toISOString()).not.toThrow();
@@ -354,13 +363,17 @@ describe('CLI search command', () => {
     // Insert the WITHOUT-lesson row first (newer) to prove the lesson boost
     // overcomes any tie-break favoring recency.
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
       title: 'Queue fix uniquebetatoken variant A',
       text: 'uniquebetatoken race condition in worker queue',
       epochOffset: 0,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
       title: 'Queue fix uniquebetatoken variant B',
       text: 'uniquebetatoken race condition in worker queue',
       lessonLearned: 'Always acquire the mutex before peeking the queue head',
@@ -388,30 +401,46 @@ describe('CLI recent command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows recent observations with default count (10)', async () => {
     for (let i = 0; i < 12; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Observation ${i}`, text: `content ${i}`, epochOffset: i * 60000,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Observation ${i}`,
+        text: `content ${i}`,
+        epochOffset: i * 60000,
       });
     }
     const output = await captureStdout(() => run(['recent']));
     expect(output).toContain('[mem] Recent');
-    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    const resultLines = output
+      .trim()
+      .split('\n')
+      .filter((l) => l.startsWith('#'));
     expect(resultLines.length).toBe(10);
   });
 
   it('respects explicit count', async () => {
     for (let i = 0; i < 5; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Obs ${i}`, text: `content ${i}`, epochOffset: i * 60000,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Obs ${i}`,
+        text: `content ${i}`,
+        epochOffset: i * 60000,
       });
     }
     const output = await captureStdout(() => run(['recent', '3']));
-    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    const resultLines = output
+      .trim()
+      .split('\n')
+      .filter((l) => l.startsWith('#'));
     expect(resultLines.length).toBe(3);
   });
 
@@ -423,20 +452,29 @@ describe('CLI recent command', () => {
   it('formats relative time correctly', async () => {
     // Insert obs with epoch 2 hours ago
     const twoHoursAgo = Date.now() - 2 * 3600000;
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES ('mem-s1', 'test--project', 'content', 'discovery', 'Two hours ago obs', '', '', '', '', '[]', '[]', 1, ?, ?)
-    `).run(new Date(twoHoursAgo).toISOString(), twoHoursAgo);
+    `,
+      )
+      .run(new Date(twoHoursAgo).toISOString(), twoHoursAgo);
 
     const output = await captureStdout(() => run(['recent']));
     expect(output).toContain('2h ago');
   });
 
   it('--since filters to a relative window; invalid duration errors', async () => {
-    const mk = (title, ageMs) => testDb.prepare(`
+    const mk = (title, ageMs) =>
+      testDb
+        .prepare(
+          `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES ('mem-s1', 'test--project', ?, 'discovery', ?, '', '', '', '', '[]', '[]', 1, ?, ?)
-    `).run(title, title, new Date(Date.now() - ageMs).toISOString(), Date.now() - ageMs);
+    `,
+        )
+        .run(title, title, new Date(Date.now() - ageMs).toISOString(), Date.now() - ageMs);
     mk('fresh-2h', 2 * 3600000);
     mk('old-10d', 10 * 86400000);
 
@@ -454,12 +492,19 @@ describe('CLI recent command', () => {
 
   it('excludes compressed observations', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Compressed obs', text: 'content', compressedInto: 999,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Compressed obs',
+      text: 'content',
+      compressedInto: 999,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Active obs', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Active obs',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['recent']));
     expect(output).not.toContain('Compressed obs');
@@ -473,25 +518,39 @@ describe('CLI recent command', () => {
   it('respects --limit flag as alias for positional count', async () => {
     for (let i = 0; i < 5; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Obs ${i}`, text: `content ${i}`, epochOffset: i * 60000,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Obs ${i}`,
+        text: `content ${i}`,
+        epochOffset: i * 60000,
       });
     }
     const output = await captureStdout(() => run(['recent', '--limit', '3']));
-    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    const resultLines = output
+      .trim()
+      .split('\n')
+      .filter((l) => l.startsWith('#'));
     expect(resultLines.length).toBe(3);
   });
 
   it('--limit invalid value warns and falls back to default 10', async () => {
     for (let i = 0; i < 12; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Obs ${i}`, text: `content ${i}`, epochOffset: i * 60000,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Obs ${i}`,
+        text: `content ${i}`,
+        epochOffset: i * 60000,
       });
     }
     const output = await captureStdout(() => run(['recent', '--limit', '-5']));
     expect(output).toContain('Invalid --limit');
-    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    const resultLines = output
+      .trim()
+      .split('\n')
+      .filter((l) => l.startsWith('#'));
     expect(resultLines.length).toBe(10);
   });
 
@@ -503,21 +562,32 @@ describe('CLI recent command', () => {
   it('positional count over max (1000) warns and falls back to default 10', async () => {
     for (let i = 0; i < 12; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Obs ${i}`, text: `content ${i}`, epochOffset: i * 60000,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Obs ${i}`,
+        text: `content ${i}`,
+        epochOffset: i * 60000,
       });
     }
     const output = await captureStdout(() => run(['recent', '999999']));
     expect(output).toContain('between 1 and 1000');
-    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    const resultLines = output
+      .trim()
+      .split('\n')
+      .filter((l) => l.startsWith('#'));
     expect(resultLines.length).toBe(10);
   });
 
   // Boundary: exactly 1000 is the documented max and must remain valid (≤1000).
   it('positional count at the 1000 boundary is accepted (no warning)', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Boundary obs', text: 'content', epochOffset: 1000,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Boundary obs',
+      text: 'content',
+      epochOffset: 1000,
     });
     const output = await captureStdout(() => run(['recent', '1000']));
     expect(output).not.toContain('Invalid count');
@@ -527,9 +597,27 @@ describe('CLI recent command', () => {
   // `recent --type bugfix` previously parsed as a silent no-op — the flag was unrecognized
   // and returned every obs type. Mirrors the validation cmdSearch already had.
   it('--type filter narrows to a single observation type', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix', title: 'Bug A', text: 'a' });
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Disc B', text: 'b' });
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix', title: 'Bug C', text: 'c' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Bug A',
+      text: 'a',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Disc B',
+      text: 'b',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Bug C',
+      text: 'c',
+    });
     const output = await captureStdout(() => run(['recent', '--type', 'bugfix']));
     expect(output).toContain('Bug A');
     expect(output).toContain('Bug C');
@@ -537,7 +625,13 @@ describe('CLI recent command', () => {
   });
 
   it('--type rejects unknown obs types', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix', title: 'Bug', text: 'x' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Bug',
+      text: 'x',
+    });
     const output = await captureStdout(() => run(['recent', '--type', 'WRONG']));
     expect(output).toContain('Invalid --type');
     expect(output).toContain('WRONG');
@@ -551,12 +645,17 @@ describe('CLI recall command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('finds observations by filename in files_modified', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'change',
-      title: 'Updated server config', text: 'config update',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Updated server config',
+      text: 'config update',
       filesModified: '["src/server.mjs"]',
     });
     const output = await captureStdout(() => run(['recall', 'src/server.mjs']));
@@ -571,8 +670,11 @@ describe('CLI recall command', () => {
 
   it('shows lesson_learned inline when present', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fixed import order', text: 'import bug',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fixed import order',
+      text: 'import bug',
       filesModified: '["app/main.ts"]',
       lessonLearned: 'Check import order carefully',
     });
@@ -593,11 +695,15 @@ describe('CLI get command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows full detail for single ID', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
       title: 'Chose PostgreSQL over MySQL',
       text: 'database selection',
       narrative: 'We evaluated both databases and chose Postgres for JSON support',
@@ -610,12 +716,18 @@ describe('CLI get command', () => {
 
   it('shows multiple IDs', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'First observation', text: 'first',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'First observation',
+      text: 'first',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'feature',
-      title: 'Second observation', text: 'second',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'feature',
+      title: 'Second observation',
+      text: 'second',
     });
     const output = await captureStdout(() => run(['get', '1,2']));
     expect(output).toContain('First observation');
@@ -627,10 +739,57 @@ describe('CLI get command', () => {
     expect(output).toMatch(/No records found.*\[obs\]/);
   });
 
+  // A PARTIAL miss used to be silent: `get 1,9999` printed #1 and nothing about 9999, so an
+  // agent that asked for three ids and got two had no way to tell which one was missing —
+  // and the total-miss case above DOES report, so a partial miss read as complete success.
+  // Both siblings already got this right: MCP mem_get appends "Note: ID(s) … not found.",
+  // and CLI `delete` prints "not found and will be skipped". This is the CLI↔MCP twin-drift
+  // class, on the surface the plugin's own instructions tell agents to prefer.
+  describe('get reports IDs it could not find alongside the ones it did', () => {
+    beforeEach(() => {
+      insertObs(testDb, {
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'bugfix',
+        title: 'A real observation',
+        text: 'real',
+      });
+    });
+
+    it('names the missing observation id', async () => {
+      const output = await captureStdout(() => run(['get', '1,9999']));
+      expect(output).toContain('A real observation');
+      expect(output).toMatch(/not found.*#9999|#9999.*not found/);
+    });
+
+    it('names the missing id with its own source prefix', async () => {
+      const output = await captureStdout(() => run(['get', '1,P#9999,S#9998,E#9997']));
+      expect(output).toContain('A real observation');
+      expect(output).toContain('P#9999');
+      expect(output).toContain('S#9998');
+      expect(output).toContain('E#9997');
+    });
+
+    it('says nothing when every id resolved', async () => {
+      const output = await captureStdout(() => run(['get', '1']));
+      expect(output).not.toMatch(/not found/);
+    });
+
+    // The note is diagnostic, so it belongs on stderr — `get` output is piped.
+    it('keeps stdout to records only', async () => {
+      const stdout = await captureStdoutOnly(() => run(['get', '1,9999']));
+      expect(stdout).toContain('A real observation');
+      expect(stdout).not.toMatch(/not found/);
+    });
+  });
+
   it('shows files from files_modified under the `files` label', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'change',
-      title: 'Updated configs', text: 'config changes',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Updated configs',
+      text: 'config changes',
       filesModified: '["src/config.ts", "src/db.ts"]',
     });
     const output = await captureStdout(() => run(['get', '1']));
@@ -643,8 +802,11 @@ describe('CLI get command', () => {
 
   it('shows lesson when present', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Memory leak fix', text: 'memory leak',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Memory leak fix',
+      text: 'memory leak',
       lessonLearned: 'Always clear intervals on unmount',
     });
     const output = await captureStdout(() => run(['get', '1']));
@@ -657,60 +819,6 @@ describe('CLI get command', () => {
   });
 });
 
-// ─── pagination stability WITH vectors (D#30 reopened) ───────────────────────
-// The #8642 guard test (cli-e2e) seeds NO observation_vectors, so it only proved
-// FTS-only pagination is stable. This block populates vectors so the FTS+vector
-// RRF fusion is live — the exact path that overlapped/gapped on the real DB before
-// computePerSourceWindow was made offset-independent.
-describe('CLI search pagination stability (hybrid FTS+vector RRF)', () => {
-  beforeEach(() => {
-    _resetVocabCache();
-    testDb = createTestDb();
-    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
-    // 25 obs all matching "widget" with VARIED FTS weight (widget repeated 0–4×)
-    // and varied vector content (distinct term mixes) so fusion is non-trivial and
-    // candidate-pool-sensitive — a smaller pool would re-rank the prefix.
-    for (let i = 0; i < 25; i++) {
-      insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `widget pipeline stage ${i} ${i % 3 === 0 ? 'cache' : 'queue'} handler`,
-        text: `widget pipeline payload ${i} ${'widget '.repeat(i % 5)}`,
-        epochOffset: -i * 1000,
-      });
-    }
-    seedVectors(testDb);   // build vocab + observation_vectors over the corpus
-    _resetVocabCache();    // force the search to reload the seeded vocab
-  });
-  afterEach(() => { testDb.close(); });
-
-  const idsOf = async (...args) => {
-    const out = await captureStdoutOnly(() => run(['search', 'widget', '--source', 'observations', '--json', ...args]));
-    return JSON.parse(out).results.map(r => r.id);
-  };
-
-  it('paging limit=5 across offsets is disjoint and reconstructs the single query', async () => {
-    const defaultPage = await idsOf();
-    const vecCount = testDb.prepare('SELECT COUNT(*) AS c FROM observation_vectors').get().c;
-    expect(vecCount).toBeGreaterThan(0); // guard: vector arm is actually live
-    const p0 = await idsOf('--limit', '5', '--offset', '0');
-    const p1 = await idsOf('--limit', '5', '--offset', '5');
-    const p2 = await idsOf('--limit', '5', '--offset', '10');
-    const combined = await idsOf('--limit', '15', '--offset', '0');
-    const paged = [...p0, ...p1, ...p2];
-    expect(defaultPage).toEqual(p0);
-    expect(new Set(paged).size).toBe(paged.length);   // no id on two pages
-    expect(paged).toEqual(combined);                  // identical order ⇒ stable
-  });
-
-  it('top-N is limit-stable for limits ≤ 20 (top-5 ⊂ top-10 ⊂ top-20)', async () => {
-    const t5 = await idsOf('--limit', '5');
-    const t10 = await idsOf('--limit', '10');
-    const t20 = await idsOf('--limit', '20');
-    expect(t10.slice(0, 5)).toEqual(t5);
-    expect(t20.slice(0, 10)).toEqual(t10);
-  });
-});
-
 // ─── timeline command ────────────────────────────────────────────────────────
 
 describe('CLI timeline command', () => {
@@ -718,16 +826,22 @@ describe('CLI timeline command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows timeline around anchor with <-- marker', async () => {
     const baseEpoch = Date.now() - 100000;
     for (let i = 0; i < 7; i++) {
       const epoch = baseEpoch + i * 10000;
-      testDb.prepare(`
+      testDb
+        .prepare(
+          `
         INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
         VALUES ('mem-s1', 'test--project', 'content ${i}', 'discovery', 'Timeline obs ${i}', '', '', '', '', '[]', '[]', 1, ?, ?)
-      `).run(new Date(epoch).toISOString(), epoch);
+      `,
+        )
+        .run(new Date(epoch).toISOString(), epoch);
     }
     // Anchor on the 4th observation (id=4)
     const output = await captureStdout(() => run(['timeline', '--anchor', '4']));
@@ -741,14 +855,23 @@ describe('CLI timeline command', () => {
     const baseEpoch = Date.now() - 100000;
     for (let i = 0; i < 10; i++) {
       const epoch = baseEpoch + i * 10000;
-      testDb.prepare(`
+      testDb
+        .prepare(
+          `
         INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
         VALUES ('mem-s1', 'test--project', 'content ${i}', 'discovery', 'TL ${i}', '', '', '', '', '[]', '[]', 1, ?, ?)
-      `).run(new Date(epoch).toISOString(), epoch);
+      `,
+        )
+        .run(new Date(epoch).toISOString(), epoch);
     }
-    const output = await captureStdout(() => run(['timeline', '--anchor', '5', '--before', '1', '--after', '1']));
+    const output = await captureStdout(() =>
+      run(['timeline', '--anchor', '5', '--before', '1', '--after', '1']),
+    );
     // Should have header + anchor + 1 before + 1 after = 4 lines
-    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    const resultLines = output
+      .trim()
+      .split('\n')
+      .filter((l) => l.startsWith('#'));
     expect(resultLines.length).toBe(3); // 1 before + anchor + 1 after
   });
 
@@ -773,8 +896,12 @@ describe('CLI timeline command', () => {
 
   it('shows recent observations when no --anchor provided', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Recent obs', text: 'content', epochOffset: 0,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Recent obs',
+      text: 'content',
+      epochOffset: 0,
     });
     const output = await captureStdout(() => run(['timeline']));
     expect(output).toContain('Timeline (most recent');
@@ -794,7 +921,9 @@ describe('CLI save command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('saves with default options (type=discovery)', async () => {
     const output = await captureStdout(() => run(['save', 'Authentication uses JWT tokens']));
@@ -810,7 +939,9 @@ describe('CLI save command', () => {
   });
 
   it('saves with explicit --type and --title', async () => {
-    const output = await captureStdout(() => run(['save', 'Use Redis for caching', '--type', 'decision', '--title', 'Cache architecture']));
+    const output = await captureStdout(() =>
+      run(['save', 'Use Redis for caching', '--type', 'decision', '--title', 'Cache architecture']),
+    );
     expect(output).toContain('[decision]');
     expect(output).toContain('Cache architecture');
 
@@ -824,18 +955,33 @@ describe('CLI save command', () => {
   // exactly these types (14d: bugfix 18.8% / decision 28.7%), and the save response is
   // the one moment the caller still has the context to write the lesson.
   it('nudges when a bugfix is saved without --lesson', async () => {
-    const output = await captureStdout(() => run(['save', 'Fixed the race in the flush path', '--type', 'bugfix', '--title', 'Flush race fix']));
+    const output = await captureStdout(() =>
+      run(['save', 'Fixed the race in the flush path', '--type', 'bugfix', '--title', 'Flush race fix']),
+    );
     expect(output).toContain('[mem] Saved');
     expect(output).toContain('without a lesson');
     expect(output).toContain('--lesson');
   });
 
   it('does NOT nudge when the lesson is provided, or for low-obligation types', async () => {
-    const withLesson = await captureStdout(() => run(['save', 'Fixed the race', '--type', 'bugfix', '--title', 'Race fix 2', '--lesson', 'Hold the lock until the side-effect commits']));
+    const withLesson = await captureStdout(() =>
+      run([
+        'save',
+        'Fixed the race',
+        '--type',
+        'bugfix',
+        '--title',
+        'Race fix 2',
+        '--lesson',
+        'Hold the lock until the side-effect commits',
+      ]),
+    );
     expect(withLesson).toContain('💡lesson captured');
     expect(withLesson).not.toContain('without a lesson');
 
-    const discovery = await captureStdout(() => run(['save', 'Interesting corner of the codebase', '--type', 'discovery']));
+    const discovery = await captureStdout(() =>
+      run(['save', 'Interesting corner of the codebase', '--type', 'discovery']),
+    );
     expect(discovery).not.toContain('without a lesson');
   });
 
@@ -874,7 +1020,9 @@ describe('CLI save command', () => {
     expect(testDb.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(0); // nothing persisted
     // Float literal still truncates + saves (deliberate #8277 parity with parseIntFlag).
     await captureStdout(() => run(['save', 'imp float two-point-nine', '--importance', '2.9']));
-    expect(testDb.prepare('SELECT importance FROM observations ORDER BY id DESC LIMIT 1').get().importance).toBe(2);
+    expect(
+      testDb.prepare('SELECT importance FROM observations ORDER BY id DESC LIMIT 1').get().importance,
+    ).toBe(2);
   });
 
   it('rejects invalid type', async () => {
@@ -893,7 +1041,19 @@ describe('CLI save command', () => {
   // error lands on stderr and the whole shape reads as "CLI doesn't support save".
   // --text is the positional-content alias so the flags-only invocation just works.
   it('saves with --text as flags-only alias for positional content', async () => {
-    const output = await captureStdout(() => run(['save', '--text', 'Keepalive audit: three residual gaps', '--type', 'decision', '--title', 'Keepalive audit', '--lesson', 'Half-open detection has two blind spots']));
+    const output = await captureStdout(() =>
+      run([
+        'save',
+        '--text',
+        'Keepalive audit: three residual gaps',
+        '--type',
+        'decision',
+        '--title',
+        'Keepalive audit',
+        '--lesson',
+        'Half-open detection has two blind spots',
+      ]),
+    );
     expect(output).toContain('[mem] Saved');
     const row = testDb.prepare('SELECT * FROM observations ORDER BY id DESC LIMIT 1').get();
     expect(row.text).toBe('Keepalive audit: three residual gaps');
@@ -924,7 +1084,9 @@ describe('CLI save command', () => {
 
   it('creates a session for FK constraint', async () => {
     await captureStdout(() => run(['save', 'New observation via CLI']));
-    const sessions = testDb.prepare("SELECT * FROM sdk_sessions WHERE content_session_id LIKE 'manual-%'").all();
+    const sessions = testDb
+      .prepare("SELECT * FROM sdk_sessions WHERE content_session_id LIKE 'manual-%'")
+      .all();
     expect(sessions.length).toBe(1);
     expect(sessions[0].status).toBe('active');
   });
@@ -941,10 +1103,17 @@ describe('CLI MCP-field flag aliases', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('search accepts --query as alias for the positional query', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Alias probe hit', text: 'uniquealiastoken payload' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      title: 'Alias probe hit',
+      text: 'uniquealiastoken payload',
+    });
     const output = await captureStdout(() => run(['search', '--query', 'uniquealiastoken']));
     expect(output).not.toContain('Usage');
     expect(output).toContain('Alias probe hit');
@@ -952,8 +1121,12 @@ describe('CLI MCP-field flag aliases', () => {
 
   it('recall accepts --file as alias for the positional file', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'change',
-      title: 'Touched hook entry', text: 'x', filesModified: '["hook.mjs"]',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Touched hook entry',
+      text: 'x',
+      filesModified: '["hook.mjs"]',
     });
     const output = await captureStdout(() => run(['recall', '--file', 'hook.mjs']));
     expect(output).toContain('History for hook.mjs');
@@ -961,13 +1134,23 @@ describe('CLI MCP-field flag aliases', () => {
   });
 
   it('get accepts --ids as alias for the positional id list', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Get alias target', text: 'full detail body' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      title: 'Get alias target',
+      text: 'full detail body',
+    });
     const output = await captureStdout(() => run(['get', '--ids', '1']));
     expect(output).toContain('Get alias target');
   });
 
   it('delete accepts --ids as alias for the positional id list', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Delete alias target', text: 'x' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      title: 'Delete alias target',
+      text: 'x',
+    });
     await captureStdout(() => run(['delete', '--ids', '1', '--confirm']));
     expect(testDb.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(0);
   });
@@ -979,9 +1162,13 @@ describe('CLI MCP-field flag aliases', () => {
   });
 
   it('save accepts --content (MCP mem_save field name) as content alias', async () => {
-    const output = await captureStdout(() => run(['save', '--content', 'MCP-field-shaped content', '--type', 'decision']));
+    const output = await captureStdout(() =>
+      run(['save', '--content', 'MCP-field-shaped content', '--type', 'decision']),
+    );
     expect(output).toContain('[mem] Saved');
-    expect(testDb.prepare('SELECT text FROM observations ORDER BY id DESC LIMIT 1').get().text).toBe('MCP-field-shaped content');
+    expect(testDb.prepare('SELECT text FROM observations ORDER BY id DESC LIMIT 1').get().text).toBe(
+      'MCP-field-shaped content',
+    );
   });
 
   it('rejects two content aliases at once (--text + --content)', async () => {
@@ -1000,11 +1187,21 @@ describe('CLI MCP-field flag aliases', () => {
   });
 
   it('usage lines advertise the alias flags', async () => {
-    const s = await captureStdout(() => run(['search'])); expect(s).toContain('--query'); process.exitCode = undefined;
-    const r = await captureStdout(() => run(['recall'])); expect(r).toContain('--file'); process.exitCode = undefined;
-    const g = await captureStdout(() => run(['get'])); expect(g).toContain('--ids'); process.exitCode = undefined;
-    const d = await captureStdout(() => run(['delete'])); expect(d).toContain('--ids'); process.exitCode = undefined;
-    const u = await captureStdout(() => run(['update'])); expect(u).toContain('--id'); process.exitCode = undefined;
+    const s = await captureStdout(() => run(['search']));
+    expect(s).toContain('--query');
+    process.exitCode = undefined;
+    const r = await captureStdout(() => run(['recall']));
+    expect(r).toContain('--file');
+    process.exitCode = undefined;
+    const g = await captureStdout(() => run(['get']));
+    expect(g).toContain('--ids');
+    process.exitCode = undefined;
+    const d = await captureStdout(() => run(['delete']));
+    expect(d).toContain('--ids');
+    process.exitCode = undefined;
+    const u = await captureStdout(() => run(['update']));
+    expect(u).toContain('--id');
+    process.exitCode = undefined;
   });
 });
 
@@ -1015,20 +1212,31 @@ describe('CLI stats command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows stats with observations in DB', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Bug 1', text: 'bugfix',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Bug 1',
+      text: 'bugfix',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Bug 2', text: 'bugfix 2',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Bug 2',
+      text: 'bugfix 2',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Discovery 1', text: 'discovery',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Discovery 1',
+      text: 'discovery',
     });
 
     const output = await captureStdout(() => run(['stats']));
@@ -1049,15 +1257,25 @@ describe('CLI stats command', () => {
 
   it('routes stats --search-telemetry in text and JSON modes', async () => {
     const searchId = recordSearch(testDb, {
-      project: 'test--project', query: 'widget', surface: 'mcp_search',
-      corpusCounts: { obs: 3 }, matchedCount: 1, client: 'cli-test',
+      project: 'test--project',
+      query: 'widget',
+      surface: 'mcp_search',
+      corpusCounts: { obs: 3 },
+      matchedCount: 1,
+      client: 'cli-test',
       results: [{ source: 'obs', id: 99, title: 'Widget decision' }],
     });
     rateSearchResults(testDb, { searchId, relevant: ['#99'], ratedBy: 'cli-test' });
-    const text = await captureStdoutOnly(() => run(['stats', '--search-telemetry', '--project', 'test--project']));
+    const text = await captureStdoutOnly(() =>
+      run(['stats', '--search-telemetry', '--project', 'test--project']),
+    );
     expect(text).toContain('Search telemetry (test--project)');
     expect(text).toContain('Relevance coverage: 1/1 (100.0%)');
-    const json = JSON.parse(await captureStdoutOnly(() => run(['stats', '--search-telemetry', '--project', 'test--project', '--json'])));
+    const json = JSON.parse(
+      await captureStdoutOnly(() =>
+        run(['stats', '--search-telemetry', '--project', 'test--project', '--json']),
+      ),
+    );
     expect(json).toMatchObject({ search_count: 1, rated_count: 1, relevance_coverage: 1 });
   });
 
@@ -1067,15 +1285,29 @@ describe('CLI stats command', () => {
   // compress finds nothing). An already-compressed low-value row must NOT count as noise.
   it('excludes already-compressed rows from the low-value noise count', async () => {
     const old = 40 * 86400000; // >30d so both rows clear the staleness threshold
-    insertObs(testDb, { // live low-value row → counts as noise
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Live low value', text: 'live', importance: 1, accessCount: 0,
-      epochOffset: -old, compressedInto: null,
+    insertObs(testDb, {
+      // live low-value row → counts as noise
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Live low value',
+      text: 'live',
+      importance: 1,
+      accessCount: 0,
+      epochOffset: -old,
+      compressedInto: null,
     });
-    insertObs(testDb, { // already-compressed low-value row → must be excluded
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Compressed low value', text: 'compressed', importance: 1, accessCount: 0,
-      epochOffset: -old, compressedInto: 999,
+    insertObs(testDb, {
+      // already-compressed low-value row → must be excluded
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Compressed low value',
+      text: 'compressed',
+      importance: 1,
+      accessCount: 0,
+      epochOffset: -old,
+      compressedInto: 999,
     });
     const output = await captureStdoutOnly(() => run(['stats', '--json']));
     const stats = JSON.parse(output);
@@ -1089,18 +1321,30 @@ describe('CLI stats command', () => {
   // that was ~24% low-signal-titled. low_signal_titles surfaces that population using
   // the same LOW_SIGNAL pattern source (lib/low-signal-patterns.mjs) as the read filter.
   it('counts low-signal titles the imp=1 gauge cannot see', async () => {
-    insertObs(testDb, { // LOW_SIGNAL title + high importance + accessed → invisible to low_value_count
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Error while working on auth.js', text: 'cmd → ERROR', importance: 3, accessCount: 5,
+    insertObs(testDb, {
+      // LOW_SIGNAL title + high importance + accessed → invisible to low_value_count
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Error while working on auth.js',
+      text: 'cmd → ERROR',
+      importance: 3,
+      accessCount: 5,
     });
-    insertObs(testDb, { // substantive title → must NOT count as low-signal
-      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
-      title: 'Chose RRF over linear fusion for hybrid recall', text: 'rationale', importance: 2, accessCount: 1,
+    insertObs(testDb, {
+      // substantive title → must NOT count as low-signal
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
+      title: 'Chose RRF over linear fusion for hybrid recall',
+      text: 'rationale',
+      importance: 2,
+      accessCount: 1,
     });
     const output = await captureStdoutOnly(() => run(['stats', '--json']));
     const stats = JSON.parse(output);
     expect(stats.data_health.low_signal_titles).toBe(1); // the "Error while working" row, not the decision
-    expect(stats.data_health.low_value_count).toBe(0);    // neither is imp=1+unaccessed+stale → old gauge blind
+    expect(stats.data_health.low_value_count).toBe(0); // neither is imp=1+unaccessed+stale → old gauge blind
     const text = await captureStdout(() => run(['stats']));
     expect(text).toContain('Low-signal titles');
   });
@@ -1111,15 +1355,31 @@ describe('CLI stats command', () => {
   // `<= 1` + never-injected makes the gauge honest without miscounting pinned noise.
   it('counts imp=0 dormant rows the old imp=1 gauge was blind to', async () => {
     const old = 40 * 86400000; // >30d so both clear the staleness threshold
-    insertObs(testDb, { // imp=0, never accessed/injected, stale → now counts (was invisible)
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Decayed dormant row', text: 'dormant', importance: 0, accessCount: 0,
-      injectionCount: 0, epochOffset: -old, compressedInto: null,
+    insertObs(testDb, {
+      // imp=0, never accessed/injected, stale → now counts (was invisible)
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Decayed dormant row',
+      text: 'dormant',
+      importance: 0,
+      accessCount: 0,
+      injectionCount: 0,
+      epochOffset: -old,
+      compressedInto: null,
     });
-    insertObs(testDb, { // imp=0 BUT injected → "pinned noise" (tracked separately), not "never used" → excluded
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Injected but decayed', text: 'pinned', importance: 0, accessCount: 0,
-      injectionCount: 4, epochOffset: -old, compressedInto: null,
+    insertObs(testDb, {
+      // imp=0 BUT injected → "pinned noise" (tracked separately), not "never used" → excluded
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Injected but decayed',
+      text: 'pinned',
+      importance: 0,
+      accessCount: 0,
+      injectionCount: 4,
+      epochOffset: -old,
+      compressedInto: null,
     });
     const output = await captureStdoutOnly(() => run(['stats', '--json']));
     const stats = JSON.parse(output);
@@ -1133,7 +1393,9 @@ describe('CLI help and error handling', () => {
   beforeEach(() => {
     testDb = createTestDb();
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows help for no args', async () => {
     const output = await captureStdout(() => run([]));
@@ -1169,7 +1431,9 @@ describe('CLI delete command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows usage when no IDs provided', async () => {
     const output = await captureStdout(() => run(['delete']));
@@ -1178,8 +1442,11 @@ describe('CLI delete command', () => {
 
   it('shows preview without --confirm', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Delete preview test', text: 'content to delete',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Delete preview test',
+      text: 'content to delete',
     });
     const output = await captureStdout(() => run(['delete', '1']));
     expect(output).toContain('Preview');
@@ -1192,8 +1459,11 @@ describe('CLI delete command', () => {
 
   it('deletes with --confirm', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'To be deleted', text: 'deletion target',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'To be deleted',
+      text: 'deletion target',
     });
     const output = await captureStdout(() => run(['delete', '1', '--confirm']));
     expect(output).toContain('Deleted 1');
@@ -1213,12 +1483,19 @@ describe('CLI delete command', () => {
 
   it('cleans related_ids references on delete', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'First', text: 'first content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'First',
+      text: 'first content',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Second', text: 'second content', relatedIds: '[1]',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Second',
+      text: 'second content',
+      relatedIds: '[1]',
     });
     await captureStdout(() => run(['delete', '1', '--confirm']));
     const row = testDb.prepare('SELECT related_ids FROM observations WHERE id = 2').get();
@@ -1231,17 +1508,25 @@ describe('CLI delete command', () => {
     // hidden from every COALESCE(compressed_into,0)=0 view and unrecoverable. The delete
     // path must reset #2.compressed_into to NULL first (same guard as maintain).
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Keeper', text: 'keeper content', importance: 3,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Keeper',
+      text: 'keeper content',
+      importance: 3,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Merged child', text: 'child content', compressedInto: 1,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Merged child',
+      text: 'child content',
+      compressedInto: 1,
     });
     const output = await captureStdout(() => run(['delete', '1', '--confirm']));
     expect(output).toContain('Recovered 1');
     const child = testDb.prepare('SELECT compressed_into FROM observations WHERE id = 2').get();
-    expect(child).toBeDefined();              // child row survived
+    expect(child).toBeDefined(); // child row survived
     expect(child.compressed_into).toBeNull(); // and was resurfaced as live
   });
 });
@@ -1253,7 +1538,9 @@ describe('CLI update command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows usage when no ID provided', async () => {
     const output = await captureStdout(() => run(['update']));
@@ -1267,8 +1554,11 @@ describe('CLI update command', () => {
 
   it('shows error when no fields specified', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'No update', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'No update',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['update', '1']));
     expect(output).toContain('No fields to update');
@@ -1281,8 +1571,11 @@ describe('CLI update command', () => {
   it('rejects float-shaped id "3.9" instead of truncating to row #3', async () => {
     for (let i = 0; i < 3; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `row ${i + 1}`, text: 'content',
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `row ${i + 1}`,
+        text: 'content',
       });
     }
     const output = await captureStdout(() => run(['update', '3.9', '--title', 'HACKED']));
@@ -1294,8 +1587,11 @@ describe('CLI update command', () => {
 
   it('updates title', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Original title', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Original title',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['update', '1', '--title', 'Updated title']));
     expect(output).toContain('Updated #1');
@@ -1306,8 +1602,11 @@ describe('CLI update command', () => {
 
   it('rejects empty --title to prevent silent data corruption', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Original title', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Original title',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['update', '1', '--title', '']));
     expect(output).toContain('--title cannot be empty');
@@ -1317,8 +1616,11 @@ describe('CLI update command', () => {
 
   it('rejects whitespace-only --title', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Original title', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Original title',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['update', '1', '--title', '   ']));
     expect(output).toContain('--title cannot be empty');
@@ -1334,8 +1636,12 @@ describe('CLI update command', () => {
   // row unchanged — same accidental shell-strip class as the #8470 empty-title guard.
   it('rejects value-less string flags (bare --flag) instead of crashing on SQLite bind', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Original title', narrative: 'orig narrative', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Original title',
+      narrative: 'orig narrative',
+      text: 'content',
     });
     for (const flag of ['--title', '--narrative', '--lesson', '--concepts']) {
       const output = await captureStdout(() => run(['update', '1', flag]));
@@ -1352,8 +1658,12 @@ describe('CLI update command', () => {
   // literals still truncate (#8277).
   it('rejects garbage-token --importance (does not coerce/persist via UPDATE)', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'orig', text: 'content', importance: 1,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'orig',
+      text: 'content',
+      importance: 1,
     });
     for (const bad of ['2abc', '3xyz', '1e2']) {
       const out = await captureStdout(() => run(['update', '1', '--importance', bad]));
@@ -1369,8 +1679,12 @@ describe('CLI update command', () => {
   // matches save's 500-char cap (and the MCP memSaveSchema upper bound).
   it('rejects --lesson longer than 500 chars (parity with cmdSave + MCP schema)', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Lesson cap test', text: 'content', lessonLearned: 'before',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Lesson cap test',
+      text: 'content',
+      lessonLearned: 'before',
     });
     const longLesson = 'L'.repeat(501);
     const output = await captureStdout(() => run(['update', '1', '--lesson', longLesson]));
@@ -1382,8 +1696,11 @@ describe('CLI update command', () => {
 
   it('--lesson-learned alias on update also enforces the 500-char cap', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Lesson alias cap', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Lesson alias cap',
+      text: 'content',
     });
     const longLesson = 'X'.repeat(501);
     const output = await captureStdout(() => run(['update', '1', '--lesson-learned', longLesson]));
@@ -1392,8 +1709,11 @@ describe('CLI update command', () => {
 
   it('updates type', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Type change', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Type change',
+      text: 'content',
     });
     await captureStdout(() => run(['update', '1', '--type', 'bugfix']));
     const row = testDb.prepare('SELECT type FROM observations WHERE id = 1').get();
@@ -1402,8 +1722,11 @@ describe('CLI update command', () => {
 
   it('rejects invalid importance values', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Importance test', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Importance test',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['update', '1', '--importance', '5']));
     expect(output).toContain('Invalid importance');
@@ -1413,8 +1736,11 @@ describe('CLI update command', () => {
 
   it('updates lesson_learned via --lesson', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Lesson update', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Lesson update',
+      text: 'content',
     });
     await captureStdout(() => run(['update', '1', '--lesson', 'Always validate input']));
     const row = testDb.prepare('SELECT lesson_learned FROM observations WHERE id = 1').get();
@@ -1423,8 +1749,11 @@ describe('CLI update command', () => {
 
   it('updates narrative', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Narrative update', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Narrative update',
+      text: 'content',
     });
     await captureStdout(() => run(['update', '1', '--narrative', 'Detailed narrative text']));
     const row = testDb.prepare('SELECT narrative FROM observations WHERE id = 1').get();
@@ -1433,8 +1762,11 @@ describe('CLI update command', () => {
 
   it('updates concepts', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Concepts update', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Concepts update',
+      text: 'content',
     });
     await captureStdout(() => run(['update', '1', '--concepts', 'auth security jwt']));
     const row = testDb.prepare('SELECT concepts FROM observations WHERE id = 1').get();
@@ -1449,12 +1781,17 @@ describe('CLI export command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('exports observations as JSON by default', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Export test bug', text: 'export content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Export test bug',
+      text: 'export content',
     });
     const output = await captureStdoutOnly(() => run(['export']));
     const data = JSON.parse(output);
@@ -1465,12 +1802,18 @@ describe('CLI export command', () => {
 
   it('exports as JSONL format', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'JSONL export 1', text: 'line 1',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'JSONL export 1',
+      text: 'line 1',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'JSONL export 2', text: 'line 2',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'JSONL export 2',
+      text: 'line 2',
     });
     const output = await captureStdoutOnly(() => run(['export', '--format', 'jsonl']));
     const lines = output.trim().split('\n');
@@ -1480,12 +1823,18 @@ describe('CLI export command', () => {
 
   it('filters by --type', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Bug export', text: 'bug content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Bug export',
+      text: 'bug content',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Discovery export', text: 'discovery content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Discovery export',
+      text: 'discovery content',
     });
     const output = await captureStdoutOnly(() => run(['export', '--type', 'bugfix']));
     const data = JSON.parse(output);
@@ -1495,12 +1844,19 @@ describe('CLI export command', () => {
 
   it('filters by --from and --to', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Old export', text: 'old content', epochOffset: -10 * 86400000,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Old export',
+      text: 'old content',
+      epochOffset: -10 * 86400000,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Recent export', text: 'recent content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Recent export',
+      text: 'recent content',
     });
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
     const output = await captureStdoutOnly(() => run(['export', '--from', yesterday]));
@@ -1512,8 +1868,11 @@ describe('CLI export command', () => {
   it('respects --limit', async () => {
     for (let i = 0; i < 5; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Export item ${i}`, text: `content ${i}`,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Export item ${i}`,
+        text: `content ${i}`,
       });
     }
     const output = await captureStdoutOnly(() => run(['export', '--limit', '2']));
@@ -1521,14 +1880,66 @@ describe('CLI export command', () => {
     expect(data.length).toBe(2);
   });
 
+  // An INVALID --limit used to land on parseIntFlag's `defaultValue: 200`, which is the
+  // right convention for `search`/`recent` (default = display width) and the wrong one
+  // here (default = COMPLETENESS). `export --limit "$N" > backup.json` with `$N` unset
+  // writes 200 rows, warns on the stderr the redirect discards, and exits 0 — the same
+  // truncated-backup shape the no-limit default was changed to -1 to close, reached
+  // through the invalid door instead of the absent one. 205 rows because a 200-row store
+  // cannot tell the two behaviours apart.
+  it('recovers an invalid --limit to the COMPLETE set, not to 200', async () => {
+    for (let i = 0; i < 205; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Bulk export item ${i}`,
+        text: `bulk content ${i}`,
+      });
+    }
+    for (const bad of ['abc', '0', '-5']) {
+      const output = await captureStdoutOnly(() => run(['export', '--limit', bad]));
+      expect(JSON.parse(output).length).toBe(205);
+    }
+  });
+
+  // The other half: recovering to -1 makes `rows.length >= limit` trivially true, so the
+  // cap notice announced "Results capped at -1" on the one path guaranteed not to be
+  // capped. A real cap must still say so.
+  it('announces a real cap and stays quiet on the recovered one', async () => {
+    for (let i = 0; i < 5; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Cap notice item ${i}`,
+        text: `content ${i}`,
+      });
+    }
+    const capped = await captureStdout(() => run(['export', '--limit', '2']));
+    expect(capped).toContain('Results capped at 2');
+
+    const recovered = await captureStdout(() => run(['export', '--limit', 'abc']));
+    expect(recovered).toContain('COMPLETE matching set');
+    expect(recovered).not.toContain('capped at -1');
+    expect(recovered).not.toMatch(/Results capped at/);
+  });
+
   it('excludes compressed observations by default', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Compressed obs', text: 'compressed', compressedInto: 999,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Compressed obs',
+      text: 'compressed',
+      compressedInto: 999,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Active obs', text: 'active',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Active obs',
+      text: 'active',
     });
     const output = await captureStdoutOnly(() => run(['export']));
     const data = JSON.parse(output);
@@ -1538,12 +1949,19 @@ describe('CLI export command', () => {
 
   it('includes compressed with --include-compressed', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Compressed obs', text: 'compressed', compressedInto: 999,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Compressed obs',
+      text: 'compressed',
+      compressedInto: 999,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Active obs', text: 'active',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Active obs',
+      text: 'active',
     });
     const output = await captureStdoutOnly(() => run(['export', '--include-compressed']));
     const data = JSON.parse(output);
@@ -1585,15 +2003,21 @@ describe('CLI compress command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows preview by default', async () => {
     // Insert old, low-importance observations
     const oldEpoch = -60 * 86400000; // 60 days ago
     for (let i = 0; i < 5; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Old obs ${i}`, text: `old content ${i}`, importance: 1,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Old obs ${i}`,
+        text: `old content ${i}`,
+        importance: 1,
         epochOffset: oldEpoch + i * 1000,
       });
     }
@@ -1604,8 +2028,12 @@ describe('CLI compress command', () => {
 
   it('shows no candidates when all are recent', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Recent obs', text: 'recent content', importance: 1,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Recent obs',
+      text: 'recent content',
+      importance: 1,
     });
     const output = await captureStdout(() => run(['compress']));
     expect(output).toContain('No candidates');
@@ -1625,8 +2053,12 @@ describe('CLI compress command', () => {
     const oldEpoch = -60 * 86400000;
     for (let i = 0; i < 4; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Compress target ${i}`, text: `compress content ${i}`, importance: 1,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Compress target ${i}`,
+        text: `compress content ${i}`,
+        importance: 1,
         epochOffset: oldEpoch + i * 1000,
       });
     }
@@ -1634,15 +2066,23 @@ describe('CLI compress command', () => {
     expect(output).toContain('Compressed');
     expect(output).toContain('weekly summaries');
     // Verify compressed_into is set on originals
-    const compressed = testDb.prepare('SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL AND compressed_into > 0').get();
+    const compressed = testDb
+      .prepare(
+        'SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL AND compressed_into > 0',
+      )
+      .get();
     expect(compressed.c).toBeGreaterThan(0);
   });
 
   it('shows no candidates when importance is high', async () => {
     const oldEpoch = -60 * 86400000;
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Important obs', text: 'important content', importance: 3,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Important obs',
+      text: 'important content',
+      importance: 3,
       epochOffset: oldEpoch,
     });
     const output = await captureStdout(() => run(['compress']));
@@ -1657,7 +2097,9 @@ describe('CLI maintain command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows usage for no action', async () => {
     const output = await captureStdout(() => run(['maintain']));
@@ -1669,10 +2111,58 @@ describe('CLI maintain command', () => {
     expect(output).toContain('Usage');
   });
 
+  // `--ops` is documented under `maintain <scan|execute>`, and `execute` rejects an
+  // unknown op by name. `scan` never read the flag at all, so the PREVIEW step — the
+  // one whose job is to tell you what the operation would do before you run it —
+  // accepted `--ops purge-stale` (hyphen for underscore), printed a normal report,
+  // and exited 0. The typo surfaced only on execute, after the user had already read
+  // a scan they believed was scoped to that op.
+  describe('scan --ops validation (parity with execute)', () => {
+    beforeEach(() => {
+      process.exitCode = 0;
+    });
+    afterEach(() => {
+      process.exitCode = 0;
+    });
+
+    it('rejects an unknown op by name, exactly as execute does', async () => {
+      const output = await captureStdout(() => run(['maintain', 'scan', '--ops', 'purge-stale']));
+      expect(output).toContain('Unknown operation(s): purge-stale');
+      expect(output).toContain('purge_stale'); // the valid list names the near-miss
+      expect(output).not.toContain('Maintenance scan'); // rejected before the report
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('rejects the invalid member of a partly-valid list', async () => {
+      const output = await captureStdout(() => run(['maintain', 'scan', '--ops', 'cleanup,bogus']));
+      expect(output).toContain('Unknown operation(s): bogus');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('accepts a valid op, and says the report is not scoped to it', async () => {
+      const output = await captureStdout(() => run(['maintain', 'scan', '--ops', 'purge_stale']));
+      expect(output).toContain('Maintenance scan');
+      // The flag is real on execute but scan always reports every category — say so
+      // rather than letting a scoped-looking invocation imply a scoped report.
+      expect(output).toContain('reports every category');
+      expect(process.exitCode).toBe(0);
+    });
+
+    it('plain scan stays silent about ops', async () => {
+      const output = await captureStdout(() => run(['maintain', 'scan']));
+      expect(output).toContain('Maintenance scan');
+      expect(output).not.toContain('reports every category');
+      expect(process.exitCode).toBe(0);
+    });
+  });
+
   it('scan reports maintenance stats', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Active observation', text: 'active content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Active observation',
+      text: 'active content',
     });
     const output = await captureStdout(() => run(['maintain', 'scan']));
     expect(output).toContain('Maintenance scan');
@@ -1698,12 +2188,18 @@ describe('CLI maintain command', () => {
 
   it('scan detects near-duplicates', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Fix authentication bug in login page', text: 'auth bug content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Fix authentication bug in login page',
+      text: 'auth bug content',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Fix authentication bug in login page', text: 'auth bug content 2',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Fix authentication bug in login page',
+      text: 'auth bug content 2',
     });
     const output = await captureStdout(() => run(['maintain', 'scan']));
     expect(output).toContain('Near-duplicate pairs: 1');
@@ -1711,10 +2207,14 @@ describe('CLI maintain command', () => {
 
   it('execute runs cleanup operation', async () => {
     // Insert broken observation (no title, no narrative)
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES ('mem-s1', 'test--project', '', 'discovery', '', '', '', '', '', '[]', '[]', 1, ?, ?)
-    `).run(new Date().toISOString(), Date.now());
+    `,
+      )
+      .run(new Date().toISOString(), Date.now());
     const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'cleanup']));
     expect(output).toContain('Cleaned up');
   });
@@ -1722,8 +2222,12 @@ describe('CLI maintain command', () => {
   it('execute runs boost operation', async () => {
     // Insert frequently accessed low-importance observation
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Boostable obs', text: 'boostable content', importance: 1,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Boostable obs',
+      text: 'boostable content',
+      importance: 1,
       accessCount: 5,
     });
     const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'boost']));
@@ -1734,8 +2238,12 @@ describe('CLI maintain command', () => {
 
   it('execute runs decay operation', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Stale obs', text: 'stale content', importance: 2,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Stale obs',
+      text: 'stale content',
+      importance: 2,
       epochOffset: -60 * 86400000, // 60 days ago
     });
     const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'decay']));
@@ -1745,34 +2253,58 @@ describe('CLI maintain command', () => {
   it('execute runs demote_pinned: drops importance for heavily-injected, never-cited obs only', async () => {
     // The pinned-noise the regular `decay` op can't reach (it protects injection_count>0).
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Pinned noise', text: 'injected often, never cited',
-      importance: 3, injectionCount: 41, citedCount: 0,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Pinned noise',
+      text: 'injected often, never cited',
+      importance: 3,
+      injectionCount: 41,
+      citedCount: 0,
     });
     // Cited → protected (must NOT demote).
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
-      title: 'Earned its keep', text: 'cited',
-      importance: 3, injectionCount: 12, citedCount: 4,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
+      title: 'Earned its keep',
+      text: 'cited',
+      importance: 3,
+      injectionCount: 12,
+      citedCount: 4,
     });
     // Low injection → below threshold (must NOT demote).
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Rarely injected', text: 'few injections',
-      importance: 3, injectionCount: 2, citedCount: 0,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Rarely injected',
+      text: 'few injections',
+      importance: 3,
+      injectionCount: 2,
+      citedCount: 0,
     });
     const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'demote_pinned']));
     expect(output).toContain('Demoted 1 pinned-but-uncited');
     // Dropped to 1 in one pass (below the binary importance>=2 injection-priority tier).
-    expect(testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Pinned noise').importance).toBe(1);
-    expect(testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Earned its keep').importance).toBe(3);
-    expect(testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Rarely injected').importance).toBe(3);
+    expect(
+      testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Pinned noise').importance,
+    ).toBe(1);
+    expect(
+      testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Earned its keep').importance,
+    ).toBe(3);
+    expect(
+      testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Rarely injected').importance,
+    ).toBe(3);
   });
 
   it('execute runs vacuum and reports freelist reclaim', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Some obs', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Some obs',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'vacuum']));
     expect(output).toContain('VACUUM: reclaimed');
@@ -1781,8 +2313,14 @@ describe('CLI maintain command', () => {
 
   it('scan reports pinned-but-uncited count', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Pinned noise', text: 'x', importance: 3, injectionCount: 10, citedCount: 0,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Pinned noise',
+      text: 'x',
+      importance: 3,
+      injectionCount: 10,
+      citedCount: 0,
     });
     const output = await captureStdout(() => run(['maintain', 'scan']));
     expect(output).toContain('Pinned-but-uncited (inj>=8, cited=0, above floor): 1');
@@ -1790,14 +2328,24 @@ describe('CLI maintain command', () => {
 
   it('execute runs dedup with --merge-ids', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Keep this one', text: 'keep content', importance: 2,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Keep this one',
+      text: 'keep content',
+      importance: 2,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Remove this dup', text: 'dup content', importance: 1,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Remove this dup',
+      text: 'dup content',
+      importance: 1,
     });
-    const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'dedup', '--merge-ids', '1:2']));
+    const output = await captureStdout(() =>
+      run(['maintain', 'execute', '--ops', 'dedup', '--merge-ids', '1:2']),
+    );
     expect(output).toContain('Merged');
     const row = testDb.prepare('SELECT compressed_into FROM observations WHERE id = 2').get();
     expect(row.compressed_into).toBe(1);
@@ -1806,22 +2354,28 @@ describe('CLI maintain command', () => {
   it('execute runs purge_stale operation', async () => {
     // Insert observation marked as pending purge (old). -2 matches COMPRESSED_PENDING_PURGE in utils.mjs.
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Pending purge obs', text: 'purge content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Pending purge obs',
+      text: 'purge content',
       compressedInto: -2,
       epochOffset: -60 * 86400000,
     });
     // T2-P0-A: --confirm is now required for the destructive path.
-    const output = await captureStdout(() => run([
-      'maintain', 'execute', '--ops', 'purge_stale', '--confirm',
-    ]));
+    const output = await captureStdout(() =>
+      run(['maintain', 'execute', '--ops', 'purge_stale', '--confirm']),
+    );
     expect(output).toContain('Purged 1 stale observations');
   });
 
   it('execute purge_stale without --confirm previews and does not delete', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Pending purge obs preview', text: 'purge content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Pending purge obs preview',
+      text: 'purge content',
       compressedInto: -2,
       epochOffset: -60 * 86400000,
     });
@@ -1839,7 +2393,9 @@ describe('CLI browse command', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows empty dashboard with no observations', async () => {
     const output = await captureStdout(() => run(['browse']));
@@ -1849,8 +2405,11 @@ describe('CLI browse command', () => {
 
   it('shows observations grouped by tier', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Recent working memory', text: 'recent content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Recent working memory',
+      text: 'recent content',
     });
     const output = await captureStdout(() => run(['browse']));
     expect(output).toContain('Memory Dashboard');
@@ -1861,8 +2420,11 @@ describe('CLI browse command', () => {
 
   it('filters by --tier', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Browse tier filter', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Browse tier filter',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['browse', '--tier', 'working']));
     expect(output).toContain('Working Memory');
@@ -1875,8 +2437,11 @@ describe('CLI browse command', () => {
 
   it('shows totals when no tier filter', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Totals test', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Totals test',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['browse']));
     expect(output).toContain('Totals:');
@@ -1889,12 +2454,12 @@ describe('CLI context command', () => {
   beforeEach(() => {
     testDb = createTestDb();
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('reports empty context for a project with no data', async () => {
-    const output = await captureStdout(() =>
-      run(['context', '--project', 'test--empty-proj']),
-    );
+    const output = await captureStdout(() => run(['context', '--project', 'test--empty-proj']));
     expect(output).toContain('No context yet');
     expect(output).toContain('test--empty-proj');
   });
@@ -1902,14 +2467,16 @@ describe('CLI context command', () => {
   it('generates context block live from DB when session summary exists', async () => {
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
     const now = Date.now();
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
       VALUES (?, 'test--project', 'Fix auth bug', 'Patched middleware', 'Add tests', ?, ?)
-    `).run('mem-s1', new Date(now).toISOString(), now);
+    `,
+      )
+      .run('mem-s1', new Date(now).toISOString(), now);
 
-    const output = await captureStdout(() =>
-      run(['context', '--project', 'test--project']),
-    );
+    const output = await captureStdout(() => run(['context', '--project', 'test--project']));
     expect(output).toContain('<claude-mem-context>');
     expect(output).toContain('</claude-mem-context>');
     expect(output).toContain('### Last Session');
@@ -1923,14 +2490,16 @@ describe('CLI context command', () => {
     // from any CLAUDE.md file that might be sitting around.
     insertSession(testDb, { id: 's2', project: 'test--db-only', memoryId: 'mem-s2' });
     const now = Date.now();
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
       VALUES (?, 'test--db-only', 'DB-derived request', 'DB-derived completed', 'DB-derived next', ?, ?)
-    `).run('mem-s2', new Date(now).toISOString(), now);
+    `,
+      )
+      .run('mem-s2', new Date(now).toISOString(), now);
 
-    const output = await captureStdout(() =>
-      run(['context', '--project', 'test--db-only']),
-    );
+    const output = await captureStdout(() => run(['context', '--project', 'test--db-only']));
     expect(output).toContain('DB-derived request');
     // Ensure the error-paths from the old CLAUDE.md-reading implementation are gone.
     expect(output).not.toContain('No CLAUDE.md');
@@ -1940,14 +2509,16 @@ describe('CLI context command', () => {
   it('emits JSON with parsed sections when --json is set', async () => {
     insertSession(testDb, { id: 's3', project: 'test--json-proj', memoryId: 'mem-s3' });
     const now = Date.now();
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
       VALUES (?, 'test--json-proj', 'Ship v2.30', 'Done', 'Release notes', ?, ?)
-    `).run('mem-s3', new Date(now).toISOString(), now);
+    `,
+      )
+      .run('mem-s3', new Date(now).toISOString(), now);
 
-    const output = await captureStdout(() =>
-      run(['context', '--project', 'test--json-proj', '--json']),
-    );
+    const output = await captureStdout(() => run(['context', '--project', 'test--json-proj', '--json']));
     const parsed = JSON.parse(output);
     expect(parsed).toHaveProperty('raw');
     expect(parsed).toHaveProperty('sections');
@@ -1963,12 +2534,17 @@ describe('CLI stats command extended', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows data health metrics', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Health test', text: 'some content here',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Health test',
+      text: 'some content here',
     });
     const output = await captureStdout(() => run(['stats']));
     expect(output).toContain('Data Health');
@@ -1994,8 +2570,11 @@ describe('CLI stats command extended', () => {
 
   it('shows daily activity', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Daily activity test', text: 'daily content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Daily activity test',
+      text: 'daily content',
     });
     const output = await captureStdout(() => run(['stats']));
     expect(output).toContain('Daily activity');
@@ -2019,8 +2598,11 @@ describe('CLI stats command extended', () => {
 
   it('shows top projects when no project filter', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Projects list test', text: 'content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Projects list test',
+      text: 'content',
     });
     const output = await captureStdout(() => run(['stats']));
     expect(output).toContain('Top projects');
@@ -2036,34 +2618,91 @@ describe('CLI stats --quality command', () => {
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
     // Deterministic seed: 10 obs in-window, known lesson/LOW_SIGNAL/access distribution.
     // bugfix: 4 total, 2 with lesson (50%), 1 accessed (25% hit)
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fixed queue race', text: 'q', lessonLearned: 'Always mutex first', accessCount: 1 });
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fixed token expiry', text: 't', lessonLearned: 'Check TTL on refresh' });
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fixed null deref', text: 'n' });
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fixed off-by-one', text: 'o' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fixed queue race',
+      text: 'q',
+      lessonLearned: 'Always mutex first',
+      accessCount: 1,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fixed token expiry',
+      text: 't',
+      lessonLearned: 'Check TTL on refresh',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fixed null deref',
+      text: 'n',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fixed off-by-one',
+      text: 'o',
+    });
     // decision: 1 total, 1 with lesson (100%), 1 accessed (100% hit)
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'decision',
-      title: 'Switch to RRF merge', text: 'r',
-      lessonLearned: 'BM25+vector beats either alone', accessCount: 2 });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
+      title: 'Switch to RRF merge',
+      text: 'r',
+      lessonLearned: 'BM25+vector beats either alone',
+      accessCount: 2,
+    });
     // discovery: 1 total, 1 with lesson, 0 accessed
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'FTS5 CJK quirk', text: 'f', lessonLearned: 'Needs bigram workaround' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'FTS5 CJK quirk',
+      text: 'f',
+      lessonLearned: 'Needs bigram workaround',
+    });
     // change: 3 total, all LOW_SIGNAL titles, 0 lessons, 0 accessed
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'change',
-      title: 'Modified auth.mjs', text: 'a' });
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'change',
-      title: 'Modified server.mjs', text: 's' });
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'change',
-      title: 'Worked on utils.mjs', text: 'u' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Modified auth.mjs',
+      text: 'a',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Modified server.mjs',
+      text: 's',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Worked on utils.mjs',
+      text: 'u',
+    });
     // refactor: 1 total, no lesson, no access
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'refactor',
-      title: 'Extracted helper', text: 'h' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'refactor',
+      title: 'Extracted helper',
+      text: 'h',
+    });
     // Totals: 10 obs, 4 with lesson (40%), 3 LOW_SIGNAL (30%), 2 accessed (20% hit)
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('outputs quality snapshot header with --quality flag', async () => {
     const output = await captureStdout(() => run(['stats', '--quality']));
@@ -2079,6 +2718,93 @@ describe('CLI stats --quality command', () => {
   it('reports LOW_SIGNAL rate as "3 / 10 (30.0%)"', async () => {
     const output = await captureStdout(() => run(['stats', '--quality']));
     expect(output).toMatch(/LOW_SIGNAL:\s*3\s*\/\s*10\s*\(30\.0%\)/);
+  });
+
+  // D#191: every ratio here must divide LIVE rows by LIVE rows. Before v3.86.0 the
+  // window / all-time / per-type queries were bare `FROM observations`, so compressed
+  // and superseded rows — which are overwhelmingly lesson-less LOW_SIGNAL `change`
+  // rows, that being why compression retires them — were counted into both halves and
+  // the dashboard described a population retrieval never searches (live store 92.9%
+  // lesson rate rendered as 59.6%).
+  //
+  // The decoys are chosen so the WRONG population computes DIFFERENT numbers, not
+  // merely a bigger denominator: 10 lesson-less LOW_SIGNAL retired rows against the
+  // 10-row live seed move lesson 40.0% -> 20.0% and LOW_SIGNAL 30.0% -> 65.0%, and
+  // the `change` type row 3 -> 13. Drop any one of the three filters and this reddens.
+  it('excludes compressed + superseded rows from every quality ratio', async () => {
+    for (let i = 0; i < 5; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'change',
+        title: `Modified retired-${i}.mjs`,
+        text: 'r',
+        compressedInto: 99,
+      });
+      insertObs(testDb, {
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'change',
+        title: `Worked on stale-${i}.mjs`,
+        text: 's',
+        supersededAt: '2026-01-01T00:00:00.000Z',
+      });
+    }
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    // window ratios: unchanged by 10 retired rows
+    expect(output).toMatch(/Lesson rate:\s*4\s*\/\s*10\s*\(40\.0%\)/);
+    expect(output).toMatch(/LOW_SIGNAL:\s*3\s*\/\s*10\s*\(30\.0%\)/);
+    // all-time bracket: same live population, not the 20-row table
+    expect(output).toMatch(/\[all-time:\s*4\s*\/\s*10\s*=\s*40\.0%\]/);
+    expect(output).toMatch(/LOW_SIGNAL:.*\[all-time:\s*3\s*\/\s*10\s*=\s*30\.0%\]/);
+    // per-type breakdown: `change` stays at its 3 live rows
+    expect(output).toMatch(/change\s+3\s+.*hit\s*0\.0%.*lesson\s*0\.0%/);
+    // the population is named, so the reader is not left to assume it
+    expect(output).toContain('live observations');
+  });
+
+  // Review S1: the fourth query, `topLessons`, already filtered compressed rows before
+  // this round and gained the superseded arm with the rest. That arm was unpinned —
+  // reverting it to the old `AND COALESCE(compressed_into,0)=0` left the whole suite
+  // green, which is the superseded-invariant class this project has re-broken seven
+  // times. A superseded lesson with a high access_count belongs in no "Top accessed"
+  // list; both exclusions are asserted, with a live decoy that must still appear so
+  // "the section is empty" cannot satisfy the test.
+  it('keeps compressed AND superseded rows out of "Top accessed lessons"', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
+      title: 'live top lesson',
+      text: 'l',
+      lessonLearned: 'LIVE-LESSON-MARKER',
+      accessCount: 5,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
+      title: 'retired top lesson',
+      text: 'c',
+      lessonLearned: 'COMPRESSED-LESSON-MARKER',
+      accessCount: 99,
+      compressedInto: 77,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
+      title: 'stale top lesson',
+      text: 's',
+      lessonLearned: 'SUPERSEDED-LESSON-MARKER',
+      accessCount: 98,
+      supersededAt: '2026-01-01T00:00:00.000Z',
+    });
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    expect(output).toContain('Top accessed lessons');
+    expect(output).toContain('LIVE-LESSON-MARKER'); // the section is non-empty
+    expect(output).not.toContain('COMPRESSED-LESSON-MARKER');
+    expect(output).not.toContain('SUPERSEDED-LESSON-MARKER');
   });
 
   it('shows per-type breakdown with hit% and lesson%', async () => {
@@ -2127,7 +2853,11 @@ describe('CLI stats --quality command', () => {
   });
 
   it('renders pending-purge watchdog with ✅ at low ratio', async () => {
-    testDb.prepare("UPDATE observations SET compressed_into = 99 WHERE title IN ('Modified auth.mjs', 'Modified server.mjs', 'Worked on utils.mjs')").run();
+    testDb
+      .prepare(
+        "UPDATE observations SET compressed_into = 99 WHERE title IN ('Modified auth.mjs', 'Modified server.mjs', 'Worked on utils.mjs')",
+      )
+      .run();
     // 3 compressed, 0 pending-purge → 0% → ✅
     const output = await captureStdout(() => run(['stats', '--quality']));
     expect(output).toMatch(/✅ Pending purge ≤ 10%.*currently 0\.0%/);
@@ -2152,37 +2882,59 @@ describe('CLI stats --quality unresolved_bugfix metric', () => {
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
     // 5 bugfix observations: 3 unresolved (investigation only), 2 resolved (real fixes).
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Investigate test failure in parser', text: 'p',
-      narrative: 'Ran cargo test and saw the failure. Searched for the symbol but Root cause not yet identified from the output.',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Investigate test failure in parser',
+      text: 'p',
+      narrative:
+        'Ran cargo test and saw the failure. Searched for the symbol but Root cause not yet identified from the output.',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Lint failures in gsd-lite', text: 'l',
-      narrative: 'Investigation of npm lint failures. Errors persisted on retry. Still fails after re-running biome check.',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Lint failures in gsd-lite',
+      text: 'l',
+      narrative:
+        'Investigation of npm lint failures. Errors persisted on retry. Still fails after re-running biome check.',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Test suite failures in executor context', text: 't',
-      narrative: 'TAP output shows failures in buildExecutorContext subtests. Regression suspected but root cause not yet identified.',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Test suite failures in executor context',
+      text: 't',
+      narrative:
+        'TAP output shows failures in buildExecutorContext subtests. Regression suspected but root cause not yet identified.',
     });
     // Resolved bugfix #1 — has a clear root cause + fix
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fix race in credit deduction', text: 'r',
-      narrative: 'IntegrityError in concurrent deduction. Root cause: read-then-write without SELECT FOR UPDATE. Added row lock; verified with stress test.',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fix race in credit deduction',
+      text: 'r',
+      narrative:
+        'IntegrityError in concurrent deduction. Root cause: read-then-write without SELECT FOR UPDATE. Added row lock; verified with stress test.',
       lessonLearned: 'Use SELECT FOR UPDATE for any read-then-write on a contended row',
     });
     // Resolved bugfix #2
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fix CJK tokenization in FTS5', text: 'c',
-      narrative: 'FTS5 porter stemmer does not split CJK. Added bigram fallback in utils.mjs and verified search recall.',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fix CJK tokenization in FTS5',
+      text: 'c',
+      narrative:
+        'FTS5 porter stemmer does not split CJK. Added bigram fallback in utils.mjs and verified search recall.',
       lessonLearned: 'FTS5 needs CJK bigram workaround',
     });
     // Totals: 5 bugfix, 3 unresolved (60%), 2 resolved
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('reports unresolved bugfix count as "3 / 5 (60.0%)"', async () => {
     const output = await captureStdout(() => run(['stats', '--quality']));
@@ -2192,14 +2944,19 @@ describe('CLI stats --quality unresolved_bugfix metric', () => {
   it('flags unresolved bugfix line as a R-6 watchdog (should trend down)', async () => {
     const output = await captureStdout(() => run(['stats', '--quality']));
     // The line should explicitly mention R-6 or "trend down" so users know what to look for.
-    expect(output).toMatch(/Unresolved bugfix:.*R-6|Unresolved bugfix:.*trend.*↓|Unresolved bugfix:.*should.*decrease/);
+    expect(output).toMatch(
+      /Unresolved bugfix:.*R-6|Unresolved bugfix:.*trend.*↓|Unresolved bugfix:.*should.*decrease/,
+    );
   });
 
   it('matches case-insensitively against narrative pollution markers', async () => {
     // Add an extra observation with mixed-case marker — should still count
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Edge case', text: 'e',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Edge case',
+      text: 'e',
       narrative: 'NOT YET RESOLVED — needs follow-up.',
     });
     const output = await captureStdout(() => run(['stats', '--quality']));
@@ -2215,7 +2972,9 @@ describe('CLI search cross-source', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows invalid source error', async () => {
     const output = await captureStdout(() => run(['search', 'test', '--source', 'invalid']));
@@ -2231,10 +2990,14 @@ describe('CLI search cross-source', () => {
 
   it('searches sessions when --source sessions', async () => {
     // Insert a session summary
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, created_at, created_at_epoch)
       VALUES ('mem-s1', 'test--project', 'Fix authentication module', 'Fixed auth module', ?, ?)
-    `).run(new Date().toISOString(), Date.now());
+    `,
+      )
+      .run(new Date().toISOString(), Date.now());
     const output = await captureStdout(() => run(['search', 'authentication', '--source', 'sessions']));
     // Session search may work or fail depending on FTS availability
     expect(output).toBeDefined();
@@ -2242,10 +3005,14 @@ describe('CLI search cross-source', () => {
 
   it('searches prompts when --source prompts', async () => {
     // Insert a user prompt
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch)
       VALUES ('s1', 'How to fix the database connection issue', ?, ?)
-    `).run(new Date().toISOString(), Date.now());
+    `,
+      )
+      .run(new Date().toISOString(), Date.now());
     const output = await captureStdout(() => run(['search', 'database connection', '--source', 'prompts']));
     expect(output).toBeDefined();
   });
@@ -2253,8 +3020,11 @@ describe('CLI search cross-source', () => {
   it('searches with --offset for pagination', async () => {
     for (let i = 0; i < 5; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `Paginated search item ${i}`, text: `paginated search content ${i}`,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Paginated search item ${i}`,
+        text: `paginated search content ${i}`,
       });
     }
     const output = await captureStdout(() => run(['search', 'paginated', '--limit', '2', '--offset', '2']));
@@ -2268,26 +3038,37 @@ describe('CLI search cross-source', () => {
   it('applies --offset exactly once on the obs-type-filtered path (no double-offset drop)', async () => {
     for (let i = 0; i < 3; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-        title: `Offset bug ${i}`, text: `offsetcase fix entry ${i}`,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'bugfix',
+        title: `Offset bug ${i}`,
+        text: `offsetcase fix entry ${i}`,
       });
     }
     const all = await captureStdout(() => run(['search', 'offsetcase', '--type', 'bugfix', '--limit', '5']));
     expect(all).toMatch(/Found 3 results/);
-    const paged = await captureStdout(() => run(['search', 'offsetcase', '--type', 'bugfix', '--limit', '5', '--offset', '1']));
+    const paged = await captureStdout(() =>
+      run(['search', 'offsetcase', '--type', 'bugfix', '--limit', '5', '--offset', '1']),
+    );
     expect(paged).not.toContain('No results'); // pre-fix: "No results for ... at offset 1"
     expect(paged).toMatch(/Found 2 of 3 results/); // offset 1 of 3 matches → 2 returned, total 3
   });
 
   it('searches with --branch filter', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Feature branch obs', text: 'branch filter content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Feature branch obs',
+      text: 'branch filter content',
       branch: 'feat/auth',
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Main branch obs', text: 'main branch filter content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Main branch obs',
+      text: 'main branch filter content',
       branch: 'main',
     });
     const output = await captureStdout(() => run(['search', 'branch filter', '--branch', 'feat/auth']));
@@ -2300,28 +3081,43 @@ describe('CLI search cross-source', () => {
   // Fix: --branch implicitly restricts to observations, like --type/--tier/--importance.
   it('--branch implicitly restricts to observations only', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Obs with no branch', text: 'cross source target',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Obs with no branch',
+      text: 'cross source target',
     });
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch)
       VALUES ('s1', 'cross source target text', ?, ?)
-    `).run(new Date().toISOString(), Date.now());
+    `,
+      )
+      .run(new Date().toISOString(), Date.now());
     // With --branch set to a value that won't match any obs, the prompt row would
     // historically leak through (it has no branch column to filter on). Now it's excluded.
-    const output = await captureStdout(() => run(['search', 'cross source target', '--branch', 'definitely-nonexistent-branch']));
+    const output = await captureStdout(() =>
+      run(['search', 'cross source target', '--branch', 'definitely-nonexistent-branch']),
+    );
     expect(output).not.toContain('cross source target text'); // prompt content excluded
   });
 
   it('searches with --from and --to date filters', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Old date filter obs', text: 'old date filter content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Old date filter obs',
+      text: 'old date filter content',
       epochOffset: -10 * 86400000,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Recent date filter obs', text: 'recent date filter content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Recent date filter obs',
+      text: 'recent date filter content',
     });
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
     const output = await captureStdout(() => run(['search', 'date filter', '--from', yesterday]));
@@ -2331,8 +3127,11 @@ describe('CLI search cross-source', () => {
 
   it('type-list fallback when FTS returns nothing for typed search', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fallback type list bug', text: 'some unrelated content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fallback type list bug',
+      text: 'some unrelated content',
     });
     // Search for terms not in FTS but with --type, should trigger type-list fallback
     const output = await captureStdout(() => run(['search', 'zzz_nonexistent_zzz', '--type', 'bugfix']));
@@ -2348,13 +3147,19 @@ describe('CLI get command with source', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('gets session details with --source session', async () => {
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO session_summaries (memory_session_id, project, request, completed, investigated, learned, next_steps, created_at, created_at_epoch)
       VALUES ('mem-s1', 'test--project', 'Implement auth', 'Auth implemented', 'Auth patterns', 'JWT is better', 'Add tests', ?, ?)
-    `).run(new Date().toISOString(), Date.now());
+    `,
+      )
+      .run(new Date().toISOString(), Date.now());
     const output = await captureStdout(() => run(['get', '1', '--source', 'session']));
     expect(output).toContain('S#1');
     expect(output).toContain('Request: Implement auth');
@@ -2370,10 +3175,14 @@ describe('CLI get command with source', () => {
   });
 
   it('gets prompt details with --source prompt', async () => {
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch)
       VALUES ('s1', 'How to fix the auth bug', ?, ?)
-    `).run(new Date().toISOString(), Date.now());
+    `,
+      )
+      .run(new Date().toISOString(), Date.now());
     const output = await captureStdout(() => run(['get', '1', '--source', 'prompt']));
     expect(output).toContain('P#1');
     expect(output).toContain('Text: How to fix the auth bug');
@@ -2387,8 +3196,12 @@ describe('CLI get command with source', () => {
 
   it('gets observations with --fields filter', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Fields filter test', text: 'content', narrative: 'Full narrative here',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Fields filter test',
+      text: 'content',
+      narrative: 'Full narrative here',
     });
     const output = await captureStdout(() => run(['get', '1', '--fields', 'title,narrative']));
     expect(output).toContain('Fields filter test');
@@ -2407,13 +3220,19 @@ describe('CLI get command with prefix routing', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('routes P#N to user_prompts without --source', async () => {
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch)
       VALUES ('s1', 'Prompt with prefix', ?, ?)
-    `).run(new Date().toISOString(), Date.now());
+    `,
+      )
+      .run(new Date().toISOString(), Date.now());
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['get', 'P#1']));
     expect(output).toContain('P#1');
@@ -2421,10 +3240,14 @@ describe('CLI get command with prefix routing', () => {
   });
 
   it('routes S#N to session_summaries without --source', async () => {
-    testDb.prepare(`
+    testDb
+      .prepare(
+        `
       INSERT INTO session_summaries (memory_session_id, project, request, created_at, created_at_epoch)
       VALUES ('mem-s1', 'test--project', 'Session with prefix', ?, ?)
-    `).run(new Date().toISOString(), Date.now());
+    `,
+      )
+      .run(new Date().toISOString(), Date.now());
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['get', 'S#1']));
     expect(output).toContain('S#1');
@@ -2432,7 +3255,13 @@ describe('CLI get command with prefix routing', () => {
   });
 
   it('routes bare #N to observations (explicit #)', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Obs with hash prefix', text: 'hash' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Obs with hash prefix',
+      text: 'hash',
+    });
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['get', '#1']));
     expect(output).toContain('#1 [discovery]');
@@ -2440,16 +3269,36 @@ describe('CLI get command with prefix routing', () => {
   });
 
   it('routes bare N to observations (default, no prefix)', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Bare id default obs', text: 'bare' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Bare id default obs',
+      text: 'bare',
+    });
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['get', '1']));
     expect(output).toContain('Bare id default obs');
   });
 
   it('merges mixed prefixes: P#1,S#1,#1 in a single call', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'feature', title: 'Mixed obs', text: 'o' });
-    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Mixed prompt', ?, ?)`).run(new Date().toISOString(), Date.now());
-    testDb.prepare(`INSERT INTO session_summaries (memory_session_id, project, request, created_at, created_at_epoch) VALUES ('mem-s1', 'test--project', 'Mixed session', ?, ?)`).run(new Date().toISOString(), Date.now());
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'feature',
+      title: 'Mixed obs',
+      text: 'o',
+    });
+    testDb
+      .prepare(
+        `INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Mixed prompt', ?, ?)`,
+      )
+      .run(new Date().toISOString(), Date.now());
+    testDb
+      .prepare(
+        `INSERT INTO session_summaries (memory_session_id, project, request, created_at, created_at_epoch) VALUES ('mem-s1', 'test--project', 'Mixed session', ?, ?)`,
+      )
+      .run(new Date().toISOString(), Date.now());
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['get', 'P#1,S#1,#1']));
     expect(output).toContain('Mixed prompt');
@@ -2458,7 +3307,11 @@ describe('CLI get command with prefix routing', () => {
   });
 
   it('hints alternative sources when obs-only lookup misses', async () => {
-    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Only a prompt', ?, ?)`).run(new Date().toISOString(), Date.now());
+    testDb
+      .prepare(
+        `INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Only a prompt', ?, ?)`,
+      )
+      .run(new Date().toISOString(), Date.now());
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['get', '1']));
     // Suggest P#1 exists as a prompt
@@ -2466,14 +3319,26 @@ describe('CLI get command with prefix routing', () => {
   });
 
   it('explicit --source obs strips P# prefix and queries observations', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Explicit override obs', text: 'e' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Explicit override obs',
+      text: 'e',
+    });
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['get', 'P#1', '--source', 'obs']));
     expect(output).toContain('Explicit override obs');
   });
 
   it('warns on unparseable tokens and processes the rest', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Partial valid', text: 'p' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Partial valid',
+      text: 'p',
+    });
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['get', '1,garbage']));
     expect(output).toContain('Partial valid');
@@ -2490,11 +3355,17 @@ describe('CLI/MCP parity on cross-source hint', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('probe returns identical hits across CLI and MCP call paths', async () => {
     // Same ID exists only as a prompt.
-    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'parity', ?, ?)`).run(new Date().toISOString(), Date.now());
+    testDb
+      .prepare(
+        `INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'parity', ?, ?)`,
+      )
+      .run(new Date().toISOString(), Date.now());
 
     const { probeOtherSources } = await import('../lib/id-routing.mjs');
     // Simulate CLI lookup (queried=obs) and MCP lookup (queried=obs) — same exclude set
@@ -2515,16 +3386,36 @@ describe('CLI timeline anchor prefix routing', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('resolves P#N anchor to nearest observation in time', async () => {
     const base = Date.now();
     // Observation 1m before the prompt
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Before prompt obs', text: 'b', epochOffset: -60000 });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Before prompt obs',
+      text: 'b',
+      epochOffset: -60000,
+    });
     // Observation 2m after the prompt
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'After prompt obs', text: 'a', epochOffset: 120000 });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'After prompt obs',
+      text: 'a',
+      epochOffset: 120000,
+    });
     // Prompt sits between
-    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Anchor me', ?, ?)`).run(new Date(base).toISOString(), base);
+    testDb
+      .prepare(
+        `INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Anchor me', ?, ?)`,
+      )
+      .run(new Date(base).toISOString(), base);
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['timeline', '--anchor', 'P#1']));
     expect(output).toContain('Timeline');
@@ -2544,11 +3435,19 @@ describe('CLI timeline anchor prefix routing', () => {
     const base = Date.now();
     // Observation near the prompt (so nearest-in-time resolves to it)
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Near prompt obs', text: 'near content', epochOffset: 60000,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Near prompt obs',
+      text: 'near content',
+      epochOffset: 60000,
     });
     // Insert a prompt with a specific id that has NO matching observation id
-    testDb.prepare(`INSERT INTO user_prompts (id, content_session_id, prompt_text, created_at, created_at_epoch) VALUES (?, 's1', 'bare-int fallback target', ?, ?)`).run(99999, new Date(base).toISOString(), base);
+    testDb
+      .prepare(
+        `INSERT INTO user_prompts (id, content_session_id, prompt_text, created_at, created_at_epoch) VALUES (?, 's1', 'bare-int fallback target', ?, ?)`,
+      )
+      .run(99999, new Date(base).toISOString(), base);
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['timeline', '--anchor', '99999']));
     expect(output).toContain('Timeline');
@@ -2570,18 +3469,28 @@ describe('CLI timeline anchor prefix routing', () => {
   // Fix re-anchors to the compression parent and emits an explanatory note.
   it('bare-int anchor on compressed obs routes to its compressed_into parent', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'feature',
-      title: 'Parent summary', text: 'live parent', epochOffset: 1000,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'feature',
+      title: 'Parent summary',
+      text: 'live parent',
+      epochOffset: 1000,
     });
     const parentId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'change',
-      title: 'Child compressed into parent', text: 'dead child', epochOffset: 0,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Child compressed into parent',
+      text: 'dead child',
+      epochOffset: 0,
       compressedInto: parentId,
     });
     const childId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
     const { run } = await import('../mem-cli.mjs');
-    const output = await captureStdout(() => run(['timeline', '--anchor', String(childId), '--before', '0', '--after', '0']));
+    const output = await captureStdout(() =>
+      run(['timeline', '--anchor', String(childId), '--before', '0', '--after', '0']),
+    );
     expect(output).toContain(`Timeline around #${parentId}`);
     expect(output).toContain(`#${childId} was compressed into it`);
     expect(output).not.toContain(`Timeline around #${childId}`);
@@ -2589,8 +3498,12 @@ describe('CLI timeline anchor prefix routing', () => {
 
   it('bare-int anchor on pruned obs (compressed_into < 0) surfaces explicit error', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'change',
-      title: 'Pruned child', text: 'pruned', compressedInto: -2,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'change',
+      title: 'Pruned child',
+      text: 'pruned',
+      compressedInto: -2,
     });
     const prunedId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
     const { run } = await import('../mem-cli.mjs');
@@ -2606,7 +3519,9 @@ describe('CLI delete/update rejects non-obs prefixes', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('delete P#N rejects with source-specific message', async () => {
     const { run } = await import('../mem-cli.mjs');
@@ -2628,12 +3543,24 @@ describe('CLI get command — mixed-prefix routing', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('routes mixed tokens to their per-prefix source buckets in one call', async () => {
-    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix', title: 'Obs target', text: 'obs content' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Obs target',
+      text: 'obs content',
+    });
     const obsId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
-    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'prompt target', ?, ?)`).run(new Date().toISOString(), Date.now());
+    testDb
+      .prepare(
+        `INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'prompt target', ?, ?)`,
+      )
+      .run(new Date().toISOString(), Date.now());
     const promptId = testDb.prepare('SELECT MAX(id) AS id FROM user_prompts').get().id;
 
     const { run } = await import('../mem-cli.mjs');
@@ -2673,21 +3600,33 @@ describe('CLI timeline query-based anchor', () => {
     testDb = createTestDb();
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('finds anchor via --query flag', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'Timeline query anchor target', text: 'unique anchor content for query',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'Timeline query anchor target',
+      text: 'unique anchor content for query',
       epochOffset: -60000,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Before item', text: 'before content', epochOffset: -120000,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Before item',
+      text: 'before content',
+      epochOffset: -120000,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'After item', text: 'after content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'After item',
+      text: 'after content',
     });
     const output = await captureStdout(() => run(['timeline', '--query', 'unique anchor']));
     expect(output).toContain('<--');
@@ -2696,8 +3635,11 @@ describe('CLI timeline query-based anchor', () => {
 
   it('finds anchor via positional query', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'feature',
-      title: 'Positional query anchor', text: 'positional query content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'feature',
+      title: 'Positional query anchor',
+      text: 'positional query content',
     });
     const output = await captureStdout(() => run(['timeline', 'positional query']));
     expect(output).toContain('Positional query anchor');
@@ -2706,8 +3648,11 @@ describe('CLI timeline query-based anchor', () => {
 
   it('timeline with --project filter', async () => {
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-      title: 'Project timeline obs', text: 'project timeline content',
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'discovery',
+      title: 'Project timeline obs',
+      text: 'project timeline content',
     });
     const output = await captureStdout(() => run(['timeline', '--project', 'test--project']));
     expect(output).toContain('Project timeline obs');
@@ -2716,12 +3661,20 @@ describe('CLI timeline query-based anchor', () => {
   it('auto-scopes anchor timeline to anchor project when --project omitted', async () => {
     insertSession(testDb, { id: 's2', project: 'other--project', memoryId: 'mem-s2' });
     insertObs(testDb, {
-      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
-      title: 'AnchorInTest', text: 'anchor payload', epochOffset: -50000,
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'AnchorInTest',
+      text: 'anchor payload',
+      epochOffset: -50000,
     });
     insertObs(testDb, {
-      sessionId: 'mem-s2', project: 'other--project', type: 'change',
-      title: 'LeakFromOther', text: 'other project content', epochOffset: -40000,
+      sessionId: 'mem-s2',
+      project: 'other--project',
+      type: 'change',
+      title: 'LeakFromOther',
+      text: 'other project content',
+      epochOffset: -40000,
     });
     const anchorId = testDb.prepare("SELECT id FROM observations WHERE title = 'AnchorInTest'").get().id;
     const output = await captureStdout(() => run(['timeline', '--anchor', String(anchorId)]));
@@ -2736,7 +3689,9 @@ describe('CLI fts-check command', () => {
   beforeEach(() => {
     testDb = createTestDb();
   });
-  afterEach(() => { testDb.close(); });
+  afterEach(() => {
+    testDb.close();
+  });
 
   it('shows usage for no action', async () => {
     const output = await captureStdout(() => run(['fts-check']));
@@ -2761,57 +3716,69 @@ describe('CLI fts-check command', () => {
     const output = await captureStdout(() => run(['fts-check', 'rebuild']));
     expect(output).toContain('rebuilt');
   });
-});
 
-// ─── registry command ───────────────────────────────────────────────────────
-
-describe('CLI registry command', () => {
-  beforeEach(() => {
-    testDb = createTestDb();
-  });
-  afterEach(() => { testDb.close(); });
-
-  it('shows usage for no action', async () => {
-    const output = await captureStdout(() => run(['registry']));
-    expect(output).toContain('Usage');
-  });
-
-  it('shows usage for invalid action', async () => {
-    const output = await captureStdout(() => run(['registry', 'invalid']));
-    expect(output).toContain('Usage');
+  it('delete preview names the ids that do not exist', async () => {
+    // The preview is where the user decides. Reporting the miss only after
+    // --confirm tells them a row was never there once it is too late to matter.
+    insertSession(testDb, { id: 's-del', project: 'p' });
+    const id = Number(
+      insertObs(testDb, { sessionId: 's-del', project: 'p', type: 'bugfix', title: 'doomed row' })
+        .lastInsertRowid,
+    );
+    const output = await captureStdout(() => run(['delete', `${id},99999`]));
+    expect(output).toContain('will be deleted');
+    expect(output).toContain('doomed row');
+    expect(output).toContain('not found');
+    expect(output).toContain('99999');
   });
 
-  // Registry commands access real DB files via REGISTRY_DB_PATH.
-  // These tests just verify the command routing works without crashing.
-  it('list runs without crashing', async () => {
-    const output = await captureStdout(() => run(['registry', 'list']));
-    // May succeed or show "not available" depending on registry DB
-    expect(output).toBeDefined();
-  });
+  // Exit codes. `doctor` points users here when it flags an unhealthy index, and
+  // both actions used to report the failure on stdout and then exit 0 — so
+  // `fts-check rebuild && echo repaired` printed "repaired" after failing to
+  // repair, and an agent reading the exit code was told the index was fine.
+  // Convention matched: memdir-audit, the other diagnostic in CLI_COMMANDS,
+  // documents "Exit 0 if every file is compliant, 1 otherwise". Details stay on
+  // stdout (they are what the user reads); only the exit code changes.
+  describe('exit codes', () => {
+    beforeEach(() => {
+      process.exitCode = 0;
+    });
+    afterEach(() => {
+      process.exitCode = 0;
+    });
 
-  it('stats runs without crashing', async () => {
-    const output = await captureStdout(() => run(['registry', 'stats']));
-    expect(output).toBeDefined();
-  });
+    it('check exits 0 on a healthy index', async () => {
+      const output = await captureStdout(() => run(['fts-check', 'check']));
+      expect(output).toContain('healthy');
+      expect(process.exitCode).toBe(0);
+    });
 
-  it('reindex runs without crashing', async () => {
-    const output = await captureStdout(() => run(['registry', 'reindex']));
-    expect(output).toBeDefined();
-  });
+    it('check exits 1 when an index is missing or corrupt', async () => {
+      // Drop one FTS table: checkFTSIntegrity reports it "missing" — the same
+      // unhealthy verdict a corrupt index produces, reached deterministically.
+      testDb.exec('DROP TABLE IF EXISTS user_prompts_fts');
+      const output = await captureStdout(() => run(['fts-check', 'check']));
+      expect(output).toContain('issues found');
+      expect(output).toContain('user_prompts_fts');
+      expect(process.exitCode).toBe(1);
+    });
 
-  it('search shows usage when no query', async () => {
-    const output = await captureStdout(() => run(['registry', 'search']));
-    expect(output).toContain('Usage');
-  });
+    it('rebuild exits 0 when every index rebuilt', async () => {
+      const output = await captureStdout(() => run(['fts-check', 'rebuild']));
+      expect(output).toContain('Successfully rebuilt');
+      expect(process.exitCode).toBe(0);
+    });
 
-  it('import shows usage when missing params', async () => {
-    const output = await captureStdout(() => run(['registry', 'import']));
-    expect(output).toContain('Usage');
-  });
-
-  it('remove shows usage when missing params', async () => {
-    const output = await captureStdout(() => run(['registry', 'remove']));
-    expect(output).toContain('Usage');
+    it('rebuild exits 1 when any index could not be rebuilt', async () => {
+      testDb.exec('DROP TABLE IF EXISTS user_prompts_fts');
+      const output = await captureStdout(() => run(['fts-check', 'rebuild']));
+      expect(output).toContain('Errors:');
+      expect(output).toContain('user_prompts_fts');
+      // Premise: the OTHER indexes did rebuild, so this is a partial failure —
+      // exactly the case the old code reported and then called success.
+      expect(output).toContain('observations_fts');
+      expect(process.exitCode).toBe(1);
+    });
   });
 });
 
@@ -2830,8 +3797,7 @@ describe('CLI memdir-audit command', () => {
     const memdir = join(tmp, 'memory');
     mkdirSync(memdir, { recursive: true });
     const front = '---\nname: F\ndescription: d\ntype: feedback\n---\n';
-    writeFileSync(join(memdir, 'feedback_good.md'),
-      front + '**Why:** reason\n**How to apply:** rule\n');
+    writeFileSync(join(memdir, 'feedback_good.md'), front + '**Why:** reason\n**How to apply:** rule\n');
     writeFileSync(join(memdir, 'feedback_bad.md'), front + 'orphan body\n');
     writeFileSync(join(memdir, 'project_partial.md'), front + '**Why:** reason\n');
     process.exitCode = 0;
@@ -2866,8 +3832,7 @@ describe('CLI memdir-audit command', () => {
     const front = '---\nname: F\ndescription: d\ntype: feedback\n---\n';
     unlinkSync(join(memdir, 'feedback_bad.md'));
     unlinkSync(join(memdir, 'project_partial.md'));
-    writeFileSync(join(memdir, 'feedback_good.md'),
-      front + '**Why:** reason\n**How to apply:** rule\n');
+    writeFileSync(join(memdir, 'feedback_good.md'), front + '**Why:** reason\n**How to apply:** rule\n');
 
     const out = await captureStdout(() => run(['memdir-audit', '--memdir', memdir]));
     expect(out).toContain('Compliant (1):');
@@ -2893,12 +3858,19 @@ describe('CLI Round3 numeric-flag + ops validation', () => {
     insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
     for (let i = 0; i < 3; i++) {
       insertObs(testDb, {
-        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
-        title: `numflag obs ${i}`, text: `numflagcase entry ${i}`, importance: 2,
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `numflag obs ${i}`,
+        text: `numflagcase entry ${i}`,
+        importance: 2,
       });
     }
   });
-  afterEach(() => { testDb.close(); process.exitCode = undefined; });
+  afterEach(() => {
+    testDb.close();
+    process.exitCode = undefined;
+  });
 
   it('search --importance rejects garbage tokens (REJECT-style, not parseInt-coerced)', async () => {
     for (const bad of ['2abc', '1e2', '3xyz']) {

@@ -1,6 +1,32 @@
-/docs
-/CLAUDE.md
+# docs/ is developer-local (design specs, plans, templates) EXCEPT the four negated
+# below, which are records later rounds have to read: docs/measurement/ is CLAUDE.md's
+# evidence appendix, and docs/audit/ + docs/audits/ + docs/ARCHITECTURE.md are the audit
+# ledger — with them ignored, every round re-derived its context and nine items of the
+# 2026-09-02 round were unrecoverable. Written as `/docs/*` plus negations on purpose: git
+# does not descend into an excluded DIRECTORY, so a bare `/docs` would make every `!` line
+# silently inert.
+#
+# `docs/audits/` (PLURAL) is a second ledger directory, not a typo for `docs/audit/`: the
+# two audit prompt templates write to different paths, and the 2026-09-05 R5 round landed
+# in the plural one and was immediately unreadable to the next round — the exact failure
+# the singular directory was negated to stop (A20260905-R5-P2-2). Negating it beats moving
+# the file: the template that produces these reports names the plural path.
+/docs/*
+!/docs/measurement/
+!/docs/audit/
+!/docs/audits/
+!/docs/ARCHITECTURE.md
+# CLAUDE.md is tracked on purpose — it is the operating manual for this tree, and /init
+# cannot reconstruct the measurement doctrine or the record of which drafts were refuted.
+# It was listed here once; the entry did nothing (gitignore does not apply to tracked
+# files) except make `git add CLAUDE.md` need -f and hide an accidental untracking.
 /node_modules
+# Bumping a native dep on a FUSE filesystem can leave one behind: `npm ci` cannot rmdir
+# `better-sqlite3/build/Release` while a long-running process still has the old `.node`
+# open, so the tree gets renamed aside and reinstalled. What is left is a ~2 MB
+# `.fuse_hidden*` binary that only disappears when that process exits — untracked, at the
+# repo root, and one `git add -A` away from a release commit.
+/node_modules.stale-*
 /coverage
 /managed
 /.data/
@@ -59,3 +85,5 @@ release-signing-key.pem
 # runtime twin written by benchmark/rerank-pool-replay.mjs (deleted after import;
 # listed so a crashed run cannot leave a committable stray at the repo root)
 .tmp-rerank-pool-twin.mjs
+.tmp-keyctx-pool-twin.mjs
+.tmp-keyctx-why-*.mjs

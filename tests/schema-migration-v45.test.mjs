@@ -16,19 +16,32 @@ import { initSchema, CURRENT_SCHEMA_VERSION } from '../schema.mjs';
 // v38/v39 did not.
 describe('schema v45 — per-surface citation funnel table', () => {
   const tableNames = (db) =>
-    db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
+    db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all()
+      .map((r) => r.name);
 
   it('fresh init creates citation_surface_log with its composite PK', () => {
     const db = new Database(':memory:');
     initSchema(db);
     expect(tableNames(db)).toContain('citation_surface_log');
     const cols = db.prepare('PRAGMA table_info(citation_surface_log)').all();
-    expect(cols.map((c) => c.name).sort())
-      .toEqual(['cited_n', 'injected_n', 'project', 'resolved_at', 'session_id', 'surface']);
+    expect(cols.map((c) => c.name).sort()).toEqual([
+      'cited_n',
+      'injected_n',
+      'project',
+      'resolved_at',
+      'session_id',
+      'surface',
+    ]);
     // (project, session_id, surface) is the upsert conflict target — a
     // narrower PK would make per-face rows overwrite each other.
-    expect(cols.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name))
-      .toEqual(['project', 'session_id', 'surface']);
+    expect(
+      cols
+        .filter((c) => c.pk > 0)
+        .sort((a, b) => a.pk - b.pk)
+        .map((c) => c.name),
+    ).toEqual(['project', 'session_id', 'surface']);
     db.close();
   });
 
@@ -42,8 +55,9 @@ describe('schema v45 — per-surface citation funnel table', () => {
     initSchema(db);
     // Simulate the observed hole: version row already says "done", table absent.
     db.exec('DROP TABLE citation_surface_log');
-    expect(db.prepare('SELECT version FROM schema_version LIMIT 1').get().version)
-      .toBe(CURRENT_SCHEMA_VERSION);
+    expect(db.prepare('SELECT version FROM schema_version LIMIT 1').get().version).toBe(
+      CURRENT_SCHEMA_VERSION,
+    );
     expect(tableNames(db)).not.toContain('citation_surface_log');
 
     initSchema(db); // re-open must NOT take the fast path
@@ -55,9 +69,11 @@ describe('schema v45 — per-surface citation funnel table', () => {
   it('re-init is idempotent and preserves existing rows', () => {
     const db = new Database(':memory:');
     initSchema(db);
-    db.prepare(`INSERT INTO citation_surface_log
+    db.prepare(
+      `INSERT INTO citation_surface_log
                   (project, session_id, surface, resolved_at, injected_n, cited_n)
-                VALUES ('p','s','pretool',1,7,2)`).run();
+                VALUES ('p','s','pretool',1,7,2)`,
+    ).run();
     expect(() => initSchema(db)).not.toThrow();
     const row = db.prepare('SELECT * FROM citation_surface_log').get();
     expect(row.injected_n).toBe(7);
@@ -65,12 +81,14 @@ describe('schema v45 — per-surface citation funnel table', () => {
     db.close();
   });
 
-  it('merges the local search-telemetry v45 shape into v46', () => {
+  it('preserves the local search-telemetry v45 shape through v49', () => {
     const db = new Database(':memory:');
     initSchema(db);
-    db.prepare(`INSERT INTO search_runs
+    db.prepare(
+      `INSERT INTO search_runs
       (project, query, surface, search_mode, client, created_at, created_at_epoch)
-      VALUES ('p', 'q', 'mcp_search', 'normal', 'test', 'now', 1)`).run();
+      VALUES ('p', 'q', 'mcp_search', 'normal', 'test', 'now', 1)`,
+    ).run();
     db.pragma('foreign_keys = OFF');
     db.exec(`
       DROP TABLE citation_surface_log;
@@ -81,18 +99,27 @@ describe('schema v45 — per-surface citation funnel table', () => {
     initSchema(db);
 
     expect(tableNames(db)).toContain('citation_surface_log');
-    expect(db.prepare("SELECT COUNT(*) c FROM pragma_table_info('observations') WHERE name = 'decay_seen_at_first_cite'").get().c).toBe(1);
+    expect(
+      db
+        .prepare(
+          "SELECT COUNT(*) c FROM pragma_table_info('observations') WHERE name = 'decay_seen_at_first_cite'",
+        )
+        .get().c,
+    ).toBe(1);
     expect(db.prepare('SELECT query FROM search_runs').get().query).toBe('q');
+    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(49);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
     db.close();
   });
 
-  it('merges the upstream citation-funnel v45 shape into v46', () => {
+  it('adds telemetry to the upstream citation-funnel v45 shape through v49', () => {
     const db = new Database(':memory:');
     initSchema(db);
-    db.prepare(`INSERT INTO citation_surface_log
+    db.prepare(
+      `INSERT INTO citation_surface_log
       (project, session_id, surface, resolved_at, injected_n, cited_n)
-      VALUES ('p', 's', 'pretool', 1, 7, 2)`).run();
+      VALUES ('p', 's', 'pretool', 1, 7, 2)`,
+    ).run();
     db.pragma('foreign_keys = OFF');
     db.exec(`
       DROP TABLE search_results;
@@ -105,9 +132,18 @@ describe('schema v45 — per-surface citation funnel table', () => {
 
     expect(tableNames(db)).toContain('search_runs');
     expect(tableNames(db)).toContain('search_results');
-    expect(db.prepare("SELECT COUNT(*) c FROM pragma_table_info('observations') WHERE name = 'decay_seen_at_first_cite'").get().c).toBe(1);
-    expect(db.prepare('SELECT injected_n, cited_n FROM citation_surface_log').get())
-      .toEqual({ injected_n: 7, cited_n: 2 });
+    expect(
+      db
+        .prepare(
+          "SELECT COUNT(*) c FROM pragma_table_info('observations') WHERE name = 'decay_seen_at_first_cite'",
+        )
+        .get().c,
+    ).toBe(1);
+    expect(db.prepare('SELECT injected_n, cited_n FROM citation_surface_log').get()).toEqual({
+      injected_n: 7,
+      cited_n: 2,
+    });
+    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(49);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
     db.close();
   });

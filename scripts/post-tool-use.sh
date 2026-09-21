@@ -107,7 +107,25 @@ if [[ "$tool" == "Read" ]]; then
         fi
       fi
     fi
-    runtime_dir="${_data_dir}/runtime"
+    # Mirror resolveRuntimeDir() (lib/resolve-data-dir.mjs): CLAUDE_MEM_RUNTIME_DIR wins when
+    # non-empty, and a relative value resolves against cwd. Without this the two sides of the
+    # channel disagreed whenever that override was set — bash appended to
+    # $CLAUDE_MEM_DIR/runtime while hook.mjs read (and hook-shared.mjs reaped) the override
+    # dir, which is both harms named at the top of this branch: every Read dropped from the
+    # episode, and an orphaned file nothing ever collects.
+    #
+    # The override deliberately wins over the test-containment redirect above, because the
+    # Node resolver ignores dataDir entirely once it is set. Mirroring it is the whole point;
+    # a "safer" bash rule here would be a second policy nobody reviewed.
+    #
+    # Builtins only. This is the ~5ms pre-filter — a `node -e` resolver of the kind setup.sh
+    # can afford at SessionStart costs ~27ms measured, on every tool call.
+    if [[ -n "${CLAUDE_MEM_RUNTIME_DIR:-}" ]]; then
+      runtime_dir="$CLAUDE_MEM_RUNTIME_DIR"
+      [[ "$runtime_dir" == /* ]] || runtime_dir="${PWD}/${runtime_dir}"
+    else
+      runtime_dir="${_data_dir}/runtime"
+    fi
     # Owner-only (0700 dir / 0600 file): reads-<project>.txt lists captured file
     # paths, so on a shared host the default umask leaked them to every local user.
     # umask is a shell builtin — no extra process on this ~5ms per-tool-call path

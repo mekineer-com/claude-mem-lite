@@ -4,11 +4,11 @@
 // because the launcher derives its install dir from __dirname and the whole
 // point of the wrapper is what happens at process boundaries.
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, readFileSync } from 'fs';
+import { mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, readFileSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -29,14 +29,37 @@ afterEach(() => {
   tracked.clear();
 });
 
+// The two heal-cooldown markers are keyed per CODE HOME (the launcher hashes its own
+// INSTALL_DIR), because the runtime dir is shared by every install shape on the machine and
+// a global name let a failed heal for one root silence another's. The launcher's INSTALL_DIR
+// is `join(__dirname, '..')` = the install root, so the key is a hash of `root` itself.
+//
+// This derivation is duplicated from scripts/hook-launcher.mjs on purpose and is SELF-
+// CHECKING rather than hand-synced: the cases below both READ these paths (a wrong key
+// would find no marker) and WRITE them to simulate an armed cooldown (a wrong key would
+// leave the launcher healing instead of skipping), so a scheme change goes red here.
+const installKey = (root) => createHash('sha256').update(root).digest('hex').slice(0, 12);
+const healMarker = (root) => join(root, 'runtime', `hook-launcher-lastheal-${installKey(root)}`);
+// The native-binding cooldown stays MACHINE-WIDE on purpose: rebuildBinding() repairs every
+// code home on the machine, so one attempt covers them all. Only the repair cooldown above is
+// per code home.
+const nbHealMarker = (root) => join(root, 'runtime', 'native-binding-lastheal');
+
 function runLauncher(root, args, env = {}) {
-  return spawnSync(
-    process.execPath,
-    [join(root, 'scripts', 'hook-launcher.mjs'), ...args],
-    { encoding: 'utf8', env: { ...process.env, CLAUDE_MEM_DIR: root, ...env } },
-  );
+  return spawnSync(process.execPath, [join(root, 'scripts', 'hook-launcher.mjs'), ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, CLAUDE_MEM_DIR: root, ...env },
+  });
 }
 
+// A20260905-R5-Q2: the module-missing repair is SESSION-START ONLY. `install.mjs repair`
+// is a synchronous spawn with a 300s timeout, and hooks/hooks.json gives the hot-path events
+// 2-5s — and because the 6h cooldown is armed BEFORE the spawn (concurrent-fire rate
+// limiting), a repair the host killed at 2s used to buy six hours of "Self-heal skipped",
+// including for the SessionStart fire that could have finished it. Every case below that
+// asserts a heal therefore passes `session-start` as the event; the two cases at the end of
+// this block assert the hot path declines, and the breakage-marker case deliberately does
+// NOT pass it — recording breakage is common to both paths.
 describe('hook-launcher self-heal', () => {
   it('passes through when the target entry imports cleanly', () => {
     const root = makeInstall('cml-launcher-pass');
@@ -83,20 +106,59 @@ describe('hook-launcher self-heal', () => {
     writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
     writeFileSync(join(root, 'entry.mjs'), "import './missing-local.mjs';\n");
 
-    const first = runLauncher(root, ['entry.mjs']);
+    const first = runLauncher(root, ['entry.mjs', 'session-start']);
     expect(first.stderr).toMatch(/Detected broken install/);
     expect(first.stderr).toMatch(/REPAIR-ATTEMPTED/);
     expect(first.status).toBe(0);
     expect(first.stderr).not.toMatch(/node:internal|ERR_MODULE_NOT_FOUND/);
-    expect(existsSync(join(root, 'runtime', 'hook-launcher-lastheal'))).toBe(true);
+    expect(existsSync(healMarker(root))).toBe(true);
 
     // Second invocation within cooldown skips repair and still degrades quietly
     // (clean guidance, exit 0, no stack trace) rather than failing every fire.
-    const second = runLauncher(root, ['entry.mjs']);
+    const second = runLauncher(root, ['entry.mjs', 'session-start']);
     expect(second.stderr).not.toMatch(/REPAIR-ATTEMPTED/);
     expect(second.stderr).toMatch(/Self-heal skipped/);
     expect(second.status).toBe(0);
     expect(second.stderr).not.toMatch(/node:internal|ERR_MODULE_NOT_FOUND/);
+  });
+
+  it('does not let one code home arm the cooldown against another', () => {
+    // The runtime dir is SHARED by every install shape on a machine (a plugin cache version,
+    // a managed ~/.claude-mem-lite, a dev checkout), and each is repaired by its own
+    // `cli.mjs repair`. With a single global marker name, root A's failed attempt bought six
+    // hours of silence for root B — measured as a real gap 2026-09-08.
+    const shared = join(tmpdir(), `cml-launcher-shared-rt-${randomUUID().slice(0, 8)}`);
+    mkdirSync(shared, { recursive: true });
+    tracked.add(shared);
+    const env = { CLAUDE_MEM_RUNTIME_DIR: shared };
+
+    const rootA = makeInstall('cml-launcher-home-a');
+    const rootB = makeInstall('cml-launcher-home-b');
+    for (const r of [rootA, rootB]) {
+      writeFileSync(join(r, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
+      writeFileSync(join(r, 'entry.mjs'), "import './missing-local.mjs';\n");
+    }
+
+    const a = runLauncher(rootA, ['entry.mjs', 'session-start'], env);
+    expect(a.stderr).toMatch(/REPAIR-ATTEMPTED/);
+
+    // Premise: A really did arm a cooldown in the SHARED dir. Without this the case could
+    // pass because nothing was written at all.
+    const armed = readdirSync(shared).filter((n) => n.startsWith('hook-launcher-lastheal-'));
+    expect(armed).toHaveLength(1);
+
+    const b = runLauncher(rootB, ['entry.mjs', 'session-start'], env);
+    expect(b.stderr).toMatch(/REPAIR-ATTEMPTED/);
+    expect(b.stderr).not.toMatch(/Self-heal skipped/);
+
+    // Two homes, two markers, same directory — that is the property, not just "B healed".
+    expect(readdirSync(shared).filter((n) => n.startsWith('hook-launcher-lastheal-'))).toHaveLength(2);
+
+    // Control: B's SECOND fire is still rate-limited by B's own marker, so this is
+    // namespacing, not a cooldown that stopped working.
+    const bAgain = runLauncher(rootB, ['entry.mjs', 'session-start'], env);
+    expect(bAgain.stderr).toMatch(/Self-heal skipped/);
+    expect(bAgain.stderr).not.toMatch(/REPAIR-ATTEMPTED/);
   });
 
   it('treats a missing bare dependency (e.g. better-sqlite3) as a broken install, not a foreign error', () => {
@@ -111,7 +173,7 @@ describe('hook-launcher self-heal', () => {
     // better-sqlite3 during a half-finished npm install.
     writeFileSync(join(root, 'entry.mjs'), "import x from 'better-sqlite3-nope-xyz';\n");
 
-    const r = runLauncher(root, ['entry.mjs']);
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
     // Recognized as ours → self-heal attempted (vs silently re-thrown).
     expect(r.stderr).toMatch(/Detected broken install/);
     expect(r.stderr).toMatch(/REPAIR-ATTEMPTED/);
@@ -127,17 +189,17 @@ describe('hook-launcher self-heal', () => {
     writeFileSync(
       join(root, 'install.mjs'),
       `import { writeFileSync, mkdirSync } from 'fs';\n` +
-      `import { join, dirname } from 'path';\n` +
-      `import { fileURLToPath } from 'url';\n` +
-      `const __dirname = dirname(fileURLToPath(import.meta.url));\n` +
-      `const target = join(__dirname, 'missing-local.mjs');\n` +
-      `mkdirSync(dirname(target), { recursive: true });\n` +
-      `writeFileSync(target, 'process.stdout.write("HEALED-OK\\\\n");\\n');\n` +
-      `process.exit(0);\n`,
+        `import { join, dirname } from 'path';\n` +
+        `import { fileURLToPath } from 'url';\n` +
+        `const __dirname = dirname(fileURLToPath(import.meta.url));\n` +
+        `const target = join(__dirname, 'missing-local.mjs');\n` +
+        `mkdirSync(dirname(target), { recursive: true });\n` +
+        `writeFileSync(target, 'process.stdout.write("HEALED-OK\\\\n");\\n');\n` +
+        `process.exit(0);\n`,
     );
     writeFileSync(join(root, 'entry.mjs'), "import './missing-local.mjs';\n");
 
-    const r = runLauncher(root, ['entry.mjs']);
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
     expect(r.stderr).toMatch(/Detected broken install/);
     expect(r.stdout).toContain('HEALED-OK');
     expect(r.status).toBe(0);
@@ -164,7 +226,7 @@ describe('hook-launcher self-heal', () => {
     writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: { 'declared-dep-xyz': '^1' } }));
     writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
     writeFileSync(join(root, 'entry.mjs'), "import x from 'declared-dep-xyz';\n");
-    const r = runLauncher(root, ['entry.mjs']);
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
     expect(r.stderr).toMatch(/Detected broken install/);
     expect(r.stderr).toMatch(/REPAIR-ATTEMPTED/);
     expect(r.status).toBe(0);
@@ -190,7 +252,7 @@ describe('hook-launcher self-heal', () => {
     const root = makeInstall('cml-launcher-retry-fail');
     writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-DONE");process.exit(0);\n');
     writeFileSync(join(root, 'entry.mjs'), "import './still-missing.mjs';\n");
-    const r = runLauncher(root, ['entry.mjs']);
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
     expect(r.status).toBe(0);
     expect(r.stderr).toMatch(/Detected broken install/);
     expect(r.stderr).toMatch(/Hook still failing after self-heal/);
@@ -203,21 +265,181 @@ describe('hook-launcher self-heal', () => {
     writeFileSync(
       join(root, 'install.mjs'),
       `import { writeFileSync, mkdirSync } from 'fs';\n` +
-      `import { join, dirname } from 'path';\n` +
-      `import { fileURLToPath } from 'url';\n` +
-      `const __dirname = dirname(fileURLToPath(import.meta.url));\n` +
-      `const target = join(__dirname, 'missing-local.mjs');\n` +
-      `mkdirSync(dirname(target), { recursive: true });\n` +
-      `writeFileSync(target, 'process.stdout.write("HEALED-OK\\\\n");\\n');\n` +
-      `process.exit(0);\n`,
+        `import { join, dirname } from 'path';\n` +
+        `import { fileURLToPath } from 'url';\n` +
+        `const __dirname = dirname(fileURLToPath(import.meta.url));\n` +
+        `const target = join(__dirname, 'missing-local.mjs');\n` +
+        `mkdirSync(dirname(target), { recursive: true });\n` +
+        `writeFileSync(target, 'process.stdout.write("HEALED-OK\\\\n");\\n');\n` +
+        `process.exit(0);\n`,
     );
     writeFileSync(join(root, 'entry.mjs'), "import './missing-local.mjs';\n");
-    const r = runLauncher(root, ['entry.mjs']);
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('HEALED-OK');
     // cooldown cleared so an unrelated later breakage can heal immediately
-    expect(existsSync(join(root, 'runtime', 'hook-launcher-lastheal'))).toBe(false);
+    expect(existsSync(healMarker(root))).toBe(false);
     expect(existsSync(join(root, 'runtime', 'hook-launcher-broken'))).toBe(false);
+  });
+
+  // ── A20260905-R5-Q2: the hot path records and defers, it does not repair ──
+
+  it('does NOT run install.mjs repair on the per-tool hot path — only session-start pays', () => {
+    const root = makeInstall('cml-launcher-hotpath-defer');
+    writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
+    writeFileSync(join(root, 'entry.mjs'), "import './missing-local.mjs';\n");
+
+    // No event argument = a PreToolUse/PostToolUse-shaped fire (2-3s host cap).
+    const hot = runLauncher(root, ['entry.mjs']);
+    expect(hot.status).toBe(0);
+    expect(hot.stderr).not.toMatch(/REPAIR-ATTEMPTED/);
+    expect(hot.stderr).toMatch(/deferred to the next SessionStart/);
+    expect(hot.stderr).not.toMatch(/node:internal|ERR_MODULE_NOT_FOUND/);
+    // The breakage stays observable to `doctor` — deferring is not hiding.
+    expect(existsSync(join(root, 'runtime', 'hook-launcher-broken'))).toBe(true);
+
+    // CONTROL, same fixture: with the event argument the repair does run. Without this the
+    // assertions above are equally consistent with a launcher that stopped healing at all.
+    const cold = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(cold.stderr).toMatch(/REPAIR-ATTEMPTED/);
+  });
+
+  it('a killed hot-path fire cannot arm the 6h cooldown against the SessionStart that follows', () => {
+    // The actual damage in A20260905-R5-Q2. recordHealAttempt() writes the cooldown marker
+    // BEFORE spawning (deliberately — it is the mutual exclusion between concurrent fires),
+    // so a hot-path repair the host kills still bought six hours of "Self-heal skipped" for
+    // every later fire, SessionStart included. Assert the sequence, not the internals: a hot
+    // fire must leave no cooldown marker, and the SessionStart right after it must still be
+    // able to attempt the repair.
+    const root = makeInstall('cml-launcher-hotpath-cooldown');
+    writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
+    writeFileSync(join(root, 'entry.mjs'), "import './missing-local.mjs';\n");
+
+    runLauncher(root, ['entry.mjs']);
+    expect(existsSync(healMarker(root))).toBe(false);
+
+    const ss = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(ss.stderr).toMatch(/REPAIR-ATTEMPTED/);
+    expect(ss.stderr).not.toMatch(/Self-heal skipped/);
+    expect(existsSync(healMarker(root))).toBe(true);
+  });
+});
+
+// A20260905-R5-Q2, second half. Gating the heal to session-start left one route open and
+// one closed: a hot-path fire now records the breakage and defers, but if the missing module
+// sits on ANOTHER entry's import chain (this launcher fronts hook.mjs plus four standalone
+// hook scripts), session-start's own entry imports cleanly, the catch never fires, and the
+// clean fire used to simply clear the marker — so nothing ever repaired it.
+//
+// The repair here is DETACHED with stdio ignored: the fire is capped at 15s while
+// `install.mjs repair` takes minutes, and install.mjs logs to stdout while SessionStart
+// stdout is the JSON envelope Claude Code parses. So it cannot be observed through the
+// launcher's streams — the stub records itself on disk and these cases wait for that.
+describe('hook-launcher marker-driven self-heal (session-start)', () => {
+  const BROKEN = (root) => join(root, 'runtime', 'hook-launcher-broken');
+  const COOLDOWN = healMarker;
+  const RAN = (root) => join(root, 'repair-ran');
+  const sleepSync = (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  };
+  const waitFor = (pred, ms = 5000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (pred()) return true;
+      sleepSync(25);
+    }
+    return pred();
+  };
+  const writeBroken = (root, reason = 'lib/cite-back-hint.mjs') => {
+    mkdirSync(join(root, 'runtime'), { recursive: true });
+    writeFileSync(BROKEN(root), JSON.stringify({ reason, ts: Date.now() }));
+  };
+  const stubInstaller = (root) =>
+    writeFileSync(
+      join(root, 'install.mjs'),
+      `import { writeFileSync } from 'fs';\n` +
+        `writeFileSync(${JSON.stringify(RAN(root))}, process.argv[2] || '');\n` +
+        `process.exit(0);\n`,
+    );
+  const cleanEntry = (root) =>
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
+
+  it('repairs in the background when a PREVIOUS fire recorded a breakage this entry cannot see', () => {
+    const root = makeInstall('cml-launcher-marker-heal');
+    stubInstaller(root);
+    cleanEntry(root); // this entry is fine — the broken module is on another one's chain
+    writeBroken(root);
+
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ENTRY-OK'); // the fire is never blocked on the repair
+    expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
+    expect(readFileSync(RAN(root), 'utf8')).toBe('repair');
+    // Marker cleared (doctor must not keep reporting a breakage we acted on) and the 6h
+    // cooldown armed (it, not the marker, is what bounds repair spawns).
+    expect(waitFor(() => !existsSync(BROKEN(root)))).toBe(true);
+    expect(existsSync(COOLDOWN(root))).toBe(true);
+  });
+
+  it('CONTROL: a healthy install spawns nothing at session-start', () => {
+    // Without this the case above is equally consistent with a launcher that repairs on
+    // every session-start regardless of state.
+    const root = makeInstall('cml-launcher-marker-healthy');
+    stubInstaller(root);
+    cleanEntry(root);
+
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(r.status).toBe(0);
+    sleepSync(300);
+    expect(existsSync(RAN(root))).toBe(false);
+    expect(existsSync(COOLDOWN(root))).toBe(false);
+  });
+
+  it('drops a stale cooldown once no fire is recording breakage any more (#6/#9)', () => {
+    const root = makeInstall('cml-launcher-marker-cooldown-drop');
+    stubInstaller(root);
+    cleanEntry(root);
+    mkdirSync(join(root, 'runtime'), { recursive: true });
+    writeFileSync(COOLDOWN(root), String(Date.now()));
+
+    runLauncher(root, ['entry.mjs', 'session-start']);
+    // No marker → the install is as healthy as this launcher can tell → an old window must
+    // not keep blocking an unrelated future break.
+    expect(existsSync(COOLDOWN(root))).toBe(false);
+  });
+
+  it('honors the cooldown, and KEEPS the marker while it does so', () => {
+    const root = makeInstall('cml-launcher-marker-cooldown-honored');
+    stubInstaller(root);
+    cleanEntry(root);
+    writeBroken(root);
+    mkdirSync(join(root, 'runtime'), { recursive: true });
+    writeFileSync(COOLDOWN(root), String(Date.now())); // fresh window
+
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(r.status).toBe(0);
+    sleepSync(300);
+    expect(existsSync(RAN(root))).toBe(false);
+    // Not clearing here is the point: within the window nothing repaired it, so `doctor`
+    // must still be able to see the degraded state.
+    expect(existsSync(BROKEN(root))).toBe(true);
+  });
+
+  it('does nothing on the per-tool hot path — the marker survives for session-start', () => {
+    const root = makeInstall('cml-launcher-marker-hotpath');
+    stubInstaller(root);
+    cleanEntry(root);
+    writeBroken(root);
+
+    const hot = runLauncher(root, ['entry.mjs']); // no event arg = hot path
+    expect(hot.status).toBe(0);
+    sleepSync(300);
+    expect(existsSync(RAN(root))).toBe(false);
+    expect(existsSync(BROKEN(root))).toBe(true);
+
+    // CONTROL, same fixture: session-start does act on it.
+    runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
   });
 });
 
@@ -230,7 +452,7 @@ describe('hook-launcher self-heal', () => {
 // dlopen'd the stale binary.
 describe('hook-launcher native-binding self-heal (session-start)', () => {
   const BROKEN = (root) => join(root, 'runtime', 'native-binding-broken');
-  const COOLDOWN = (root) => join(root, 'runtime', 'native-binding-lastheal');
+  const COOLDOWN = nbHealMarker;
   const RAN = (root) => join(root, 'rebuild-ran');
   const writeBroken = (root, reason = 'NODE_MODULE_VERSION 127 vs 137') => {
     mkdirSync(join(root, 'runtime'), { recursive: true });
@@ -240,18 +462,21 @@ describe('hook-launcher native-binding self-heal (session-start)', () => {
   // 15s-capped hook, and its stdout would corrupt the SessionStart JSON
   // envelope), so it cannot be observed through the launcher's own streams —
   // the stub records itself on disk and the test waits for that.
-  const stubInstaller = (root, { exitCode = 0, clearsMarker = true } = {}) => writeFileSync(
-    join(root, 'install.mjs'),
-    `import { writeFileSync, unlinkSync } from 'fs';\n` +
-    `writeFileSync(${JSON.stringify(RAN(root))}, process.argv[2] || '');\n` +
-    (clearsMarker && exitCode === 0
-      ? `try { unlinkSync(${JSON.stringify(BROKEN(root))}); } catch {}\n`
-      : '') +
-    `process.exit(${exitCode});\n`,
-  );
+  const stubInstaller = (root, { exitCode = 0, clearsMarker = true } = {}) =>
+    writeFileSync(
+      join(root, 'install.mjs'),
+      `import { writeFileSync, unlinkSync } from 'fs';\n` +
+        `writeFileSync(${JSON.stringify(RAN(root))}, process.argv[2] || '');\n` +
+        (clearsMarker && exitCode === 0
+          ? `try { unlinkSync(${JSON.stringify(BROKEN(root))}); } catch {}\n`
+          : '') +
+        `process.exit(${exitCode});\n`,
+    );
   // Synchronous poll — the assertions are about a DETACHED child, so the test
   // has to wait for the filesystem rather than for the launcher's exit.
-  const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+  const sleepSync = (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  };
   const waitFor = (pred, ms = 5000) => {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
@@ -282,8 +507,8 @@ describe('hook-launcher native-binding self-heal (session-start)', () => {
     writeFileSync(
       join(root, 'install.mjs'),
       `import { writeFileSync } from 'fs';\n` +
-      `writeFileSync(${JSON.stringify(RAN(root))}, 'slow');\n` +
-      `setTimeout(() => process.exit(0), 8000);\n`,   // outlives the 15s cap's useful budget
+        `writeFileSync(${JSON.stringify(RAN(root))}, 'slow');\n` +
+        `setTimeout(() => process.exit(0), 8000);\n`, // outlives the 15s cap's useful budget
     );
     writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
     writeBroken(root);
@@ -303,9 +528,9 @@ describe('hook-launcher native-binding self-heal (session-start)', () => {
     writeFileSync(
       join(root, 'install.mjs'),
       `import { writeFileSync } from 'fs';\n` +
-      `console.log('  ✓ better-sqlite3 binding rebuilt');\n` +
-      `writeFileSync(${JSON.stringify(RAN(root))}, 'x');\n` +
-      `process.exit(0);\n`,
+        `console.log('  ✓ better-sqlite3 binding rebuilt');\n` +
+        `writeFileSync(${JSON.stringify(RAN(root))}, 'x');\n` +
+        `process.exit(0);\n`,
     );
     writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write(JSON.stringify({ok:true}) + "\\n");\n');
     writeBroken(root);
@@ -340,13 +565,13 @@ describe('hook-launcher native-binding self-heal (session-start)', () => {
     const first = runLauncher(root, ['entry.mjs', 'session-start']);
     expect(first.status).toBe(0);
     expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
-    expect(existsSync(BROKEN(root))).toBe(true);     // unresolved → next session retries
+    expect(existsSync(BROKEN(root))).toBe(true); // unresolved → next session retries
     expect(existsSync(COOLDOWN(root))).toBe(true);
     rmSync(RAN(root), { force: true });
 
     const second = runLauncher(root, ['entry.mjs', 'session-start']);
     expect(second.status).toBe(0);
-    expect(existsSync(RAN(root))).toBe(false);       // suppressed by the cooldown
+    expect(existsSync(RAN(root))).toBe(false); // suppressed by the cooldown
   });
 
   it('drops a stale cooldown once the binding is healthy again', () => {
@@ -355,7 +580,7 @@ describe('hook-launcher native-binding self-heal (session-start)', () => {
     stubInstaller(root);
     writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
     mkdirSync(join(root, 'runtime'), { recursive: true });
-    writeFileSync(COOLDOWN(root), String(Date.now()));   // recent heal, no breakage
+    writeFileSync(COOLDOWN(root), String(Date.now())); // recent heal, no breakage
 
     runLauncher(root, ['entry.mjs', 'session-start']);
     expect(existsSync(COOLDOWN(root))).toBe(false);
@@ -374,10 +599,10 @@ describe('hook-launcher native-binding self-heal (session-start)', () => {
     writeFileSync(
       join(root, 'entry.mjs'),
       `import { writeFileSync, mkdirSync } from 'fs';\n` +
-      `import { join } from 'path';\n` +
-      `mkdirSync(join(process.env.CLAUDE_MEM_DIR, 'runtime'), { recursive: true });\n` +
-      `writeFileSync(join(process.env.CLAUDE_MEM_DIR, 'runtime', 'native-binding-broken'), JSON.stringify({ reason: 'abi', ts: Date.now() }));\n` +
-      `process.stdout.write("ENTRY-OK\\n");\n`,
+        `import { join } from 'path';\n` +
+        `mkdirSync(join(process.env.CLAUDE_MEM_DIR, 'runtime'), { recursive: true });\n` +
+        `writeFileSync(join(process.env.CLAUDE_MEM_DIR, 'runtime', 'native-binding-broken'), JSON.stringify({ reason: 'abi', ts: Date.now() }));\n` +
+        `process.stdout.write("ENTRY-OK\\n");\n`,
     );
 
     const r = runLauncher(root, ['entry.mjs', 'session-start']);
@@ -396,7 +621,7 @@ describe('hook-launcher native-binding self-heal (session-start)', () => {
   });
 
   it('reads the marker dir the standalone hook scripts write to (CLAUDE_MEM_RUNTIME_DIR)', () => {
-    // pre-tool-recall.js / pre-skill-bridge.js honor CLAUDE_MEM_RUNTIME_DIR and
+    // pre-tool-recall.js / post-tool-recall.js honor CLAUDE_MEM_RUNTIME_DIR and
     // wrote 78 of the 79 field markers; a launcher reading only CLAUDE_MEM_DIR
     // would look in the wrong place and never heal.
     const root = makeInstall('cml-launcher-nb-runtimedir');
@@ -404,7 +629,10 @@ describe('hook-launcher native-binding self-heal (session-start)', () => {
     writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
     const altRuntime = join(root, 'alt-runtime');
     mkdirSync(altRuntime, { recursive: true });
-    writeFileSync(join(altRuntime, 'native-binding-broken'), JSON.stringify({ reason: 'abi', ts: Date.now() }));
+    writeFileSync(
+      join(altRuntime, 'native-binding-broken'),
+      JSON.stringify({ reason: 'abi', ts: Date.now() }),
+    );
 
     const r = runLauncher(root, ['entry.mjs', 'session-start'], { CLAUDE_MEM_RUNTIME_DIR: altRuntime });
     expect(r.status).toBe(0);
@@ -425,7 +653,7 @@ describe('hook-launcher swap barrier (audit P2-4)', () => {
   it('skips the fire (exit 0, entry never imported) while a swap is in progress', () => {
     const root = makeInstall('cml-launcher-swap');
     writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-RAN\\n");\n');
-    writeMarker(root, { pid: process.pid, ts: Date.now() });   // live holder
+    writeMarker(root, { pid: process.pid, ts: Date.now() }); // live holder
     const r = runLauncher(root, ['entry.mjs']);
     expect(r.status).toBe(0);
     expect(r.stdout).not.toContain('ENTRY-RAN');
@@ -443,7 +671,7 @@ describe('hook-launcher swap barrier (audit P2-4)', () => {
   it('runs normally when the marker names a dead pid', () => {
     const root = makeInstall('cml-launcher-swap-dead');
     writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-RAN\\n");\n');
-    writeMarker(root, { pid: 0x7ffffffe, ts: Date.now() });   // not a live process
+    writeMarker(root, { pid: 0x7ffffffe, ts: Date.now() }); // not a live process
     const r = runLauncher(root, ['entry.mjs']);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('ENTRY-RAN');

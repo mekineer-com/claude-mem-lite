@@ -2,18 +2,40 @@
 // Handles file-based episode storage with advisory locking and pending entry recovery
 
 import { join } from 'path';
-import { readFileSync, writeFileSync, unlinkSync, readdirSync, openSync, closeSync, writeSync, renameSync, statSync, constants as fsConstants } from 'fs';
+import {
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+  readdirSync,
+  openSync,
+  closeSync,
+  writeSync,
+  renameSync,
+  statSync,
+  constants as fsConstants,
+} from 'fs';
 import { inferProject, EDIT_TOOLS } from './utils.mjs';
 import { RUNTIME_DIR } from './hook-shared.mjs';
 
 /**
- * Read episode file without locking (for signal handlers only).
+ * Read the episode buffer WITHOUT holding the lock: the dying-process salvage in hook.mjs's
+ * signal handler, and the snapshot Stop / SessionStart take before they flush.
+ *
+ * Same body as `readEpisode` on purpose — the two names record which locking contract the
+ * CALLER is under, and neither function takes a lock itself. What must not differ is the
+ * PATH, so both go through `episodeFile()`. This one used to re-spell it inline, which put
+ * the buffer's name in three places (here, `episodeFile`, and the signal handler's unlink)
+ * and left the salvage path — the one that runs while the process is dying, and the hardest
+ * to notice when it is wrong — as the only one not reading the accessor.
+ *
  * @returns {object|null} Parsed episode or null on failure
  */
 export function readEpisodeRaw() {
   try {
-    return JSON.parse(readFileSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`), 'utf8'));
-  } catch { return null; }
+    return JSON.parse(readFileSync(episodeFile(), 'utf8'));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -60,16 +82,28 @@ export function acquireLock(maxWaitMs = 500) {
         const age = Date.now() - (info.ts || 0);
         let stale = age > 30000; // >30s = stale
         if (!stale && info.pid) {
-          try { process.kill(info.pid, 0); } catch (killErr) {
+          try {
+            process.kill(info.pid, 0);
+          } catch (killErr) {
             stale = killErr.code === 'ESRCH'; // Only stale if process truly gone
           }
         }
-        if (stale) { try { unlinkSync(lf); } catch {} continue; }
+        if (stale) {
+          try {
+            unlinkSync(lf);
+          } catch {}
+          continue;
+        }
       } catch {
         // Can't read lock — check mtime
         try {
           const st = statSync(lf);
-          if (Date.now() - st.mtimeMs > 30000) { try { unlinkSync(lf); } catch {} continue; }
+          if (Date.now() - st.mtimeMs > 30000) {
+            try {
+              unlinkSync(lf);
+            } catch {}
+            continue;
+          }
         } catch {}
       }
       // WARNING: Atomics.wait blocks the main thread. This is intentional and safe here
@@ -86,7 +120,9 @@ export function acquireLock(maxWaitMs = 500) {
  * Release the advisory file lock for episode buffer operations.
  */
 export function releaseLock() {
-  try { unlinkSync(lockFile()); } catch {}
+  try {
+    unlinkSync(lockFile());
+  } catch {}
 }
 
 /**
@@ -116,7 +152,9 @@ export function writeEpisode(episode) {
   try {
     renameSync(tmp, target);
   } catch (err) {
-    try { unlinkSync(tmp); } catch {}
+    try {
+      unlinkSync(tmp);
+    } catch {}
     throw err;
   }
 }
@@ -164,7 +202,7 @@ export function planEpisodeFlush(episode) {
     subs.push({
       ...episode,
       entries,
-      files: [...new Set(entries.flatMap(e => e.files || []))],
+      files: [...new Set(entries.flatMap((e) => e.files || []))],
       filesRead: episode.filesRead,
       savedId: undefined,
     });
@@ -202,7 +240,9 @@ export function writePendingEntry(entry, sessionId, project) {
     writeFileSync(tmp, JSON.stringify({ entry, sessionId, project, ts }), { mode: 0o600 });
     renameSync(tmp, pendingFile);
   } catch {
-    try { unlinkSync(tmp); } catch {}
+    try {
+      unlinkSync(tmp);
+    } catch {}
   }
 }
 
@@ -216,8 +256,18 @@ export function mergePendingEntries(episode) {
   const MAX_PENDING_MERGE = 50;
   let files;
   try {
-    files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('pending-')).sort();
-  } catch { return; }
+    files = readdirSync(RUNTIME_DIR)
+      // R10 P3-4: `.json.tmp` is the WRITER's in-flight temp, not a pending entry.
+      // writePendingEntry writes `pending-<ts>-<rand>.json.tmp` then renames it into place;
+      // the bare `pending-` prefix matched the temp too, this loop's JSON.parse failed on a
+      // partial file, the catch deleted it as corrupt, and the writer's rename then failed
+      // ENOENT inside its own swallowed catch. One tool entry lost, silently, every time
+      // the two raced.
+      .filter((f) => f.startsWith('pending-') && f.endsWith('.json'))
+      .sort();
+  } catch {
+    return;
+  }
 
   let merged = 0;
   for (const f of files) {
@@ -226,7 +276,12 @@ export function mergePendingEntries(episode) {
     try {
       const raw = readFileSync(fp, 'utf8');
       const pending = JSON.parse(raw);
-      if (pending.ts < oneHourAgo) { try { unlinkSync(fp); } catch {} continue; }
+      if (pending.ts < oneHourAgo) {
+        try {
+          unlinkSync(fp);
+        } catch {}
+        continue;
+      }
       // Only merge entries belonging to the same project
       if (pending.project && episode.project && pending.project !== episode.project) continue;
       if (pending.entry) {
@@ -237,11 +292,15 @@ export function mergePendingEntries(episode) {
         merged++;
       } else {
         // No entry data — clean up the file without merging
-        try { unlinkSync(fp); } catch {}
+        try {
+          unlinkSync(fp);
+        } catch {}
       }
     } catch {
       // Corrupt pending file — remove
-      try { unlinkSync(fp); } catch {}
+      try {
+        unlinkSync(fp);
+      } catch {}
     }
   }
 }
@@ -390,30 +449,39 @@ const RESEARCH_ENTRY_THRESHOLD = 8;
  */
 export function explainSignificance(episode) {
   const entries = episode?.entries || [];
-  const grepCount = entries.filter(e => e.tool === 'Grep').length;
-  const readCount = entries.filter(e => e.tool === 'Read' || e.tool === 'Grep').length;
+  const grepCount = entries.filter((e) => e.tool === 'Grep').length;
+  const readCount = entries.filter((e) => e.tool === 'Read' || e.tool === 'Grep').length;
   const base = { readCount, grepCount, grepDecisive: false };
 
   // 1. File edits → always significant (code changes matter)
-  if (entries.some(e => EDIT_TOOLS.has(e.tool))) return { ...base, significant: true, rule: 1 };
+  if (entries.some((e) => EDIT_TOOLS.has(e.tool))) return { ...base, significant: true, rule: 1 };
 
   // 2. Test/build errors → significant (actionable failures)
   // Plain bash errors without edits are noise (e.g. typos, exploration errors)
-  if (entries.some(e => e.tool === 'Bash' && e.isError && (e.bashSig?.isTest || e.bashSig?.isBuild))) {
+  if (entries.some((e) => e.tool === 'Bash' && e.isError && (e.bashSig?.isTest || e.bashSig?.isBuild))) {
     return { ...base, significant: true, rule: 2 };
   }
 
   // 3. Important files touched (config, schema, security, migration)
   // Checks episode.files (all touched files, including reads) — catches important-file investigation
   const allFiles = episode?.files || [];
-  if (allFiles.some(f =>
-    /\.(env|yml|yaml|toml|lock|sql|prisma|proto)$/.test(f) ||
-    /(config|schema|migration|auth|security)/i.test(f)
-  )) return { ...base, significant: true, rule: 3 };
+  if (
+    allFiles.some(
+      (f) =>
+        /\.(env|yml|yaml|toml|lock|sql|prisma|proto)$/.test(f) ||
+        /(config|schema|migration|auth|security)/i.test(f),
+    )
+  )
+    return { ...base, significant: true, rule: 3 };
 
   // 4. Research pattern: reading many files indicates investigation
   if (readCount >= RESEARCH_ENTRY_THRESHOLD) {
-    return { ...base, significant: true, rule: 4, grepDecisive: readCount - grepCount < RESEARCH_ENTRY_THRESHOLD };
+    return {
+      ...base,
+      significant: true,
+      rule: 4,
+      grepDecisive: readCount - grepCount < RESEARCH_ENTRY_THRESHOLD,
+    };
   }
   return { ...base, significant: false, rule: null };
 }

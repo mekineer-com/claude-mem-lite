@@ -1,8 +1,16 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters } from './utils.mjs';
-import { upsFtsQuery } from './lib/ups-query.mjs';
+import {
+  relaxFtsQueryToOr,
+  debugCatch,
+  truncate,
+  OBS_BM25,
+  notLowSignalTitleClause,
+  noisePenaltyClause,
+  neutralizeContextDelimiters,
+} from './utils.mjs';
+import { upsFtsQuery, upsQueryTerms } from './lib/ups-query.mjs';
 import { citeFactorJs, TYPE_QUALITY, TYPE_QUALITY_DEFAULT } from './scoring-sql.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { recordMetric } from './lib/metrics.mjs';
@@ -24,23 +32,68 @@ const MEMORY_LOOKBACK_MS = 60 * DAY_MS; // 60 days
  * importance × cross-project × OR × noise × cite). So whatever these numbers are, a row
  * outside the window cannot be picked however high its composite score would have been.
  *
- * The window has to be wide because the composite spread is enormous. Multiplying the
- * extremes of the JS factors (same-project, AND mode): best = 1.5 decision × 1.5 lesson
- * × 1.0 importance × 1.0 noise × 3.0 cite = 6.75; worst = 0.5 change × 1.0 no-lesson
- * × 0.6 importance × 0.2 noise × 0.4 cite = 0.024. That is a **281× spread**, so a row
- * ranked below the window on raw bm25 can outscore the window's contents by a wide
- * margin. (The audit estimated ">10×"; the factor tables say 281×.)
+ * The window has to be wide because the composite spread is wide — 281× by the tables,
+ * 60.0× as realised over the rows this pool can actually return. Multiplying the extremes
+ * of the JS factors
+ * (same-project, AND mode): best = 1.5 decision × 1.5 lesson × 1.0 importance × 1.0 noise
+ * × 3.0 cite = 6.75; worst = 0.5 change × 1.0 no-lesson × 0.6 importance × 0.2 noise ×
+ * 0.4 cite = 0.024, i.e. a **281× DECLARED range**. That is an upper bound off the factor
+ * tables, not a measurement: `citeFactor = 0.4` requires `uncited_streak >= 3`, and
+ * citation-decay rolls the streak over to 0 when it reaches 3, so the steady state is
+ * bounded by [0,2] (scoring-sql.mjs, citeFactorJs docblock). That rollover used to be
+ * paired with an `importance - 1`; D#179/D#198 removed the importance write, and the
+ * bound is unaffected because it was always the streak reset that produced it.
+ * Measured 2026-09-01 over the
+ * 2284 rows that clear `liveObsFilterSql` — the one predicate in the WHERE of BOTH SELECTs
+ * below — 0 are at streak >= 3, and recomputing the factor per row gives a REALISED range
+ * of 0.1125 … 6.750: a **60.0× spread** (81 rows hit the full best case, 0 the full worst).
+ * Each leg then narrows further and the spread survives the narrowing, which is why one
+ * number is quotable: live+`importance >= 1` n=2249 and +`notLowSignalTitleClause` n=2245
+ * both still read 60.00×. The CROSS leg is the exception — its own population
+ * (`type IN ('decision','discovery') AND importance >= 2`) is n=444 at **17.31×**, so if
+ * you are reasoning about `RERANK_POOL_CROSS_PROJECT` specifically, 60× is the wrong figure.
  *
- * HONEST LIMIT OF THIS FIX: because the spread is 281× and bm25 magnitude decays slowly
- * across a top-N window, NO finite pool size proves sufficiency. 30/15 is a 3× widening
- * chosen where cost stays flat (the SELECT carries `narrative`, so the pool is the
- * expensive term, not the sort) — it makes the bound loose, it does not remove it.
+ * COUNT THAT POPULATION WITH THE POOL'S OWN FILTER. Over the raw `observations` table it
+ * reads 0.0780 … 6.750 = 86.5×, and that is the number the first draft of this comment
+ * shipped: 1458 of 3742 rows (39.0%) are compressed or superseded, the row supplying the
+ * 0.0780 minimum (`id 10239`) carries `compressed_into = 10713`, and no such row can enter
+ * the pool, be scored, or be an endpoint of a range describing what the LIMIT cuts. Same
+ * error as v3.82.0's raw `importance = 3` count, overstating by 44% instead of a third.
  *
- * The bound is REMOVABLE, and deliberately was not removed: ordering both SELECTs by the
- * composite instead of raw bm25 is expressible in SQL today (every factor already has a
- * clause — TYPE_QUALITY_CASE / noisePenaltyClause / citeFactorClause — and the two
- * remaining factors, cross-project and OR, are per-QUERY constants that cannot affect
- * within-query order). That would make LIMIT a true ranking bound. It is not done here
+ * Quote whichever population you mean, and say which. Either is wide enough that a row
+ * ranked below the window on raw bm25 can outscore the window's contents by a wide margin.
+ * (The audit estimated ">10×".)
+ *
+ * HONEST LIMIT OF THIS FIX: because the spread is wide and bm25 magnitude decays slowly
+ * across a top-N window, NO finite pool size proves sufficiency. 30/15 makes the bound
+ * loose; it does not remove it. And it is bought, not free — the first draft of this
+ * comment claimed "cost stays flat" in the same breath as a parenthetical saying the pool
+ * is the expensive term, which is its own refutation. Measured instead:
+ * `node benchmark/rerank-pool-replay.mjs --cost` reads **+5% to +16% depending on caliber,
+ * and +6% to +10% with this one**. Whole-corpus runs of `--cost` on this machine: 1.058,
+ * 1.068, 1.078, 1.080, 1.083, 1.102 — same code, same corpus, pure machine variance, and
+ * the absolute ms/prompt moved 3.04 -> 1.80 across the same runs. Other calibers:
+ * 1.054–1.065 with the arm order held fixed, 1.063–1.156 with each arm alone in its own
+ * process (the closest shape to production).
+ *
+ * **Quote the range, re-measure, and never quote the absolute ms** — they vary by 2x with
+ * load while the ratio holds. The first draft of this comment quoted a flat 1.058x and said
+ * it reproduced to three digits; it does not, and every later run came in above it. See
+ * `costCompare`'s docblock for which caliber biases which way. Timing the SELECT alone
+ * reports ~1.00x and misses the JS scoring that the widened pool feeds — a different
+ * question, not a better answer.
+ *
+ * The bound is REMOVABLE, and deliberately was not removed. Ordering both SELECTs by the
+ * composite instead of raw bm25 is close to expressible in SQL, but "every factor already
+ * has a clause" overstated it: of the SEVEN factors, three have named clauses
+ * (TYPE_QUALITY_CASE / noisePenaltyClause / citeFactorClause); two more — the 1.5× lesson
+ * bonus and the `importance >= 2` step — still need one written, because the SQL forms
+ * that exist encode different weights and shapes (`1.0 + 0.3·lesson` and
+ * `0.5 + 0.5·importance` in search-engine.mjs's FULL_SCORE); and the last two,
+ * cross-project and OR, are constant WITHIN EACH SELECT — they differ between the
+ * same-project and cross-project legs, so they are not per-CALL constants, but they never
+ * vary among the rows any one LIMIT cuts, which is the only thing this argument needs.
+ * That would make LIMIT a true ranking bound. It is not done here
  * because `lib/inject-search-core.mjs:23-25` records this surface's "BM25-sort + JS
  * scoring" composition as a deliberate per-surface asymmetry (#8786), and this face is
  * one `benchmark/denoise-ab.mjs` is structurally blind to (its suites drive the
@@ -48,8 +101,13 @@ const MEMORY_LOOKBACK_MS = 60 * DAY_MS; // 60 days
  * project has repeatedly shipped regressions. Widening is monotone and provable;
  * re-ranking needs a ruler that does not exist yet.
  *
- * WHY WIDENING IS SAFE: the old window is a strict PREFIX of the new one (same ORDER BY,
- * larger LIMIT), so the new candidate set is a superset. `scored` sorts by composite and
+ * WHY WIDENING IS SAFE: in practice the old window is a PREFIX of the new one (same plan,
+ * same ORDER BY, larger LIMIT), so the new candidate set is a superset. "Strict" would be
+ * overclaiming — `ORDER BY bm25(...)` carries no tiebreaker, and this release's own
+ * fixture lesson is that a degenerate corpus makes `bm25()` return 0.000 for every row and
+ * ranking fall to rowid. What is measured rather than argued: `rerank-pool-replay.mjs`
+ * reports nonEmptyToEmpty = 0 across the whole corpus, i.e. no prompt loses its injection
+ * to the widening. `scored` sorts by composite and
  * the threshold filter is monotone in that score, so every row returned is at least as
  * good as the row it displaced. The only non-monotone stage is the term-coverage filter,
  * which is exactly why the pool needs slack rather than just `MAX_MEMORY_INJECTIONS`.
@@ -108,13 +166,6 @@ function getCrossProjectBoost() {
   const n = parseFloat(raw);
   return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.4;
 }
-function extractQueryTerms(text) {
-  if (!text) return [];
-  const ascii = tokenizeHandoff(text).filter(t => !HANDOFF_STOP_WORDS.has(t));
-  let cjk = [];
-  try { cjk = extractCjkKeywords(text) || []; } catch { /* CJK extraction best-effort */ }
-  return [...new Set([...ascii, ...cjk.map(t => String(t).toLowerCase())])];
-}
 // v2.41: hay spans every FTS column whose BM25 weight is >=5 in OBS_BM25
 // (title=10, subtitle=5, narrative=5, lesson_learned=8). Pre-v2.41 was only
 // title + lesson_learned — rows that matched on narrative but happened to
@@ -126,7 +177,8 @@ const COVERAGE_NARRATIVE_PREFIX = 400;
 function candidateCoverage(row, queryTerms) {
   if (queryTerms.length === 0) return 1.0;
   const narrativeHead = (row.narrative || '').slice(0, COVERAGE_NARRATIVE_PREFIX);
-  const hay = `${row.title || ''} ${row.subtitle || ''} ${row.lesson_learned || ''} ${narrativeHead}`.toLowerCase();
+  const hay =
+    `${row.title || ''} ${row.subtitle || ''} ${row.lesson_learned || ''} ${narrativeHead}`.toLowerCase();
   let hits = 0;
   for (const t of queryTerms) {
     if (/[^ -~]/.test(t)) {
@@ -140,7 +192,6 @@ function candidateCoverage(row, queryTerms) {
   }
   return hits / queryTerms.length;
 }
-
 
 // P1: stale-obs verify-before-use threshold. An injected obs older than this
 // AND carrying file paths is flagged so Claude is reminded to grep/Read the
@@ -167,15 +218,19 @@ export function formatMemoryLine(obs) {
   // citation-decay denominator (its promote/demote loop was silently dead).
   const lessonTag = obs.lesson_learned ? ` | Lesson: ${truncate(obs.lesson_learned, 200)}` : '';
   let staleHint = '';
-  if (typeof obs.created_at_epoch === 'number'
-    && Date.now() - obs.created_at_epoch > STALE_OBS_THRESHOLD_MS
-    && hasFilePaths(obs.files_modified)) {
+  if (
+    typeof obs.created_at_epoch === 'number' &&
+    Date.now() - obs.created_at_epoch > STALE_OBS_THRESHOLD_MS &&
+    hasFilePaths(obs.files_modified)
+  ) {
     staleHint = ' [verify-before-use]';
   }
   // Defang any literal block-delimiter tag in title/lesson so it can't prematurely close
   // the <memory-context> block this line is injected into (parity with hook-context's
   // <claude-mem-context> defense).
-  return neutralizeContextDelimiters(`- [${obs.type}] ${truncate(obs.title, 80)}${lessonTag} (#${obs.id})${staleHint}`);
+  return neutralizeContextDelimiters(
+    `- [${obs.type}] ${truncate(obs.title, 80)}${lessonTag} (#${obs.id})${staleHint}`,
+  );
 }
 
 function hasFilePaths(filesModified) {
@@ -197,7 +252,34 @@ function hasFilePaths(filesModified) {
  * @param {number[]} excludeIds Observation IDs already in Key Context
  * @returns {object[]} Top memories (max 3) with {id, type, title, lesson_learned}
  */
-export function searchRelevantMemories(db, userPrompt, project, excludeIds = []) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.counterfactual] — this call is a MEASUREMENT, not a delivery.
+ *   Nothing it returns is shown to the model, so it must leave no trace: no
+ *   `injection_count` / `last_injected_at` bump, and no `inject` metric row.
+ *
+ *   Added for `lib/patha-exclude-meter.mjs`'s arm B (D#214). The first version of that
+ *   ruler handed this function the live writable handle, and the pre-tag review
+ *   reproduced both halves of the damage: rows that were never shown to anyone reached
+ *   `injection_count = 1` — which feeds `noisePenaltyClause`, `demotePinned`'s
+ *   `injection_count >= N AND cited_count = 0` predicate, and the `injection_count = 0`
+ *   GC-eligibility gate — and the `inject` meter counted two calls per prompt, on
+ *   exactly the installs where the D#214 corpus is gathered. CLAUDE.md already carried
+ *   this rule for `rerank-pool-replay` ("the handle must reject a write … a writable
+ *   handle would move the very noise signal being measured"); the new ruler quoted it
+ *   and then broke it.
+ *
+ *   A read-only handle would also work; a flag is used instead because the caller needs
+ *   BOTH arms to see one store state, which is achieved by ordering (arm B first, and
+ *   it writes nothing) rather than by isolation.
+ */
+export function searchRelevantMemories(
+  db,
+  userPrompt,
+  project,
+  excludeIds = [],
+  { counterfactual = false } = {},
+) {
   // Min-length guard is English-centric: 5 chars ≈ one short English word. A CJK
   // query is meaningful at 2 chars (状态/架构) and most real Chinese queries are
   // 2-4 chars (状态管理, 召回率, 熔断降级) — the bare `.length < 5` silently
@@ -219,8 +301,12 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
   // v2.41 metrics: record timing + candidate/filter/return counts per call.
   // Gated by CLAUDE_MEM_METRICS=1 — no-op when disabled (zero hot-path cost).
   const _t0 = Date.now();
-  let _candidates = 0, _aboveThreshold = 0, _returned = 0, _orFired = false;
+  let _candidates = 0,
+    _aboveThreshold = 0,
+    _returned = 0,
+    _orFired = false;
   const _emit = () => {
+    if (counterfactual) return;
     try {
       recordMetric(DB_DIR, {
         event: 'inject',
@@ -230,7 +316,9 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         returned: _returned,
         orFallback: _orFired,
       });
-    } catch { /* metric record must not crash the caller */ }
+    } catch {
+      /* metric record must not crash the caller */
+    }
   };
 
   try {
@@ -278,7 +366,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // Count original search terms (AND-separated groups), not expanded synonym tokens.
     const queryTokenCount = ftsQuery.includes(' AND ')
       ? ftsQuery.split(' AND ').length
-      : ftsQuery.split(/\s+/).filter(t => t && !t.startsWith('(') && !t.endsWith(')')).length;
+      : ftsQuery.split(/\s+/).filter((t) => t && !t.startsWith('(') && !t.endsWith(')')).length;
     // CJK-dominant queries bypass the token-count gate: a single CJK word becomes
     // 2-N overlapping bigrams (优化召回率 → 优化/召回/回率), inflating
     // queryTokenCount past the gate, so the AND-too-strict query never gets the OR
@@ -297,8 +385,12 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         // (The two bare catches further down, around the per-row access bumps, are
         // deliberately left bare: they are write-path and per-row, so logging them would
         // flood the debug stream on the same corruption this one reports once.)
-        try { rows = selectStmt.all(orQuery, project, cutoff); usedOrFallback = true; }
-        catch (e) { debugCatch(e, 'injectMemory:orFallback'); }
+        try {
+          rows = selectStmt.all(orQuery, project, cutoff);
+          usedOrFallback = true;
+        } catch (e) {
+          debugCatch(e, 'injectMemory:orFallback');
+        }
       }
     }
 
@@ -331,56 +423,69 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         if (orQuery && (queryIsCjkDominant || queryTokenCount <= orFallbackMaxTokens)) {
           // Same reasoning as the same-project OR fallback above: a fault here silently
           // drops the cross-project half of the injection.
-          try { crossRows = crossStmt.all(orQuery, project, cutoff); crossUsedOr = true; }
-          catch (e) { debugCatch(e, 'injectMemory:crossOrFallback'); }
+          try {
+            crossRows = crossStmt.all(orQuery, project, cutoff);
+            crossUsedOr = true;
+          } catch (e) {
+            debugCatch(e, 'injectMemory:crossOrFallback');
+          }
         }
       }
-    } catch (e) { debugCatch(e, 'crossProjectSearch'); }
+    } catch (e) {
+      debugCatch(e, 'crossProjectSearch');
+    }
 
-    // Merge and score: same-project full weight, cross-project (default 0.7x).
-    // v2.41: cross-project penalty is env-overridable via MEM_CROSS_PROJECT_BOOST
-    // (0..1). Default 0.7 — tuned for typical multi-project installs where
-    // transferable decisions/discoveries are a minority of matches. Set to 1.0
-    // for single-project users (no effective penalty); set lower to tighten
-    // same-project focus in noisy cross-project environments.
+    // Merge and score: same-project full weight, cross-project penalised by
+    // getCrossProjectBoost(). R12 A6 — this block used to restate that knob's default as
+    // 0.7 twice over, which v2.41 changed to 0.4 while updating only the comment at the
+    // function. The value and its rationale live at getCrossProjectBoost() and nowhere
+    // else; a second copy of a tuned number is a second answer to "what is the baseline".
     //
     // OR-fallback results get 0.4x penalty — they matched individual words, not the full intent
     // v26 P0: noise_penalty (from SQL) shrinks high-inject/low-cite rows.
     const crossPenalty = getCrossProjectBoost();
-    const allRows = [...rows.map(r => ({ ...r, _or: usedOrFallback })), ...crossRows.map(r => ({ ...r, _or: crossUsedOr }))];
+    const allRows = [
+      ...rows.map((r) => ({ ...r, _or: usedOrFallback })),
+      ...crossRows.map((r) => ({ ...r, _or: crossUsedOr })),
+    ];
     const scored = allRows
-      .filter(r => !excludeSet.has(r.id))
-      .map(r => {
+      .filter((r) => !excludeSet.has(r.id))
+      .map((r) => {
         const crossProjectPenalty = r.project === project ? 1.0 : crossPenalty;
         const orFallbackPenalty = r._or ? 0.4 : 1.0;
         const noisePenalty = typeof r.noise_penalty === 'number' ? r.noise_penalty : 1.0;
         const citeFactor = citeFactorJs(r);
         return {
           ...r,
-          score: Math.abs(r.relevance)
-            * (TYPE_QUALITY[r.type] || TYPE_QUALITY_DEFAULT)
-            * (r.lesson_learned ? 1.5 : 1.0)
-            * (r.importance >= 2 ? 1.0 : 0.6)
-            * crossProjectPenalty
-            * orFallbackPenalty
-            * noisePenalty
-            * citeFactor,
+          score:
+            Math.abs(r.relevance) *
+            (TYPE_QUALITY[r.type] || TYPE_QUALITY_DEFAULT) *
+            (r.lesson_learned ? 1.5 : 1.0) *
+            (r.importance >= 2 ? 1.0 : 0.6) *
+            crossProjectPenalty *
+            orFallbackPenalty *
+            noisePenalty *
+            citeFactor,
         };
       })
       .sort((a, b) => b.score - a.score);
 
     // Adaptive threshold: scales with corpus size to filter noise.
     // Each result must individually exceed the threshold (not just the top one).
-    const obsCount = db.prepare(
-      `SELECT COUNT(*) as c FROM observations WHERE project = ? AND ${liveObsFilterSql('')}`,
-    ).get(project)?.c || 0;
+    const obsCount =
+      db
+        .prepare(`SELECT COUNT(*) as c FROM observations WHERE project = ? AND ${liveObsFilterSql('')}`)
+        .get(project)?.c || 0;
     const { TINY, SMALL, MEDIUM, LARGE } = BM25_THRESHOLD;
     const threshold = obsCount < 5 ? TINY : obsCount < 100 ? SMALL : obsCount < 500 ? MEDIUM : LARGE;
     _candidates = scored.length;
     _orFired = usedOrFallback || crossUsedOr;
-    const aboveThreshold = scored.filter(r => r.score >= threshold);
+    const aboveThreshold = scored.filter((r) => r.score >= threshold);
     _aboveThreshold = aboveThreshold.length;
-    if (aboveThreshold.length === 0) { _emit(); return []; }
+    if (aboveThreshold.length === 0) {
+      _emit();
+      return [];
+    }
 
     // v27: term-coverage filter — drop candidates whose title+lesson_learned
     // covers <threshold of the query's significant terms. Skipped for
@@ -389,10 +494,24 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     let coverageFiltered = aboveThreshold;
     const coverageThreshold = getCoverageThreshold();
     if (coverageThreshold > 0) {
-      const queryTerms = extractQueryTerms(userPrompt);
+      // A1: the denominator is the terms the query was actually BUILT from, via the one
+      // source (lib/ups-query.mjs -> nlp.mjs::ftsQueryTokens). Counting anything else
+      // counts terms that were never searched, so no matched row can cover them and the
+      // ratio falls with prompt length until the whole surface goes silent.
+      //
+      // The first cut of this fix shared only maxChars and the pre-ship review measured
+      // the hole it left: sanitizeFtsQuery also caps at maxTokens = 64, so a 1511-character
+      // prompt — under the char cap, where the shared cut is a no-op — still returned []
+      // against a row whose narrative was the entire prompt.
+      const queryTerms = upsQueryTerms(userPrompt);
       if (queryTerms.length >= COVERAGE_MIN_QUERY_TERMS) {
-        coverageFiltered = aboveThreshold.filter(r => candidateCoverage(r, queryTerms) >= coverageThreshold);
-        if (coverageFiltered.length === 0) { _emit(); return []; }
+        coverageFiltered = aboveThreshold.filter(
+          (r) => candidateCoverage(r, queryTerms) >= coverageThreshold,
+        );
+        if (coverageFiltered.length === 0) {
+          _emit();
+          return [];
+        }
       }
     }
 
@@ -422,12 +541,18 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     //                     denominator is citation_surface_log, not this column.
     // Per-row try/catch for FTS trigger safety (project_non_obvious.md).
     const result = coverageFiltered.slice(0, MAX_MEMORY_INJECTIONS);
-    const now = Date.now();
-    const bumpStmt = db.prepare(
-      'UPDATE observations SET injection_count = COALESCE(injection_count, 0) + 1, last_injected_at = ? WHERE id = ?'
-    );
-    for (const r of result) {
-      try { bumpStmt.run(now, r.id); } catch {}
+    // `counterfactual` skips the bump entirely rather than reverting it: these rows were
+    // never shown to anyone, and `injection_count` is read by three ranking/GC paths.
+    if (!counterfactual) {
+      const now = Date.now();
+      const bumpStmt = db.prepare(
+        'UPDATE observations SET injection_count = COALESCE(injection_count, 0) + 1, last_injected_at = ? WHERE id = ?',
+      );
+      for (const r of result) {
+        try {
+          bumpStmt.run(now, r.id);
+        } catch {}
+      }
     }
 
     _returned = result.length;
@@ -466,9 +591,13 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
  * projects on this machine the importance=3 population ALONE exceeds 50 — so every
  * importance=2 lesson in those projects was structurally unreachable, and a
  * citation-decay demotion 3->2 EVICTED a row from the pool instead of down-ranking it.
- * That eviction loop is the risk D#172 was filed on; raising the bound above any
- * plausible per-project population is what closes it, because a 3->2 demotion then only
- * changes the row's score multiplier, which is what the decay design intends.
+ * That eviction loop is the risk D#172 was filed on, and raising the bound above any
+ * plausible per-project population is what closed it. The second half of that sentence
+ * is now moot from the other end too: D#179/D#198 stopped citation-decay writing
+ * `importance` at all, so there is no 3->2 walk left for the bound to have to absorb.
+ * The bound still matters on its own terms — it is what makes importance=2 rows
+ * reachable here — but it is no longer the only thing standing between a citation and
+ * an eviction.
  *
  * COUNT THE POPULATION WITH THE POOL'S OWN FILTER. Those figures are
  * `liveObsFilterSql` + the `importance >= 2` + non-empty-lesson gates, i.e. what the query
@@ -480,14 +609,17 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
  * in lib/citation-tracker.mjs. Re-measure with `node benchmark/imperative-pool-replay.mjs
  * --population`, never with a bare `SELECT ... WHERE importance = 3`.
  *
- * 3->2 IS NOW A DOWN-RANK; 2->1 IS STILL AN EVICTION. The pool gate is
- * `COALESCE(importance, 1) >= 2`, so a row demoted to the IMPORTANCE_FLOOR of 1 leaves
- * this face's reach until some other face cites it back up. Widening the bound is also
- * what first makes importance=2 rows reachable here (56 of projects--mem's 383 eligible),
- * so it creates the injections that can walk one down to 1. Measured exposure: of the
- * picks the widening newly surfaces, one is importance=2 — `score = importance x overlap`
- * keeps importance=3 rows ahead nearly always — so this is a known small edge, not a
- * closed loop.
+ * THE EVICTION EDGE IS CLOSED FROM THE OTHER END, AND NOT BY THIS BOUND. The pool gate is
+ * `COALESCE(importance, 1) >= 2`, so a row at 1 is out of this face's reach — that part is
+ * unchanged. What changed is that nothing in the citation loop can put it there any more:
+ * D#179/D#198 deleted the `importance` write from BOTH branches of `applyCitationDecay`
+ * along with `IMPORTANCE_FLOOR` itself, so neither a 3->2 down-rank nor a 2->1 eviction can
+ * originate from a citation. This paragraph used to read "3->2 IS NOW A DOWN-RANK; 2->1 IS
+ * STILL AN EVICTION" and cite that constant; it survived the deletion because the paragraph
+ * immediately above it was the one rewritten (pre-tag review v3.88.0, correctness S3).
+ * What can still move a row to 1 is ordinary maintenance — `demotePinned` writes 1 on a
+ * heavily-injected uncited row with no lesson, and `decayAndMarkIdle` walks `imp - 1` on a
+ * never-accessed never-injected row — so the edge exists, it just is not citation-driven.
  *
  * MEASURED, and reproducible: `node benchmark/imperative-pool-replay.mjs`. Over 373 real
  * user prompts replayed against their OWN project's live corpus (85 produced a candidate
@@ -530,7 +662,9 @@ export function rankImperativeCandidates(db, userPrompt, project, excludeIds = [
   // guaranteed one. There are zero such collisions live, so it changes no behaviour here;
   // it makes the guarantee hold on corpora nobody has seen.
   try {
-    rows = db.prepare(`
+    rows = db
+      .prepare(
+        `
       SELECT id, title, lesson_learned, importance
       FROM observations
       WHERE project = ?
@@ -542,12 +676,18 @@ export function rankImperativeCandidates(db, userPrompt, project, excludeIds = [
         AND (? IS NULL OR created_at_epoch <= ?)
       ORDER BY importance DESC, created_at_epoch DESC, id DESC
       LIMIT ${IMPERATIVE_POOL_BACKSTOP}
-    `).all(project, epochTo, epochTo);
-  } catch { return []; }
+    `,
+      )
+      .all(project, epochTo, epochTo);
+  } catch {
+    return [];
+  }
   const out = [];
   for (const r of rows) {
     if (exclude.has(r.id)) continue;
-    const overlap = extractIdents(`${r.lesson_learned} ${r.title || ''}`).filter((id) => promptIdents.has(id)).length;
+    const overlap = extractIdents(`${r.lesson_learned} ${r.title || ''}`).filter((id) =>
+      promptIdents.has(id),
+    ).length;
     if (overlap === 0) continue;
     const score = (r.importance || 2) * overlap;
     out.push({ id: r.id, lesson_learned: r.lesson_learned, importance: r.importance || 2, overlap, score });

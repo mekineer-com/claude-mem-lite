@@ -6,22 +6,55 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege for every job here (audit 2026-09-02 P2-19). This workflow only reads the
+# repo: it lints, tests, benchmarks and smoke-tests. `publish.yml` and `sandbox-install.yml`
+# already declared theirs; this one was the gap, and it is the workflow that runs on
+# `pull_request` — i.e. the one that executes code from a fork's branch after installing
+# several thousand dev dependencies' install scripts. No job below uploads a release asset,
+# writes a comment or opens an issue; the one job that needs more than this (`sandbox-install`
+# wanting `issues: write`) lives in its own file and keeps its own block.
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run lint
+      # Added with the 2026-09-05 P1-3 reformat (commit 36f8c0f). This is a real gate:
+      # it fails the job. Before the reformat it would have failed on 525 of 531 files,
+      # which is why the check existed unenforced for two days.
+      - run: npm run format:check
+
+      # Informational only — this step cannot fail the job, and nothing reads its
+      # output automatically. CLAUDE.md's knip measurement contract records that a
+      # `git worktree --detach HEAD` checkout reads ~15 LOWER than the primary
+      # working tree on the same commit with the same binary, reproduced and cause
+      # never established. CI is a fresh clone: which side it lands on is unknown,
+      # so a name-set guard written today would be a bet, not a measurement. Print
+      # it for a few rounds first. The NAME SET goes to the log too, not just the
+      # count — rule 3 of that contract is that a count is a smoke alarm and the
+      # name set is the evidence, and a future guard needs the set.
+      #
+      # Output goes to RUNNER_TEMP, never the workspace: an untracked file at the
+      # repo root changes the case count `tests/obs-id-caliber-sync.test.mjs`
+      # generates, which is a real (if here cross-job) way to move a headline number.
+      - name: Knip unused-export count (informational — cannot fail the job)
+        continue-on-error: true
+        run: |
+          ./node_modules/.bin/knip --reporter json > "$RUNNER_TEMP/knip-ci.json" || true
+          node -e "const fs=require('fs');const d=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+'/knip-ci.json','utf8'));const n=d.issues.flatMap(i=>(i.exports||[]).map(e=>i.file+':'+e.name)).sort();console.log('knip unused exports (CI fresh clone):',n.length);console.log('unused files:',d.issues.flatMap(i=>i.files||[]).length);console.log(n.join('\n'))"
 
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # shellcheck is preinstalled on ubuntu-latest runners. setup.sh's two
       # node -e blocks are single-quoted on purpose (vars passed via env, not
       # shell expansion) and now carry inline `# shellcheck disable=SC2016`
@@ -33,11 +66,42 @@ jobs:
       - name: ShellCheck shipped scripts
         run: shellcheck scripts/post-tool-use.sh scripts/pre-agent-inject.sh scripts/pre-commit.sh scripts/setup.sh
 
+  # The plugin and marketplace manifests, checked by the tool that actually loads them.
+  #
+  # tests/plugin-manifest.test.mjs encodes the documented field set locally, so it can say NO
+  # on every machine — but only about rules it was told, and the reference moves. That gap is
+  # not hypothetical: the validator had never been run here, and when it was (2026-09-08) BOTH
+  # manifests exited 1 under --strict — the marketplace over `metadata.homepage` (a rule the
+  # local guard now does encode), and `.claude-plugin/plugin.json`, which `claude plugin
+  # validate . --strict` never reaches because `.` resolves to the marketplace manifest alone.
+  # That second one is why this runs a script instead of the bare command. Both guards stay;
+  # they answer different questions.
+  #
+  # The CLI is PINNED. A floating version would turn an upstream rule change into a red build
+  # on an unrelated commit; pinning makes "we adopted a new rule" a reviewable bump of this
+  # line, which is the same convention the SHA-pinned actions above follow. The cost is that
+  # new upstream rules arrive only when someone bumps it — bump it deliberately.
+  #
+  # No `continue-on-error`, and no skip when the CLI is missing: the script treats a failure
+  # to RUN as a failure. A spawn-based check that quietly passes where the tool is absent is
+  # the permanently-skipped-test shape this repo has already paid for once.
+  plugin-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Install the Claude Code CLI (pinned)
+        run: npm install -g @anthropic-ai/claude-code@2.1.263
+      - name: Validate plugin + marketplace manifests
+        run: npm run validate:manifests
+
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -52,10 +116,20 @@ jobs:
     needs: lint
     strategy:
       matrix:
-        node-version: [20, 22, 24]
+        # v4.0.0 dropped Node 20 (EOL 2026-04): better-sqlite3 13 requires >=22, and
+        # `engines` now says so. 26 joins in the same change — it is the current release
+        # line, and it closes the long-standing "local Node is ahead of the CI matrix" item
+        # that had been deferred until a matrix edit was due.
+        # R10 P3-28: this line used to cite A20260905-R5-P3-1. That ID belongs to a
+        # different finding entirely — the duplicate export of FALLBACK_OBS_WINDOW_MS in
+        # hook-shared.mjs, fixed in the same round. The matrix item comes from an earlier,
+        # un-prefixed round whose numbering collides across rounds, so it is described here
+        # rather than cited: a wrong ID is worse than no ID, since it sends the next reader
+        # to a closed and unrelated entry.
+        node-version: [22, 24, 26]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -63,7 +137,7 @@ jobs:
       - run: npm run test:coverage
       - name: Upload coverage report
         if: always() && matrix.node-version == 22
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
           path: coverage/
@@ -72,14 +146,56 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - name: Run benchmark gate
-        run: node benchmark/ci-gate.mjs
+        # `--strict` on PUSH only, and deliberately not on pull_request.
+        #
+        # On push it matches publish.yml: the tag path must never be the stricter of the
+        # two, or a green branch tells you nothing about the release that follows it. A
+        # baseline past BASELINE_STALE_AGE_DAYS then fails here first, on main, where
+        # recapturing it is a one-line commit. That arms a DATED failure: the age test is
+        # `floor((now - baseline.timestamp) / DAY) >= 30` and the baseline is stamped
+        # 2026-09-14T16:06:53Z, so main goes red from 2026-10-14 **16:06 UTC** — that
+        # day's earlier pushes are still green. Intended reminder, not automated.
+        # R10 P3-23: this comment named 2026-09-01 / 2026-10-01 for a baseline that was
+        # recaptured on 2026-09-05. Re-read benchmark/baseline.json's own `timestamp` when
+        # you touch this — a stamp copied by hand is a stamp that goes stale silently.
+        #
+        # It fires HERE FIRST, and that ordering is the mitigation for the release path:
+        # publish.yml's gate is also strict, and a strict failure there happens inside
+        # `validate` AFTER the tag has been pushed, which strands the tag (expensive — see
+        # the v3.69.0/v3.69.1 note in publish.yml). Main going red at day 30 is what stops
+        # anyone reaching that state unaware.
+        #
+        # PRs stay advisory because the same red would otherwise land on an outside
+        # contributor for a reason that has nothing to do with their change and that they
+        # have no way to clear (this repo started taking external PRs at v3.84.1).
+        run: node benchmark/ci-gate.mjs ${{ github.event_name == 'push' && '--strict' || '' }}
+      - name: Multiplier wiring gate
+        # The gate above CANNOT say NO about the eight scoring multipliers, and that is
+        # measured, not suspected. Its only multiplier check is `hybrid_over_bm25` with
+        # floor -0.05 against a reading of +0.0002 R@10, so the whole chain can degrade to
+        # pure BM25 and stay 0.05 clear of the floor; the eight per-term ablation deltas
+        # `--matrix` prints are gated by nothing at all. Mutating the real tree on
+        # 2026-09-07 and reverting it: neutering MULT_EXPR.importance left the step above
+        # at exit 0 with all four checks PASS and `hybrid_over_bm25` going UP, because
+        # importance is a NEGATIVE contributor on the canonical fixture; changing
+        # MULT_EXPR.lesson's 0.3 to 0.5 left its output byte-identical, every digit.
+        #
+        # This step runs the discrimination ruler's own self-checks, which drive all four
+        # verdict families to failure (MEASURED / MISMATCH / DEAD / BLIND) on synthetic
+        # arms. It is deliberately NOT gated on `push` only: unlike the baseline-age check
+        # above there is no dated component and no outside-contributor trap — a PR that
+        # breaks a multiplier SHOULD go red on the PR.
+        #
+        # No network, no LLM, no fixture on disk; the whole self-check is well under a
+        # second, so it costs nothing to run on every event.
+        run: npm run benchmark:multipliers:gate
 
   # Real publishable-tarball install: npm pack → clean-dir npm install →
   # better-sqlite3 native rebuild → import entry + open DB. This is the ONLY CI
@@ -92,8 +208,8 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -101,29 +217,47 @@ jobs:
         run: node scripts/smoke-tarball.mjs
 
   # Same smoke on a PRISTINE npm >= 12, where install/lifecycle scripts are
-  # blocked by default (empty allow-scripts allowlist): plain `npm install`
-  # exits 0 with better-sqlite3 present-but-uncompiled — the -32000 class the
-  # whole self-heal chain (binding-probe --dangerously-allow-all-scripts,
-  # setup.sh 6b, launch.mjs, hook-update smoke gate) exists for. The `smoke`
-  # job above runs npm 10 where compilation just works, so WITHOUT this leg a
-  # regression in the heal chain is invisible to CI and only surfaces as a
-  # user-side -32000. SMOKE_EXPECT_SCRIPT_BLOCK=1 makes the job fail loudly if
-  # the block ever stops occurring (npm default change / runner pre-allowing
-  # scripts) instead of silently degrading into a duplicate of `smoke`.
-  # The flag also makes the smoke pin `allow-scripts=none` in the throwaway
-  # project's .npmrc (npm 12 rejects --allow-scripts/env for project installs
-  # with EALLOWSCRIPTS; project .npmrc is the sanctioned pin and beats any
-  # ambient runner allowlist).
+  # blocked by default (empty allow-scripts allowlist). The `smoke` job above runs
+  # npm 10 where compilation just works, so without this leg a regression here is
+  # invisible to CI and only surfaces as a user-side -32000. Both legs pin the block
+  # via `allow-scripts=none` in the throwaway project's .npmrc (npm 12 rejects
+  # --allow-scripts/env for project installs with EALLOWSCRIPTS; project .npmrc is the
+  # sanctioned pin and beats any ambient runner allowlist).
+  #
+  # v4.0.0 SPLIT THIS IN TWO, because better-sqlite3 13 ships `prebuilds/<platform>.node`
+  # in its own tarball and that retires the failure this job was built on. Measured:
+  # `npm install --ignore-scripts better-sqlite3@13` lands 8 prebuilds and opens a DB;
+  # the same install of 12 lands none and cannot. So under 13 a blocked script no longer
+  # produces a broken binding on any covered platform — the single old assertion
+  # ("the heal MUST fire") would now fail outright, and deleting it would have dropped
+  # heal coverage silently. Each leg asserts one thing and can fail on its own:
+  #
+  #   1. prebuilds intact  → the install must come up WITHOUT healing. Guards the
+  #      user-facing claim that npm's script block no longer reaches them. The smoke
+  #      also proves the block really happened by asserting node-gyp left no
+  #      build/Release — the cause, since the broken-binding symptom is gone.
+  #   2. prebuilds deleted → stands in for a platform no prebuild covers (exotic
+  #      libc/arch), where the shipped heal is still the only thing between the user and
+  #      a -32000. Covers binding-probe / setup.sh 6b / launch.mjs, which all route through
+  #      ensureBetterSqlite3Working (scripts/smoke-tarball.mjs). It does NOT reach
+  #      hook-update.mjs's post-install smoke, which inlines its own rebuild chain and is
+  #      pinned by tests/hook-update.test.mjs instead — an independent review caught this
+  #      line claiming otherwise.
   smoke-npm12:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - name: Install npm 12
         run: npm install -g npm@^12 && npm --version
-      - name: Tarball smoke under npm-12 script block (heal path required)
+      - name: Script block must not reach the user (prebuilds intact, no heal expected)
         env:
           SMOKE_EXPECT_SCRIPT_BLOCK: '1'
+        run: node scripts/smoke-tarball.mjs
+      - name: Heal path still works where no prebuild covers the platform
+        env:
+          SMOKE_EXPECT_SCRIPT_BLOCK: '1'
+          SMOKE_FORCE_NO_PREBUILDS: '1'
         run: node scripts/smoke-tarball.mjs

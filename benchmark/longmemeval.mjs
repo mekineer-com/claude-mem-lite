@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // LongMemEval benchmark adapter for claude-mem-lite.
 //
-// Measures our REAL production retrieval (FTS5/BM25 + TF-IDF + RRF, zero
+// Measures our REAL production retrieval (FTS5/BM25 + query expansion, zero
 // embeddings) against the LongMemEval long-term-memory benchmark, so we have a
 // standardized recall number comparable to the field instead of only our local
 // micro-benchmark. It reuses the existing benchmark seams (seedDatabase /
-// seedVectors / searchProductionHybrid) — the only new thing here is the dataset
+// searchProductionHybrid) — the only new thing here is the dataset
 // adapter and the recall_any@k metric.
 //
 // HONEST FRAMING (read before quoting any number):
@@ -40,21 +40,15 @@ import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { pathToFileURL } from 'url';
 import { createTestDb } from '../tests/test-helpers.mjs';
-import {
-  seedDatabase,
-  seedVectors,
-  searchProductionHybrid,
-  computeNDCG,
-  computeMRR,
-} from './benchmark.mjs';
+import { seedDatabase, searchProductionHybrid, computeNDCG, computeMRR } from './benchmark.mjs';
 
 // ─── Corpus builder ──────────────────────────────────────────────────────────
 //
 // Each haystack session becomes ONE observation row. observations.id is an
 // INTEGER primary key, but LongMemEval session ids are strings, so we key rows by
 // an integer index and map back via idToSession. The session text lands in
-// `narrative` + `text` (both FTS-indexed via OBS_FTS_COLUMNS) and `narrative`
-// also feeds the TF-IDF vector arm, so both retrieval arms see the content.
+// `narrative` + `text` (both FTS-indexed via OBS_FTS_COLUMNS), so the whole turn
+// text is searchable alongside the title.
 // LongMemEval dates look like "2023/05/30 (Tue) 23:40". Strip the weekday paren
 // so Date.parse accepts the "YYYY/MM/DD HH:MM" remainder. Returns epoch ms, or
 // null on missing/unparseable input (caller falls back to offset 0). Timezone is
@@ -82,7 +76,10 @@ export function buildCorpus(entry, { turns = 'user', temporal = false } = {}) {
   for (let i = 0; i < sessions.length; i++) {
     const turnList = sessions[i] || [];
     const kept = turns === 'all' ? turnList : turnList.filter((t) => t.role === 'user');
-    const docText = kept.map((t) => t.content).join('\n').trim();
+    const docText = kept
+      .map((t) => t.content)
+      .join('\n')
+      .trim();
     const intId = i + 1;
     const sid = sessionIds[i] ?? `idx-${i}`;
     idToSession.set(intId, sid);
@@ -154,7 +151,6 @@ export function evalEntry(entry, { turns = 'user', temporal = false, ks = [1, 5,
   let retrieved = [];
   try {
     seedDatabase(db, data);
-    seedVectors(db); // build TF-IDF vocab + vectors so the RRF vector arm is live
     const rows = searchProductionHybrid(db, entry.question, { limit: fetchN, project: null });
     retrieved = rows.map((r) => idToSession.get(r.id)).filter(Boolean);
   } finally {
@@ -181,7 +177,10 @@ export function evalEntry(entry, { turns = 'user', temporal = false, ks = [1, 5,
 }
 
 // ─── Aggregation ─────────────────────────────────────────────────────────────
-export function runLongMemEval(entries, { turns = 'user', temporal = false, ks = [1, 5, 10], limit = 10 } = {}) {
+export function runLongMemEval(
+  entries,
+  { turns = 'user', temporal = false, ks = [1, 5, 10], limit = 10 } = {},
+) {
   const perQuestion = entries.map((e) => evalEntry(e, { turns, temporal, ks, limit }));
 
   const meanRecall = (rows, field = 'ks') => {
@@ -198,13 +197,24 @@ export function runLongMemEval(entries, { turns = 'user', temporal = false, ks =
   for (const r of perQuestion) (byType[r.question_type] ||= []).push(r);
   const perType = {};
   for (const [t, rows] of Object.entries(byType)) {
-    perType[t] = { n: rows.length, recallAny: meanRecall(rows), recallFrac: meanRecall(rows, 'ksFrac'), ndcg: mean(rows, (r) => r.ndcg), mrr: mean(rows, (r) => r.mrr) };
+    perType[t] = {
+      n: rows.length,
+      recallAny: meanRecall(rows),
+      recallFrac: meanRecall(rows, 'ksFrac'),
+      ndcg: mean(rows, (r) => r.ndcg),
+      mrr: mean(rows, (r) => r.mrr),
+    };
   }
 
   return {
     config: { turns, temporal, ks, limit },
     n: perQuestion.length,
-    overall: { recallAny: meanRecall(perQuestion), recallFrac: meanRecall(perQuestion, 'ksFrac'), ndcg: mean(perQuestion, (r) => r.ndcg), mrr: mean(perQuestion, (r) => r.mrr) },
+    overall: {
+      recallAny: meanRecall(perQuestion),
+      recallFrac: meanRecall(perQuestion, 'ksFrac'),
+      ndcg: mean(perQuestion, (r) => r.ndcg),
+      mrr: mean(perQuestion, (r) => r.mrr),
+    },
     perType,
     perQuestion,
   };
@@ -217,7 +227,15 @@ export function loadDataset(path) {
 }
 
 function parseArgs(args) {
-  const opts = { turns: 'user', temporal: false, ks: [1, 5, 10], limit: 10, max: Infinity, out: null, dataset: null };
+  const opts = {
+    turns: 'user',
+    temporal: false,
+    ks: [1, 5, 10],
+    limit: 10,
+    max: Infinity,
+    out: null,
+    dataset: null,
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--turns') opts.turns = args[++i];
@@ -241,28 +259,43 @@ function main(argv) {
     process.stderr.write(
       'Usage: node benchmark/longmemeval.mjs <dataset.json> [--turns user|all] [--temporal] [--ks 1,5,10] [--limit 10] [--max N] [--out results.jsonl]\n' +
         'Dataset is not committed (~300 MB). Fetch it first:\n' +
-        '  bash benchmark/datasets/download-longmemeval.sh\n'
+        '  bash benchmark/datasets/download-longmemeval.sh\n',
     );
     process.exit(1);
   }
 
   let entries = loadDataset(opts.dataset);
   if (Number.isFinite(opts.max)) entries = entries.slice(0, opts.max);
-  process.stderr.write(`Running LongMemEval on ${entries.length} questions (turns=${opts.turns}${opts.temporal ? ', temporal' : ''}) …\n`);
+  process.stderr.write(
+    `Running LongMemEval on ${entries.length} questions (turns=${opts.turns}${opts.temporal ? ', temporal' : ''}) …\n`,
+  );
 
-  const out = runLongMemEval(entries, { turns: opts.turns, temporal: opts.temporal, ks: opts.ks, limit: opts.limit });
+  const out = runLongMemEval(entries, {
+    turns: opts.turns,
+    temporal: opts.temporal,
+    ks: opts.ks,
+    limit: opts.limit,
+  });
 
   const lines = [];
-  lines.push(`\nLongMemEval — claude-mem-lite (lexical FTS5+TF-IDF+RRF, turns=${opts.turns}${opts.temporal ? ', temporal' : ''}, n=${out.n})`);
-  lines.push(`  recall_any@k:  ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallAny[String(k)])}`).join('  ')}   nDCG=${out.overall.ndcg.toFixed(3)}  MRR=${out.overall.mrr.toFixed(3)}`);
-  lines.push(`  recall_frac@k: ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallFrac[String(k)])}`).join('  ')}   (standard recall@k = |gold∩topk|/|gold|; stricter on the 65% multi-gold questions)`);
+  lines.push(
+    `\nLongMemEval — claude-mem-lite (lexical FTS5 BM25, turns=${opts.turns}${opts.temporal ? ', temporal' : ''}, n=${out.n})`,
+  );
+  lines.push(
+    `  recall_any@k:  ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallAny[String(k)])}`).join('  ')}   nDCG=${out.overall.ndcg.toFixed(3)}  MRR=${out.overall.mrr.toFixed(3)}`,
+  );
+  lines.push(
+    `  recall_frac@k: ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallFrac[String(k)])}`).join('  ')}   (standard recall@k = |gold∩topk|/|gold|; stricter on the 65% multi-gold questions)`,
+  );
   lines.push('  per question_type (any-hit / fractional):');
   for (const [t, s] of Object.entries(out.perType).sort()) {
     const any = opts.ks.map((k) => `@${k}=${fmtPct(s.recallAny[String(k)])}`).join(' ');
     const frac = opts.ks.map((k) => `@${k}=${fmtPct(s.recallFrac[String(k)])}`).join(' ');
     lines.push(`    ${t.padEnd(28)} n=${String(s.n).padStart(4)}  any[${any}]  frac[${frac}]`);
   }
-  lines.push('\n  NOTE: lexical baseline. recall_any@k is the LongMemEval headline (and what agentmemory / MemPalace report); recall_frac@k is the stricter standard recall@k. Neither is comparable to embedding R@5 on paraphrase categories. See file header.');
+  lines.push(
+    '\n  NOTE: lexical baseline. recall_any@k is the LongMemEval headline (and what agentmemory / MemPalace report); recall_frac@k is the stricter standard recall@k. Neither is comparable to embedding R@5 on paraphrase categories. See file header.',
+  );
   process.stdout.write(lines.join('\n') + '\n');
 
   if (opts.out) {
@@ -270,7 +303,10 @@ function main(argv) {
     const jsonl = out.perQuestion.map((r) => JSON.stringify(r)).join('\n');
     writeFileSync(opts.out, jsonl + '\n');
     const summaryPath = opts.out.replace(/\.jsonl?$/, '') + '.summary.json';
-    writeFileSync(summaryPath, JSON.stringify({ config: out.config, n: out.n, overall: out.overall, perType: out.perType }, null, 2));
+    writeFileSync(
+      summaryPath,
+      JSON.stringify({ config: out.config, n: out.n, overall: out.overall, perType: out.perType }, null, 2),
+    );
     process.stderr.write(`Wrote per-question results → ${opts.out}\n  summary → ${summaryPath}\n`);
   }
 }

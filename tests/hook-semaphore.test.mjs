@@ -1,6 +1,7 @@
 // Tests for hook-semaphore.mjs — LLM concurrency semaphore
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, readdirSync, mkdirSync } from 'fs';
 import {
   acquireLLMSlot,
@@ -21,7 +22,9 @@ function cleanupSemFiles() {
   try {
     for (const f of readdirSync(RUNTIME_DIR)) {
       if (f.startsWith('llm-sem-')) {
-        try { unlinkSync(join(RUNTIME_DIR, f)); } catch {}
+        try {
+          unlinkSync(join(RUNTIME_DIR, f));
+        } catch {}
       }
     }
   } catch {}
@@ -31,7 +34,9 @@ function cleanupSemFiles() {
 
 describe('hook-semaphore.mjs', () => {
   beforeEach(() => {
-    try { mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
+    try {
+      mkdirSync(RUNTIME_DIR, { recursive: true });
+    } catch {}
     // acquireLLMSlot keeps MODULE-level bookkeeping of whether this process holds
     // the slot (so a concurrent same-process acquire cannot unlink a live
     // sibling's file). Several cases below acquire without releasing, and unlinking
@@ -78,7 +83,11 @@ describe('hook-semaphore.mjs', () => {
     // reinstates D#134 MEDIUM-2 verbatim while every assertion above stays
     // green. Cheap source guard for the one line that consumes the budget.
     it('the acquire loop derives its deadline from LLM_SEM_TIMEOUT, not a literal', () => {
-      const src = readFileSync(new URL('../hook-semaphore.mjs', import.meta.url), 'utf8');
+      // D#207: join(), not new URL('../X.mjs', …) — that form blinds knip to the module.
+      const src = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), '..', 'hook-semaphore.mjs'),
+        'utf8',
+      );
       const deadline = src.match(/const deadline = [^;]+;/);
       expect(deadline, 'acquire deadline not found').not.toBeNull();
       expect(deadline[0]).toContain('LLM_SEM_TIMEOUT');
@@ -86,7 +95,11 @@ describe('hook-semaphore.mjs', () => {
     });
 
     it('the stale reaper compares against LLM_SEM_STALE_MS, not a literal', () => {
-      const src = readFileSync(new URL('../hook-semaphore.mjs', import.meta.url), 'utf8');
+      // D#207: join(), not new URL('../X.mjs', …) — that form blinds knip to the module.
+      const src = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), '..', 'hook-semaphore.mjs'),
+        'utf8',
+      );
       const ageCheck = src.match(/if \(age > [^)]+\)/);
       expect(ageCheck, 'age check not found').not.toBeNull();
       expect(ageCheck[0]).toContain('LLM_SEM_STALE_MS');
@@ -160,10 +173,12 @@ describe('hook-semaphore.mjs', () => {
       writeFileSync(liveHolder, JSON.stringify({ pid: process.pid, ts: Date.now() - 90_000 }));
       try {
         const got = await acquireLLMSlot();
-        expect(got).toBe(true);           // ours + the live holder = 2 = LLM_SEM_MAX
+        expect(got).toBe(true); // ours + the live holder = 2 = LLM_SEM_MAX
         expect(existsSync(liveHolder)).toBe(true);
       } finally {
-        try { unlinkSync(liveHolder); } catch {}
+        try {
+          unlinkSync(liveHolder);
+        } catch {}
       }
     });
 
@@ -172,13 +187,18 @@ describe('hook-semaphore.mjs', () => {
     // forever, so age still wins once it is implausible as a real hold.
     it('still reaps a slot older than the stale threshold even if its pid is alive', async () => {
       const zombie = join(RUNTIME_DIR, 'llm-sem-zombietest');
-      writeFileSync(zombie, JSON.stringify({ pid: process.pid, ts: Date.now() - (LLM_SEM_STALE_MS + 10_000) }));
+      writeFileSync(
+        zombie,
+        JSON.stringify({ pid: process.pid, ts: Date.now() - (LLM_SEM_STALE_MS + 10_000) }),
+      );
       try {
         const got = await acquireLLMSlot();
         expect(got).toBe(true);
         expect(existsSync(zombie)).toBe(false);
       } finally {
-        try { unlinkSync(zombie); } catch {}
+        try {
+          unlinkSync(zombie);
+        } catch {}
       }
     });
 
@@ -193,7 +213,7 @@ describe('hook-semaphore.mjs', () => {
       expect(got).toBe(true);
 
       // Count active sem files
-      const semFiles = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('llm-sem-'));
+      const semFiles = readdirSync(RUNTIME_DIR).filter((f) => f.startsWith('llm-sem-'));
       expect(semFiles.length).toBe(1);
     });
 
@@ -222,7 +242,7 @@ describe('hook-semaphore.mjs', () => {
     // assumption ("we are inside acquire and therefore do NOT hold a slot, so it
     // is always stale") and unlinks unconditionally. De-blocking makes the
     // overlap the normal case for two concurrent mem_optimize calls.
-    it('a concurrent acquire in the SAME process does not delete the live holder\'s slot', async () => {
+    it("a concurrent acquire in the SAME process does not delete the live holder's slot", async () => {
       const first = await acquireLLMSlot();
       expect(first).toBe(true);
       const held = JSON.parse(readFileSync(slotFile(), 'utf8'));
@@ -234,9 +254,9 @@ describe('hook-semaphore.mjs', () => {
       // holder's later release unlinks the SECOND holder's file.
       const secondPromise = acquireLLMSlot();
       await sleepMs(250);
-      expect(existsSync(slotFile()), 'live holder\'s slot was unlinked by a sibling acquire').toBe(true);
+      expect(existsSync(slotFile()), "live holder's slot was unlinked by a sibling acquire").toBe(true);
       const still = JSON.parse(readFileSync(slotFile(), 'utf8'));
-      expect(still.ts, 'the live holder\'s slot was replaced, not preserved').toBe(held.ts);
+      expect(still.ts, "the live holder's slot was replaced, not preserved").toBe(held.ts);
 
       // Once the holder releases, the waiter proceeds.
       releaseLLMSlot();
@@ -270,12 +290,15 @@ describe('hook-semaphore.mjs', () => {
     it('a FRESH local hold record still queues (the gate is not simply gone)', async () => {
       _setLocalHeldAt(Date.now());
       let settled = false;
-      const pending = acquireLLMSlot().then((v) => { settled = true; return v; });
+      const pending = acquireLLMSlot().then((v) => {
+        settled = true;
+        return v;
+      });
 
       await sleepMs(300);
       expect(settled, 'a live sibling hold must make a second acquire wait').toBe(false);
 
-      releaseLLMSlot();               // sibling finishes
+      releaseLLMSlot(); // sibling finishes
       await expect(pending).resolves.toBe(true);
     });
   });

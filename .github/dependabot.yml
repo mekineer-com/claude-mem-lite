@@ -1,0 +1,61 @@
+# Audit 2026-09-02 P2-19: there was no dependency-update automation at all, so the four dev
+# advisories the audit found (brace-expansion / nanoid / postcss / vite, all reached through
+# vitest) were visible only to someone who happened to run `npm audit` WITHOUT
+# `--omit=dev` — and CI runs it with that flag, because a dev advisory must not block a
+# release. That is the right call for the gate and the wrong place to learn about the
+# advisory; this is the other half.
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # 5 -> 3 (2026-09-04). The first run opened seven PRs at once — four npm plus three
+    # actions — which reads as a rate and was a one-time backlog: all seven were created
+    # inside a 68-second span (2026-09-03T19:29:12Z -> 19:30:20Z). That span is BETWEEN the
+    # PRs; the config itself landed as 25cd93d about fifty minutes earlier, and the first
+    # version of this comment conflated the two. Steady state is under three, so this caps
+    # a future burst without delaying anything today.
+    #
+    # Two changes deliberately NOT made, because each trades a real property for less
+    # noise. Grouping prod minor/patch would have cut those four PRs to one, and the
+    # `groups:` comment below is the standing argument against it (attributable failure
+    # over a bisect) — it applies with more force to prod than to dev. And moving to
+    # `interval: monthly` is per-ECOSYSTEM, not per-group: dependabot allows one entry
+    # per ecosystem+directory, so the only way to slow the dev tree is to slow the prod
+    # deps with it, which is backwards — the prod bumps are the ones that reach users
+    # through the release-time `npm shrinkwrap`.
+    open-pull-requests-limit: 3
+    # A PR per package makes a failure attributable; a batched one makes it a bisect.
+    #
+    # This comment used to open with "Every lockfile change has to pass the `@emnapi`
+    # pruning guard in `scripts/pre-commit.sh`". That is FALSE for the PRs this file
+    # creates, and 2026-09-04 demonstrated it: the grouped dev bump took `@emnapi` grep
+    # lines 13 -> 11, exactly the signature that guard exits 1 on — and nothing fired,
+    # because a dependabot PR is merged server-side and no local pre-commit hook runs.
+    # The guard covers hand-written lockfile changes only. That drop was benign on
+    # inspection (all three `@emnapi/*` entries survive; the two lost lines are references
+    # from upstream-removed wasm32-wasi bindings, not the single-platform prune signature),
+    # and the guard counts LINES rather than entries, so it would have false-positived here
+    # anyway. Reviewing a grouped lockfile diff by hand is the real control.
+    groups:
+      dev-minor-and-patch:
+        dependency-type: development
+        update-types: [minor, patch]
+    ignore:
+      # Majors are reviewed by hand against their changelog, per the audit's explicit
+      # "do not bump better-sqlite3 to 13, do not `npm audit fix` the dev tree wholesale".
+      # better-sqlite3 in particular carries a compiled native binding whose ABI this
+      # project has already had to self-heal in the field.
+      - dependency-name: '*'
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # The actions are SHA-pinned (same audit item). Pinning without an updater is how a
+    # pinned SHA quietly becomes an unpatched one, so the two ship together: dependabot
+    # rewrites the SHA and the trailing `# vX.Y.Z` comment.
+    open-pull-requests-limit: 3

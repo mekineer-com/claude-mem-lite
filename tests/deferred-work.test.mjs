@@ -1,25 +1,53 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+// D#207: repo-source paths are built with join(), never `new URL('../…', import.meta.url)`
+// — the URL form makes knip drop the named module from its unused-export report.
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 import { createTestDb } from './test-helpers.mjs';
 import {
-  insertDeferred, listOpenWithOrdinal, dropDeferred,
-  resolveDeferredIds, closeDeferredItems,
+  insertDeferred,
+  listOpenWithOrdinal,
+  dropDeferred,
+  resolveDeferredIds,
+  closeDeferredItems,
 } from '../lib/deferred-work.mjs';
+import { saveWithClosures } from '../lib/save-observation.mjs';
 
 describe('deferred_work schema (v31)', () => {
   it('creates deferred_work table with required columns', () => {
     const db = createTestDb();
-    const cols = db.prepare(`PRAGMA table_info(deferred_work)`).all().map(c => c.name);
-    expect(cols).toEqual(expect.arrayContaining([
-      'id', 'project', 'title', 'detail', 'priority', 'status',
-      'created_at_epoch', 'closed_at_epoch', 'closed_by_obs_id',
-      'drop_reason', 'source_session_id', 'source_prompt_id', 'files',
-    ]));
+    const cols = db
+      .prepare(`PRAGMA table_info(deferred_work)`)
+      .all()
+      .map((c) => c.name);
+    expect(cols).toEqual(
+      expect.arrayContaining([
+        'id',
+        'project',
+        'title',
+        'detail',
+        'priority',
+        'status',
+        'created_at_epoch',
+        'closed_at_epoch',
+        'closed_by_obs_id',
+        'drop_reason',
+        'source_session_id',
+        'source_prompt_id',
+        'files',
+      ]),
+    );
     db.close();
   });
 
   it('creates partial index on open items', () => {
     const db = createTestDb();
-    const idx = db.prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_deferred_open'`).get();
+    const idx = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_deferred_open'`)
+      .get();
     expect(idx).toBeTruthy();
     expect(idx.sql).toMatch(/WHERE\s+status\s*=\s*'open'/i);
     db.close();
@@ -49,9 +77,9 @@ describe('deferred_work CRUD', () => {
     const b = insertDeferred(db, { project: 'p', title: 'B', priority: 3 });
     const _c = insertDeferred(db, { project: 'p', title: 'C', priority: 2 });
     const list = listOpenWithOrdinal(db, 'p');
-    expect(list.map(r => r.title)).toEqual(['B', 'A', 'C']);
-    expect(list.map(r => r.ordinal)).toEqual([1, 2, 3]);
-    expect(list.find(r => r.title === 'B').id).toBe(b.id);
+    expect(list.map((r) => r.title)).toEqual(['B', 'A', 'C']);
+    expect(list.map((r) => r.ordinal)).toEqual([1, 2, 3]);
+    expect(list.find((r) => r.title === 'B').id).toBe(b.id);
     db.close();
   });
 
@@ -59,8 +87,8 @@ describe('deferred_work CRUD', () => {
     const db = createTestDb();
     insertDeferred(db, { project: 'p1', title: 'A', priority: 2 });
     insertDeferred(db, { project: 'p2', title: 'B', priority: 2 });
-    expect(listOpenWithOrdinal(db, 'p1').map(r => r.title)).toEqual(['A']);
-    expect(listOpenWithOrdinal(db, 'p2').map(r => r.title)).toEqual(['B']);
+    expect(listOpenWithOrdinal(db, 'p1').map((r) => r.title)).toEqual(['A']);
+    expect(listOpenWithOrdinal(db, 'p2').map((r) => r.title)).toEqual(['B']);
     db.close();
   });
 
@@ -81,8 +109,8 @@ describe('deferred_work CRUD', () => {
     insertDeferred(db, { project: 'p', title: 'C', priority: 2 });
     db.prepare(`UPDATE deferred_work SET status='done' WHERE id=?`).run(a.id);
     const list = listOpenWithOrdinal(db, 'p');
-    expect(list.map(r => r.title)).toEqual(['B', 'C']);
-    expect(list.map(r => r.ordinal)).toEqual([1, 2]);
+    expect(list.map((r) => r.title)).toEqual(['B', 'C']);
+    expect(list.map((r) => r.ordinal)).toEqual([1, 2]);
     db.close();
   });
 
@@ -99,6 +127,52 @@ describe('deferred_work CRUD', () => {
     const r2 = dropDeferred(db, a.id, 'again');
     expect(r2.changed).toBe(0);
     db.close();
+  });
+
+  // D#195 (c): the mis-drop is cheap to prevent at the moment it happens. The
+  // hint is advisory text only — drop still succeeds, so a false positive costs
+  // one line of output and never blocks.
+  it('formatDropReasonHint fires on fixed-shaped reasons and stays quiet otherwise', () => {
+    const fires = [
+      '已在 v3.86.0 修复',
+      'fixed in this round',
+      'implemented',
+      'shipped in v3.9',
+      'done — closed by the batch',
+      'resolved upstream',
+      // The REAL reason on the six v3.86.0 mis-drops that motivated this hint.
+      // An earlier draft of the pattern missed exactly this string.
+      'closed this round; fix + mutation-verified binding test landed',
+    ];
+    for (const r of fires) {
+      expect(dw.formatDropReasonHint(r), `expected a hint for: ${r}`).toMatch(/closes-deferred/);
+    }
+    const quiet = [
+      'no longer relevant',
+      'superseded by D#42',
+      'refuted by measurement',
+      'obsolete',
+      'out of scope',
+      '',
+      // The negative CJK senses must NOT fire — they say the opposite.
+      '等待上游修复',
+      '尚未修复',
+      '需修复但优先级太低',
+      // Widening the positive arm to `closed` made these reachable; the veto
+      // has to hold them back or the hint fires on ordinary rejections.
+      'closed as obsolete',
+      'closed — superseded by D#42',
+      'waiting for an upstream fix',
+      // `wontfix` has no word boundary after `wont`, so `won'?t\b` never saw it and the
+      // positive arm's `resolved` won. The single most common English spelling of this
+      // rejection (pre-tag review v3.88.0, correctness N4).
+      'resolved as wontfix',
+      "closed — won'tfix",
+      'wontfix',
+    ];
+    for (const r of quiet) {
+      expect(dw.formatDropReasonHint(r), `expected NO hint for: ${r}`).toBeNull();
+    }
   });
 
   it('dropDeferred requires non-empty reason', () => {
@@ -144,17 +218,85 @@ describe('deferred_work closure', () => {
   it('resolveDeferredIds rejects D#N from foreign project', () => {
     const db = createTestDb();
     const a = insertDeferred(db, { project: 'p1', title: 'A', priority: 2 });
-    expect(() => resolveDeferredIds(db, 'p2', [`D#${a.id}`])).toThrow(
-      new RegExp(`D#${a.id}.*project.*p1`)
-    );
+    expect(() => resolveDeferredIds(db, 'p2', [`D#${a.id}`])).toThrow(new RegExp(`D#${a.id}.*project.*p1`));
     db.close();
   });
 
-  it('resolveDeferredIds rejects done/dropped items', () => {
+  // Was named "rejects done/dropped items" while only exercising 'done'. Split,
+  // because D#195 makes the two statuses behave DIFFERENTLY under the close verb.
+  it('resolveDeferredIds rejects done items', () => {
     const db = createTestDb();
     const a = insertDeferred(db, { project: 'p', title: 'A', priority: 2 });
     db.prepare(`UPDATE deferred_work SET status='done' WHERE id=?`).run(a.id);
     expect(() => resolveDeferredIds(db, 'p', [`D#${a.id}`])).toThrow(/status.*done/);
+    // 'done' stays rejected even under the permissive close policy — re-closing an
+    // already-closed item would overwrite a real closed_by_obs_id link.
+    expect(() => resolveDeferredIds(db, 'p', [`D#${a.id}`], { allowStatuses: ['open', 'dropped'] })).toThrow(
+      /status.*done/,
+    );
+    db.close();
+  });
+
+  it('resolveDeferredIds rejects dropped items BY DEFAULT (drop verb keeps open-only)', () => {
+    const db = createTestDb();
+    const a = insertDeferred(db, { project: 'p', title: 'A', priority: 2 });
+    dropDeferred(db, a.id, 'dropped by mistake');
+    expect(() => resolveDeferredIds(db, 'p', [`D#${a.id}`])).toThrow(/status.*dropped/);
+    db.close();
+  });
+
+  // D#195: `defer drop` used on an item that was actually FIXED was a one-way
+  // gate — the row became indistinguishable from a genuinely rejected item and
+  // lost the closed_by_obs_id link that the repo's convention relies on. The
+  // real invariant is "a fixed item must carry an obs link", not "dropped is
+  // immutable", so the close verb may re-open a dropped row into 'done'.
+  it('resolveDeferredIds accepts a dropped item under the close policy (D#195)', () => {
+    const db = createTestDb();
+    const a = insertDeferred(db, { project: 'p', title: 'A', priority: 2 });
+    dropDeferred(db, a.id, 'dropped by mistake');
+    expect(resolveDeferredIds(db, 'p', [`D#${a.id}`], { allowStatuses: ['open', 'dropped'] })).toEqual([
+      a.id,
+    ]);
+    db.close();
+  });
+
+  it('closeDeferredItems converts a dropped row to done and attaches the obs link (D#195)', () => {
+    const db = createTestDb();
+    db.pragma('foreign_keys = OFF'); // see note in atomicity test below
+    const a = insertDeferred(db, { project: 'p', title: 'A', priority: 2 });
+    dropDeferred(db, a.id, 'dropped by mistake');
+    closeDeferredItems(db, [a.id], 4242);
+    const ra = db.prepare(`SELECT * FROM deferred_work WHERE id=?`).get(a.id);
+    expect(ra.status).toBe('done');
+    expect(ra.closed_by_obs_id).toBe(4242);
+    // The drop reason is KEPT, not erased — the row's history is what makes the
+    // mis-drop auditable afterwards.
+    expect(ra.drop_reason).toBe('dropped by mistake');
+    db.close();
+  });
+
+  it('closeDeferredItems still refuses a done row (no silent obs-link overwrite)', () => {
+    const db = createTestDb();
+    db.pragma('foreign_keys = OFF');
+    const a = insertDeferred(db, { project: 'p', title: 'A', priority: 2 });
+    closeDeferredItems(db, [a.id], 111);
+    expect(() => closeDeferredItems(db, [a.id], 222)).toThrow(/not in a closable status/);
+    expect(
+      db.prepare(`SELECT closed_by_obs_id FROM deferred_work WHERE id=?`).get(a.id).closed_by_obs_id,
+    ).toBe(111);
+    db.close();
+  });
+
+  it('formatDeferredDetail surfaces the prior drop reason on a re-closed row (D#195)', () => {
+    const db = createTestDb();
+    db.pragma('foreign_keys = OFF');
+    const a = insertDeferred(db, { project: 'p', title: 'A', priority: 2 });
+    dropDeferred(db, a.id, 'dropped by mistake');
+    closeDeferredItems(db, [a.id], 4242);
+    const [row] = dw.getDeferredByIds(db, [a.id]);
+    const out = dw.formatDeferredDetail(row);
+    expect(out).toContain('closed_by: #4242');
+    expect(out).toContain('previously_dropped: dropped by mistake');
     db.close();
   });
 
@@ -174,6 +316,101 @@ describe('deferred_work closure', () => {
     expect(ra.closed_at_epoch).toBeGreaterThan(0);
     expect(rb.status).toBe('done');
     db.close();
+  });
+
+  // The OTHER policy `saveWithClosures` holds, and the one nothing pinned until a mutation
+  // said so: the dedup short-circuit must come BEFORE the resolver. Removing that `return`
+  // left all 41 cases green while making a repeated save re-close an item that had already
+  // transitioned out of 'open' — i.e. throw at the user for replaying an idempotent command.
+  it('a DUPLICATE save does not re-resolve or re-close the deferred item (P1-6)', () => {
+    const db = createTestDb();
+    const project = 'dupproj';
+    const d = insertDeferred(db, { project, title: 'fix the thing', priority: 2 });
+    const params = {
+      content: 'Root cause was an off-by-one in the window bound; fixed and covered.',
+      title: 'off-by-one in the window bound',
+      type: 'bugfix',
+      importance: 2,
+      project,
+      files: [],
+    };
+
+    const first = saveWithClosures(db, params, { closesTokens: [`D#${d.id}`], project });
+    expect(first.result.kind).not.toBe('duplicate');
+    expect(first.closesIds).toEqual([d.id]);
+    expect(db.prepare('SELECT status FROM deferred_work WHERE id=?').get(d.id).status).toBe('done');
+
+    // Same content, inside saveObservation's 5-minute dedup window → duplicate. The item is
+    // now 'done', which allowStatuses does NOT accept, so a resolver call here THROWS. The
+    // short-circuit is what keeps the replay idempotent instead of erroring.
+    const second = saveWithClosures(db, params, { closesTokens: [`D#${d.id}`], project });
+    expect(second.result.kind, 'the second save must dedup, or this case proves nothing').toBe('duplicate');
+    expect(second.closesIds, 'a duplicate must not report closures it did not make').toBeNull();
+    expect(
+      db.prepare('SELECT closed_by_obs_id FROM deferred_work WHERE id=?').get(d.id).closed_by_obs_id,
+    ).toBe(first.result.id);
+    db.close();
+  });
+
+  // CLASS-LEVEL SWEEP, not a per-face test. This repo's recurring defect is
+  // "the copy I fixed was not the only copy" — a guard wired on the CLI face
+  // while the MCP twin keeps the old policy passes every per-face test. So:
+  // find EVERY closeDeferredItems() call site in the shipped faces and require
+  // the resolveDeferredIds() immediately above it to carry the close policy.
+  // Reverting either face turns this red.
+  it('SWEEP: every close-verb call site passes the dropped-allowing policy (D#195)', () => {
+    // `lib/save-observation.mjs` joined this list in audit P1-6, which collapsed the save
+    // transaction — including this policy — out of both faces into one body. The sweep has
+    // to follow the code: scoped to the two faces it found ZERO call sites and passed its
+    // own offenders check while failing only on the denominator, i.e. the guard would have
+    // gone quiet about the policy the moment the policy moved.
+    const faces = ['mem-cli.mjs', 'server.mjs', 'lib/save-observation.mjs'];
+    const offenders = [];
+    let sites = 0;
+    for (const face of faces) {
+      const src = readFileSync(join(REPO, face), 'utf8');
+      // Call sites only — skip the import statement, which also names the symbol.
+      const re = /closeDeferredItems\(/g;
+      for (const m of src.matchAll(re)) {
+        sites++;
+        const window = src.slice(Math.max(0, m.index - 500), m.index);
+        const resolved = window.lastIndexOf('resolveDeferredIds(');
+        if (resolved === -1) {
+          offenders.push(`${face}: no resolveDeferredIds above call at ${m.index}`);
+          continue;
+        }
+        if (!window.slice(resolved).includes('allowStatuses')) {
+          offenders.push(`${face}: close call at ${m.index} resolves with the default open-only policy`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Denominator guard: with no call sites the sweep above passes vacuously, which is the
+    // shape that lets a face go dark. It was 2 (one per face) until P1-6 made it 1 (the
+    // shared body). Raise or lower this deliberately, never to make a red run green.
+    expect(sites).toBe(1);
+    // …and the reachability half, which the per-face count used to provide implicitly:
+    // one shared call site is only as good as the faces that reach it.
+    for (const face of ['mem-cli.mjs', 'server.mjs']) {
+      const src = readFileSync(join(REPO, face), 'utf8');
+      expect(src, `${face} must close deferred items through the shared body`).toMatch(/saveWithClosures\(/);
+    }
+  });
+
+  // Same sweep for the OTHER half of D#195. The CLI drop face has a behavioural
+  // E2E in cli-defer.test.mjs; the MCP one does not (it needs real stdio), so
+  // this is the only thing standing between the MCP twin and a silent revert.
+  it('SWEEP: every drop-verb face consults formatDropReasonHint (D#195)', () => {
+    const faces = ['mem-cli.mjs', 'server.mjs'];
+    const missing = [];
+    for (const face of faces) {
+      const src = readFileSync(join(REPO, face), 'utf8');
+      const drops = [...src.matchAll(/dropDeferred\(/g)].length;
+      const hints = [...src.matchAll(/formatDropReasonHint\(/g)].length;
+      if (drops === 0) missing.push(`${face}: no dropDeferred call site — sweep would pass vacuously`);
+      else if (hints === 0) missing.push(`${face}: drops without consulting formatDropReasonHint`);
+    }
+    expect(missing).toEqual([]);
   });
 
   it('closeDeferredItems rolls back when one id is invalid', () => {
@@ -208,7 +445,9 @@ describe('getDeferredByIds + formatDeferredDetail (D# read surface)', () => {
   it('getDeferredByIds returns full rows incl detail/files for any status, input order, missing omitted', () => {
     const db = createTestDb();
     const a = insertDeferred(db, {
-      project: 'p', title: 'env precheck design', priority: 2,
+      project: 'p',
+      title: 'env precheck design',
+      priority: 2,
       detail: 'design doc: docs/specs/env-precheck.md\nexit codes 0/5/6',
       files: ['scripts/osn_precheck.py'],
     });
@@ -216,7 +455,7 @@ describe('getDeferredByIds + formatDeferredDetail (D# read surface)', () => {
     dropDeferred(db, b.id, 'obsolete');
     expect(typeof dw.getDeferredByIds).toBe('function');
     const rows = dw.getDeferredByIds(db, [a.id, b.id, 99999]);
-    expect(rows.map(r => r.id)).toEqual([a.id, b.id]);
+    expect(rows.map((r) => r.id)).toEqual([a.id, b.id]);
     expect(rows[0].detail).toContain('exit codes 0/5/6');
     expect(JSON.parse(rows[0].files)).toEqual(['scripts/osn_precheck.py']);
     expect(rows[1].status).toBe('dropped');
@@ -226,7 +465,12 @@ describe('getDeferredByIds + formatDeferredDetail (D# read surface)', () => {
   it('formatDeferredDetail renders FULL untruncated detail + status + priority', () => {
     const db = createTestDb();
     const longDetail = 'design pointer: docs/specs/env-precheck-design.md — ' + 'x'.repeat(400);
-    const a = insertDeferred(db, { project: 'p', title: 'env precheck step', detail: longDetail, priority: 2 });
+    const a = insertDeferred(db, {
+      project: 'p',
+      title: 'env precheck step',
+      detail: longDetail,
+      priority: 2,
+    });
     const rows = dw.getDeferredByIds(db, [a.id]);
     expect(typeof dw.formatDeferredDetail).toBe('function');
     const text = dw.formatDeferredDetail(rows[0]);
@@ -257,10 +501,17 @@ describe('getDeferredByIds + formatDeferredDetail (D# read surface)', () => {
 describe('searchDeferredWork (P2 search leg)', () => {
   function seed(db) {
     const a = insertDeferred(db, {
-      project: 'p', title: '实施环境自检步（设计已定稿，待批准）', priority: 2,
+      project: 'p',
+      title: '实施环境自检步（设计已定稿，待批准）',
+      priority: 2,
       detail: '设计文档：docs/specs/env-precheck-design.md，exit codes 0/5/6',
     });
-    const b = insertDeferred(db, { project: 'p', title: 'progress 50%_done marker', priority: 1, detail: 'literal wildcard chars' });
+    const b = insertDeferred(db, {
+      project: 'p',
+      title: 'progress 50%_done marker',
+      priority: 1,
+      detail: 'literal wildcard chars',
+    });
     const c = insertDeferred(db, { project: 'other', title: '环境自检 foreign twin', priority: 2 });
     return { a, b, c };
   }
@@ -270,7 +521,7 @@ describe('searchDeferredWork (P2 search leg)', () => {
     const { a } = seed(db);
     expect(typeof dw.searchDeferredWork).toBe('function');
     const rows = dw.searchDeferredWork(db, '环境自检', 'p');
-    expect(rows.map(r => r.id)).toContain(a.id);
+    expect(rows.map((r) => r.id)).toContain(a.id);
     db.close();
   });
 
@@ -278,7 +529,7 @@ describe('searchDeferredWork (P2 search leg)', () => {
     const db = createTestDb();
     const { a } = seed(db);
     const rows = dw.searchDeferredWork(db, 'env-precheck-design.md', 'p');
-    expect(rows.map(r => r.id)).toContain(a.id);
+    expect(rows.map((r) => r.id)).toContain(a.id);
     db.close();
   });
 
@@ -295,17 +546,17 @@ describe('searchDeferredWork (P2 search leg)', () => {
     const db = createTestDb();
     const { a } = seed(db);
     dropDeferred(db, a.id, 'testing closed reachability');
-    expect(dw.searchDeferredWork(db, '环境自检', 'p').map(r => r.id)).not.toContain(a.id);
+    expect(dw.searchDeferredWork(db, '环境自检', 'p').map((r) => r.id)).not.toContain(a.id);
     const byRef = dw.searchDeferredWork(db, `D#${a.id} 相关背景`, 'p');
-    expect(byRef.map(r => r.id)).toContain(a.id);
-    expect(byRef.find(r => r.id === a.id).status).toBe('dropped');
+    expect(byRef.map((r) => r.id)).toContain(a.id);
+    expect(byRef.find((r) => r.id === a.id).status).toBe('dropped');
     db.close();
   });
 
   it('is project-scoped for both refs and keywords', () => {
     const db = createTestDb();
     const { c } = seed(db);
-    expect(dw.searchDeferredWork(db, '环境自检', 'p').map(r => r.id)).not.toContain(c.id);
+    expect(dw.searchDeferredWork(db, '环境自检', 'p').map((r) => r.id)).not.toContain(c.id);
     expect(dw.searchDeferredWork(db, `D#${c.id}`, 'p').length).toBe(0);
     db.close();
   });
@@ -314,8 +565,8 @@ describe('searchDeferredWork (P2 search leg)', () => {
     const db = createTestDb();
     const { a, b } = seed(db);
     const rows = dw.searchDeferredWork(db, '50%_done', 'p');
-    expect(rows.map(r => r.id)).toEqual([b.id]);
-    expect(rows.map(r => r.id)).not.toContain(a.id);
+    expect(rows.map((r) => r.id)).toEqual([b.id]);
+    expect(rows.map((r) => r.id)).not.toContain(a.id);
     db.close();
   });
 
@@ -337,8 +588,7 @@ describe('defer list age + stale hint (G11)', () => {
   it('formatDeferListRow appends age in days to the id tag', () => {
     const db = createTestDb();
     const { id } = insertDeferred(db, { project: 'p', title: 'aged item', priority: 2 });
-    db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE id = ?`)
-      .run(Date.now() - 12 * DAY, id);
+    db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE id = ?`).run(Date.now() - 12 * DAY, id);
     const [row] = listOpenWithOrdinal(db, 'p');
     const line = dw.formatDeferListRow(row);
     expect(line).toContain(`(D#${id}, 12d)`);
@@ -380,7 +630,7 @@ describe('defer list age + stale hint (G11)', () => {
     const sunk = insertDeferred(db, { project: 'p', title: 'sunk low-priority item', priority: 1 });
     db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE id = ?`).run(now - 60 * DAY, sunk.id);
     const list = listOpenWithOrdinal(db, 'p', 3);
-    expect(list.map(r => r.id)).not.toContain(sunk.id);
+    expect(list.map((r) => r.id)).not.toContain(sunk.id);
     expect(dw.countStaleOpen(db, 'p')).toBe(1);
     db.close();
   });

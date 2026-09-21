@@ -6,7 +6,7 @@
 //
 // Both differences the copy had are observable from outside, so they are tested from
 // outside: a real `hook.mjs stop` subprocess with the lock already held by a live PID.
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { execFileSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync } from 'fs';
@@ -32,24 +32,35 @@ function writeBuffer() {
   // planEpisodeFlush returns a single group, and the split this file is about silently
   // does not happen while the run still looks successful.
   const entry = (session, file, desc) => ({
-    tool: 'Write', desc, file, files: [file], ccSession: session,
-    isError: false, ts: Date.now(),
+    tool: 'Write',
+    desc,
+    file,
+    files: [file],
+    ccSession: session,
+    isError: false,
+    ts: Date.now(),
   });
-  writeFileSync(join(runtimeDir, `ep-${project}.json`), JSON.stringify({
-    project, sessionId: 'mem-sess',
-    entries: [
-      entry('cc-one', join(cwd, 'db-schema.sql'), 'Write db-schema.sql'),
-      entry('cc-two', join(cwd, 'migrations/002.sql'), 'Write migrations/002.sql'),
-    ],
-    files: [join(cwd, 'db-schema.sql')],
-    filesRead: [],
-  }));
+  writeFileSync(
+    join(runtimeDir, `ep-${project}.json`),
+    JSON.stringify({
+      project,
+      sessionId: 'mem-sess',
+      entries: [
+        entry('cc-one', join(cwd, 'db-schema.sql'), 'Write db-schema.sql'),
+        entry('cc-two', join(cwd, 'migrations/002.sql'), 'Write migrations/002.sql'),
+      ],
+      files: [join(cwd, 'db-schema.sql')],
+      filesRead: [],
+    }),
+  );
 }
 
 /** Hold the episode lock with THIS process's live pid: acquireLock cannot steal it. */
 function holdLock() {
-  writeFileSync(join(runtimeDir, `ep-${project}.json.lock`),
-    JSON.stringify({ pid: process.pid, ts: Date.now() }));
+  writeFileSync(
+    join(runtimeDir, `ep-${project}.json.lock`),
+    JSON.stringify({ pid: process.pid, ts: Date.now() }),
+  );
 }
 
 function runStop(extraEnv = {}) {
@@ -60,8 +71,13 @@ function runStop(extraEnv = {}) {
       // PWD as well as CLAUDE_PROJECT_DIR: inferProject reads CLAUDE_PROJECT_DIR || PWD ||
       // cwd, and a child spawned with an inherited PWD names the PARENT's project — it
       // then looks for an episode buffer that is not there and does nothing, quietly.
-      ...process.env, CLAUDE_MEM_DIR: dataDir, CLAUDE_PROJECT_DIR: cwd, PWD: cwd,
-      MEM_QUIET_HOOKS: '1', CLAUDE_MEM_SKIP_UPDATE: '1', ...extraEnv,
+      ...process.env,
+      CLAUDE_MEM_DIR: dataDir,
+      CLAUDE_PROJECT_DIR: cwd,
+      PWD: cwd,
+      MEM_QUIET_HOOKS: '1',
+      CLAUDE_MEM_SKIP_UPDATE: '1',
+      ...extraEnv,
     },
     encoding: 'utf8',
     timeout: 60000,
@@ -82,9 +98,30 @@ beforeEach(() => {
   project = episodeName();
 });
 
+// R10 P2-18. This afterEach was already here and still left directories behind, because
+// a contended Stop spawns a DETACHED llm-episode worker that writes into dataDir/runtime
+// after the parent has exited — it recreates the tree the cleanup just removed. You cannot
+// deterministically outlive a process you did not wait for, so this sweeps twice: once
+// per case, and once at the end, by which time the workers have finished. `stop-fallback-`
+// is also in TEST_FIXTURE_PREFIXES as the backstop for whatever still races.
+const ALL_DIRS = [];
+function sweep(dirs) {
+  for (const d of dirs) {
+    try {
+      rmSync(d, { recursive: true, force: true });
+    } catch {
+      /* gone */
+    }
+  }
+}
+
 afterEach(() => {
-  for (const d of PROJECT_DIRS.splice(0)) { try { rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
+  const done = PROJECT_DIRS.splice(0);
+  ALL_DIRS.push(...done);
+  sweep(done);
 });
+
+afterAll(() => sweep(ALL_DIRS));
 
 describe('handleStop lock-contended fallback', () => {
   it('honours CLAUDE_MEM_SKIP_EPISODE_LLM, which the hand-copied version ignored', () => {
@@ -113,7 +150,10 @@ describe('handleStop lock-contended fallback', () => {
     runStop({ CLAUDE_MEM_SKIP_EPISODE_LLM: '1' });
 
     const db = new Database(join(dataDir, 'claude-mem-lite.db'), { readonly: true });
-    const titles = db.prepare('SELECT title FROM observations ORDER BY id').all().map((r) => r.title);
+    const titles = db
+      .prepare('SELECT title FROM observations ORDER BY id')
+      .all()
+      .map((r) => r.title);
     db.close();
     // One row per CC session. Merged, the two sessions' work lands in a single garbled
     // observation — the v3.35.2 defect, reachable again through this path.

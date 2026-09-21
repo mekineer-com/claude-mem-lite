@@ -1,10 +1,188 @@
 #!/usr/bin/env node
-const CLI_COMMANDS = new Set(['search', 'recent', 'recall', 'get', 'timeline', 'save', 'stats', 'context', 'browse', 'citation-stats', 'delete', 'update', 'export', 'restore', 'compress', 'maintain', 'optimize', 'fts-check', 'registry', 'import', 'import-jsonl', 'enrich', 'activity', 'adopt', 'unadopt', 'memdir-audit', 'defer', 'help']);
-const INSTALL_COMMANDS = new Set(['install', 'uninstall', 'status', 'doctor', 'cleanup', 'cleanup-hooks', 'self-update', 'repair', 'rebuild-binding', 'release']);
+const CLI_COMMANDS = new Set([
+  'search',
+  'recent',
+  'recall',
+  'get',
+  'timeline',
+  'save',
+  'stats',
+  'context',
+  'browse',
+  'citation-stats',
+  'delete',
+  'update',
+  'export',
+  'restore',
+  'compress',
+  'maintain',
+  'optimize',
+  'fts-check',
+  'import-jsonl',
+  'activity',
+  'adopt',
+  'unadopt',
+  'memdir-audit',
+  'defer',
+  'help',
+]);
+// Removed with the skill/agent resource registry (docs/audits/20260906-145304.md).
+// Kept as a named set so a stale script or muscle-memory invocation gets the reason rather
+// than a bare "Unknown command" plus a misleading edit-distance suggestion.
+const REMOVED_COMMANDS = new Set(['registry', 'import', 'enrich']);
+
+// D#26 / R12 P1-1, second half. `doctor` and `repair` exist to tell a user which
+// file their install is missing. Until now, on exactly that install, they did not
+// run: install.mjs's ~13 static imports resolve BEFORE its first line executes, so
+// one absent module killed the command with a bare ERR_MODULE_NOT_FOUND and zero
+// bytes of stdout. A half-finished update, a trimmed tarball (this repo has
+// shipped three) or a hand-deleted file all land there — CLAUDE.md's "a recovery
+// path must not import the thing it recovers", on the startup edge.
+//
+// A static import cannot be caught inside the module that declares it, so the
+// catch lives one entry up. THIS file is the host because it is the published
+// `bin` and because its own static closure is one file — itself; every route
+// below is an `await import()`. Whatever this prints must therefore rely on
+// nothing but the language, the same charter scripts/hook-launcher.mjs follows:
+// no local import may appear here, or the fallback shares the fate it reports on.
+//
+// The remedy is deliberately NOT `install.mjs repair` — that is the file that
+// would not load. It has to come from outside the broken tree.
+// THREE shapes, not one. The first cut caught only ERR_MODULE_NOT_FOUND, and pre-ship
+// review pointed out that an interrupted write leaves a file PRESENT and truncated far
+// more often than it leaves it absent: that arrives as a SyntaxError, and a truncated
+// install.mjs arrives as neither — the module loads and simply has no `main`, which
+// died at the call site with "main is not a function". All three are the same fact
+// about the world (this install's files are not intact) and get the same answer.
+// Anything else is rethrown: this is a classifier, not a swallow.
+function explainBrokenInstall(what) {
+  const w = (s) => process.stderr.write(`[claude-mem-lite] ${s}\n`);
+  w(`This install is incomplete — ${what}`);
+  w('That is why this command cannot run: these files load before any of their code executes.');
+  w('Repair: npm install -g claude-mem-lite@latest --force');
+  w('Or, in Claude Code: /plugin uninstall claude-mem-lite && /plugin install claude-mem-lite@sdsrss');
+  process.exit(1);
+}
+
+/**
+ * Absolute path out of an error that carries one, or null.
+ *
+ * ERR_MODULE_NOT_FOUND carries `url`. An ESM SyntaxError carries NOTHING —
+ * measured on Node 26: `url` and `code` both undefined, message a bare
+ * "Unexpected end of input", every stack frame a node-internal loader. So the
+ * caller must be able to say its piece without a filename rather than printing
+ * "undefined", and naming the damaged file would take a `node --check` scan of
+ * the install, which is a bigger thing than this line.
+ */
+function fileFromError(e) {
+  const m = String(e?.url || e?.stack || e?.message || '').match(/file:\/\/(\/[^\s:)'"]+)/);
+  if (m) return m[1];
+  const quoted = String(e?.message || '').match(/'([^']+\.mjs)'/);
+  return quoted ? quoted[1] : null;
+}
+
+/**
+ * Is this `doctor` invocation one of the DB-layer modes?
+ *
+ * DYNAMIC on purpose. A static import here would put lib/doctor-modes.mjs in the LAUNCHER's
+ * load graph, and a missing file there kills cli.mjs before any of its own error handling
+ * exists — the user gets a raw ERR_MODULE_NOT_FOUND instead of "this install is incomplete,
+ * run repair". tests/doctor-startup-closure.test.mjs caught exactly that when the import was
+ * static. Same rule as "a recovery path must not import the thing it recovers", applied to
+ * the entry point: nothing the launcher needs before it can speak may be a hard edge.
+ * install.mjs may import it statically — that failure is caught by loadInstaller() below.
+ */
+async function isDoctorDbMode() {
+  try {
+    const { DOCTOR_DB_MODES } = await import('./lib/doctor-modes.mjs');
+    return process.argv.slice(3).some((a) => DOCTOR_DB_MODES.some((m) => a === `--${m}`));
+  } catch {
+    // Unreadable module → treat as the plain install health check, which is the branch that
+    // can still explain a broken install.
+    return false;
+  }
+}
+
+async function loadInstaller() {
+  let mod;
+  try {
+    mod = await import('./install.mjs');
+  } catch (e) {
+    if (e?.code === 'ERR_MODULE_NOT_FOUND') {
+      explainBrokenInstall(`it is missing: ${fileFromError(e) || 'a module'}`);
+    }
+    // Never reprint the parser's own output: the stack is what this exists to replace.
+    if (e instanceof SyntaxError) {
+      const at = fileFromError(e);
+      explainBrokenInstall(`this file is damaged or truncated: ${at || 'one of its modules'}`);
+    }
+    throw e;
+  }
+  if (typeof mod?.main !== 'function') {
+    explainBrokenInstall('install.mjs loaded but exports no `main` — it is truncated');
+  }
+  return mod;
+}
+const INSTALL_COMMANDS = new Set([
+  'install',
+  'uninstall',
+  'status',
+  'doctor',
+  'cleanup',
+  'cleanup-hooks',
+  'self-update',
+  'repair',
+  'rebuild-binding',
+  'release',
+]);
+
+// A reader that leaves is not an error. `claude-mem-lite search x | head -1`,
+// `| grep -q`, or quitting `less` closes the read end while we are still writing;
+// Node then emits 'error' on the stdout Socket, and with no listener that is an
+// UNHANDLED error event — a ~20-line stack ending in `outVerbatim` where the user
+// expected the shell prompt.
+//
+// WHICH COMMANDS, measured rather than generalised (20 trials each, `| head -1`,
+// pre-fix): `search`, `export`, `recent`, `stats`, `doctor`, `timeline`,
+// `citation-stats` 20/20; `browse` 19/20; `help`, `status`, `context`, `get`,
+// `memdir-audit` 0/20. So NOT "every stdout-bearing command" — what decides it is
+// whether a write is still pending when the reader goes, which depends on how many
+// lines the consumer takes and how the output is batched — NOT on the 64 KB pipe
+// buffer, which an earlier draft of this comment blamed: pre-ship review found
+// `stats` crashing at `head -20` on an output far under it. That output's size is
+// corpus dependent, so no byte count is quoted here. This is also why the crash
+// survived so long — it is invisible to exactly the pipe depths a smoke test picks.
+//
+// Lives HERE, at the published `bin`, and not at `cli/common.mjs`'s `out()`: the
+// crash reproduces on `doctor` too, whose writes are `console.log` inside
+// install.mjs, so a chokepoint fix would cover the CLI half and leave the installer
+// half loud. One process-level listener covers both routes below.
+//
+// SWALLOW, DO NOT EXIT. The first cut called `process.exit(0)` here, on the
+// reasoning that a CLI whose consumer has gone should stop rather than serialise a
+// whole-DB `export` into a dead pipe. Pre-ship review measured what that costs:
+// `doctor | head -1` under `pipefail` exited 0 on 10/10 runs while the same doctor
+// exits 1 unpiped, because `runDoctor` assigns `process.exitCode = 1` AFTER its last
+// print (install.mjs, "Diagnostic-tool exit-code contract") and the forced exit lands
+// first. That silently turns a failing `claude-mem-lite doctor || alert` — the
+// wrapper that contract names — into a passing one. `process.exitCode ?? 0` does not
+// rescue it: the verdict does not exist yet at kill time. Returning instead reads
+// exit 1 on 10/10 and keeps the crash fixed (doctor 0/10, search 0/10 EPIPE stacks).
+// Correctness over the saved work: the process finishes into a pipe nobody reads,
+// which is wasted effort but never a wrong answer. Non-EPIPE is rethrown — this is a
+// classifier, not a blanket swallow, the same charter `explainBrokenInstall` follows.
+process.stdout.on('error', (err) => {
+  if (err && err.code === 'EPIPE') return;
+  throw err;
+});
 
 const cmd = process.argv[2];
 
-if (cmd === '--version' || cmd === '-v') {
+// `version` and `-V` are aliases, not extra syntax: the bare subcommand is what a user
+// types first (`claude-mem-lite version`), and it is far enough from every real command
+// name that the edit-distance suggester below fell through to the generic
+// "Run help / Run install" line — a wrong answer to a question the CLI can answer.
+if (cmd === '--version' || cmd === '-v' || cmd === '-V' || cmd === 'version') {
   const { readFileSync } = await import('fs');
   const { fileURLToPath } = await import('url');
   const { dirname, join } = await import('path');
@@ -13,7 +191,7 @@ if (cmd === '--version' || cmd === '-v') {
 } else if (cmd === '--help' || cmd === '-h') {
   const { run } = await import('./mem-cli.mjs');
   await run(['help']);
-} else if (cmd === 'doctor' && process.argv.slice(3).some(a => a === '--benchmark' || a === '--metrics' || a === '--session-audit')) {
+} else if (cmd === 'doctor' && (await isDoctorDbMode())) {
   // Per #8217: the DB-layer doctor modes (--benchmark / --metrics / --session-audit,
   // each implemented in cli/doctor.mjs) route to mem-cli. Everything else — plain
   // `doctor`, `doctor --` (POSIX end-of-options), and `doctor --json` — stays with
@@ -42,29 +220,60 @@ if (cmd === '--version' || cmd === '-v') {
     const { run } = await import('./mem-cli.mjs');
     await run(['help']);
   } else {
-    const { main } = await import('./install.mjs');
+    const { main } = await loadInstaller();
     await main([]);
   }
 } else if (INSTALL_COMMANDS.has(cmd)) {
-  const { main } = await import('./install.mjs');
+  const { main } = await loadInstaller();
   await main(process.argv.slice(2));
+} else if (REMOVED_COMMANDS.has(cmd)) {
+  // Released-artifact discoverability signal for the skill-registry removal. Deliberately
+  // names NO version: this ships before the version is decided, and a hardcoded one is a
+  // guess in a third place (package.json and the CHANGELOG heading being the other two).
+  // The revert instruction is version-specific and correct, which is what a user needs.
+  // Deliberately NOT routed through the edit-distance suggester below: its nearest
+  // match for `import` is `import-jsonl`, a different feature that accepts a path
+  // argument, so a stale `import <github-url>` would be pointed at something that
+  // could plausibly run. Naming the removal is the only honest answer.
+  process.stderr.write(
+    `[mem] "${cmd}" was removed along with the skill/agent resource registry.\n` +
+      "[mem] Claude Code's own plugins/marketplace replace it. See CHANGELOG.md for the\n" +
+      '[mem] migration note; to revert, pin claude-mem-lite@4.0.4.\n',
+  );
+  process.exit(1);
 } else {
   process.stderr.write(`[mem] Unknown command: "${cmd}"\n`);
   // Suggest closest command by edit distance
   const allCmds = [...CLI_COMMANDS, ...INSTALL_COMMANDS];
-  let best = null, bestDist = Infinity;
+  let best = null,
+    bestDist = Infinity;
   for (const c of allCmds) {
-    const a = cmd.toLowerCase(), b = c;
-    const m = a.length, n = b.length;
+    const a = cmd.toLowerCase(),
+      b = c;
+    const m = a.length,
+      n = b.length;
     if (Math.abs(m - n) > 2) continue;
-    const d = Array.from({ length: m + 1 }, (_, i) => Array.from({ length: n + 1 }, (_, j) => i === 0 ? j : j === 0 ? i : 0));
-    for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) d[i][j] = Math.min(d[i-1][j] + 1, d[i][j-1] + 1, d[i-1][j-1] + (a[i-1] !== b[j-1] ? 1 : 0));
-    if (d[m][n] < bestDist) { bestDist = d[m][n]; best = c; }
+    const d = Array.from({ length: m + 1 }, (_, i) =>
+      Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)),
+    );
+    for (let i = 1; i <= m; i++)
+      for (let j = 1; j <= n; j++)
+        d[i][j] = Math.min(
+          d[i - 1][j] + 1,
+          d[i][j - 1] + 1,
+          d[i - 1][j - 1] + (a[i - 1] !== b[j - 1] ? 1 : 0),
+        );
+    if (d[m][n] < bestDist) {
+      bestDist = d[m][n];
+      best = c;
+    }
   }
   if (best && bestDist <= 2) {
     process.stderr.write(`[mem] Did you mean: ${best}?\n`);
   } else {
-    process.stderr.write('[mem] Run "claude-mem-lite help" for CLI commands or "claude-mem-lite install" for setup\n');
+    process.stderr.write(
+      '[mem] Run "claude-mem-lite help" for CLI commands or "claude-mem-lite install" for setup\n',
+    );
   }
   process.exitCode = 1;
 }

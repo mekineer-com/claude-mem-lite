@@ -17,15 +17,25 @@ vi.mock('../haiku-client.mjs', () => ({
 }));
 
 import { callModelJSONAsync } from '../haiku-client.mjs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// D#207: built with join(), never `new URL('../hook.mjs', import.meta.url)` — the URL
+// form makes knip drop hook.mjs out of its unused-export report entirely.
+const HOOK_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'hook.mjs');
 
 describe('schema: optimized_at column', () => {
   let db;
-  beforeEach(() => { db = createTestDb(); });
-  afterEach(() => { db.close(); });
+  beforeEach(() => {
+    db = createTestDb();
+  });
+  afterEach(() => {
+    db.close();
+  });
 
   it('observations table has optimized_at column', () => {
     const cols = db.prepare(`PRAGMA table_info(observations)`).all();
-    const col = cols.find(c => c.name === 'optimized_at');
+    const col = cols.find((c) => c.name === 'optimized_at');
     expect(col).toBeDefined();
     expect(col.dflt_value).toBe('NULL');
   });
@@ -45,7 +55,9 @@ describe('re-enrich', () => {
     insertSession(db, { id: 'sess-1', project: 'test' });
     callModelJSONAsync.mockReset();
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+  });
 
   it('finds degraded observations missing concepts/facts/lesson/aliases', async () => {
     const { findReenrichCandidates } = await import('../hook-optimize.mjs');
@@ -131,19 +143,25 @@ describe('re-enrich', () => {
 // the user's curated title / narrative / lesson (the general re-enrich would).
 describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
   let db;
-  const substantive = 'The worker pool deadlocked when every connection was checked out and a callback tried to acquire another one, so the pool never drained.';
+  const substantive =
+    'The worker pool deadlocked when every connection was checked out and a callback tried to acquire another one, so the pool never drained.';
   beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
     callModelJSONAsync.mockReset();
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+  });
 
   it('selects a lesson-bearing, alias-less substantive row that narrow+wide both skip', async () => {
     const { findReenrichCandidates } = await import('../hook-optimize.mjs');
     insertObs(db, {
-      title: 'Fixed deadlock in the connection pool', narrative: substantive,
-      text: 'deadlock connection pool worker timeout', type: 'bugfix', importance: 2,
+      title: 'Fixed deadlock in the connection pool',
+      narrative: substantive,
+      text: 'deadlock connection pool worker timeout',
+      type: 'bugfix',
+      importance: 2,
       lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
       searchAliases: null,
     });
@@ -158,8 +176,11 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
   it('excludes rows that already have search_aliases', async () => {
     const { findReenrichCandidates } = await import('../hook-optimize.mjs');
     insertObs(db, {
-      title: 'Already enriched', narrative: substantive, type: 'bugfix',
-      lessonLearned: 'lesson', searchAliases: 'existing alias phrase',
+      title: 'Already enriched',
+      narrative: substantive,
+      type: 'bugfix',
+      lessonLearned: 'lesson',
+      searchAliases: 'existing alias phrase',
     });
     expect(findReenrichCandidates(db, 10, { scope: 'aliases' }).length).toBe(0);
   });
@@ -167,14 +188,19 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
   it('adds ONLY aliases and preserves title/narrative/lesson; appends aliases to FTS text', async () => {
     const { executeReenrich } = await import('../hook-optimize.mjs');
     insertObs(db, {
-      title: 'Fixed deadlock in the connection pool', narrative: substantive,
-      text: 'deadlock connection pool worker timeout', type: 'bugfix', importance: 2,
+      title: 'Fixed deadlock in the connection pool',
+      narrative: substantive,
+      text: 'deadlock connection pool worker timeout',
+      type: 'bugfix',
+      importance: 2,
       lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
       searchAliases: null,
     });
     // The alias-only mock deliberately omits title/narrative/lesson — the general
     // re-enrich would skip on missing title; the aliases path must not need them.
-    callModelJSONAsync.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'] });
+    callModelJSONAsync.mockResolvedValue({
+      search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'],
+    });
 
     const result = await executeReenrich(db, 10, { scope: 'aliases' });
     expect(result.processed).toBe(1);
@@ -184,7 +210,9 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
     // Curated fields untouched.
     expect(obs.title).toBe('Fixed deadlock in the connection pool');
     expect(obs.narrative).toBe(substantive);
-    expect(obs.lesson_learned).toBe('Never acquire a second pool connection inside a callback holding the first');
+    expect(obs.lesson_learned).toBe(
+      'Never acquire a second pool connection inside a callback holding the first',
+    );
     // FTS text keeps original terms AND gains the alias terms (append, not rebuild).
     expect(obs.text).toContain('deadlock');
     expect(obs.text).toContain('pool hang');
@@ -199,17 +227,225 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
   it('default-scope optimizeRun backfills aliases on a lesson-bearing manual save (P1-2)', async () => {
     const { optimizeRun } = await import('../hook-optimize.mjs');
     insertObs(db, {
-      title: 'Fixed deadlock in the connection pool', narrative: substantive,
-      text: 'deadlock connection pool worker timeout', type: 'bugfix', importance: 2,
+      title: 'Fixed deadlock in the connection pool',
+      narrative: substantive,
+      text: 'deadlock connection pool worker timeout',
+      type: 'bugfix',
+      importance: 2,
       lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
       searchAliases: null,
     });
     // narrow (the pre-fix default) has 0 candidates here → it never calls the model; only the
     // aliases sub-pass does, so a single alias-shaped mock is unambiguous.
-    callModelJSONAsync.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'] });
+    callModelJSONAsync.mockResolvedValue({
+      search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'],
+    });
     await optimizeRun(db, { tasks: ['re-enrich'], maxItems: 10 }); // no reenrichScope → default
     const obs = db.prepare('SELECT search_aliases FROM observations LIMIT 1').get();
     expect(obs.search_aliases).toContain('connection deadlock');
+  });
+});
+
+// D#6 concepts-backfill (scope='concepts'). Same defect class as P1-2 above, one
+// column over, and the fix that closed P1-2 is what OPENED this one: save-enrich runs
+// on every successful manual save and writes search_aliases (always) + lesson_learned
+// (bugfix/decision) + scope. Those three columns ARE the other pools' predicates, so a
+// save-enriched row matches NONE of them — narrow needs lesson AND aliases null, wide
+// needs lesson null, aliases needs search_aliases null, scopes needs scope null. It
+// therefore never receives concepts or facts, permanently. save-enrich's docblock says
+// "the daily wide re-enrich stays the safety net"; that is true of optimized_at, which
+// it does not stamp, and false in effect, because its own lesson write evicts the row
+// from wide.
+//
+// Measured on the real DB 2026-09-07: 14/14 live observations have empty concepts AND
+// empty facts, 14/14 have search_aliases, 13/14 have a lesson, 0/14 have optimized_at,
+// and all four pools return 0 candidates. Worth closing, measured same day on the
+// benchmark fixture (200 obs, 543 unique terms, 30 queries, same-tree back-to-back A/B
+// with concepts blanked): hybrid R@10 0.8998 vs 0.8152 (+0.0846), nDCG +0.0579. For
+// scale, all EIGHT scoring multipliers together buy +0.0002 R@10 on that fixture.
+//
+// This is deliberately NOT the fix D#6 proposed (riding save-enrich's existing Haiku
+// call), for two reasons: that would change save-enrich's stated contract, which says
+// concepts/facts stay byte-identical, and it could only ever help FUTURE saves. A pool
+// keyed on the column it fills is what this file already does twice — see the aliases
+// block above and the 'scopes' pool — and it is the only option that reaches the
+// existing backlog.
+describe("re-enrich scope='concepts' (D#6 concepts backfill)", () => {
+  let db;
+  const substantive =
+    'The worker pool deadlocked when every connection was checked out and a callback tried to acquire another one, so the pool never drained.';
+  /** A row exactly as save-enrich leaves it: lesson + aliases + scope written, concepts empty. */
+  const saveEnriched = (over = {}) => ({
+    title: 'Fixed deadlock in the connection pool',
+    narrative: substantive,
+    text: 'deadlock connection pool worker timeout connection deadlock pool hang',
+    type: 'bugfix',
+    importance: 2,
+    lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
+    searchAliases: 'connection deadlock pool hang db lock timeout',
+    ...over,
+  });
+  const setScope = (value = 'module') =>
+    db.prepare('UPDATE observations SET scope = ? WHERE scope IS NULL').run(value);
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    callModelJSONAsync.mockReset();
+  });
+  afterEach(() => {
+    db.close();
+  });
+
+  it('selects a save-enriched row that all four existing pools skip', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    setScope();
+    // The premise, asserted rather than assumed: this row is invisible to every pool
+    // that exists today. If any of these stops being 0, the finding has changed.
+    expect(findReenrichCandidates(db, 10, { scope: 'narrow' }).length).toBe(0);
+    expect(findReenrichCandidates(db, 10, { scope: 'wide' }).length).toBe(0);
+    expect(findReenrichCandidates(db, 10, { scope: 'aliases' }).length).toBe(0);
+    expect(findReenrichCandidates(db, 10, { scope: 'scopes' }).length).toBe(0);
+
+    const found = findReenrichCandidates(db, 10, { scope: 'concepts' });
+    expect(found.length).toBe(1);
+    expect(found[0].title).toBe('Fixed deadlock in the connection pool');
+  });
+
+  it('is NOT gated on optimized_at — a fully re-enriched row that still lacks concepts qualifies', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    setScope();
+    // The general pass preserves-on-empty, so a re-enrich whose LLM returned no
+    // concepts leaves the row stamped AND conceptless. Gating on the stamp would
+    // strand exactly those rows, which is the R10 P2-2 shape.
+    db.prepare('UPDATE observations SET optimized_at = ?').run(Date.now());
+    expect(findReenrichCandidates(db, 10, { scope: 'concepts' }).length).toBe(1);
+  });
+
+  it('excludes rows that already have concepts (idempotent via the column it fills)', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    // TWO rows, and the assertion is a name, not a count. Written the obvious way —
+    // one row, expect 0 — this case passed BEFORE the pool existed, because an
+    // unknown scope falls through to `narrow`, which also returns 0 here. A
+    // no-rows-returned assertion cannot tell "correctly excluded" from "pool absent".
+    insertObs(db, saveEnriched({ title: 'Already has concepts' }));
+    db.prepare("UPDATE observations SET concepts = 'deadlock pool'").run();
+    insertObs(db, saveEnriched({ title: 'Still conceptless' }));
+
+    const found = findReenrichCandidates(db, 10, { scope: 'concepts' });
+    expect(found.map((r) => r.title)).toEqual(['Still conceptless']);
+  });
+
+  it('excludes a superseded row', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    expect(findReenrichCandidates(db, 10, { scope: 'concepts' }).length).toBe(1);
+    db.prepare('UPDATE observations SET superseded_at = ?').run(Date.now());
+    expect(findReenrichCandidates(db, 10, { scope: 'concepts' }).length).toBe(0);
+  });
+
+  it('writes ONLY concepts/facts, preserves the curated fields, and appends to FTS text', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    // Deliberately omits title/narrative/lesson: the general re-enrich SKIPS on a
+    // missing title, so a mock this thin proves the concepts path is its own branch.
+    callModelJSONAsync.mockResolvedValue({
+      concepts: ['connection pool', 'deadlock', 'callback reentrancy'],
+      facts: ['the pool never drained once every connection was checked out'],
+    });
+
+    const result = await executeReenrich(db, 10, { scope: 'concepts' });
+    expect(result.processed).toBe(1);
+
+    const obs = db.prepare('SELECT * FROM observations LIMIT 1').get();
+    expect(obs.concepts).toContain('callback reentrancy');
+    expect(obs.facts).toContain('never drained');
+    // Curated fields untouched — this is the contract the general pass cannot honour.
+    expect(obs.title).toBe('Fixed deadlock in the connection pool');
+    expect(obs.narrative).toBe(substantive);
+    expect(obs.lesson_learned).toBe(
+      'Never acquire a second pool connection inside a callback holding the first',
+    );
+    expect(obs.search_aliases).toBe('connection deadlock pool hang db lock timeout');
+    expect(obs.importance).toBe(2);
+    expect(obs.type).toBe('bugfix');
+    // Append, not rebuild: rebuilding text from concepts/facts would drop the original
+    // narrative and alias terms, which is the regression the aliases branch warns about.
+    expect(obs.text).toContain('deadlock connection pool worker timeout');
+    expect(obs.text).toContain('callback reentrancy');
+  });
+
+  it('never stamps optimized_at, so the wide pass keeps its own candidates', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    callModelJSONAsync.mockResolvedValue({ concepts: ['a concept'], facts: [] });
+    const result = await executeReenrich(db, 10, { scope: 'concepts' });
+    // Premise first: a null optimized_at proves nothing if the pass never ran, and
+    // before the pool existed this case passed for exactly that reason.
+    expect(result.processed).toBe(1);
+    expect(db.prepare('SELECT optimized_at FROM observations LIMIT 1').get().optimized_at).toBeNull();
+  });
+
+  it('skips instead of writing when the model returns no concepts', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    callModelJSONAsync.mockResolvedValue({ concepts: [], facts: [] });
+    const result = await executeReenrich(db, 10, { scope: 'concepts' });
+    expect(result.processed).toBe(0);
+    expect(result.skipped).toBe(1);
+    const obs = db.prepare('SELECT concepts, text FROM observations LIMIT 1').get();
+    expect(obs.concepts).toBe('');
+    expect(obs.text).toBe('deadlock connection pool worker timeout connection deadlock pool hang');
+  });
+
+  it('does not resurrect a row superseded during the LLM round-trip (R10 P3-3 shape)', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    // 45 s is long enough for a concurrent hook to retire the row; the guard belongs on
+    // the UPDATE's WHERE, not only on the SELECT that chose it.
+    callModelJSONAsync.mockImplementation(async () => {
+      db.prepare('UPDATE observations SET superseded_at = ?').run(Date.now());
+      return { concepts: ['too late'], facts: [] };
+    });
+    const result = await executeReenrich(db, 10, { scope: 'concepts' });
+    // Premise: the row WAS selected and the model WAS called, so an unwritten row is
+    // the guard firing rather than the pass never starting. Without this the case
+    // passed before the pool existed.
+    expect(callModelJSONAsync).toHaveBeenCalledTimes(1);
+    expect(result.processed).toBe(0);
+    expect(db.prepare('SELECT concepts FROM observations LIMIT 1').get().concepts).toBe('');
+  });
+
+  it('reports the backlog under optimizePreview.reenrichConcepts', async () => {
+    const { optimizePreview } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    setScope();
+    const preview = optimizePreview(db);
+    // A backlog nobody can see cannot be sized for a one-shot drain, and the other
+    // three side-pools are all reported here. Premise on the same object: the other
+    // pools really are empty, so this 1 is the new pool and not a mislabelled count.
+    expect(preview.reenrichConcepts).toBe(1);
+    expect(preview.reenrich).toBe(0);
+    expect(preview.reenrichWide).toBe(0);
+    expect(preview.reenrichAliases).toBe(0);
+    expect(preview.reenrichScopes).toBe(0);
+  });
+
+  it('default-scope optimizeRun backfills concepts on a save-enriched row (D#6)', async () => {
+    const { optimizeRun } = await import('../hook-optimize.mjs');
+    insertObs(db, saveEnriched());
+    setScope();
+    // Every other sub-pass has 0 candidates here, so a concepts-shaped mock is
+    // unambiguous — and this is the assertion that matters, because a pool nothing
+    // schedules is the P1-2 defect repeated rather than fixed.
+    callModelJSONAsync.mockResolvedValue({
+      concepts: ['connection pool', 'deadlock'],
+      facts: ['the pool never drained'],
+    });
+    await optimizeRun(db, { tasks: ['re-enrich'], maxItems: 10 }); // no reenrichScope → default
+    expect(db.prepare('SELECT concepts FROM observations LIMIT 1').get().concepts).toContain('deadlock');
   });
 
   // Audit 2026-07-17 P4: the DAILY auto path (handleLLMOptimize via auto-maintain)
@@ -220,8 +456,11 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
   it("scope 'wide' (the daily auto path) also backfills aliases on a lesson-bearing manual save", async () => {
     const { optimizeRun } = await import('../hook-optimize.mjs');
     insertObs(db, {
-      title: 'Fixed deadlock in the connection pool', narrative: substantive,
-      text: 'deadlock connection pool worker timeout', type: 'bugfix', importance: 2,
+      title: 'Fixed deadlock in the connection pool',
+      narrative: substantive,
+      text: 'deadlock connection pool worker timeout',
+      type: 'bugfix',
+      importance: 2,
       lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
       searchAliases: null,
     });
@@ -239,15 +478,23 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
   it("scope 'wide' with no aliases candidates gives wide the full budget", async () => {
     const { optimizeRun } = await import('../hook-optimize.mjs');
     insertObs(db, {
-      title: 'Fixed race in scheduler', narrative: substantive,
-      text: 'race scheduler', type: 'bugfix', importance: 2,
+      title: 'Fixed race in scheduler',
+      narrative: substantive,
+      text: 'race scheduler',
+      type: 'bugfix',
+      importance: 2,
       searchAliases: 'already has aliases', // NOT an aliases candidate
     });
     db.prepare("UPDATE observations SET concepts = 'race', facts = 'scheduler'").run();
     callModelJSONAsync.mockResolvedValue({
-      type: 'bugfix', title: 'Race in scheduler', narrative: 'Race fixed.',
-      concepts: ['race'], facts: ['scheduler'], importance: 2,
-      lesson_learned: 'Hold the lock', search_aliases: ['race fix'],
+      type: 'bugfix',
+      title: 'Race in scheduler',
+      narrative: 'Race fixed.',
+      concepts: ['race'],
+      facts: ['scheduler'],
+      importance: 2,
+      lesson_learned: 'Hold the lock',
+      search_aliases: ['race fix'],
     });
     const result = await optimizeRun(db, { tasks: ['re-enrich'], maxItems: 10, reenrichScope: 'wide' });
     expect(result.reenrich.byScope.aliases.processed).toBe(0);
@@ -255,108 +502,81 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
   });
 });
 
-// Bug #1: rebuildVector was writing to a non-existent column `computed_at`.
-// Every executeReenrich silently caught SqliteError: observation_vectors has no column named computed_at.
-// The catch is intentional (non-critical path), so the bug was invisible at runtime.
-// This test calls rebuildVector directly and asserts the row actually lands.
-describe('rebuildVector (Bug #1)', () => {
+// D#12. R10 P3-3 put a live-row guard on the general re-enrich UPDATE because a
+// BG_LLM_TIMEOUT_MS (45 s) round-trip sits between the SELECT that chose the row and
+// the write, and a concurrent hook can retire or compress it inside that window. The
+// D#6 concepts branch was written with the same guard. TWO SIBLING BRANCHES of the same
+// function were left without it, and their harm is not the same — see each case.
+describe('executeReenrich post-LLM writes are live-guarded (D#12)', () => {
   let db;
-  let prevVec;
-  beforeEach(async () => {
-    // rebuildVector writes observation_vectors — exercise it with the vector arm ON
-    // (choke-point-gated OFF by default since the 2026-06 memory-quality audit).
-    prevVec = process.env.CLAUDE_MEM_VECTORS;
-    process.env.CLAUDE_MEM_VECTORS = '1';
+  beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
-    // Seed several observations so rebuildVocabulary has enough corpus to build a vocab
-    for (let i = 0; i < 5; i++) {
-      insertObs(db, {
-        type: 'bugfix',
-        title: `Fix issue ${i} in module X`,
-        narrative: `Detailed narrative about issue ${i}: a concurrency bug in the handler released the lock before the side-effect finished, causing a race window that let the second caller overwrite state.`,
-        text: `concurrency lock race handler side-effect state issue-${i}`,
-      });
-    }
-    // Force vocab rebuild so rebuildVector has something to embed against
-    const { rebuildVocabulary, _resetVocabCache } = await import('../tfidf.mjs');
-    _resetVocabCache();
-    rebuildVocabulary(db);
-  });
-  afterEach(() => {
-    db.close();
-    if (prevVec === undefined) delete process.env.CLAUDE_MEM_VECTORS;
-    else process.env.CLAUDE_MEM_VECTORS = prevVec;
-  });
-
-  it('writes a row to observation_vectors for the target observation', async () => {
-    const { rebuildVector } = await import('../hook-optimize.mjs');
-    const obsId = db.prepare("SELECT id FROM observations ORDER BY id LIMIT 1").get().id;
-
-    rebuildVector(db, obsId, ['concurrency race lock', 'handler side-effect state overwrite']);
-
-    const row = db.prepare('SELECT COUNT(*) as c FROM observation_vectors WHERE observation_id = ?').get(obsId);
-    expect(row.c).toBe(1);
-  });
-
-  it('writes the correct column set (schema-aligned: created_at_epoch)', async () => {
-    const { rebuildVector } = await import('../hook-optimize.mjs');
-    const obsId = db.prepare("SELECT id FROM observations ORDER BY id LIMIT 1").get().id;
-
-    rebuildVector(db, obsId, ['concurrency race lock', 'handler side-effect state overwrite']);
-
-    // Row should have a non-null created_at_epoch populated by the helper
-    const row = db.prepare('SELECT observation_id, vocab_version, created_at_epoch FROM observation_vectors WHERE observation_id = ?').get(obsId);
-    expect(row).toBeDefined();
-    expect(row.created_at_epoch).toBeGreaterThan(0);
-    expect(row.vocab_version).toBeTruthy();
-  });
-});
-
-// I-1 (v3.39.2): the alias-only backfill APPENDs aliases to the FTS text but,
-// before the fix, never rebuilt the TF-IDF vector — so the newly generated
-// aliases (the whole point of the pass) were invisible to the vector arm. The
-// branch must refresh the vector like the narrow/wide branch does.
-describe('re-enrich --scope aliases rebuilds the vector (I-1)', () => {
-  let db;
-  let prevVec;
-  beforeEach(async () => {
-    prevVec = process.env.CLAUDE_MEM_VECTORS;
-    process.env.CLAUDE_MEM_VECTORS = '1';
-    db = createTestDb();
-    insertSession(db, { id: 'sess-1', project: 'test' });
-    for (let i = 0; i < 5; i++) {
-      insertObs(db, { type: 'bugfix', title: `Fix issue ${i} in module X`,
-        narrative: `Detailed narrative about issue ${i}: a concurrency bug in the handler released the lock before the side-effect finished, causing a race window that let the second caller overwrite state.`,
-        text: `concurrency lock race handler side-effect state issue-${i}` });
-    }
-    const { rebuildVocabulary, _resetVocabCache } = await import('../tfidf.mjs');
-    _resetVocabCache();
-    rebuildVocabulary(db);
     callModelJSONAsync.mockReset();
   });
   afterEach(() => {
     db.close();
-    if (prevVec === undefined) delete process.env.CLAUDE_MEM_VECTORS;
-    else process.env.CLAUDE_MEM_VECTORS = prevVec;
   });
 
-  it('writes an observation_vectors row for the alias-backfilled observation', async () => {
+  // The high-harm one. compressed_into is the child -> keeper POINTER, and
+  // lib/maintain-core.mjs:316 recovers orphans with `WHERE compressed_into > 0`. Writing
+  // COMPRESSED_AUTO (-1) over a positive keeper id does not merely stamp a dead row: it
+  // destroys the link, putting the child out of recoverOrphanedChildren's reach AND out
+  // of recoverChildrenOf's. The sibling write in lib/maintain-core.mjs:631 already carries
+  // the guard, so this is a gap rather than a design choice.
+  it('does not overwrite a keeper pointer won during the round-trip (auto-hide path)', async () => {
     const { executeReenrich } = await import('../hook-optimize.mjs');
-    // Alias-less, substantive row (narrative > 100 chars, real title) → qualifies
-    // for scope=aliases. insertObs writes no vector, so none exists yet.
-    const id = Number(insertObs(db, { type: 'bugfix',
-      title: 'Race in the credit deduction path',
-      narrative: 'IntegrityError under concurrent credit deduction: the balance was read then written without a row lock, so two in-flight requests overwrote each other. Fixed with SELECT FOR UPDATE inside the transaction.',
-      text: 'credit deduction race balance row lock integrityerror' }).lastInsertRowid);
-    expect(db.prepare('SELECT COUNT(*) c FROM observation_vectors WHERE observation_id = ?').get(id).c).toBe(0);
+    insertObs(db, { title: 'A fully degraded row', narrative: 'short body', type: 'change' });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+    // Premise: this really is a narrow candidate before the call.
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    expect(findReenrichCandidates(db, 10, { scope: 'narrow' }).map((r) => r.id)).toEqual([id]);
 
-    callModelJSONAsync.mockResolvedValue({ search_aliases: ['concurrency race', 'double spend', 'lost update'] });
-    const r = await executeReenrich(db, 10, { scope: 'aliases' });
-    expect(r.processed).toBeGreaterThanOrEqual(1);
+    const KEEPER = 999;
+    callModelJSONAsync.mockImplementation(async () => {
+      // A concurrent cluster-merge / smart-compress lands mid-call and adopts this row.
+      db.prepare('UPDATE observations SET compressed_into = ? WHERE id = ?').run(KEEPER, id);
+      return { title: 'still worthless', importance: 0 };
+    });
 
-    // The backfill must refresh the vector (before the fix: UPDATE ran but no rebuild).
-    expect(db.prepare('SELECT COUNT(*) c FROM observation_vectors WHERE observation_id = ?').get(id).c).toBe(1);
+    const result = await executeReenrich(db, 10, { scope: 'narrow' });
+    const row = db.prepare('SELECT compressed_into, optimized_at FROM observations WHERE id = ?').get(id);
+    // The assertion that matters is the POINTER, not the skip: a test that only checked
+    // `processed === 0` would still pass if the row were stamped some other way.
+    expect(row.compressed_into).toBe(KEEPER);
+    expect(row.optimized_at).toBeNull();
+    expect(result.processed).toBe(0);
+  });
+
+  // The lower-harm one. A superseded row is hidden from every read path, so the FTS write
+  // is inert for retrieval — but it still counts as `processed` and rebuilds a vector for
+  // a dead row, and it is the one branch of executeReenrich that lacked what its three
+  // siblings carry.
+  it('does not write aliases to a row superseded during the round-trip', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      title: 'Fixed deadlock in the connection pool',
+      narrative:
+        'The worker pool deadlocked when every connection was checked out and a callback tried to acquire another one, so the pool never drained.',
+      text: 'deadlock connection pool worker timeout',
+      type: 'bugfix',
+      lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
+      searchAliases: null,
+    });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+    callModelJSONAsync.mockImplementation(async () => {
+      db.prepare('UPDATE observations SET superseded_at = ? WHERE id = ?').run(Date.now(), id);
+      return { search_aliases: ['connection deadlock', 'pool hang'] };
+    });
+
+    const result = await executeReenrich(db, 10, { scope: 'aliases' });
+    // Premise: the row was selected and the model WAS called, so an unwritten row is the
+    // guard firing rather than an empty pool.
+    expect(callModelJSONAsync).toHaveBeenCalledTimes(1);
+    expect(result.processed).toBe(0);
+    const row = db.prepare('SELECT search_aliases, text FROM observations WHERE id = ?').get(id);
+    expect(row.search_aliases).toBeNull();
+    expect(row.text).toBe('deadlock connection pool worker timeout');
   });
 });
 
@@ -370,7 +590,9 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertSession(db, { id: 'sess-1', project: 'test' });
     callModelJSONAsync.mockReset();
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+  });
 
   it('wide scope finds bugfix with narrative but no lesson (narrow scope misses it)', async () => {
     const { findReenrichCandidates } = await import('../hook-optimize.mjs');
@@ -379,10 +601,13 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'bugfix',
       title: 'Fix race condition in credit deduction',
-      narrative: 'IntegrityError appeared when two concurrent requests deducted credit from the same account. Root cause: balance read-then-write without SELECT FOR UPDATE. Added row-level lock via SELECT FOR UPDATE in the transaction.',
+      narrative:
+        'IntegrityError appeared when two concurrent requests deducted credit from the same account. Root cause: balance read-then-write without SELECT FOR UPDATE. Added row-level lock via SELECT FOR UPDATE in the transaction.',
     });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
-    db.prepare("UPDATE observations SET concepts = 'credit race', facts = 'credit balance' WHERE id = ?").run(id);
+    db.prepare("UPDATE observations SET concepts = 'credit race', facts = 'credit balance' WHERE id = ?").run(
+      id,
+    );
 
     // Narrow scope (default) should miss it — concepts is populated
     const narrow = findReenrichCandidates(db, 10);
@@ -399,7 +624,8 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'bugfix',
       title: 'Modified schema.mjs',
-      narrative: 'long narrative that would otherwise be substantive but the title marks it as a fallback/degraded observation from hook-llm without LLM enrichment — not a real lesson candidate because the episode captured raw tool output',
+      narrative:
+        'long narrative that would otherwise be substantive but the title marks it as a fallback/degraded observation from hook-llm without LLM enrichment — not a real lesson candidate because the episode captured raw tool output',
     });
     const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
     expect(wide.length).toBe(0);
@@ -414,7 +640,8 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'bugfix',
       title: 'gh release list --repo sdsrss/claude-mem-lite --l… (error)',
-      narrative: 'Tool invocation output captured as the degraded title; narrative is the raw gh CLI output with no actual fix or root cause — lesson extraction is impossible from this.',
+      narrative:
+        'Tool invocation output captured as the degraded title; narrative is the raw gh CLI output with no actual fix or root cause — lesson extraction is impossible from this.',
     });
     const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
     expect(wide.length).toBe(0);
@@ -437,7 +664,8 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'bugfix',
       title: 'Fix memory leak in parser',
-      narrative: 'Long enough narrative describing the problem and the fix in detail with technical specifics',
+      narrative:
+        'Long enough narrative describing the problem and the fix in detail with technical specifics',
       lessonLearned: 'already has a lesson that is long enough',
     });
     const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
@@ -451,7 +679,8 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'change',
       title: 'Bumped version to 2.30.0',
-      narrative: 'Updated package.json, Cargo.toml, and the version constant in cli.mjs. Ran the sync-versions script to propagate the change across all build manifests and verified consistency.',
+      narrative:
+        'Updated package.json, Cargo.toml, and the version constant in cli.mjs. Ran the sync-versions script to propagate the change across all build manifests and verified consistency.',
     });
     const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
     expect(wide.length).toBe(0);
@@ -462,7 +691,8 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'bugfix',
       title: 'Fix CJK tokenization in FTS5',
-      narrative: 'FTS5 porter stemmer does not tokenize CJK — needed to add bigram generation in utils.mjs. Applied a workaround that splits on unicode category and emits overlapping bigrams.',
+      narrative:
+        'FTS5 porter stemmer does not tokenize CJK — needed to add bigram generation in utils.mjs. Applied a workaround that splits on unicode category and emits overlapping bigrams.',
     });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
 
@@ -518,7 +748,8 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'bugfix',
       title: 'Fix timezone bug in report generator',
-      narrative: 'Report dates were off by one day in some reports because date.today() returned UTC dates but downstream code expected Beijing dates. Needed a consistent timezone-aware helper.',
+      narrative:
+        'Report dates were off by one day in some reports because date.today() returned UTC dates but downstream code expected Beijing dates. Needed a consistent timezone-aware helper.',
     });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
     db.prepare("UPDATE observations SET concepts = 'timezone', facts = 'date helper' WHERE id = ?").run(id);
@@ -526,11 +757,13 @@ describe('re-enrich --scope wide (R-7)', () => {
     callModelJSONAsync.mockResolvedValue({
       type: 'bugfix',
       title: 'Use timezone-aware helpers for all date operations',
-      narrative: 'Report dates were off by one day because date.today() returned UTC but downstream code expected Beijing.',
+      narrative:
+        'Report dates were off by one day because date.today() returned UTC but downstream code expected Beijing.',
       concepts: ['timezone', 'beijing', 'date'],
       facts: ['date.today() returns UTC', 'reports need Beijing dates'],
       importance: 2,
-      lesson_learned: 'In timezone-sensitive apps, never call date.today() directly — always use a timezone-aware helper',
+      lesson_learned:
+        'In timezone-sensitive apps, never call date.today() directly — always use a timezone-aware helper',
       search_aliases: ['timezone bug', 'utc beijing mismatch'],
     });
 
@@ -547,10 +780,13 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'bugfix',
       title: 'Fix deadlock in balance deduction',
-      narrative: 'A race condition let two concurrent deductions read the same balance and double-spend; needed SELECT ... FOR UPDATE row locking to serialize them so the second reader waits.',
+      narrative:
+        'A race condition let two concurrent deductions read the same balance and double-spend; needed SELECT ... FOR UPDATE row locking to serialize them so the second reader waits.',
     });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
-    db.prepare("UPDATE observations SET concepts = 'race-condition locking', facts = 'SELECT FOR UPDATE needed', search_aliases = 'deadlock; concurrent deduct' WHERE id = ?").run(id);
+    db.prepare(
+      "UPDATE observations SET concepts = 'race-condition locking', facts = 'SELECT FOR UPDATE needed', search_aliases = 'deadlock; concurrent deduct' WHERE id = ?",
+    ).run(id);
 
     // The LLM returns a good lesson/title but OMITS the metadata (empty arrays / missing key) —
     // the common partial shape. Without preserve-on-empty this wipes the row's retrieval metadata
@@ -569,8 +805,12 @@ describe('re-enrich --scope wide (R-7)', () => {
     const result = await executeReenrich(db, 10, { scope: 'wide' });
     expect(result.processed).toBe(1);
 
-    const obs = db.prepare('SELECT concepts, facts, search_aliases, lesson_learned FROM observations WHERE id = ?').get(id);
-    expect(obs.concepts, 'existing concepts must survive an empty LLM response').toBe('race-condition locking');
+    const obs = db
+      .prepare('SELECT concepts, facts, search_aliases, lesson_learned FROM observations WHERE id = ?')
+      .get(id);
+    expect(obs.concepts, 'existing concepts must survive an empty LLM response').toBe(
+      'race-condition locking',
+    );
     expect(obs.facts).toBe('SELECT FOR UPDATE needed');
     expect(obs.search_aliases).toBe('deadlock; concurrent deduct');
     expect(obs.lesson_learned).toContain('FOR UPDATE');
@@ -581,7 +821,8 @@ describe('re-enrich --scope wide (R-7)', () => {
     insertObs(db, {
       type: 'decision',
       title: 'Chose RRF over union-by-max for hybrid fusion',
-      narrative: 'Union-by-max let one strong lexical hit dominate the fused ranking; RRF blends rank positions so the vector and lexical signals contribute evenly. Kept RRF k=60 after measuring recall on the eval set.',
+      narrative:
+        'Union-by-max let one strong lexical hit dominate the fused ranking; RRF blends rank positions so the vector and lexical signals contribute evenly. Kept RRF k=60 after measuring recall on the eval set.',
     });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
 
@@ -589,8 +830,9 @@ describe('re-enrich --scope wide (R-7)', () => {
       type: 'decision',
       title: 'RRF chosen for hybrid fusion',
       narrative: 'RRF blends rank positions evenly across signals.',
-      concepts: ['rrf', 'fusion'], facts: ['k=60'],
-      importance: 0,   // a single Haiku misjudgment on a substantive row
+      concepts: ['rrf', 'fusion'],
+      facts: ['k=60'],
+      importance: 0, // a single Haiku misjudgment on a substantive row
       lesson_learned: 'none',
     });
 
@@ -599,19 +841,24 @@ describe('re-enrich --scope wide (R-7)', () => {
 
     const obs = db.prepare('SELECT compressed_into, importance FROM observations WHERE id = ?').get(id);
     expect(obs.compressed_into ?? 0, 'wide importance:0 must not hide a substantive row at -1').toBe(0);
-    expect(obs.importance).toBe(1);   // clampImportance floored 0 -> 1, row stays visible
+    expect(obs.importance).toBe(1); // clampImportance floored 0 -> 1, row stays visible
   });
 
   it('narrow re-enrich still hides importance:0 rows at COMPRESSED_AUTO (unchanged behavior)', async () => {
     const { executeReenrich } = await import('../hook-optimize.mjs');
     insertObs(db, { title: 'trivial log tweak', narrative: 'changed a log string' });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
-    callModelJSONAsync.mockResolvedValue({ type: 'change', title: 'log tweak', narrative: 'x', importance: 0 });
+    callModelJSONAsync.mockResolvedValue({
+      type: 'change',
+      title: 'log tweak',
+      narrative: 'x',
+      importance: 0,
+    });
 
-    const result = await executeReenrich(db, 10);   // narrow scope (default)
+    const result = await executeReenrich(db, 10); // narrow scope (default)
     expect(result.processed).toBe(1);
     const obs = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
-    expect(obs.compressed_into).toBe(-1);   // COMPRESSED_AUTO — narrow auto-hide preserved
+    expect(obs.compressed_into).toBe(-1); // COMPRESSED_AUTO — narrow auto-hide preserved
   });
 });
 
@@ -622,7 +869,9 @@ describe('normalize', () => {
     insertSession(db, { id: 'sess-1', project: 'test' });
     callModelJSONAsync.mockReset();
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+  });
 
   it('extracts unique concepts from active observations', async () => {
     const { extractUniqueConcepts } = await import('../hook-optimize.mjs');
@@ -642,9 +891,7 @@ describe('normalize', () => {
     insertObs(db, { title: 'obs1', text: 'full-text search' });
     db.prepare("UPDATE observations SET concepts = 'full-text search' WHERE id = 1").run();
 
-    const groups = [
-      { canonical: 'FTS5', aliases: ['full-text', 'FTS', '全文搜索'] }
-    ];
+    const groups = [{ canonical: 'FTS5', aliases: ['full-text', 'FTS', '全文搜索'] }];
     const result = applyNormalization(db, groups);
     expect(result.updated).toBeGreaterThan(0);
 
@@ -667,16 +914,16 @@ describe('normalize', () => {
     const now = 1_800_000_000_000;
     const WEEK = 7 * 86400000;
     // fail-open (run)
-    expect(_normalizeGateOpen({}, now)).toBe(true);                 // missing epoch
-    expect(_normalizeGateOpen({ epoch: 'x' }, now)).toBe(true);     // non-numeric
-    expect(_normalizeGateOpen({ epoch: null }, now)).toBe(true);    // null
-    expect(_normalizeGateOpen({ epoch: NaN }, now)).toBe(true);     // NaN
+    expect(_normalizeGateOpen({}, now)).toBe(true); // missing epoch
+    expect(_normalizeGateOpen({ epoch: 'x' }, now)).toBe(true); // non-numeric
+    expect(_normalizeGateOpen({ epoch: null }, now)).toBe(true); // null
+    expect(_normalizeGateOpen({ epoch: NaN }, now)).toBe(true); // NaN
     expect(_normalizeGateOpen({ epoch: now + WEEK }, now)).toBe(true); // future
-    expect(_normalizeGateOpen(null, now)).toBe(true);              // no object
+    expect(_normalizeGateOpen(null, now)).toBe(true); // no object
     // honor the interval for a valid epoch
-    expect(_normalizeGateOpen({ epoch: now }, now)).toBe(false);          // just ran
+    expect(_normalizeGateOpen({ epoch: now }, now)).toBe(false); // just ran
     expect(_normalizeGateOpen({ epoch: now - 86400000 }, now)).toBe(false); // 1d ago
-    expect(_normalizeGateOpen({ epoch: now - WEEK - 1 }, now)).toBe(true);  // >7d ago
+    expect(_normalizeGateOpen({ epoch: now - WEEK - 1 }, now)).toBe(true); // >7d ago
   });
 });
 
@@ -687,12 +934,20 @@ describe('cluster-merge', () => {
     insertSession(db, { id: 'sess-1', project: 'test' });
     callModelJSONAsync.mockReset();
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+  });
 
   it('finds merge candidates with moderate similarity', async () => {
     const { findMergeCandidates } = await import('../hook-optimize.mjs');
-    insertObs(db, { title: 'Fix FTS5 query sanitization bug in utils.mjs', narrative: 'Fixed special char handling' });
-    insertObs(db, { title: 'Fix FTS5 query sanitization edge case in utils.mjs', narrative: 'Fixed parentheses handling' });
+    insertObs(db, {
+      title: 'Fix FTS5 query sanitization bug in utils.mjs',
+      narrative: 'Fixed special char handling',
+    });
+    insertObs(db, {
+      title: 'Fix FTS5 query sanitization edge case in utils.mjs',
+      narrative: 'Fixed parentheses handling',
+    });
     const candidates = findMergeCandidates(db, 10);
     expect(candidates.length).toBeGreaterThanOrEqual(0);
   });
@@ -726,16 +981,24 @@ describe('cluster-merge', () => {
 
   it('snapshots the keeper original text before in-place overwrite (HIGH-3: data loss)', async () => {
     const { executeMergeCluster } = await import('../hook-optimize.mjs');
-    insertObs(db, { title: 'Keeper original title', narrative: 'irreplaceable repro steps', importance: 3, accessCount: 5 });
+    insertObs(db, {
+      title: 'Keeper original title',
+      narrative: 'irreplaceable repro steps',
+      importance: 3,
+      accessCount: 5,
+    });
     insertObs(db, { title: 'Other member', narrative: 'minor', importance: 1, accessCount: 1 });
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
-    const keeperId = obs.find(o => o.importance === 3).id;
+    const keeperId = obs.find((o) => o.importance === 3).id;
 
     callModelJSONAsync.mockResolvedValue({
       should_merge: true,
       merged_title: 'Merged summary title',
       merged_narrative: 'lossy summary that drops the repro steps',
-      merged_concepts: ['x'], merged_facts: ['y'], merged_lesson: null, importance: 2,
+      merged_concepts: ['x'],
+      merged_facts: ['y'],
+      merged_lesson: null,
+      importance: 2,
     });
 
     const result = await executeMergeCluster(db, obs);
@@ -746,9 +1009,9 @@ describe('cluster-merge', () => {
     expect(keeper.title).toBe('Merged summary title');
 
     // the keeper's ORIGINAL text survives as a recoverable compressed_into child
-    const snap = db.prepare(
-      "SELECT * FROM observations WHERE compressed_into = ? AND title = 'Keeper original title'"
-    ).get(keeperId);
+    const snap = db
+      .prepare("SELECT * FROM observations WHERE compressed_into = ? AND title = 'Keeper original title'")
+      .get(keeperId);
     expect(snap, 'keeper original must be snapshotted, not lost').toBeTruthy();
     expect(snap.narrative).toBe('irreplaceable repro steps');
   });
@@ -758,9 +1021,14 @@ describe('cluster-merge', () => {
     insertObs(db, { title: 'Fix FTS5 keeper', narrative: 'keeper narrative', importance: 2, accessCount: 5 });
     insertObs(db, { title: 'Fix FTS5 other', narrative: 'other narrative', importance: 1, accessCount: 1 });
     const rows = db.prepare('SELECT id FROM observations ORDER BY id').all();
-    const keeperId = rows[0].id, otherId = rows[1].id;
-    db.prepare("UPDATE observations SET lesson_learned = 'FTS5 special chars MUST be escaped' WHERE id = ?").run(keeperId);
-    db.prepare("UPDATE observations SET lesson_learned = 'parentheses need balancing too' WHERE id = ?").run(otherId);
+    const keeperId = rows[0].id,
+      otherId = rows[1].id;
+    db.prepare(
+      "UPDATE observations SET lesson_learned = 'FTS5 special chars MUST be escaped' WHERE id = ?",
+    ).run(keeperId);
+    db.prepare("UPDATE observations SET lesson_learned = 'parentheses need balancing too' WHERE id = ?").run(
+      otherId,
+    );
 
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
     // LLM approves the merge but declines to synthesize a lesson — the prompt explicitly permits null.
@@ -768,7 +1036,8 @@ describe('cluster-merge', () => {
       should_merge: true,
       merged_title: 'Merged FTS5 sanitization',
       merged_narrative: 'consolidated',
-      merged_concepts: ['x'], merged_facts: ['y'],
+      merged_concepts: ['x'],
+      merged_facts: ['y'],
       merged_lesson: null,
       importance: 2,
     });
@@ -783,9 +1052,11 @@ describe('cluster-merge', () => {
     expect(keeper.lesson_learned).toContain('parentheses need balancing');
 
     // Invariant: at least one lesson stays on a LIVE (compressed_into=0) surface after the merge.
-    const liveLessons = db.prepare(
-      "SELECT COUNT(*) c FROM observations WHERE COALESCE(compressed_into,0)=0 AND lesson_learned IS NOT NULL AND lesson_learned != ''"
-    ).get().c;
+    const liveLessons = db
+      .prepare(
+        "SELECT COUNT(*) c FROM observations WHERE COALESCE(compressed_into,0)=0 AND lesson_learned IS NOT NULL AND lesson_learned != ''",
+      )
+      .get().c;
     expect(liveLessons).toBeGreaterThan(0);
   });
 
@@ -801,13 +1072,18 @@ describe('cluster-merge', () => {
     insertObs(db, { title: 'Fix FTS5 query sanitization crash in utils.mjs', narrative: 'n3' });
     const rows = db.prepare('SELECT id FROM observations ORDER BY id').all();
     const supId = rows[2].id;
-    db.prepare("UPDATE observations SET lesson_learned = 'live lesson' WHERE id IN (?, ?)").run(rows[0].id, rows[1].id);
-    db.prepare("UPDATE observations SET lesson_learned = 'STALE retired lesson', superseded_at = ?, superseded_by = 'auto-dedup' WHERE id = ?").run(Date.now(), supId);
+    db.prepare("UPDATE observations SET lesson_learned = 'live lesson' WHERE id IN (?, ?)").run(
+      rows[0].id,
+      rows[1].id,
+    );
+    db.prepare(
+      "UPDATE observations SET lesson_learned = 'STALE retired lesson', superseded_at = ?, superseded_by = 'auto-dedup' WHERE id = ?",
+    ).run(Date.now(), supId);
 
     const members = findMergeCandidates(db, 5, {}).flat();
-    const memberIds = members.map(o => o.id);
+    const memberIds = members.map((o) => o.id);
     expect(memberIds, 'a superseded (tombstoned) row must not be a merge candidate').not.toContain(supId);
-    expect(members.some(o => o.lesson_learned === 'STALE retired lesson')).toBe(false);
+    expect(members.some((o) => o.lesson_learned === 'STALE retired lesson')).toBe(false);
   });
 
   it('skips merge when LLM says should_merge=false', async () => {
@@ -827,17 +1103,29 @@ describe('cluster-merge', () => {
     // #1: critical (importance=3) but never accessed.  #2: trivial (importance=1) but
     // accessed often. Pre-fix the keeper was chosen by access_count alone, so the critical
     // observation was compressed away and the merged importance fell to the LLM default (2).
-    insertObs(db, { title: 'Critical FTS bug A', narrative: 'data-loss root cause', importance: 3, accessCount: 0 });
-    insertObs(db, { title: 'Critical FTS bug B', narrative: 'trivial follow-up', importance: 1, accessCount: 9 });
+    insertObs(db, {
+      title: 'Critical FTS bug A',
+      narrative: 'data-loss root cause',
+      importance: 3,
+      accessCount: 0,
+    });
+    insertObs(db, {
+      title: 'Critical FTS bug B',
+      narrative: 'trivial follow-up',
+      importance: 1,
+      accessCount: 9,
+    });
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
-    const criticalId = obs.find(o => o.importance === 3).id;
+    const criticalId = obs.find((o) => o.importance === 3).id;
 
     callModelJSONAsync.mockResolvedValue({
       should_merge: true,
       merged_title: 'Critical FTS bug (merged)',
       merged_narrative: 'merged narrative',
-      merged_concepts: ['fts'], merged_facts: ['fact'],
-      merged_lesson: 'lesson', importance: 2, // LLM proposes 2 — must be floored up to 3
+      merged_concepts: ['fts'],
+      merged_facts: ['fact'],
+      merged_lesson: 'lesson',
+      importance: 2, // LLM proposes 2 — must be floored up to 3
     });
 
     const result = await executeMergeCluster(db, obs);
@@ -855,7 +1143,9 @@ describe('smart-compress', () => {
     insertSession(db, { id: 'sess-1', project: 'test' });
     callModelJSONAsync.mockReset();
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+  });
 
   it('finds compress candidates (old, low-importance, no access)', async () => {
     const { findSmartCompressCandidates } = await import('../hook-optimize.mjs');
@@ -879,14 +1169,26 @@ describe('smart-compress', () => {
     const { executeSmartCompressCluster } = await import('../hook-optimize.mjs');
     const oldEpoch = -(31 * 86400000);
     insertObs(db, { title: 'Modified utils.mjs', narrative: 'Changed sanitize fn', epochOffset: oldEpoch });
-    insertObs(db, { title: 'Updated utils.mjs tests', narrative: 'Added test cases', epochOffset: oldEpoch - 1000 });
-    insertObs(db, { title: 'Fixed utils.mjs lint', narrative: 'Resolved lint warnings', epochOffset: oldEpoch - 2000 });
+    insertObs(db, {
+      title: 'Updated utils.mjs tests',
+      narrative: 'Added test cases',
+      epochOffset: oldEpoch - 1000,
+    });
+    insertObs(db, {
+      title: 'Fixed utils.mjs lint',
+      narrative: 'Resolved lint warnings',
+      epochOffset: oldEpoch - 2000,
+    });
 
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
 
     callModelJSONAsync.mockResolvedValue({
+      // D#10: the verdict is now required. This mock predates it, and leaving it out
+      // would make the case assert the OLD contract (no way for the model to refuse).
+      should_compress: true,
       title: 'Utils.mjs maintenance: sanitize improvements and cleanup',
-      narrative: 'Series of changes to utils.mjs including sanitize function updates, test additions, and lint fixes.',
+      narrative:
+        'Series of changes to utils.mjs including sanitize function updates, test additions, and lint fixes.',
       concepts: ['utils', 'sanitize', 'lint'],
       facts: ['sanitize function in utils.mjs was updated', 'lint warnings resolved'],
       lesson_learned: 'none',
@@ -906,24 +1208,125 @@ describe('smart-compress', () => {
     expect(summary.importance).toBe(2);
     expect(summary.title).toContain('Utils.mjs');
   });
+
+  // D#10. This path HIDES its inputs — the originals get compressed_into set, which
+  // removes them from every injection and search surface and puts them out of
+  // recoverBuriedLessons' reach. It ran with no way for the model to refuse: the prompt
+  // ASSERTED the premise ("Summarize these related …") and the only bail was a missing
+  // title. Its sibling executeMergeCluster has had `should_merge` all along, so the two
+  // LLM cluster paths disagreed about whether the model may say no.
+  //
+  // That mattered because there is no relatedness check upstream. Measured 2026-09-07,
+  // BEFORE the vector arm was removed, with a control arm that can no longer be run:
+  // three observations with nothing in common but project and era (a CSS variable bump, a
+  // Kafka consumer-group rename, a Terraform provider pin) over 12 days formed 0 clusters
+  // with the TF-IDF cosine branch live, and ONE cluster of all three on the DEFAULT config
+  // where that branch was unreachable and a 14-day window alone did the grouping.
+  //
+  // Phase-2 deleted the cosine branch, so the second reading is now the ONLY behaviour and
+  // this veto is the only guard left in front of it. The rationale below got stronger, not
+  // weaker; the subject of these cases is the veto, which is untouched.
+  const cluster3 = (db) => {
+    const oldEpoch = -(31 * 86400000);
+    insertObs(db, {
+      title: 'Bumped the sidebar hover colour',
+      narrative: 'CSS var change',
+      epochOffset: oldEpoch,
+    });
+    insertObs(db, {
+      title: 'Renamed the Kafka consumer group',
+      narrative: 'Billing topic',
+      epochOffset: oldEpoch - 1000,
+    });
+    insertObs(db, {
+      title: 'Pinned the Terraform AWS provider',
+      narrative: 'Spurious diffs',
+      epochOffset: oldEpoch - 2000,
+    });
+    return db.prepare('SELECT * FROM observations ORDER BY id').all();
+  };
+
+  it('refuses when the model says the cluster is not one story', async () => {
+    const { executeSmartCompressCluster } = await import('../hook-optimize.mjs');
+    const obs = cluster3(db);
+    callModelJSONAsync.mockResolvedValue({
+      should_compress: false,
+      title: 'Assorted unrelated maintenance',
+      narrative: 'These three changes have nothing to do with each other.',
+    });
+    const result = await executeSmartCompressCluster(db, obs, 'test');
+    expect(result.compressed).toBe(false);
+    // The assertion that matters is that the INPUTS survive visible, not just the return
+    // value: compressed_into is what removes them from every surface.
+    // Asserted with the system's OWN liveness predicate, not a literal: a fresh row's
+    // compressed_into is NULL, not 0, and COALESCE(...,0)=0 is what every read path uses.
+    const hidden = db
+      .prepare(
+        `SELECT COUNT(*) c FROM observations WHERE id IN (${obs.map(() => '?').join(',')}) AND COALESCE(compressed_into,0) <> 0`,
+      )
+      .get(...obs.map((o) => o.id)).c;
+    expect(hidden).toBe(0);
+  });
+
+  it('refuses when the model omits the verdict (fail closed, like should_merge)', async () => {
+    const { executeSmartCompressCluster } = await import('../hook-optimize.mjs');
+    const obs = cluster3(db);
+    // A response that is otherwise perfectly usable. Fail-closed is the deliberate
+    // direction: the bad outcome of refusing is "no compression happened", the bad
+    // outcome of proceeding is "unrelated observations were hidden".
+    callModelJSONAsync.mockResolvedValue({
+      title: 'Assorted maintenance',
+      narrative: 'Three changes.',
+      concepts: ['maintenance'],
+    });
+    const result = await executeSmartCompressCluster(db, obs, 'test');
+    expect(result.compressed).toBe(false);
+    // Asserted with the system's OWN liveness predicate, not a literal: a fresh row's
+    // compressed_into is NULL, not 0, and COALESCE(...,0)=0 is what every read path uses.
+    const hidden = db
+      .prepare(
+        `SELECT COUNT(*) c FROM observations WHERE id IN (${obs.map(() => '?').join(',')}) AND COALESCE(compressed_into,0) <> 0`,
+      )
+      .get(...obs.map((o) => o.id)).c;
+    expect(hidden).toBe(0);
+  });
+
+  it('asks for the verdict in the prompt it actually sends', async () => {
+    const { executeSmartCompressCluster } = await import('../hook-optimize.mjs');
+    const obs = cluster3(db);
+    callModelJSONAsync.mockResolvedValue({ should_compress: true, title: 'T', narrative: 'N' });
+    await executeSmartCompressCluster(db, obs, 'test');
+    // A veto nothing asks for is a veto that always fires — with fail-closed semantics
+    // that would silently stop ALL compression. Assert on the prompt the mock received,
+    // not on the source text.
+    const [prompt] = callModelJSONAsync.mock.calls[0];
+    // QUOTED, so it matches the JSON TEMPLATE and not the prose line that explains the
+    // field. The bare-string form was walked straight past by the real revert shape
+    // (delete the key from the template, keep the explanation) — mutation M16.
+    expect(prompt).toContain('"should_compress"');
+    expect(prompt).not.toContain('Summarize these related');
+  });
 });
 
 describe('hook integration', () => {
   it('BG_EVENTS includes llm-optimize', async () => {
     const { readFileSync } = await import('fs');
-    const hookSrc = readFileSync(new URL('../hook.mjs', import.meta.url), 'utf8');
+    // D#207: join(), not new URL('../X.mjs', …) — that form blinds knip to hook.mjs.
+    const hookSrc = readFileSync(HOOK_PATH, 'utf8');
     expect(hookSrc).toContain("'llm-optimize'");
   });
 
   it('hook.mjs imports handleLLMOptimize', async () => {
     const { readFileSync } = await import('fs');
-    const hookSrc = readFileSync(new URL('../hook.mjs', import.meta.url), 'utf8');
+    // D#207: join(), not new URL('../X.mjs', …) — that form blinds knip to hook.mjs.
+    const hookSrc = readFileSync(HOOK_PATH, 'utf8');
     expect(hookSrc).toContain('handleLLMOptimize');
   });
 
   it('hook.mjs spawns llm-optimize after auto-compress', async () => {
     const { readFileSync } = await import('fs');
-    const hookSrc = readFileSync(new URL('../hook.mjs', import.meta.url), 'utf8');
+    // D#207: join(), not new URL('../X.mjs', …) — that form blinds knip to hook.mjs.
+    const hookSrc = readFileSync(HOOK_PATH, 'utf8');
     const autoCompressIdx = hookSrc.indexOf("spawnBackground('auto-compress')");
     const llmOptimizeIdx = hookSrc.indexOf("spawnBackground('llm-optimize')");
     expect(autoCompressIdx).toBeGreaterThan(-1);
@@ -938,7 +1341,9 @@ describe('pipeline', () => {
     insertSession(db, { id: 'sess-1', project: 'test' });
     callModelJSONAsync.mockReset();
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+  });
 
   it('preview returns candidate counts without executing', async () => {
     const { optimizePreview } = await import('../hook-optimize.mjs');
@@ -958,7 +1363,9 @@ describe('pipeline', () => {
     expect(budget.normalize).toBe(1);
     expect(budget.clusterMerge).toBe(4);
     expect(budget.smartCompress).toBe(4);
-    expect(budget.reenrich + budget.normalize + budget.clusterMerge + budget.smartCompress).toBeLessThanOrEqual(15);
+    expect(
+      budget.reenrich + budget.normalize + budget.clusterMerge + budget.smartCompress,
+    ).toBeLessThanOrEqual(15);
   });
 
   it('distributeBudget clamps for small totals', async () => {
@@ -967,5 +1374,230 @@ describe('pipeline', () => {
     const sum = budget.reenrich + budget.normalize + budget.clusterMerge + budget.smartCompress;
     expect(sum).toBeLessThanOrEqual(4);
     expect(budget.normalize).toBe(1);
+  });
+});
+
+// ─── Ties in the pools' ORDER BY (D#9) ──────────────────────────────────────
+//
+// Every pool here is `ORDER BY created_at_epoch DESC LIMIT n`, and every one of them feeds
+// JS-side work — so a tie at the LIMIT boundary makes pool MEMBERSHIP arbitrary, not just
+// display order. Two same-episode observations are exactly that tie: same project, same
+// importance, access_count 0, and a created_at_epoch that lands in the same millisecond
+// about 90% of the time (measured 2026-09-07: 272/300 same-ms, 28/300 straddled, with the
+// fixture's own `Date.now()`-per-insert epoch source).
+//
+// The mechanism was DISTINGUISHED before anything was changed, because two candidates fit
+// the observation and they need different fixes. SQLite's tie order here is DETERMINISTIC
+// (8 rows on one epoch, 200 queries over 20 fresh DBs, exactly one returned order), so it
+// is not the plan varying — it is the ties themselves differing per run. What makes that
+// harmful is the direction: on a tie SQLite returns ASCENDING rowid, i.e. the OLDEST row
+// first, while an untied pool returns the NEWEST first. So "which duplicate survives a
+// merge" flips depending on whether two writes straddled a millisecond.
+describe('pool ordering is total under exact ties (D#9)', () => {
+  // Recent on purpose: findMergeCandidates only considers rows inside a 30-day window, so a
+  // fixed literal epoch would put every fixture row outside the pool and the tests would go
+  // red on their PREMISE rather than on the tie. One value, shared by every row, is what
+  // forces the exact tie.
+  const FIXED_EPOCH = Date.now() - 60_000;
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    callModelJSONAsync.mockReset();
+  });
+  afterEach(() => {
+    db.close();
+  });
+
+  const tieAllEpochs = () => db.prepare('UPDATE observations SET created_at_epoch = ?').run(FIXED_EPOCH);
+
+  it('takes the NEWEST rows when a tie sits on the LIMIT boundary', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    // Five eligible rows, all on one epoch, asking for three. `ORDER BY created_at_epoch
+    // DESC` says "newest first", so the three highest ids must come back. Without a
+    // tiebreaker SQLite returns ascending rowid and the pool silently takes the three
+    // OLDEST — the two newest rows are then unreachable for as long as the tie holds.
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { title: `tied row ${i}`, narrative: 'x'.repeat(150) });
+    }
+    tieAllEpochs();
+    const all = db
+      .prepare('SELECT id FROM observations ORDER BY id')
+      .all()
+      .map((r) => r.id);
+    const got = findReenrichCandidates(db, 3, { scope: 'narrow' })
+      .map((r) => r.id)
+      .sort((a, b) => a - b);
+    expect(got).toEqual(all.slice(-3));
+  });
+
+  it('gives findMergeCandidates a deterministic newest-first head', async () => {
+    const { findMergeCandidates } = await import('../hook-optimize.mjs');
+    // Two rows whose titles are similar enough to cluster, tied on epoch. The head is the
+    // row the keeper reduce falls back to on a full tie, so its identity is not cosmetic.
+    insertObs(db, { title: 'Fix FTS5 query sanitization bug in utils.mjs', narrative: 'a' });
+    insertObs(db, { title: 'Fix FTS5 query sanitization edge case in utils.mjs', narrative: 'b' });
+    tieAllEpochs();
+    const clusters = findMergeCandidates(db, 5);
+    expect(clusters.length).toBeGreaterThan(0);
+    const ids = db
+      .prepare('SELECT id FROM observations ORDER BY id')
+      .all()
+      .map((r) => r.id);
+    expect(clusters[0][0].id).toBe(Math.max(...ids));
+  });
+
+  it('keeps the NEWEST member when importance and access_count are also tied', async () => {
+    const { findMergeCandidates, executeMergeCluster } = await import('../hook-optimize.mjs');
+    // The shape D#9 names: two same-episode duplicates. Equal importance, access_count 0,
+    // same millisecond. The keeper reduce breaks that full tie by falling back to the SQL
+    // head, so before the tiebreaker the OLDER row wins here and the NEWER one is hidden —
+    // and which of the two it is depends on a millisecond boundary, not on the data.
+    insertObs(db, {
+      title: 'Fix FTS5 query sanitization bug in utils.mjs',
+      narrative: 'first write of the episode',
+      importance: 2,
+      accessCount: 0,
+    });
+    insertObs(db, {
+      title: 'Fix FTS5 query sanitization edge case in utils.mjs',
+      narrative: 'second write of the same episode',
+      importance: 2,
+      accessCount: 0,
+    });
+    tieAllEpochs();
+    const ids = db
+      .prepare('SELECT id FROM observations ORDER BY id')
+      .all()
+      .map((r) => r.id);
+    const newest = Math.max(...ids);
+
+    callModelJSONAsync.mockResolvedValue({
+      should_merge: true,
+      merged_title: 'Merged',
+      merged_narrative: 'n',
+      merged_concepts: ['c'],
+      merged_facts: ['f'],
+      merged_lesson: null,
+      importance: 2,
+    });
+    const cluster = findMergeCandidates(db, 5)[0];
+    const result = await executeMergeCluster(db, cluster);
+    expect(result.merged).toBe(true);
+
+    const survivors = db
+      .prepare('SELECT id FROM observations WHERE COALESCE(compressed_into,0)=0')
+      .all()
+      .map((r) => r.id);
+    expect(survivors).toEqual([newest]);
+  });
+
+  it('breaks a full keeper tie by id even when the caller hands it any order', async () => {
+    // The reduce must be TOTAL on its own, not merely inherit an order from SQL. Handed the
+    // same two rows oldest-first, it must still keep the newest — otherwise the guard above
+    // only holds for callers that happen to go through findMergeCandidates.
+    const { executeMergeCluster } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'A', narrative: 'a', importance: 2, accessCount: 0 });
+    insertObs(db, { title: 'B', narrative: 'b', importance: 2, accessCount: 0 });
+    tieAllEpochs();
+    const rows = db.prepare('SELECT * FROM observations ORDER BY id ASC').all();
+    callModelJSONAsync.mockResolvedValue({
+      should_merge: true,
+      merged_title: 'Merged',
+      merged_narrative: 'n',
+      merged_concepts: ['c'],
+      merged_facts: ['f'],
+      merged_lesson: null,
+      importance: 2,
+    });
+    const result = await executeMergeCluster(db, rows);
+    expect(result.merged).toBe(true);
+    const survivors = db
+      .prepare('SELECT id FROM observations WHERE COALESCE(compressed_into,0)=0')
+      .all()
+      .map((r) => r.id);
+    expect(survivors).toEqual([rows[rows.length - 1].id]);
+  });
+
+  it('leaves importance and access_count ahead of the id tiebreaker', async () => {
+    // The tiebreaker is a LAST resort. If it outranked the two real signals, merging would
+    // start keeping whichever row was written last regardless of how important it is — the
+    // exact regression the importance-first keeper was introduced to fix.
+    const { executeMergeCluster } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'Critical', narrative: 'a', importance: 3, accessCount: 0 });
+    insertObs(db, { title: 'Trivial but newer', narrative: 'b', importance: 1, accessCount: 9 });
+    tieAllEpochs();
+    const rows = db.prepare('SELECT * FROM observations ORDER BY id ASC').all();
+    const critical = rows.find((r) => r.importance === 3).id;
+    callModelJSONAsync.mockResolvedValue({
+      should_merge: true,
+      merged_title: 'Merged',
+      merged_narrative: 'n',
+      merged_concepts: ['c'],
+      merged_facts: ['f'],
+      merged_lesson: null,
+      importance: 2,
+    });
+    await executeMergeCluster(db, rows);
+    const survivors = db
+      .prepare('SELECT id FROM observations WHERE COALESCE(compressed_into,0)=0')
+      .all()
+      .map((r) => r.id);
+    expect(survivors).toEqual([critical]);
+  });
+
+  // The 'wide' pool was MISSED by the first pass of this fix, in the file the fix declared
+  // complete, and it is the one the daily unattended path actually uses: handleLLMOptimize
+  // via auto-maintain passes scope 'wide' explicitly (see hook-optimize.mjs) on a reenrich
+  // budget of 6. It was missed for the reason the ledger predicted -- a multi-line
+  // `ORDER BY CASE type ..., created_at_epoch DESC` that a grep for the one-line form does
+  // not match. The boundary case above only drives scope 'narrow', so nothing was red.
+  it('takes the NEWEST rows at the wide pool LIMIT boundary too', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    // One type for all five, so the leading `CASE type` term is equal across the pool and
+    // the epoch tie is what decides. Without the id term SQLite returns ascending rowid and
+    // the daily pass re-enriches the three OLDEST rows — the inverse of the order the clause
+    // states. The two newest wait a run; they are not permanently unreachable, because
+    // `executeReenrich` stamps `optimized_at` in the same UPDATE as the enrichment, so a
+    // processed row leaves the pool. Starvation needs the pass to keep SKIPPING the same
+    // rows (no LLM slot, unparseable JSON — both `continue` without stamping).
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, {
+        type: 'bugfix',
+        title: `Fix a real defect in module ${i}.mjs`,
+        narrative: 'x'.repeat(150),
+      });
+    }
+    tieAllEpochs();
+    const all = db
+      .prepare('SELECT id FROM observations ORDER BY id')
+      .all()
+      .map((r) => r.id);
+    expect(all).toHaveLength(5); // premise: every row cleared the wide pool's predicate
+    const got = findReenrichCandidates(db, 3, { scope: 'wide' })
+      .map((r) => r.id)
+      .sort((a, b) => a - b);
+    expect(got).toEqual(all.slice(-3));
+  });
+
+  it('leaves the wide pool type ranking ahead of the id tiebreaker', async () => {
+    // Control: passes before and after the fix. The id term is a LAST resort here too --
+    // if it outranked the `CASE type` head, the daily pass would stop preferring decisions
+    // over bugfixes and simply take whatever was written last.
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    const decision = insertObs(db, {
+      type: 'decision',
+      title: 'Chose the pool predicate over widening save-enrich',
+      narrative: 'd'.repeat(150),
+    });
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'Fix a real defect written afterwards',
+      narrative: 'b'.repeat(150),
+    });
+    tieAllEpochs();
+    const got = findReenrichCandidates(db, 1, { scope: 'wide' });
+    expect(got).toHaveLength(1);
+    expect(got[0].id).toBe(Number(decision.lastInsertRowid));
   });
 });

@@ -8,7 +8,7 @@
 // relative-time formatting — every command imports from here so the CLI stays
 // consistent.
 
-import { neutralizeContextDelimiters } from '../format-utils.mjs';
+import { neutralizeContextDelimiters, neutralizeSkillDelimiters } from '../format-utils.mjs';
 
 // ─── Argument Parsing ────────────────────────────────────────────────────────
 
@@ -83,7 +83,120 @@ export function parseArgs(argv) {
       i++;
     }
   }
-  return { positional, flags };
+  return { positional, flags: trackFlagReads(flags) };
+}
+
+// ─── Inert selection flags ───────────────────────────────────────────────────
+//
+// The third cause of the harm parseArgs' docblock names twice. `--include_noise` (underscore
+// spelling) and `--obs_type` (an MCP field name) both parsed, matched no reader, and let the
+// command answer the unfiltered question; both are fixed above. `suggestUnknownFlags` fixes a
+// third case, flags unknown to the whole CLI. What is left is the case where NOTHING is
+// misspelled: `--type` is canonical and real — on `search`, `save` and `export` — so it clears
+// the global known-flag set, and `browse` simply never reads it. Measured before the fix:
+// `browse --type bugfix` printed rows of every type, exit 0, not a word.
+//
+// The check is read-tracking, not a per-command flag manifest, and that is the whole design.
+// A manifest rots, and worse, it cannot see a flag that a command forwards wholesale into a
+// core helper (`cmdSearch` hands the object to the pipeline, `cmdExport` to the writer) —
+// deriving "which flags does this command read" from its own body would fire on every one of
+// those. Watching what the object is actually ASKED for is exact in both directions.
+//
+// Scope is SELECTION-shaped flags only. Those are the ones whose silent drop hands back a
+// wider set that reads as the answer, which is the harm. A `--confirm` that a short-circuited
+// branch never reached is deliberately out of scope: nothing there is wrong, and a warning on
+// correct usage is worse than the silence it replaces.
+//
+// `prompts-limit` is NOT here, and the reason generalises: `doctor --benchmark --prompts-limit`
+// is read off raw `process.argv` in cli/doctor.mjs and never touches a flags object, so
+// read-tracking would call a working flag inert. Anything read off argv must stay out.
+export const FILTER_FLAGS = new Set([
+  'type',
+  'source',
+  'project',
+  'tier',
+  'since',
+  'from',
+  'to',
+  'branch',
+  'scope',
+  'importance',
+  'limit',
+  'offset',
+  'sort',
+  'days',
+  'age-days',
+  // Inclusion toggles, added after the same correct-usage sweep the first batch passed. They
+  // widen or narrow the SET rather than filter within it, and the harm runs the other way:
+  // an ignored `--include-noise` hands back FEWER rows than asked for, and "I searched and it
+  // was not there" is the worst answer a memory tool can give. Held back at first only
+  // because booleans are read inside branches and were the likelier false-alarm shape; the
+  // exit-code gate below turned out to cover that class, and the sweep reads zero.
+  'all',
+  'include-noise',
+  'include-compressed',
+  'deep',
+  'no-deep',
+  'or',
+  'rerank',
+]);
+
+let suppliedFlags = new Set();
+let readFlags = new Set();
+
+/**
+ * Wrap a parsed flags object so every lookup is recorded.
+ *
+ * `get` and `has` are both trapped: a reader spelled `if ('tier' in flags)` must count as a
+ * read exactly like `flags.tier`. `ownKeys` deliberately is NOT — `Object.keys(flags)` is
+ * enumeration, not consumption, and `suggestUnknownFlags` does exactly that on its own parse.
+ */
+function trackFlagReads(flags) {
+  for (const k of Object.keys(flags)) suppliedFlags.add(k);
+  return new Proxy(flags, {
+    get(target, prop, recv) {
+      if (typeof prop === 'string') readFlags.add(prop);
+      return Reflect.get(target, prop, recv);
+    },
+    has(target, prop) {
+      if (typeof prop === 'string') readFlags.add(prop);
+      return Reflect.has(target, prop);
+    },
+  });
+}
+
+/** Start a fresh recording. `run()` calls this per invocation so tests can drive it in a loop. */
+export function resetFlagTracking() {
+  suppliedFlags = new Set();
+  readFlags = new Set();
+}
+
+/**
+ * Selection flags the user supplied that nothing looked at, sorted.
+ *
+ * Read AFTER the command has finished — a flag consumed late (inside a branch, or by a helper
+ * the command awaits) has still been read, and reporting it early would be a false alarm.
+ * @returns {string[]}
+ */
+export function inertFilterFlags() {
+  return [...suppliedFlags].filter((f) => FILTER_FLAGS.has(f) && !readFlags.has(f)).sort();
+}
+
+/**
+ * The sentence the user gets. Says what happened to their results, not what the parser did:
+ * "ignored" alone leaves them to work out whether the output is still the answer they asked
+ * for. It is not.
+ * @param {string} cmd
+ * @param {string[]} inert
+ * @returns {string}
+ */
+export function inertFilterFlagNotice(cmd, inert) {
+  const names = inert.map((f) => `--${f}`).join(' and ');
+  const verb = inert.length > 1 ? 'were' : 'was';
+  return (
+    `[mem] ${names} ${verb} ignored — \`${cmd}\` does not filter on ${inert.length > 1 ? 'them' : 'it'}, ` +
+    `so the results above are UNFILTERED. Run "claude-mem-lite help" for the flags this command reads.`
+  );
 }
 
 // ─── Output Helpers ──────────────────────────────────────────────────────────
@@ -107,11 +220,19 @@ export function parseArgs(argv) {
  * The transform is idempotent (it strips brackets, it does not re-add them), so a
  * path that already defanged upstream — `context` → buildSessionContextLines — is
  * unaffected.
+ *
+ * `<skill-loaded>` is neutralized here too (audit 2026-09-05 R6 P1-2). It is deliberately
+ * OFF CONTEXT_DELIMITER_RE so the MCP `mem_use` load path can emit a real wrapper — but no
+ * CLI command emits one, while `registry search|list` DOES print third-party registry names
+ * (a GitHub frontmatter name, or `import --name`, which applies no charset filter). A crafted
+ * name therefore forged a complete skill block out of nothing in ordinary CLI output. The MCP
+ * twin closes the same hole at its own chokepoint (server.mjs defangResult); doing it on one
+ * face only is this repo's first-listed defect class.
  */
 export function out(text) {
-  // String() first: neutralizeContextDelimiters coerces nullish to '', which would turn
-  // a pre-existing `out(undefined)` line from "undefined" into an empty line.
-  outVerbatim(neutralizeContextDelimiters(String(text)));
+  // String() first: the neutralizers coerce nullish to '', which would turn a pre-existing
+  // `out(undefined)` line from "undefined" into an empty line.
+  outVerbatim(neutralizeSkillDelimiters(neutralizeContextDelimiters(String(text))));
 }
 
 /**
@@ -173,7 +294,7 @@ export function rejectBareStringFlags(flags, keys) {
  * @returns {string|null} Resolved value, or null after a conflict fail().
  */
 export function resolvePositionalAlias(positionalStr, flags, aliasKeys) {
-  const given = aliasKeys.filter(k => typeof flags[k] === 'string' && flags[k].trim() !== '');
+  const given = aliasKeys.filter((k) => typeof flags[k] === 'string' && flags[k].trim() !== '');
   if (given.length > 1) {
     fail(`[mem] Both --${given[0]} and --${given[1]} provided — pass the value once.`);
     return null;
@@ -197,21 +318,83 @@ export function resolvePositionalAlias(positionalStr, flags, aliasKeys) {
  * them to a command — same maintenance contract as JSON_SUPPORTED_CMDS in mem-cli.
  */
 export const KNOWN_CLI_FLAGS = new Set([
-  'after', 'age-days', 'all', 'anchor', 'batch', 'before', 'benchmark', 'body', 'branch',
-  'capability-summary', 'category', 'closes-deferred', 'concepts', 'confirm', 'days', 'deep',
-  'detail', 'domain-tags', 'dry-run', 'enrich', 'execute', 'fields', 'file', 'files', 'floors',
-  'force', 'format', 'from', 'help', 'id', 'ids', 'content', 'importance', 'include-compressed', 'include-noise',
-  'intent-tags', 'invocation-name', 'json', 'key', 'keywords', 'lesson', 'lesson-learned', 'limit',
-  'local-path', 'margins', 'max', 'memdir', 'merge-ids', 'metrics', 'name', 'narrative', 'no-deep',
-  'offset', 'ops', 'or', 'priority', 'project', 'quality', 'query', 'reason', 'repo-url',
-  'rerank', 'resource-type', 'retain-days', 'retry', 'run', 'run-all', 'scope', 'search-telemetry', 'session-audit',
-  'sidechain', 'since', 'sort', 'source', 'status', 'sweep', 'task', 'tech-stack', 'text', 'tier', 'title',
-  'to', 'trigger-patterns', 'type', 'use-cases', 'verbose',
+  'after',
+  'age-days',
+  'all',
+  'anchor',
+  'before',
+  'benchmark',
+  'body',
+  'branch',
+  'closes-deferred',
+  'concepts',
+  'confirm',
+  'days',
+  'deep',
+  'detail',
+  'dry-run',
+  'execute',
+  'fields',
+  'file',
+  'files',
+  'force',
+  'format',
+  'from',
+  'help',
+  'id',
+  'ids',
+  'content',
+  'importance',
+  'include-compressed',
+  'include-noise',
+  'json',
+  'key',
+  'lesson',
+  'lesson-learned',
+  'limit',
+  'max',
+  'memdir',
+  'merge-ids',
+  'metrics',
+  'name',
+  'narrative',
+  'no-deep',
+  'offset',
+  'ops',
+  'or',
+  'priority',
+  'project',
+  'quality',
+  'query',
+  'reason',
+  'rerank',
+  'retain-days',
+  'retry',
+  'run',
+  'run-all',
+  'scope',
+  'search-telemetry',
+  'session-audit',
+  'sidechain',
+  'since',
+  'sort',
+  'source',
+  'status',
+  'task',
+  'text',
+  'tier',
+  'title',
+  'to',
+  'type',
+  'verbose',
   // Catalogued 2026-08-13 when suggestUnknownFlags started reporting EVERY unknown
   // flag: these are real, code-read flags that the old edit-distance gate happened to
   // stay silent about (`adopt --disable/--enable`, `activity --min-importance`,
   // `save --supersedes`). Verified by running each command and checking for a warning.
-  'disable', 'enable', 'min-importance', 'supersedes',
+  'disable',
+  'enable',
+  'min-importance',
+  'supersedes',
   // `doctor --benchmark --prompts-limit N` — read off raw argv in cli/doctor.mjs, so
   // it never appeared in a `flags.x` grep. Caught by independent review after the
   // warn-on-every-unknown-flag flip turned the omission into a false warning on a
@@ -230,7 +413,8 @@ export const KNOWN_CLI_FLAGS = new Set([
 
 /** Levenshtein distance, early-exit past `max` (cheap enough for a handful of flags). */
 function editDistance(a, b, max = 2) {
-  const m = a.length, n = b.length;
+  const m = a.length,
+    n = b.length;
   if (Math.abs(m - n) > max) return max + 1;
   let prev = Array.from({ length: n + 1 }, (_, j) => j);
   for (let i = 1; i <= m; i++) {
@@ -261,10 +445,14 @@ export function suggestUnknownFlags(flags) {
   const result = [];
   for (const key of Object.keys(flags)) {
     if (!key || KNOWN_CLI_FLAGS.has(key)) continue;
-    let best = null, bestDist = 3;
+    let best = null,
+      bestDist = 3;
     for (const known of KNOWN_CLI_FLAGS) {
       const d = editDistance(key, known);
-      if (d < bestDist) { bestDist = d; best = known; }
+      if (d < bestDist) {
+        bestDist = d;
+        best = known;
+      }
     }
     // Report EVERY unknown flag; the suggestion is a bonus when a near-miss exists.
     // Previously an unknown flag with no neighbour within distance 2 produced no
@@ -365,9 +553,9 @@ export { parseIdToken } from '../lib/id-routing.mjs';
  */
 export function formatProbeHints(probe) {
   const hints = [];
-  if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs)`);
+  if (probe.obs.length > 0) hints.push(`#${probe.obs.join(', #')} (obs)`);
   if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session)`);
-  if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt)`);
-  if (probe.event?.length > 0)  hints.push(`E#${probe.event.join(', E#')} (event)`);
+  if (probe.prompt.length > 0) hints.push(`P#${probe.prompt.join(', P#')} (prompt)`);
+  if (probe.event?.length > 0) hints.push(`E#${probe.event.join(', E#')} (event)`);
   return hints;
 }

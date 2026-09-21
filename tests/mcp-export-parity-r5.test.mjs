@@ -5,7 +5,7 @@
 // taken via the (explicitly advertised) MCP export → restored via CLI silently collapsed
 // every empty-`narrative` row (import-jsonl / cold-start bodies live in `text`) to its bare
 // title: unrecoverable AND unsearchable. Fix = both surfaces share EXPORT_COLUMNS_SQL.
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { execFileSync } from 'child_process';
 import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
@@ -13,16 +13,19 @@ import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import { insertSession, insertObs } from './test-helpers.mjs';
+import { insertSession, insertObs, makeFixtureTracker } from './test-helpers.mjs';
 import { EXPORT_COLUMNS } from '../lib/export-columns.mjs';
 import { handleExportForTest } from '../server.mjs';
 
 const CLI_PATH = resolve('cli.mjs');
 
+const fixtures = makeFixtureTracker();
+afterAll(() => fixtures.disposeAll());
+
 function makeTmpDir() {
   const dir = join(tmpdir(), `mem-mcpexp-${randomUUID().slice(0, 8)}`);
   mkdirSync(dir, { recursive: true });
-  return dir;
+  return fixtures.track(dir);
 }
 function initDb(dataDir) {
   mkdirSync(dataDir, { recursive: true });
@@ -35,13 +38,23 @@ function initDb(dataDir) {
 function runCli(args, dataDir) {
   try {
     const stdout = execFileSync(process.execPath, [CLI_PATH, ...args], {
-      encoding: 'utf8', timeout: 15000,
-      env: { ...process.env, CLAUDE_MEM_DIR: dataDir, CLAUDE_PROJECT_DIR: dataDir, CLAUDE_MEM_HOOK_RUNNING: undefined },
+      encoding: 'utf8',
+      timeout: 15000,
+      env: {
+        ...process.env,
+        CLAUDE_MEM_DIR: dataDir,
+        CLAUDE_PROJECT_DIR: dataDir,
+        CLAUDE_MEM_HOOK_RUNNING: undefined,
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     return { stdout, exitCode: 0 };
   } catch (e) {
-    return { stdout: e.stdout?.toString() || '', stderr: e.stderr?.toString() || '', exitCode: e.status ?? 1 };
+    return {
+      stdout: e.stdout?.toString() || '',
+      stderr: e.stderr?.toString() || '',
+      exitCode: e.status ?? 1,
+    };
   }
 }
 
@@ -50,12 +63,22 @@ describe('MCP mem_export ↔ CLI export parity (v3.42 HIGH-2)', () => {
   // guard that keeps the two surfaces from drifting again.
   it('EXPORT_COLUMNS covers the columns cmdRestore reads back', () => {
     const restoreReads = [
-      'text', 'subtitle', 'concepts', 'facts', 'search_aliases', 'files_read', 'branch',
+      'text',
+      'subtitle',
+      'concepts',
+      'facts',
+      'search_aliases',
+      'files_read',
+      'branch',
       'scope',
-      'access_count', 'cited_count', 'uncited_streak', 'injection_count', 'decay_seen_count',
+      'access_count',
+      'cited_count',
+      'uncited_streak',
+      'injection_count',
+      'decay_seen_count',
       'last_accessed_at',
     ];
-    const missing = restoreReads.filter(c => !EXPORT_COLUMNS.includes(c));
+    const missing = restoreReads.filter((c) => !EXPORT_COLUMNS.includes(c));
     expect(missing, `EXPORT_COLUMNS missing restore-read columns: ${missing.join(', ')}`).toEqual([]);
   });
 
@@ -73,14 +96,23 @@ describe('MCP mem_export ↔ CLI export parity (v3.42 HIGH-2)', () => {
       // Mimic an import-jsonl / cold-start row: body in `text`, narrative empty, plus an
       // alias (FTS-indexed) so we can prove searchability survives the round trip.
       insertObs(db, {
-        sessionId: 'imp-sess', project: 'srcproj', type: 'discovery',
-        title: 'Bash: run tests', narrative: '', text: BODY, importance: 2,
+        sessionId: 'imp-sess',
+        project: 'srcproj',
+        type: 'discovery',
+        title: 'Bash: run tests',
+        narrative: '',
+        text: BODY,
+        importance: 2,
         searchAliases: ALIAS,
       });
       db.close();
     });
     afterEach(() => {
-      for (const d of [srcDir, dstDir]) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
+      for (const d of [srcDir, dstDir]) {
+        try {
+          rmSync(d, { recursive: true, force: true });
+        } catch {}
+      }
     });
 
     it('MCP export carries the body + aliases; restore keeps the row searchable', async () => {
@@ -93,7 +125,10 @@ describe('MCP mem_export ↔ CLI export parity (v3.42 HIGH-2)', () => {
       expect(text).toContain('UNIQUEMCPBODY');
 
       // Strip the "Exported N observations:\n" preamble → jsonl lines only.
-      const jsonl = text.split('\n').filter(l => l.trim().startsWith('{')).join('\n');
+      const jsonl = text
+        .split('\n')
+        .filter((l) => l.trim().startsWith('{'))
+        .join('\n');
       writeFileSync(expFile, jsonl);
 
       const restore = runCli(['restore', expFile], dstDir);

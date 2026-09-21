@@ -10,36 +10,66 @@ import { DAY_MS } from './lib/time-constants.mjs';
 // multipliers below encode PRODUCT PRIORS: recent / same-project / important /
 // high-signal-type / frequently-cited memories are more relevant to the CURRENT
 // dev session. A periodic audit tends to flag them as "0-lift dead weight" —
-// resist that on benchmark evidence alone. Measured (audit ②, obs #8773):
-//   * benchmark.mjs --matrix (micro-fixture, now models the full FULL_SCORE
-//     chain): type-quality is the TOP contributor (drop-type ΔnDCG=0.0082,
-//     ΔMRR=0.0166), decay +0.0043 nDCG, importance +0.0012; the chain lifts
-//     hybrid over bm25_only by +0.0093 nDCG / +0.0166 MRR (net 0 queries hurt).
-//     project, access and lesson read exactly 0 — but that is STRUCTURAL: the
-//     fixture is single-project, access_count=0, and has 0 lesson_learned rows,
-//     so it cannot vary those three axes.
+// resist that, and reach for the right instrument instead of the aggregate one.
+//
+// ALL EIGHT ARE ALIVE AND CARRY THE MAGNITUDE DECLARED HERE. Measured
+// 2026-09-07 at `main` @ f25e8ae with benchmark/multiplier-discrimination.mjs,
+// which ranks pairs of rows with byte-identical indexed text differing in one
+// column, so BM25 ties and the score quotient IS the multiplier:
+//     decay 1.9770  type 1.8333  project 2.0000  importance 2.0000
+//     access 1.5004  lesson 1.3000  noise 5.0000  cite 2.0000
+// Each matches its declared ratio to 4 decimals, hybrid ranks the preferred row
+// 12/12, and removing the term drops that to 6/12 — a coin flip.
+//
+// THE AGGREGATE MATRIX CANNOT SEE THAT, and its zeros must not be read as death.
+// Same tree, `benchmark.mjs --matrix`: bm25_only ALONE reads R@10 0.8996 /
+// P@10 0.9731 / nDCG 0.9728, so the fixture is saturated and all eight
+// multipliers together buy +0.0002 R@10. Five ablation arms (project, access,
+// lesson, noise, cite) read 0 on all four metrics, and dropping importance reads
+// BETTER (ΔnDCG -0.0019). Why each zero, corrected 2026-09-07 — an earlier
+// version of this note said "the fixture is single-project", which is false
+// (seed-data.json is 5 projects x 40 rows):
+//   * project — 29 of 30 queries set no project, and the one that does also
+//     FILTERS on it, which makes the boost a constant over the survivors and
+//     therefore rank-invariant. The harness used to pass the filter value as the
+//     boost; it now mirrors search-engine.mjs:606 and disables the boost under a
+//     filter, which is rank-invariant on the matrix (verified: all 11 delta
+//     blocks byte-identical across the change).
+//   * access / lesson / noise / cite — seed-data.json carries no access_count,
+//     no lesson_learned and no injection/cite counters at all, so those four
+//     columns are constant and the terms are 1.0x on every row.
+// A multiplier reading 0 there is a benchmark-MISMATCH artifact, NOT dead weight.
 //   * longmemeval.mjs --temporal (n=500, real dates): bit-identical to uniform —
 //     LongMemEval-S windows (mean 27.9d, 74% <30d) are far shorter than these
 //     half-lives, so decay moves no rank there either.
-// Where a multiplier reads 0 it is a benchmark-MISMATCH artifact (the instrument
-// can't vary that axis), NOT proven dead weight. Decision: KEEP them; do NOT
-// delete on "0 lift". Guardrail: the ci-gate `hybrid_over_bm25 >= -0.05` floor
-// (benchmark/ci-gate.mjs) covers the full modelled chain — D#121: cite + noise
-// joined the matrix MULT_EXPR after M-3 put them in FULL_SCORE (fixture carries
-// zero cite/noise state, so both read 0 by construction, same caveat as lesson;
-// their real-SQL direction pins live in benchmark/events-pipeline-probes.mjs).
-// Genuine validation of the prior-encoding axes needs a labeled real-dev-memory eval.
+//
+// DO NOT TRUST THE CI GATE TO CATCH A CHANGE HERE. The `hybrid_over_bm25 >= -0.05`
+// floor does NOT cover the chain, measured 2026-09-07 by mutating the real tree
+// and reverting it: neutering the importance multiplier left the gate at exit 0
+// with all four checks PASS and `hybrid_over_bm25` going UP (R 0.0002 -> 0.0019),
+// because importance is a negative contributor on that fixture; changing lesson's
+// 0.3 to 0.5 left the gate's output byte-identical. The eight per-term ablation
+// deltas the matrix prints are gated by nothing. Retune a constant in this file
+// and re-run benchmark/multiplier-discrimination.mjs, which reports MISMATCH on
+// exactly that shape — the aggregate gate will not.
+// D#121: cite + noise joined the matrix MULT_EXPR after M-3 put them in
+// FULL_SCORE; their real-SQL direction pins live in
+// benchmark/events-pipeline-probes.mjs.
+// Still open, and NOT what the ruler above answers: whether these priors help a
+// REAL user. "Wired up with the declared magnitude" is a different question from
+// "correctly calibrated", and the second one still needs a labeled
+// real-dev-memory eval.
 
 // ─── Type-Differentiated Recency Decay ──────────────────────────────────────
 
 /** Recency half-life per observation type (in milliseconds) */
 export const DECAY_HALF_LIFE_BY_TYPE = {
-  decision:  90 * DAY_MS,  // 90 days — architectural decisions persist
-  discovery: 60 * DAY_MS,  // 60 days — learned patterns last
-  feature:   30 * DAY_MS,  // 30 days — feature work is mid-range
-  bugfix:    14 * DAY_MS,  // 14 days — bugs are usually one-off
-  refactor:  14 * DAY_MS,  // 14 days — code cleanup
-  change:     7 * DAY_MS,  //  7 days — routine changes decay fast
+  decision: 90 * DAY_MS, // 90 days — architectural decisions persist
+  discovery: 60 * DAY_MS, // 60 days — learned patterns last
+  feature: 30 * DAY_MS, // 30 days — feature work is mid-range
+  bugfix: 14 * DAY_MS, // 14 days — bugs are usually one-off
+  refactor: 14 * DAY_MS, // 14 days — code cleanup
+  change: 7 * DAY_MS, //  7 days — routine changes decay fast
 };
 export const DEFAULT_DECAY_HALF_LIFE_MS = 14 * DAY_MS;
 
@@ -58,7 +88,16 @@ export const SESS_BM25 = 'bm25(session_summaries_fts, 5, 3, 3, 3, 2, 1, 1)';
 export const EVT_BM25 = 'bm25(events_fts, 5, 2)';
 
 /** FTS5 columns for observations (must match BM25 weight order) */
-export const OBS_FTS_COLUMNS = ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases'];
+export const OBS_FTS_COLUMNS = [
+  'title',
+  'subtitle',
+  'narrative',
+  'text',
+  'facts',
+  'concepts',
+  'lesson_learned',
+  'search_aliases',
+];
 
 /** SQL CASE for type-differentiated recency decay half-lives (milliseconds) */
 export const TYPE_DECAY_CASE = `(
@@ -101,7 +140,9 @@ export const TYPE_QUALITY_DEFAULT = 1.0;
  */
 export const TYPE_QUALITY_CASE = `(
   CASE o.type
-${Object.entries(TYPE_QUALITY).map(([t, w]) => `    WHEN '${t}' THEN ${w.toFixed(1)}`).join('\n')}
+${Object.entries(TYPE_QUALITY)
+  .map(([t, w]) => `    WHEN '${t}' THEN ${w.toFixed(1)}`)
+  .join('\n')}
     ELSE ${TYPE_QUALITY_DEFAULT.toFixed(1)}
   END
 )`;
@@ -185,10 +226,20 @@ export function notLowSignalTitleClause(alias = 'o') {
 //
 // Closes the citation-decay → ranking loop. The Stop hook citation-decay
 // already maintains cited_count (Promote on cite) and uncited_streak (bump on
-// uncited; reset on cite or demote-at-3). Before A1, both columns affected
+// uncited; reset on cite or rollover-at-3). Before A1, both columns affected
 // only the importance ±1 dial — through `(0.5 + 0.5·importance)` that's a
 // ≤2× swing and saturates fast. This factor lets ranking respond directly to
 // observed agent behavior on the obs itself.
+//
+// D#179/D#198 made this factor the ONLY thing citation-decay feeds: that loop
+// no longer writes `importance` at all. The reason is that importance is not a
+// ranking dial — every injection surface gates candidacy on it, so moving it
+// changed WHO IS IN the pool rather than where they ranked. This clause is the
+// right home for the signal precisely because it is bounded and pure-ranking:
+// a mis-read citation costs at most a 3.0× / 0.4× rank shift and can never
+// evict a row. (A second, independent citation → importance path still exists
+// via bumpCitationAccess → access_count → the `boost` maintain op; see obs
+// #10911. It is out of this clause's scope and is NOT closed.)
 //
 // Formula: clamp(0.4, 3.0, 1 + 0.2·cited_count − 0.25·uncited_streak)
 // Distribution:
@@ -224,8 +275,8 @@ export function citeFactorClause(alias = 'o') {
 }
 
 export function citeFactorJs(row) {
-  const cited = (row && typeof row.cited_count === 'number') ? row.cited_count : 0;
-  const streak = (row && typeof row.uncited_streak === 'number') ? row.uncited_streak : 0;
+  const cited = row && typeof row.cited_count === 'number' ? row.cited_count : 0;
+  const streak = row && typeof row.uncited_streak === 'number' ? row.uncited_streak : 0;
   const raw = 1.0 + CITE_FACTOR_PER_CITE * cited - CITE_FACTOR_PER_STREAK * streak;
   return Math.max(CITE_FACTOR_MIN, Math.min(CITE_FACTOR_MAX, raw));
 }

@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join, dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as acorn from 'acorn';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // `tasks/` belongs here for the same reason `tmp/` does (D#168): it is gitignored local
@@ -31,9 +32,18 @@ function collectMjs(dir, out = []) {
 
 // Static `import ... from '<spec>'`, bare `import '<spec>'`, `export ... from '<spec>'`
 // (capture 1), and lazy `import('<spec>')` with a literal specifier (capture 2).
-const SPEC_RE = /(?:^|[\s;}])(?:import|export)\s+(?:[\s\S]*?\sfrom\s*)?['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+const SPEC_RE =
+  /(?:^|[\s;}])(?:import|export)\s+(?:[\s\S]*?\sfrom\s*)?['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
 
-/** Path-like specifiers only — bare ones ('node:fs', 'better-sqlite3') are package resolution. */
+/**
+ * Path-like specifiers only — bare ones ('node:fs', 'better-sqlite3') are package
+ * resolution. TEXT scan: it reads comments and string literals as imports too.
+ *
+ * That is deliberate for ONE caller, the resolvability check at the bottom, where over-
+ * reporting is the safe direction (a typo'd path that never resolves should be loud) and
+ * where the cost is already paid by a directory skip-list. Every other caller uses
+ * `astSpecs` below.
+ */
 function pathSpecs(source) {
   const specs = [];
   for (const m of source.matchAll(SPEC_RE)) {
@@ -45,7 +55,54 @@ function pathSpecs(source) {
   return specs;
 }
 
-const relativeSpecs = (source) => pathSpecs(source).filter(s => s.spec.startsWith('.'));
+// Audit 2026-09-05 P2-10. The graph below is this repo's CYCLE guard, and it was built
+// from `pathSpecs` — so a commented-out `import('../x.mjs')` counted as a real edge, and
+// a surplus edge in a cycle detector is a cycle nobody wrote. The ruler had the same
+// defect (P2-9, fixed in `scripts/audit-metrics.mjs` the round before); this file proved
+// it by going red when that fix's self-check probe put a specifier in a string literal.
+//
+// Comments and string literals are not AST nodes, so the parser cannot make that mistake.
+// A file acorn rejects falls back to the text scan rather than contributing no edges —
+// an edge-less module cannot participate in a cycle, so a parse error would read as a
+// clean graph. `unparsed` is asserted empty so such a file is visible rather than silent.
+const unparsed = [];
+
+function astSpecs(source, file) {
+  let ast;
+  try {
+    ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module', allowHashBang: true });
+  } catch {
+    unparsed.push(relative(ROOT, file));
+    return pathSpecs(source);
+  }
+  const specs = [];
+  const walk = (node) => {
+    if (!node || typeof node.type !== 'string') return;
+    const src = node.source;
+    const isStatic =
+      node.type === 'ImportDeclaration' ||
+      node.type === 'ExportNamedDeclaration' ||
+      node.type === 'ExportAllDeclaration';
+    if ((isStatic || node.type === 'ImportExpression') && src?.type === 'Literal') {
+      const spec = src.value;
+      if (typeof spec === 'string' && (spec.startsWith('.') || spec.startsWith('/'))) {
+        specs.push({ spec, lazy: node.type === 'ImportExpression' });
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'parent') continue;
+      const v = node[key];
+      if (Array.isArray(v)) {
+        for (const c of v) if (c && typeof c.type === 'string') walk(c);
+      } else if (v && typeof v.type === 'string') walk(v);
+    }
+  };
+  walk(ast);
+  return specs;
+}
+
+const relativeSpecs = (source) => pathSpecs(source).filter((s) => s.spec.startsWith('.'));
+const relativeAstSpecs = (source, file) => astSpecs(source, file).filter((s) => s.spec.startsWith('.'));
 
 /** @param {boolean} includeLazy Follow `await import()` edges too. */
 function buildGraph(files, includeLazy) {
@@ -53,7 +110,7 @@ function buildGraph(files, includeLazy) {
   const graph = new Map();
   for (const file of files) {
     const deps = [];
-    for (const { spec, lazy } of relativeSpecs(readFileSync(file, 'utf8'))) {
+    for (const { spec, lazy } of relativeAstSpecs(readFileSync(file, 'utf8'), file)) {
       if (lazy && !includeLazy) continue;
       let target = resolve(dirname(file), spec);
       if (existsSync(target) && statSync(target).isDirectory()) target = join(target, 'index.mjs');
@@ -66,8 +123,10 @@ function buildGraph(files, includeLazy) {
 
 /** Iterative DFS with an explicit stack; returns every cycle found as a node path. */
 function findCycles(graph) {
-  const WHITE = 0, GREY = 1, BLACK = 2;
-  const color = new Map([...graph.keys()].map(k => [k, WHITE]));
+  const WHITE = 0,
+    GREY = 1,
+    BLACK = 2;
+  const color = new Map([...graph.keys()].map((k) => [k, WHITE]));
   const cycles = [];
 
   for (const root of graph.keys()) {
@@ -110,7 +169,7 @@ const KNOWN_LAZY_CYCLES = [
   // cycle that only an await-import keeps off the load path.
 ];
 
-const fmt = (cycles) => cycles.map(c => c.map(f => relative(ROOT, f)).join(' -> ')).sort();
+const fmt = (cycles) => cycles.map((c) => c.map((f) => relative(ROOT, f)).join(' -> ')).sort();
 
 describe('module import graph', () => {
   const files = collectMjs(ROOT);
@@ -134,12 +193,14 @@ describe('module import graph', () => {
   it('imports no absolute filesystem paths', () => {
     // v3.56 P3-15: scripts/p0-forward-probe.mjs imported
     // '/mnt/data_ssd/dev/projects/mem/scoring-sql.mjs' — another machine's checkout.
+    // (That file was deleted in R10 P3-24; this is the history of why the check exists,
+    // not a live reference. The rule outlives the violator.)
     // `node --check` passes on that file (it parses, never resolves), so only a
     // resolution check catches it. An absolute specifier is never portable here;
     // sibling modules must be reached relatively.
     const absolute = [];
     for (const file of files) {
-      for (const { spec } of pathSpecs(readFileSync(file, 'utf8'))) {
+      for (const { spec } of astSpecs(readFileSync(file, 'utf8'), file)) {
         if (spec.startsWith('/')) absolute.push(`${relative(ROOT, file)} -> ${spec}`);
       }
     }
@@ -156,18 +217,25 @@ describe('module import graph', () => {
       if (rel.startsWith('tests/') || rel.startsWith('benchmark/') || rel.includes('preflight')) continue;
       for (const { spec } of relativeSpecs(readFileSync(file, 'utf8'))) {
         const base = resolve(dirname(file), spec);
-        const hit = [base, `${base}.mjs`, `${base}.js`, join(base, 'index.mjs')]
-          .some(c => existsSync(c) && statSync(c).isFile());
+        const hit = [base, `${base}.mjs`, `${base}.js`, join(base, 'index.mjs')].some(
+          (c) => existsSync(c) && statSync(c).isFile(),
+        );
         if (!hit) broken.push(`${rel} -> ${spec}`);
       }
     }
     expect(broken, `unresolvable imports:\n  ${broken.join('\n  ')}`).toEqual([]);
   });
 
+  it('every file parsed — none fell back to the text scan', () => {
+    // The fallback exists so a parse error cannot empty the graph; this is what makes it
+    // visible. `unparsed` is populated by the graph build in this describe's body.
+    expect([...new Set(unparsed)].sort(), 'files acorn could not parse').toEqual([]);
+  });
+
   it('project-utils.mjs does not import from the utils.mjs barrel', () => {
     // Direct assertion on the specific trap: utils.mjs re-exports project-utils.mjs,
     // so project-utils.mjs must stay a leaf.
-    const deps = (fullGraph.get(join(ROOT, 'project-utils.mjs')) || []).map(f => relative(ROOT, f));
+    const deps = (fullGraph.get(join(ROOT, 'project-utils.mjs')) || []).map((f) => relative(ROOT, f));
     expect(deps).not.toContain('utils.mjs');
   });
 });

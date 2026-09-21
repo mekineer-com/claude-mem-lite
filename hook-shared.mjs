@@ -4,45 +4,85 @@
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync, chmodSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  renameSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  chmodSync,
+} from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
+import { CITE_RECALL_FILE_PREFIX } from './lib/cite-recall-path.mjs';
 import { ensureDbWithWalRecovery, DB_DIR } from './schema.mjs';
+import { resolveRuntimeDir } from './lib/resolve-data-dir.mjs';
 // Pure-`node:`/local module (it imports only binding-probe + native-binding-hint, and
 // neither imports this file) — no cycle.
 import { recordHookError } from './lib/hook-telemetry.mjs';
-import { execClaudeCliSync, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
-// Phase D: invited-memory sentinel detection. memdir.mjs/claudemd.mjs only pull in
-// fs/path/os/crypto; adopt-content.mjs is pure strings. No circular deps —
-// neither imports hook-shared.
-import { memdirPath as _memdirPath, isAdopted as _isAdoptedMemdir } from './memdir.mjs';
-import { isAdopted as _isAdoptedClaudeMd } from './claudemd.mjs';
-import { PLUGIN_SLUG as _PLUGIN_SLUG } from './adopt-content.mjs';
+import {
+  isSchemaSkewError,
+  schemaSkewFromError,
+  shouldRecordSkew,
+  SKEW_MARKER_PREFIX,
+} from './lib/schema-skew.mjs';
+import { isDbUnusableError, DB_UNUSABLE_MARKER_PREFIX } from './lib/db-unusable.mjs';
+import { shouldRecordOnce } from './lib/record-once.mjs';
+// Audit 2026-09-05 P1-2 (carried from 2026-09-02 P2-9): `callLLM`, the quiet/adoption
+// predicates and the handoff constants moved into `lib/` because two lib modules
+// imported them from here and dragged this file's whole import graph — haiku-client,
+// memdir, claudemd, adopt-content — along with them. Re-exported below so every caller
+// of `hook-shared.mjs` is unchanged; those four imports now live with the moved code.
+export { callLLM } from './lib/llm-call.mjs';
+export { isQuietHooks, isAdoptedHere, effectiveQuiet } from './lib/quiet-scope.mjs';
+export {
+  HANDOFF_EXPIRY_CLEAR,
+  HANDOFF_EXPIRY_EXIT,
+  HANDOFF_ANCHOR_MAX_AGE,
+  HANDOFF_MATCH_THRESHOLD,
+  CONTINUE_KEYWORDS,
+} from './lib/handoff-constants.mjs';
 
-import { DAY_MS } from './lib/time-constants.mjs';
+import { DAY_MS, ORPHAN_EPISODE_AGE_MS } from './lib/time-constants.mjs';
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-export const RUNTIME_DIR = join(DB_DIR, 'runtime');
+// P1-14: one resolver, so this module honours CLAUDE_MEM_RUNTIME_DIR like the five
+// standalone hook scripts already did. It did not, and hook.mjs / server.mjs /
+// hook-context.mjs / hook-episode.mjs all take RUNTIME_DIR from here — so the override
+// split the runtime dir in half instead of relocating it.
+export const RUNTIME_DIR = resolveRuntimeDir(DB_DIR);
 export const SCRIPT_PATH = process.argv[1];
 
 // Timing constants
 export const EPISODE_BUFFER_SIZE = 10;
-export const EPISODE_TIME_GAP_MS = 5 * 60 * 1000;       // 5 min
-export const SESSION_EXPIRY_MS = 12 * 60 * 60 * 1000;    // 12h
-export const STALE_SESSION_MS = 24 * 60 * 60 * 1000;     // 24h
-export const STALE_LOCK_MS = 30000;                       // 30s
+export const EPISODE_TIME_GAP_MS = 5 * 60 * 1000; // 5 min
+export const SESSION_EXPIRY_MS = 12 * 60 * 60 * 1000; // 12h
+export const STALE_SESSION_MS = 24 * 60 * 60 * 1000; // 24h
+export const STALE_LOCK_MS = 30000; // 30s
+
+// Backstop for cleanStaleLockFiles(): a lock whose recorded pid is ALIVE is kept until it
+// reaches this age, not STALE_LOCK_MS. Deliberately LONGER than proc-lock.mjs's own 5-min
+// steal window, so the sweeper is never the more aggressive of the two — whatever it
+// removes, the lock protocol itself would already have let the next caller steal. Its only
+// job is to garbage-collect a leaked file whose pid was recycled onto an unrelated live
+// process, which would otherwise pin the file forever. (A20260905-R5-P1-1)
+export const ABANDONED_LOCK_MS = 10 * 60 * 1000; // 10 min
 
 // The background-maintenance mutex, defined HERE next to the sweeper policy it has to
-// escape. cleanStaleLockFiles() below unlinks any `*.lock` older than STALE_LOCK_MS
-// WITHOUT checking whether the holder is alive — right for the episode lock's millisecond
-// critical section, fatal for a maintenance pass that runs for seconds to minutes. The
-// name therefore ends in `.proclock`, and `tests/auto-maintain-proc-lock.test.mjs` asserts
-// that against THIS constant rather than a re-typed copy: the first version of that test
-// built its own path from a literal, so renaming the lock left it green with the hazard
+// escape. cleanStaleLockFiles() sweeps every `*.lock` in RUNTIME_DIR; until
+// A20260905-R5-P1-1 it did so on AGE ALONE once past STALE_LOCK_MS — right for the episode
+// lock's millisecond critical section, fatal for a maintenance pass that runs for seconds
+// to minutes. The sweeper now spares a live holder, but this mutex keeps the `.proclock`
+// name: not being swept at all is a stronger guarantee than being spared by a liveness
+// probe, and pid checks are meaningless across a shared homedir. `tests/auto-maintain-proc-lock.test.mjs`
+// asserts that against THIS constant rather than a re-typed copy: the first version of that
+// test built its own path from a literal, so renaming the lock left it green with the hazard
 // back. proc-lock's own staleness policy (age OR provably-dead pid) is the correct one.
 export const AUTO_MAINTAIN_LOCK = 'auto-maintain.proclock';
-export const DEDUP_WINDOW_MS = 5 * 60 * 1000;            // 5 min (title dedup)
-export const RELATED_OBS_WINDOW_MS = 7 * DAY_MS;       // 7 days
-export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
+export const DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 min (title dedup)
+export const RELATED_OBS_WINDOW_MS = 7 * DAY_MS; // 7 days
 // Candidate rows the SessionStart Key Context surface considers (hook-context.mjs
 // keyObs; each of the two sections then renders at most 5). The user-prompt
 // exclude-set does NOT mirror this query — it reads the ids actually rendered
@@ -50,50 +90,11 @@ export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
 // <memory-context> injection on quiet/adopted projects where nothing renders).
 export const KEY_CONTEXT_LIMIT = 10;
 
-// Phase A (v2.31.3+): MEM_QUIET_HOOKS=1 drops descriptive hook/MCP-instruction
-// bodies (File Lessons / Key Context headers, MCP WHEN-TO-USE & decision rules,
-// related-memory lesson suffix). Intended for users who adopted invited-memory
-// (MEMORY.md sentinel) or who otherwise want minimal hook noise. Function form
-// (not const) so modules importing at load time still respect later env sets
-// in-process, and tests can toggle per-call. See docs/plans/2026-04-16-invited-memory-pattern.md.
-export function isQuietHooks() {
-  return process.env.MEM_QUIET_HOOKS === '1';
-}
-
-// Phase D (v2.32.1+) → v3.13: if the current project has adopted our steering,
-// the contract is already loaded at system-prompt authority — so hook +
-// MCP-instruction output can also go quiet. v3.13 moved that contract from the
-// memory-dir MEMORY.md sentinel to the project CLAUDE.md managed block, so check
-// the new scheme first and keep the legacy memdir sentinel as a fallback (an
-// un-migrated project stays quiet through the transition). isQuietHooks (env)
-// remains an independent, stronger override.
-export function isAdoptedHere(cwd) {
-  try {
-    const resolved = cwd || process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-    return _isAdoptedClaudeMd(resolved, _PLUGIN_SLUG)
-      || _isAdoptedMemdir(_memdirPath(resolved), _PLUGIN_SLUG);
-  } catch {
-    return false;
-  }
-}
-
-export function effectiveQuiet(cwd) {
-  return isQuietHooks() || isAdoptedHere(cwd);
-}
-
-// Handoff system constants
-export const HANDOFF_EXPIRY_CLEAR = 6 * 3600000;                // 6 hours (covers lunch/meeting breaks)
-export const HANDOFF_EXPIRY_EXIT = 7 * 24 * 60 * 60 * 1000;   // 7 days
-export const HANDOFF_ANCHOR_MAX_AGE = 72 * 3600000;             // 72h cap on git_sha anchor — avoids stale-HEAD false positives
-export const HANDOFF_MATCH_THRESHOLD = 3;                       // min weighted score
-export const CONTINUE_KEYWORDS = /继续|接着|上次|之前的|前面的|刚才|\bcontinue\b|\bresume\b|\bwhere[\s-]+we[\s-]+left\b|\bpick[\s-]+up\b|\bcarry[\s-]+on\b/i;
-
-// Orphan-sweep threshold for `ep-flush-*` / `pending-*` runtime artifacts.
-// handleLLMEpisode's worst-case round-trip is ~60s (delay + LLM call + DB
-// write); 1h leaves a wide safety margin against deleting an in-flight file.
-// Older orphans are crashed workers or pre-shutdown buffers that no live
-// caller will ever pick up, so sweeping them on SessionStart is safe.
-export const ORPHAN_EPISODE_AGE_MS = 60 * 60 * 1000;
+// Orphan-sweep threshold for `ep-flush-*` / `pending-*` runtime artifacts. Defined in
+// lib/time-constants.mjs (the zero-import leaf) because install.mjs's manual `cleanup`
+// needs the same window and may only import from lib/; re-exported here so this module's
+// existing importers are unchanged.
+export { ORPHAN_EPISODE_AGE_MS };
 
 // `reads-<project>.txt` (bash fast-path Read tracker) is consumed by flushEpisode's
 // rename-collect on the next edit-flush, NOT by a background worker — so a project
@@ -104,18 +105,66 @@ export const ORPHAN_EPISODE_AGE_MS = 60 * 60 * 1000;
 // stale to any current episode) while leaving every active session's file untouched.
 export const ORPHAN_READS_AGE_MS = 24 * 60 * 60 * 1000;
 
-// Sweep stale `ep-flush-*` / `pending-*` (older than `ageMs`, default 1h) and
-// `reads-*.txt` (older than `readsAgeMs`, default 24h) files in `runtimeDir` by
-// mtime. Returns the number of files removed. fs-only — no DB / no network. Used by
+// `ep-<project>.json` — the LIVE episode buffer, one file per project — had no reclamation
+// path at all: it is excluded from both marker-GC lists below (correctly: it holds unflushed
+// observations, not cache) and `sweepOrphanEpisodeFiles` only ever matched `ep-flush-`.
+// A real install on 2026-09-02 held four of them for projects deleted months earlier, the
+// oldest 53 days (`ep-tmp--loop-testing-e2e.*.json`, 07-11).
+//
+// Leaving them is not neutral. `readEpisode` has no staleness gate, so `handleSessionStart`
+// unconditionally flushes whatever it finds (hook.mjs "Flush any leftover episode buffer") —
+// revisiting such a project injects months-old tool activity into today's memory stamped
+// with today's date. The stale buffer is not preserved data, it is data that will be
+// mis-dated the moment anyone touches the project again.
+//
+// 7 days, and the argument is that no LEGITIMATE state needs a buffer to live even one day:
+// `EPISODE_TIME_GAP_MS` is 5 min and `SESSION_EXPIRY_MS` is 12 h, so a buffer untouched for
+// 7 days outlived its owning session by an order of magnitude. The margin over 12 h is
+// deliberate slack for a laptop suspended across a long weekend, not a second threshold with
+// its own meaning. Considered and rejected: flushing on sweep instead of deleting — it would
+// re-date the content exactly the way the revisit path does, i.e. commit the defect on
+// purpose rather than by omission.
+//
+// Exported as of the pre-tag review for v3.92.0, on this constant's own stated rule ("export
+// it the day something needs it"): the sweep alone does NOT close the harm described above.
+// `handleSessionStart` flushes the leftover buffer in the FOREGROUND, and the sweeper runs
+// later, in a detached auto-maintain worker — so on the revisit itself the mis-dated flush
+// happens first and the sweeper then finds nothing. What the sweep delivers is dir-wide
+// reclamation of OTHER projects' abandoned buffers; the same-project revisit needs the same
+// threshold applied at the flush, which is `hook.mjs`'s importer of this symbol.
+// `bufferAgeMs` stays a parameter so a test can pin the sweep threshold without an import.
+export const STALE_EPISODE_BUFFER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Sweep stale `ep-flush-*` / `pending-*` (older than `ageMs`, default 1h),
+// `reads-*.txt` (older than `readsAgeMs`, default 24h) and abandoned per-project episode
+// buffers `ep-<project>.json` (older than `bufferAgeMs`, default 7d) in `runtimeDir` by
+// mtime. `onSweep(name, kind)` is called before each unlink so a caller can log the one
+// deletion that discards content rather than residue ('buffer'); it is a callback rather
+// than a debugLog here because this module is imported by every hook entry point and stays
+// dependency-free. Returns the number of files removed. fs-only — no DB / no network. Used by
 // handleSessionStart auto-maintain to prevent the doctor "Stale temp files" warning
 // from accumulating across crashes; equivalent to the manual path in
 // `node install.mjs cleanup` but age-gated so concurrent in-flight workers / active
 // read sessions are never raced.
-export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE_MS, readsAgeMs = ORPHAN_READS_AGE_MS, now = Date.now() } = {}) {
+export function sweepOrphanEpisodeFiles(
+  runtimeDir,
+  {
+    ageMs = ORPHAN_EPISODE_AGE_MS,
+    readsAgeMs = ORPHAN_READS_AGE_MS,
+    bufferAgeMs = STALE_EPISODE_BUFFER_AGE_MS,
+    now = Date.now(),
+    onSweep = () => {},
+  } = {},
+) {
   let entries;
-  try { entries = readdirSync(runtimeDir); } catch { return 0; }
+  try {
+    entries = readdirSync(runtimeDir);
+  } catch {
+    return 0;
+  }
   const cutoff = now - ageMs;
   const readsCutoff = now - readsAgeMs;
+  const bufferCutoff = now - bufferAgeMs;
   let count = 0;
   for (const f of entries) {
     // Crash residue: this runtime dir writes four families of temp name, each the middle
@@ -139,19 +188,32 @@ export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE
     const isCrashResidue = /\.(claim|collect|trim|tmp)-[^.]*$/.test(f);
     const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-');
     const isReads = f.startsWith('reads-') && f.endsWith('.txt');
-    if (!isCrashResidue && !isEpisode && !isReads) continue;
+    // The live per-project buffer, on its own 7-day cutoff. `ep-flush-*` is also `ep-`-
+    // prefixed AND also ends in `.json`, so the exclusion is load-bearing, not defensive:
+    // without it a queued flush file would jump from the 1h cutoff to the 7d one.
+    const isStaleBuffer = f.startsWith('ep-') && !f.startsWith('ep-flush-') && f.endsWith('.json');
+    if (!isCrashResidue && !isEpisode && !isReads && !isStaleBuffer) continue;
     const full = join(runtimeDir, f);
     try {
       // Residue takes the short cutoff and a live tracker takes the 24h one, with no
       // tie-break needed: residue always APPENDS its suffix, so it never ends in `.txt`
       // and `isReads` is already false for it. (A `&& !isCrashResidue` tie-break was
       // written here first and no mutation could kill it — it was guarding a state the
-      // two predicates cannot both be in.)
-      if (statSync(full).mtimeMs < (isReads ? readsCutoff : cutoff)) {
+      // two predicates cannot both be in.) `isStaleBuffer` is in the same position: a
+      // residue name ends in `.tmp-<pid>`, never `.json`.
+      const fileCutoff = isReads ? readsCutoff : isStaleBuffer ? bufferCutoff : cutoff;
+      if (statSync(full).mtimeMs < fileCutoff) {
+        try {
+          onSweep(f, isStaleBuffer ? 'buffer' : isReads ? 'reads' : isCrashResidue ? 'residue' : 'episode');
+        } catch {
+          /* logging must never block the sweep */
+        }
         unlinkSync(full);
         count++;
       }
-    } catch { /* concurrent unlink / permission — ignore */ }
+    } catch {
+      /* concurrent unlink / permission — ignore */
+    }
   }
   return count;
 }
@@ -176,16 +238,25 @@ export const STALE_PROJECT_MARKER_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Regenerated on demand; safe to lose at any time.
 export const GC_PROJECT_MARKER_PREFIXES = Object.freeze([
-  'session-',                 // project → memory-session-id pointer
-  'cite-recall-',             // last session's cite-recall snapshot (nudge input)
-  '.skill-cooldown-',         // suggestion throttle timestamp
-  '.skill-reco-cooldown-',    // recommendation throttle timestamp
+  'session-', // project → memory-session-id pointer
+  CITE_RECALL_FILE_PREFIX, // last session's cite-recall snapshot (nudge input)
+  // R10 P3-5: the auto-compressible 24h gate. One file per project, regenerated on demand,
+  // and it was in NEITHER list — so a project the user stops working on kept its marker
+  // forever. `.skill-cooldown-` / `.skill-reco-cooldown-` left with the skill registry in
+  // v5.0.0; a prefix for files nothing writes any more is dead weight in a hot-path loop.
+  'last-mark-compressible-', // per-project auto-compress 24h gate
+  SKEW_MARKER_PREFIX, // per-project schema-skew log dedup; regenerated on the next skewed open
+  // Same shape, same reason, and it was missed here first time round — the note above is
+  // about exactly this defect, two entries up.
+  DB_UNUSABLE_MARKER_PREFIX, // per-project unopenable-DB log dedup; regenerated on the next failing open
 ]);
 
 // Records of a completed side effect — never age out. `ep-`/`ep-flush-`/
-// `pending-`/`reads-` are absent from BOTH lists on purpose: the first holds
-// unflushed observations (data, not cache) and the rest already belong to
-// sweepOrphanEpisodeFiles on tighter cutoffs.
+// `pending-`/`reads-` are absent from BOTH lists on purpose: they all belong to
+// sweepOrphanEpisodeFiles, on three cutoffs of their own (1h residue / 24h reads /
+// 7d abandoned buffer). `ep-<project>.json` was the one with no cutoff at all until
+// audit P1-12 — it is still not marker-GC-able here, because 30 days of unflushed
+// observations is far past the point where flushing them would mis-date them.
 export const GC_PRESERVED_MARKER_PREFIXES = Object.freeze([
   '.auto-adopt-',
   '.deferred-block-migrated-',
@@ -242,19 +313,29 @@ export function sentinelPrefixesFromShell(shellSource) {
  * @param {{ageMs?: number, now?: number, gcPrefixes?: string[], preservedPrefixes?: string[]}} [opts]
  * @returns {number}
  */
-export function sweepStaleProjectMarkers(runtimeDir, {
-  ageMs = STALE_PROJECT_MARKER_AGE_MS,
-  now = Date.now(),
-  gcPrefixes = GC_PROJECT_MARKER_PREFIXES,
-  preservedPrefixes = GC_PRESERVED_MARKER_PREFIXES,
-  env = process.env,
-} = {}) {
+export function sweepStaleProjectMarkers(
+  runtimeDir,
+  {
+    ageMs = STALE_PROJECT_MARKER_AGE_MS,
+    now = Date.now(),
+    gcPrefixes = GC_PROJECT_MARKER_PREFIXES,
+    preservedPrefixes = GC_PRESERVED_MARKER_PREFIXES,
+    env = process.env,
+  } = {},
+) {
   // Kill switch (naming mirrors SKIP_COMPRESS / SKIP_OPTIMIZE / SKIP_SAVE_ENRICH):
   // this is the only sweep that deletes files a user might want to inspect, so a
   // released default that reclaims state needs a documented way back out.
+  // R10 P3-6: exact '1', not a truthy check, and that is on purpose — the truthy form the
+  // sibling CLAUDE_MEM_SKIP_* flags use makes `=0` mean "skip", the opposite of intent.
+  // README documents the difference; do not "align" this without aligning the others too.
   if (env.CLAUDE_MEM_SKIP_MARKER_GC === '1') return 0;
   let entries;
-  try { entries = readdirSync(runtimeDir); } catch { return 0; }
+  try {
+    entries = readdirSync(runtimeDir);
+  } catch {
+    return 0;
+  }
   const cutoff = now - ageMs;
   let count = 0;
   for (const f of entries) {
@@ -264,8 +345,13 @@ export function sweepStaleProjectMarkers(runtimeDir, {
     if (!gcPrefixes.some((p) => f.startsWith(p))) continue;
     const full = join(runtimeDir, f);
     try {
-      if (statSync(full).mtimeMs < cutoff) { unlinkSync(full); count++; }
-    } catch { /* concurrent unlink / permission / directory — ignore */ }
+      if (statSync(full).mtimeMs < cutoff) {
+        unlinkSync(full);
+        count++;
+      }
+    } catch {
+      /* concurrent unlink / permission / directory — ignore */
+    }
   }
   return count;
 }
@@ -308,14 +394,100 @@ export function createSessionId() {
 
 // ─── Database ────────────────────────────────────────────────────────────────
 
+// Last forward-incompat ("the DB is newer than me") failure seen in THIS process, or null.
+// SessionStart needs the two version numbers to render its notice and openDb has just been
+// handed them, so this beats a second DB open — and on a skew there may be no working
+// binding to open with anyway.
+let lastSkew = null;
+
+/**
+ * The schema skew that made the most recent openDb() return null, or null.
+ * Cleared by any successful open, so a heal mid-session stops the notice.
+ *
+ * @returns {{dbVersion: number|null, binaryVersion: number|null}|null}
+ */
+export function lastSchemaSkew() {
+  return lastSkew;
+}
+
+// Same idea, other unhealable family: the file exists and SQLite will not open it. Held as a
+// boolean rather than the error, because the only thing SessionStart needs is "which notice",
+// and keeping an Error alive here would tempt a caller into rendering a stack trace at a user.
+let lastUnusable = false;
+
+/**
+ * True when the most recent openDb() returned null because the database file is not a usable
+ * database. Cleared by any successful open, so a repair mid-session stops the notice.
+ *
+ * @returns {boolean}
+ */
+export function lastDbUnusable() {
+  return lastUnusable;
+}
+
 export function openDb() {
   try {
     // WAL-corruption self-heal (was server.mjs-only): without it, hooks stayed
     // silently dead (null DB) on a corrupt WAL until the next MCP server start.
-    return ensureDbWithWalRecovery();
+    const db = ensureDbWithWalRecovery();
+    lastSkew = null;
+    lastUnusable = false;
+    return db;
   } catch (e) {
-    // Still null, still no throw — a hook must never crash the host session, and all
-    // eight call sites in hook.mjs are written to no-op on null. But "returned null"
+    // Forward-incompat is its own family: it cannot be healed by anything this process can
+    // do, it repeats on every single open, and it is the one failure the USER has to act on.
+    // Record it once and hand the numbers to SessionStart, which is the surface that speaks.
+    // Forward-incompat is its own family: nothing this process can do heals it, it repeats on
+    // every single open, and it is the one failure the USER has to act on. Dedup lives in
+    // lib/schema-skew.mjs so the `ups` face — which opens the DB itself and logged its own 15
+    // of the day's 727 lines — shares one implementation instead of drifting from this one.
+    //
+    // shouldRecordSkew is TOTAL by contract. Nothing in this catch may throw: the first cut
+    // called getSessionId() here, which MINTS and writes a session id, so an unwritable
+    // runtime dir turned openDb() itself into a thrower. All 12 openDb() call sites in hook.mjs are written to
+    // no-op on null and none of them expects an exception.
+    if (isSchemaSkewError(e)) {
+      lastSkew = schemaSkewFromError(e) || { dbVersion: null, binaryVersion: null };
+      lastUnusable = false;
+      // Guarded even though inferProject() reads env and cwd: "the only statement in this
+      // catch cannot throw" was true of the original one-line body and stopped being true
+      // the moment anything was added. An unscoped marker is a worse dedup, not a crash.
+      let project = '';
+      try {
+        project = inferProject();
+      } catch {
+        /* total: the marker degrades to one shared file */
+      }
+      if (shouldRecordSkew(RUNTIME_DIR, project, lastSkew)) {
+        recordHookError('hook-shared:db-open', e, RUNTIME_DIR);
+      }
+      return null;
+    }
+    // The OTHER unhealable family, and it was the silent one. A file that is not a database
+    // repeats on every fire exactly like a skew does, and until now took the generic branch
+    // below: one full stack trace per SessionStart fire (measured: 20 fires → 20 records, ~860 B
+    // each), no dedup, and no user-visible word anywhere in the session. Same treatment as skew
+    // — record once per project per hour, and hand SessionStart a flag to speak with.
+    //
+    // Nothing in this branch may throw: `isDbUnusableError` is a regex over a string and
+    // `shouldRecordOnce` is total by contract, which is exactly the property the first cut of
+    // the skew dedup lost by calling a function that WRITES.
+    if (isDbUnusableError(e)) {
+      lastUnusable = true;
+      lastSkew = null; // the two flags are a set: whichever family fired last is the true one
+      let project = '';
+      try {
+        project = inferProject();
+      } catch {
+        /* total: the marker degrades to one shared file */
+      }
+      if (shouldRecordOnce(RUNTIME_DIR, DB_UNUSABLE_MARKER_PREFIX, project, 'unusable')) {
+        recordHookError('hook-shared:db-open', e, RUNTIME_DIR);
+      }
+      return null;
+    }
+    // Still null, still no throw — a hook must never crash the host session, and all 12
+    // openDb() call sites in hook.mjs are written to no-op on null. But "returned null"
     // used to be the ONLY trace: nothing reached runtime/hook-errors/, so `stats`
     // reported 0 and doctor printed "no recent silent hook breakage" while every
     // capture path was dead (audit B1, 2026-08-14 — the same blindness that hid the
@@ -324,41 +496,6 @@ export function openDb() {
     // routing through it also flags the native-binding family for the session-start
     // self-heal. The recorder swallows its own errors, so this cannot throw.
     recordHookError('hook-shared:db-open', e, RUNTIME_DIR);
-    return null;
-  }
-}
-
-// ─── LLM (provider-routed: Anthropic API → OpenRouter → claude CLI) ─────────
-
-// Accepts either a plain string (legacy) or {system, user} (defense-in-depth
-// against prompt injection from poisoned user_prompts content — cso F#4 fix).
-// Provider priority mirrors haiku-client (ANTHROPIC_API_KEY > OPENROUTER_API_KEY
-// > CLI): when a key is present, delegate to callHaiku — it owns the Anthropic
-// Messages / OpenRouter chat-completions request shapes, uses the system role
-// natively, AND degrades to the `claude -p` CLI internally if the keyed provider
-// fails (so a region-blocked / out-of-credit key still yields a summary). The
-// keyless case shells out to `claude -p` directly here, where flattenForCLI
-// renders {system, user} with an explicit data-boundary marker. Returns the raw
-// response string (callers run parseJsonFromLLM themselves) or null.
-// maxTokens is sized for session-summary / episode JSON (larger than the
-// registry/optimize callers' budgets).
-export async function callLLM(prompt, timeoutMs = BG_LLM_TIMEOUT_MS) {
-  if (detectLLMMode() !== 'cli') {
-    const result = await callHaiku(prompt, { timeout: timeoutMs, maxTokens: 2000 });
-    return result?.text ?? null;
-  }
-
-  const { cli: modelName } = resolveModelShared();
-  try {
-    // Shared runner with haiku-client.mjs#callModelCLI (rationale there): no
-    // transcript persistence, no claudemd hook fan-out, and the one-shot
-    // retry-without-flag that keeps this leg alive on an older Claude Code CLI.
-    const result = execClaudeCliSync(modelName, { input: _flattenForCLI(prompt), timeout: timeoutMs });
-    return result.trim();
-  } catch (e) {
-    const out = _extractResponseFromError(e);
-    if (out) return out;
-    debugCatch(e, 'callLLM');
     return null;
   }
 }
@@ -373,7 +510,9 @@ export function spawnBackground(bgEvent, ...extraArgs) {
       stdio: 'ignore',
       env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
     });
-    child.on('error', (err) => { debugCatch(err, 'spawnBackground'); });
+    child.on('error', (err) => {
+      debugCatch(err, 'spawnBackground');
+    });
     child.on('exit', () => {});
     child.unref();
   } catch (err) {
@@ -383,22 +522,6 @@ export function spawnBackground(bgEvent, ...extraArgs) {
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
-export function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-/**
- * Extract partial response from CLI error output (timeout/error recovery).
- * @param {Error} error The caught error from execFileSync
- * @returns {string|null} Extracted JSON string or null
- */
-export function _extractResponseFromError(error) {
-  const out = error.stdout?.toString?.()?.trim() || error.output?.[1]?.toString?.()?.trim() || '';
-  if (out && out.startsWith('{') && out.endsWith('}')) {
-    try {
-      const parsed = JSON.parse(out);
-      // Reject structurally incomplete responses (e.g. truncated mid-output)
-      if (typeof parsed !== 'object' || parsed === null || Object.keys(parsed).length === 0) return null;
-      return out;
-    } catch { return null; }
-  }
-  return null;
+export function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }

@@ -30,7 +30,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '../..');
 const KEEP = process.argv.includes('--keep'); // leave the workdir for debugging
 const log = (m) => process.stdout.write(`[smoke] ${m}\n`);
-const fail = (m) => { process.stderr.write(`[smoke] FAIL: ${m}\n`); process.exit(1); };
+const fail = (m) => {
+  process.stderr.write(`[smoke] FAIL: ${m}\n`);
+  process.exit(1);
+};
 
 // Run a command; inherit stderr so npm/native build errors stay visible, capture
 // stdout for assertions. Throws (non-zero exit) propagate as a failed smoke run.
@@ -45,6 +48,15 @@ mkdirSync(installDir, { recursive: true });
 // CI npm-12 job sets this: REQUIRE the script block to occur and the shipped
 // heal to fire (see step 3b).
 const expectBlock = process.env.SMOKE_EXPECT_SCRIPT_BLOCK === '1';
+// v4.0.0: better-sqlite3 13 ships `prebuilds/<platform>.node` inside its own tarball, so a
+// blocked install script no longer leaves a user without a binding — measured directly:
+// `npm install --ignore-scripts better-sqlite3@13` yields 8 prebuilds and opens a DB, while
+// the same install of 12 yields none and cannot. That retires the failure mode this smoke's
+// heal leg was built for on every platform a prebuild covers, and it would have quietly
+// turned the heal leg into dead weight. This flag deletes the prebuilt binaries after
+// install to stand in for a platform no prebuild covers (exotic libc/arch), which is the
+// case where the shipped heal is still the only thing between the user and a -32000.
+const forceNoPrebuilds = process.env.SMOKE_FORCE_NO_PREBUILDS === '1';
 
 try {
   // 1. Build the real publishable tarball (same artifact `npm publish` ships).
@@ -56,8 +68,8 @@ try {
   // canonical pack name (scope '@' dropped, '/' → '-').
   const packOut = JSON.parse(packJson);
   const packInfo = Array.isArray(packOut) ? packOut[0] : Object.values(packOut)[0];
-  const packName = packInfo.filename
-    || `${packInfo.name.replace(/^@/, '').replace(/\//g, '-')}-${packInfo.version}.tgz`;
+  const packName =
+    packInfo.filename || `${packInfo.name.replace(/^@/, '').replace(/\//g, '-')}-${packInfo.version}.tgz`;
   const tgz = join(work, packName);
   log(`packed ${packName}`);
 
@@ -70,7 +82,9 @@ try {
   if (existsSync(join(REPO_ROOT, 'npm-shrinkwrap.json'))) {
     const entries = sh('tar', ['-tzf', tgz]);
     if (!entries.includes('package/npm-shrinkwrap.json')) {
-      fail('repo has npm-shrinkwrap.json but the packed tarball does not — packlist dropped it (files[] entry missing?)');
+      fail(
+        'repo has npm-shrinkwrap.json but the packed tarball does not — packlist dropped it (files[] entry missing?)',
+      );
     }
     log('shrinkwrap OK — npm-shrinkwrap.json is in the tarball');
   }
@@ -88,6 +102,31 @@ try {
   }
   sh('npm', ['init', '-y'], { cwd: installDir });
   sh('npm', ['install', tgz, '--no-audit', '--no-fund'], { cwd: installDir });
+
+  const bsqlite3Dir = join(installDir, 'node_modules', 'better-sqlite3');
+  const gypOutput = join(bsqlite3Dir, 'build', 'Release');
+  // Direct evidence that the script block ACTUALLY occurred, which is what the flag
+  // originally proved by way of a broken binding. Prebuilds took that proxy away, so assert
+  // the cause instead of the symptom: node-gyp never ran, so it left no build/Release.
+  if (expectBlock) {
+    if (existsSync(gypOutput)) {
+      fail(
+        'SMOKE_EXPECT_SCRIPT_BLOCK=1 but better-sqlite3 has build/Release — node-gyp RAN, so the script block did not occur. npm default changed or the runner pre-allows scripts; update the CI job.',
+      );
+    }
+    log('script block confirmed — no build/Release, node-gyp never ran');
+  }
+  if (forceNoPrebuilds) {
+    const prebuilds = join(bsqlite3Dir, 'prebuilds');
+    if (!existsSync(prebuilds)) {
+      fail(
+        'SMOKE_FORCE_NO_PREBUILDS=1 but better-sqlite3 shipped no prebuilds/ to remove — the dependency layout changed; this leg no longer stands in for an uncovered platform.',
+      );
+    }
+    rmSync(prebuilds, { recursive: true, force: true });
+    rmSync(join(bsqlite3Dir, 'build'), { recursive: true, force: true });
+    log('SMOKE_FORCE_NO_PREBUILDS=1 — removed prebuilds/ + build/ to stand in for an uncovered platform');
+  }
 
   const cli = join(installDir, 'node_modules', 'claude-mem-lite', 'cli.mjs');
 
@@ -111,29 +150,40 @@ try {
   //     the block stops happening, the job fails loudly rather than silently
   //     testing nothing.
   const probe = join(work, 'probe.mjs');
-  writeFileSync(probe, [
-    "import { createRequire } from 'node:module';",
-    `const require = createRequire(${JSON.stringify(join(installDir, 'package.json'))});`,
-    "const Database = require('better-sqlite3');",
-    "const db = new Database(':memory:');",
-    "db.exec('CREATE TABLE t(x)'); db.prepare('INSERT INTO t VALUES (1)').run();",
-    "const n = db.prepare('SELECT count(*) AS c FROM t').get().c; db.close();",
-    "if (n !== 1) { console.error('bad count', n); process.exit(3); }",
-    "process.stdout.write('native-ok');",
-  ].join('\n'));
+  writeFileSync(
+    probe,
+    [
+      "import { createRequire } from 'node:module';",
+      `const require = createRequire(${JSON.stringify(join(installDir, 'package.json'))});`,
+      "const Database = require('better-sqlite3');",
+      "const db = new Database(':memory:');",
+      "db.exec('CREATE TABLE t(x)'); db.prepare('INSERT INTO t VALUES (1)').run();",
+      "const n = db.prepare('SELECT count(*) AS c FROM t').get().c; db.close();",
+      "if (n !== 1) { console.error('bad count', n); process.exit(3); }",
+      "process.stdout.write('native-ok');",
+    ].join('\n'),
+  );
   // Unlike sh(), the probe swallows stderr: its FIRST run is EXPECTED to fail
   // under the npm >= 12 block, and an expected failure should not dump a full
   // Node error stack into the smoke log.
   const tryProbe = () => {
     try {
-      return execFileSync('node', [probe], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd: installDir,
-      }) === 'native-ok';
-    } catch { return false; }
+      return (
+        execFileSync('node', [probe], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          cwd: installDir,
+        }) === 'native-ok'
+      );
+    } catch {
+      return false;
+    }
   };
   let healed = false;
   if (!tryProbe()) {
-    log('binding unusable after npm install (npm >= 12 script block or ABI drift) — exercising the shipped heal …');
+    log(
+      'binding unusable after npm install (npm >= 12 script block or ABI drift) — exercising the shipped heal …',
+    );
     const healSrc = [
       `const m = await import(${JSON.stringify(pathToFileURL(join(installDir, 'node_modules', 'claude-mem-lite', 'lib', 'binding-probe.mjs')).href)});`,
       `const r = await m.ensureBetterSqlite3Working(${JSON.stringify(installDir)});`,
@@ -144,10 +194,23 @@ try {
     if (!tryProbe()) fail(`binding still unusable after shipped heal (heal reported: ${action})`);
     healed = true;
     log(`heal OK — ensureBetterSqlite3Working reported "${action}", re-probe passed`);
-  } else if (expectBlock) {
-    fail('SMOKE_EXPECT_SCRIPT_BLOCK=1 but the binding compiled on plain npm install — the script block did not occur, so the heal path was NOT exercised. npm default changed or the runner pre-allows scripts; update the CI job.');
+  } else if (forceNoPrebuilds) {
+    fail(
+      'SMOKE_FORCE_NO_PREBUILDS=1 but the binding still loaded — the prebuilt binaries were not actually removed, so the heal path was NOT exercised and this leg proved nothing.',
+    );
   }
-  log(`native OK — better-sqlite3 opened :memory: and round-tripped a row${healed ? ' (via shipped heal)' : ''}`);
+  // v4.0.0 invariant, and the reason the flag no longer demands a heal: with scripts
+  // blocked and prebuilds intact, the install must come up WITHOUT healing. If it needed
+  // the heal, better-sqlite3's prebuilds stopped covering this platform and the "npm script
+  // blocking no longer reaches users" claim in the CHANGELOG has regressed.
+  if (expectBlock && !forceNoPrebuilds && healed) {
+    fail(
+      'SMOKE_EXPECT_SCRIPT_BLOCK=1 (prebuilds intact) but the binding needed the shipped heal — better-sqlite3 prebuilds no longer survive a blocked install script on this platform.',
+    );
+  }
+  log(
+    `native OK — better-sqlite3 opened :memory: and round-tripped a row${healed ? ' (via shipped heal)' : ''}`,
+  );
 
   // 3c. Full runtime path: real import chain → schema init → DB open → query,
   //     against a fresh sandboxed data dir. `stats` reads the DB and exits 0 on
