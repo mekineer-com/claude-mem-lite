@@ -160,21 +160,24 @@ describe('search telemetry on schema v49', () => {
     db.close();
   });
 
-  it('scrubs secrets before persisting queries and result labels', () => {
+  it('scrubs and caps persisted queries, result labels, and client identity', () => {
     const db = openDb();
     const searchId = recordSearch(db, {
-      query: 'deploy with api_key=sk-mykey123',
+      query: `deploy with api_key=sk-mykey123 ${'q'.repeat(600)}`,
       surface: 'mcp_search',
-      client: 'test',
-      results: [{ source: 'obs', id: 7, title: 'token=abc123xyz' }],
+      client: `client token=abc123xyz ${'c'.repeat(600)}`,
+      results: [{ source: 'obs', id: 7, title: `token=abc123xyz ${'t'.repeat(600)}` }],
     });
-    expect(db.prepare('SELECT query FROM search_runs WHERE search_id = ?').get(searchId).query).toBe(
-      'deploy with api_key=***',
-    );
+    const query = db.prepare('SELECT query FROM search_runs WHERE search_id = ?').get(searchId).query;
+    expect(query).toHaveLength(500);
+    expect(query).toContain('api_key=***');
     expect(
       db.prepare('SELECT snapshot_label FROM search_results WHERE search_id = ?').get(searchId)
         .snapshot_label,
-    ).toBe('token=***');
+    ).toHaveLength(500);
+    const client = db.prepare('SELECT client FROM search_runs WHERE search_id = ?').get(searchId).client;
+    expect(client).toHaveLength(500);
+    expect(client).toContain('token=***');
     db.close();
   });
 
@@ -263,7 +266,7 @@ describe('search telemetry on schema v49', () => {
       result.content[0].text
         .trim()
         .endsWith(
-          `Search ${result.search_id} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For a concrete retrieval-quality investigation, separately record contribution there: relevant but redundant, helpful detail or confirmation, or changed action or prevented error.`,
+          `Search ${result.search_id} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For retrieval-quality investigations, assess contribution separately; this tool stores relevance only.`,
         ),
     ).toBe(true);
     handleSearchFeedbackForTest(
@@ -278,6 +281,7 @@ describe('search telemetry on schema v49', () => {
     expect(report).toMatchObject({ search_count: 1, rated_count: 1, relevance_coverage: 1 });
     expect(report.relevance_distribution.relevant).toBe(1);
     expect(formatSearchTelemetryReport(report)).toContain('Relevance coverage: 1/1 (100.0%)');
+    expect(formatSearchTelemetryReport(report)).toContain('recording failures (last 14d): 0');
     db.close();
   });
 
@@ -334,6 +338,41 @@ describe('search telemetry on schema v49', () => {
     ).toBe(10);
     expect(topTen.results.map((row) => row.id)).toEqual(pages.map((row) => row.id));
     expect(topTwenty.results.slice(0, 10).map((row) => row.id)).toEqual(topTen.results.map((row) => row.id));
+    db.close();
+  });
+
+  it('keeps sparse-query expansion ordering stable across limits 5, 10, and 20', async () => {
+    const db = openDb();
+    seedObservation(db, { title: 'zebra minotaur rescue one' });
+    const insert = db.prepare(`
+      INSERT INTO observations
+        (memory_session_id, project, text, narrative, type, title, created_at, created_at_epoch, importance)
+      VALUES ('memory-1', 'telemetry-test', ?, ?, 'bugfix', ?, ?, ?, 3)
+    `);
+    for (const suffix of ['two', 'three']) {
+      const title = `zebra minotaur rescue ${suffix}`;
+      const now = Date.now();
+      insert.run(title, `minotaur ${suffix} evidence`, title, new Date(now).toISOString(), now);
+    }
+    const targetTitle = 'minotaur queue saturation root cause';
+    const now = Date.now();
+    insert.run(targetTitle, 'minotaur consumers detach', targetTitle, new Date(now).toISOString(), now);
+
+    const ids = async (limit) =>
+      (
+        await handleSearchForTest(db, {
+          query: 'zebra quokka',
+          project: 'telemetry-test',
+          limit,
+          deep: false,
+        })
+      ).results.map((row) => row.id);
+    const top5 = await ids(5);
+    const top10 = await ids(10);
+    const top20 = await ids(20);
+    expect(top5).toEqual(top10.slice(0, 5));
+    expect(top10).toEqual(top20.slice(0, 10));
+    expect(top5).toHaveLength(4);
     db.close();
   });
 
@@ -395,6 +434,32 @@ describe('search telemetry on schema v49', () => {
     const text = formatSearchTelemetryReport(report);
     expect(text).toContain('mcp_search #1: 30/30 relevant');
     expect(text).toContain('user_prompt_hook #1: suppressed (surface: 1 ratings');
+
+    const underCovered = structuredClone(report);
+    underCovered.by_surface.mcp_search = {
+      returned: 151,
+      relevant: 30,
+      partial: 0,
+      irrelevant: 0,
+      unrated: 121,
+      coverage: 30 / 151,
+    };
+    expect(formatSearchTelemetryReport(underCovered)).toContain(
+      'mcp_search #1: suppressed (surface: 30 ratings, 19.9% coverage)',
+    );
+
+    const unratedRank = structuredClone(report);
+    unratedRank.by_rank['mcp_search:1'] = {
+      returned: 1,
+      relevant: 0,
+      partial: 0,
+      irrelevant: 0,
+      unrated: 1,
+      coverage: 0,
+    };
+    const unratedText = formatSearchTelemetryReport(unratedRank);
+    expect(unratedText).toContain('mcp_search #1: suppressed');
+    expect(unratedText).not.toContain('NaN%');
     db.close();
   });
 

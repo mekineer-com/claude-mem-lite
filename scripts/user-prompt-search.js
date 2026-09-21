@@ -947,9 +947,9 @@ async function main() {
       const ftsPool = ftsResult.rows;
       let ftsRows = ftsPool.slice(0, mainLimit);
       const ftsMode = ftsResult.mode;
-      searchMode = ftsMode === 'OR' ? 'or_fallback' : 'normal';
+      if (!errSig) searchMode = ftsMode === 'OR' ? 'or_fallback' : 'normal';
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
-      if (fileRows.length > 0) searchMode = 'file';
+      if (!errSig && fileRows.length > 0) searchMode = 'file';
 
       // T3 (v2.31): BM25 magnitude threshold — drop FTS hits whose relevance
       // magnitude doesn't clear the floor. This targets OR-fallback leakage
@@ -1119,7 +1119,7 @@ async function main() {
           results: telemetryRows,
           client: 'user_prompt_hook',
         });
-        rendered += `\nSearch ${telemetrySearchId} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For a concrete retrieval-quality investigation, separately record contribution there: relevant but redundant, helpful detail or confirmation, or changed action or prevented error.`;
+        rendered += `\nSearch ${telemetrySearchId} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For retrieval-quality investigations, assess contribution separately; this tool stores relevance only.`;
       } catch (e) {
         recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
       }

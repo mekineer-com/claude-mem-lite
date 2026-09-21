@@ -714,7 +714,7 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
       client: clientIdentity,
     });
     if (r.page.length > 0 && output.content?.[0]?.type === 'text') {
-      output.content[0].text += `\n\nSearch ${searchId} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For a concrete retrieval-quality investigation, separately record contribution there: relevant but redundant, helpful detail or confirmation, or changed action or prevented error.`;
+      output.content[0].text += `\n\nSearch ${searchId} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For retrieval-quality investigations, assess contribution separately; this tool stores relevance only.`;
     }
   } catch (e) {
     recordHookError('search-telemetry:mcp_search', e, RUNTIME_DIR);

@@ -1556,15 +1556,17 @@ async function cmdStats(db, args) {
   const searchTelemetry = flags['search-telemetry'] === true || flags['search-telemetry'] === 'true';
   if (searchTelemetry) {
     const now = Date.now();
+    const recordingFailureDays = Math.min(days, 14);
     const report = computeSearchTelemetry(db, {
       project,
       days,
       now,
       recordingFailures: countRecentHookErrors(
         resolveRuntimeDir(DB_DIR),
-        now - Math.min(days, 14) * DAY_MS,
+        now - recordingFailureDays * DAY_MS,
         'search-telemetry:',
       ),
+      recordingFailureDays,
     });
     out(jsonOutput ? JSON.stringify(report) : formatSearchTelemetryReport(report));
     return;

@@ -259,6 +259,23 @@ describe('CLI search command', () => {
     expect(resultLines.length).toBeLessThanOrEqual(3);
   });
 
+  it('defaults to five results while an explicit limit still overrides it', async () => {
+    for (let i = 0; i < 12; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Default limit token ${i}`,
+        text: `default limit token details ${i}`,
+      });
+    }
+    const countRows = (output) => output.split('\n').filter((line) => line.startsWith('#')).length;
+    expect(countRows(await captureStdout(() => run(['search', 'default limit token'])))).toBe(5);
+    expect(
+      countRows(await captureStdout(() => run(['search', 'default limit token', '--limit', '10']))),
+    ).toBe(10);
+  });
+
   it('shows lesson_learned when present', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1',
@@ -1276,7 +1293,12 @@ describe('CLI stats command', () => {
         run(['stats', '--search-telemetry', '--project', 'test--project', '--json']),
       ),
     );
-    expect(json).toMatchObject({ search_count: 1, rated_count: 1, relevance_coverage: 1 });
+    expect(json).toMatchObject({
+      search_count: 1,
+      rated_count: 1,
+      relevance_coverage: 1,
+      recording_failure_days: 14,
+    });
   });
 
   // Round1-P2: the low-value ("noise") count pre-fix omitted `compressed_into IS NULL`,

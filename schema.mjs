@@ -131,6 +131,10 @@ export { DB_DIR, DB_PATH, CODE_DIR };
 // 2026-07-14 on this machine's own DB). One version per migration batch keeps
 // the version number itself the detector. LATEST_MIGRATION_COLUMN advances to
 // observations.scope.
+// Local search telemetry is additive to upstream schema 49: search_runs records
+// each exposed search and search_results records its ranked rows plus sparse
+// relevance labels. Both tables are CORE_SCHEMA entries and sentinels because this
+// fork and plain upstream v49 legitimately share a version number but not this shape.
 // v45 (per-surface funnel): citation_surface_log — the same invocation→cite
 // funnel as citation_log (v38) but split by INJECTION FACE. citation_log answers
 // "is effectiveness rising or falling" for a project; it cannot answer "which

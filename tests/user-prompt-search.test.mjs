@@ -920,6 +920,26 @@ describe('user-prompt-search subprocess integration', () => {
     expect(stdout).not.toContain('Search ');
   });
 
+  it('records error-signature searches as error mode', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'bugfix',
+      title: 'TypeError cannot read properties of undefined reading foo',
+      text: 'TypeError cannot read properties of undefined reading foo',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript({
+      session_id: 'telemetry-error-mode',
+      prompt: "TypeError: Cannot read properties of undefined (reading 'foo')",
+    });
+    expect(stdout).toContain('TypeError');
+    expect(db.prepare('SELECT search_mode FROM search_runs ORDER BY search_id DESC LIMIT 1').get()).toEqual({
+      search_mode: 'error',
+    });
+  });
+
   it('accepts both "prompt" and "user_prompt" fields', async () => {
     // Both should be accepted (the script checks hookData.prompt || hookData.user_prompt)
     const { stdout: out1 } = await runScript({ prompt: 'yes' });
