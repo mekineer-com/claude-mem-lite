@@ -439,7 +439,7 @@ describe('search telemetry on schema v49', () => {
     expect(text).toContain('mcp_search #1: 30/30 relevant');
     expect(text).toContain('user_prompt_hook #1: suppressed (surface: 1 ratings');
 
-    const underCovered = structuredClone(report);
+    const underCovered = globalThis.structuredClone(report);
     underCovered.by_surface.mcp_search = {
       returned: 151,
       relevant: 30,
@@ -452,7 +452,7 @@ describe('search telemetry on schema v49', () => {
       'mcp_search #1: suppressed (surface: 30 ratings, 19.9% coverage)',
     );
 
-    const unratedRank = structuredClone(report);
+    const unratedRank = globalThis.structuredClone(report);
     unratedRank.by_rank['mcp_search:1'] = {
       returned: 1,
       relevant: 0,
