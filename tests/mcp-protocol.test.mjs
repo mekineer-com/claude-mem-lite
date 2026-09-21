@@ -239,8 +239,9 @@ describe('MCP protocol surface', () => {
       arguments: { query: 'paginationmarker', obs_type: 'bugfix', limit: 2 },
     });
     const text = textOf(res);
-    // Must surface the full population, not just the 2 shown on this page.
-    expect(text).toMatch(/2 of 6 result/);
+    // Expansion can add candidates beyond the six direct matches.
+    const total = Number(text.match(/Found 2 of (\d+) result/)?.[1]);
+    expect(total).toBeGreaterThanOrEqual(6);
   });
 
   // Regression guard: explicit single-source pagination (type='observations')

@@ -171,10 +171,11 @@ describe('search telemetry on schema v49', () => {
     const query = db.prepare('SELECT query FROM search_runs WHERE search_id = ?').get(searchId).query;
     expect(query).toHaveLength(500);
     expect(query).toContain('api_key=***');
-    expect(
-      db.prepare('SELECT snapshot_label FROM search_results WHERE search_id = ?').get(searchId)
-        .snapshot_label,
-    ).toHaveLength(500);
+    const label = db
+      .prepare('SELECT snapshot_label FROM search_results WHERE search_id = ?')
+      .get(searchId).snapshot_label;
+    expect(label).toHaveLength(500);
+    expect(label).toContain('token=***');
     const client = db.prepare('SELECT client FROM search_runs WHERE search_id = ?').get(searchId).client;
     expect(client).toHaveLength(500);
     expect(client).toContain('token=***');
@@ -349,7 +350,7 @@ describe('search telemetry on schema v49', () => {
         (memory_session_id, project, text, narrative, type, title, created_at, created_at_epoch, importance)
       VALUES ('memory-1', 'telemetry-test', ?, ?, 'bugfix', ?, ?, ?, 3)
     `);
-    for (const suffix of ['two', 'three']) {
+    for (const suffix of ['two', 'three', 'four', 'five', 'six']) {
       const title = `zebra minotaur rescue ${suffix}`;
       const now = Date.now();
       insert.run(title, `minotaur ${suffix} evidence`, title, new Date(now).toISOString(), now);
@@ -372,7 +373,10 @@ describe('search telemetry on schema v49', () => {
     const top20 = await ids(20);
     expect(top5).toEqual(top10.slice(0, 5));
     expect(top10).toEqual(top20.slice(0, 10));
-    expect(top5).toHaveLength(4);
+    expect(top5).toHaveLength(5);
+    expect(top10).toHaveLength(7);
+    expect(top20).toHaveLength(7);
+    expect(top10).toContain(db.prepare('SELECT id FROM observations WHERE title = ?').get(targetTitle).id);
     db.close();
   });
 
@@ -458,7 +462,7 @@ describe('search telemetry on schema v49', () => {
       coverage: 0,
     };
     const unratedText = formatSearchTelemetryReport(unratedRank);
-    expect(unratedText).toContain('mcp_search #1: suppressed');
+    expect(unratedText).toContain('mcp_search #1: no ratings at this rank');
     expect(unratedText).not.toContain('NaN%');
     db.close();
   });

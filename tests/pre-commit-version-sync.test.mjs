@@ -26,19 +26,19 @@ import { fileURLToPath } from 'url';
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SCRIPT = join(REPO, 'scripts', 'pre-commit.sh');
 
-/** The grep invocation the script actually uses, lifted from its own text. */
+/** The anchored extractor the script actually uses, lifted from its own text. */
 function extractorPattern() {
   const src = readFileSync(SCRIPT, 'utf8');
-  const m = /^CLAUDE_VER=\$\(grep -oP '(.+)' CLAUDE\.md\)$/m.exec(src);
-  if (!m) throw new Error('could not find the CLAUDE_VER grep line in scripts/pre-commit.sh');
+  const m = /^CLAUDE_VER=\$\(sed -nE '(.+)' CLAUDE\.md\)$/m.exec(src);
+  if (!m) throw new Error('could not find the CLAUDE_VER sed line in scripts/pre-commit.sh');
   return m[1];
 }
 
 function runExtractor(pattern, file) {
   try {
-    return execFileSync('grep', ['-oP', pattern, file], { encoding: 'utf8' });
+    return execFileSync('sed', ['-nE', pattern, file], { encoding: 'utf8' });
   } catch (e) {
-    // grep exits 1 on no match; return what it printed so the assertions can see "".
+    // Return stdout so a failed extractor still fails the cardinality assertion.
     return e.stdout?.toString() ?? '';
   }
 }
@@ -62,8 +62,8 @@ describe('pre-commit version-sync extractor', () => {
   });
 
   it('the old unanchored pattern would have matched both — the defect is real, not hypothetical', () => {
-    const out = runExtractor(String.raw`(?<=\*\*Version\*\*: )\S+`, join(REPO, 'CLAUDE.md'));
-    expect(out.split('\n').filter(Boolean).length).toBeGreaterThan(1);
+    const md = readFileSync(join(REPO, 'CLAUDE.md'), 'utf8');
+    expect([...md.matchAll(/\*\*Version\*\*:\s+(\S+)/g)]).toHaveLength(2);
   });
 
   it('refuses to compare when CLAUDE.md yields no version at all', () => {

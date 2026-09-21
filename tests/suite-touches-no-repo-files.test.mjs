@@ -71,6 +71,10 @@ function runInstall(home, proj, extraEnv) {
       HOME: home,
       CLAUDE_PROJECT_DIR: proj,
       CLAUDE_MEM_SKIP_REPOS: '1',
+      // Exercise the upstream-only dogfood branch without changing this fork's remote.
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'remote.origin.url',
+      GIT_CONFIG_VALUE_0: 'https://github.com/sdsrss/claude-mem-lite.git',
       ...extraEnv,
     },
     cwd: proj,

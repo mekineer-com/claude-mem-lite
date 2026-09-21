@@ -23,7 +23,7 @@ MKT_VER=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('.
 # Anchor on the list-item form that actually carries the version. The guard sentence's copy
 # is mid-line and preceded by a backtick, so `^- ` excludes it without depending on which
 # occurrence comes first.
-CLAUDE_VER=$(grep -oP '(?<=^- \*\*Version\*\*: )\S+' CLAUDE.md)
+CLAUDE_VER=$(sed -nE 's/^- \*\*Version\*\*: ([^ ]+).*/\1/p' CLAUDE.md)
 # A version check that silently extracts the wrong number of things is worse than none: it
 # sends the reader to "sync all 5 files" that are already in sync. Fail with the real cause.
 CLAUDE_VER_COUNT=$(printf '%s' "$CLAUDE_VER" | grep -c '' || true)
