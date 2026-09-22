@@ -227,6 +227,25 @@ describe('search telemetry on schema v49', () => {
     writer.close();
   });
 
+  it('restores the configured timeout when the prior pragma value is unreadable', () => {
+    const db = openDb();
+    const pragma = db.pragma.bind(db);
+    const wrapped = new Proxy(db, {
+      get(target, prop) {
+        if (prop === 'pragma') {
+          return (source, options) =>
+            source === 'busy_timeout' && options?.simple ? 'unknown' : pragma(source, options);
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    recordSearch(wrapped, { query: 'alpha', surface: 'mcp_search', client: 'test', results: [] });
+    expect(db.pragma('busy_timeout', { simple: true })).toBe(5000);
+    db.close();
+  });
+
   it('updates hook corpus counts without waiting on a locked writer', () => {
     const dir = mkdtempSync(join(tmpdir(), 'mem-search-telemetry-counts-'));
     tempDirs.push(dir);
