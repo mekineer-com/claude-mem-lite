@@ -81,6 +81,7 @@ export default defineConfig({
       OPENROUTER_API_KEY: '',
       MEM_QUIET_HOOKS: '',
       CLAUDE_MEM_DIR: '',
+      CLAUDE_MEM_SEARCH_TELEMETRY: '',
       CLAUDE_MEM_TEST_GUARD: '1',
     },
     // Reap test-fixture dirs leaked by prior interrupted/SIGKILL'd runs (afterEach

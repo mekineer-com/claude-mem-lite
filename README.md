@@ -348,7 +348,7 @@ surface — reach them through the CLI column in the second table.
 | Tool | Description |
 |------|-------------|
 | `mem_search` | FTS5 full-text search with BM25 ranking. Filters by type, project, date range, importance level. |
-| `mem_search_feedback` | Record sparse relevance labels for `mem_search` results when search telemetry is enabled. |
+| `mem_search_feedback` | Record sparse relevance labels for results from an existing `mem_search` Search ID. |
 | `mem_recent` | Show most recent observations, ordered by time. Quick snapshot of latest activity. |
 | `mem_recall` | Recall observations related to a file. Use before editing to surface past bugfixes and context. |
 | `mem_timeline` | Browse observations chronologically around an anchor point. |

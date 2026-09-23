@@ -120,6 +120,29 @@ describe('search telemetry on schema v49', () => {
     db.close();
   });
 
+  it('adds producer version to populated schema 49 without changing historical ratings', () => {
+    const db = openDb();
+    const searchId = recordSearch(db, {
+      query: 'historical search',
+      surface: 'mcp_search',
+      client: 'test',
+      results: [{ source: 'obs', id: 8, title: 'Historical result' }],
+    });
+    rateSearchResults(db, { searchId, relevant: ['#8'], ratedBy: 'test' });
+    db.pragma('foreign_keys = OFF');
+    db.exec('ALTER TABLE search_runs DROP COLUMN producer_version');
+
+    initSchema(db);
+
+    expect(db.prepare('SELECT query, producer_version FROM search_runs').get()).toEqual({
+      query: 'historical search',
+      producer_version: null,
+    });
+    expect(db.prepare('SELECT relevance FROM search_results').get()).toEqual({ relevance: 'relevant' });
+    expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(49);
+    db.close();
+  });
+
   it('refuses a database newer than schema 49', () => {
     const db = openDb();
     db.prepare('UPDATE schema_version SET version = 50').run();
