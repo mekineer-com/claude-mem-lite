@@ -211,9 +211,7 @@ const searchFeedbackIds = z.preprocess(
 );
 
 export const memSearchFeedbackSchema = {
-  search_id: boundedInt(z.number().int().positive()).describe(
-    'Search ID printed by mem_search or the Claude Code search-results hook',
-  ),
+  search_id: boundedInt(z.number().int().positive()).describe('Search ID printed by mem_search'),
   relevant: searchFeedbackIds.optional().describe('Returned result IDs that directly addressed the query'),
   partially_relevant: searchFeedbackIds
     .optional()
@@ -654,7 +652,7 @@ export const tools = [
       '  - Rating usefulness, correctness, or novelty rather than query relevance\n' +
       '\n' +
       'USE when:\n' +
-      '  - mem_search or the Claude Code search hook asks for relevance feedback\n' +
+      '  - mem_search asks for relevance feedback\n' +
       '  - You can label any returned #N, S#N, P#N, or E#N result\n' +
       '  - Supplying sparse feedback; unrated results may be omitted\n' +
       '\n' +

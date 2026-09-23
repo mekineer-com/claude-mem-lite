@@ -44,7 +44,6 @@ import {
 import { injectedIdsFileName, mergeInjectedMarker } from '../lib/injected-ids.mjs';
 import { getDeferredByIds } from '../lib/deferred-work.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
-import { countHookEligibleCorpus, recordSearch, updateSearchCorpusCounts } from '../lib/search-telemetry.mjs';
 import { isSchemaSkewError, schemaSkewFromError, shouldRecordSkew } from '../lib/schema-skew.mjs';
 
 import { DAY_MS } from '../lib/time-constants.mjs';
@@ -872,8 +871,6 @@ async function main() {
     const project = inferProject();
     const intent = detectIntent(promptText);
     let rows = [];
-    let searchExecuted = false;
-    let searchMode = 'hook';
 
     // A (v2.32.8): precision pass for named errors. When the prompt contains
     // a typed exception signature (TypeError/ValueError/ReferenceError/...),
@@ -886,10 +883,6 @@ async function main() {
           (r) => typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor,
         )
       : [];
-    if (errSig) {
-      searchExecuted = true;
-      if (sigRows.length > 0) searchMode = 'error';
-    }
 
     // v2.57.x explicit-signal gate. Compute files once for both the gate and
     // the file-recall path below — extractFiles is regex over the prompt,
@@ -926,7 +919,6 @@ async function main() {
       rows = [];
     } else {
       // FTS search: use the prompt as query, optionally type-filtered
-      searchExecuted = true;
       const files = filesForGate;
       const mainLimit = intent?.limit || MAX_RESULTS;
       // Over-fetch ONLY to feed the identifier bypass below (audit 2026-08-29 ALGO-2,
@@ -947,9 +939,7 @@ async function main() {
       const ftsPool = ftsResult.rows;
       let ftsRows = ftsPool.slice(0, mainLimit);
       const ftsMode = ftsResult.mode;
-      if (sigRows.length === 0) searchMode = ftsMode === 'OR' ? 'or_fallback' : 'normal';
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
-      if (sigRows.length === 0 && fileRows.length > 0) searchMode = 'file';
 
       // T3 (v2.31): BM25 magnitude threshold — drop FTS hits whose relevance
       // magnitude doesn't clear the floor. This targets OR-fallback leakage
@@ -1076,26 +1066,9 @@ async function main() {
     let promptRows = [];
     if (rows.length === 0 && (!REQUIRE_EXPLICIT_SIGNAL || signalPresent)) {
       promptRows = searchByUserPrompts(db, promptText, project, PROMPT_FALLBACK_LIMIT);
-      if (promptRows.length > 0) searchMode = 'prompt_fallback';
     }
 
-    let telemetrySearchId = null;
     const candidateIds = rows.length > 0 ? rows.map((r) => r.id) : promptRows.map((r) => `P${r.id}`);
-    if (candidateIds.length === 0 && searchExecuted) {
-      try {
-        telemetrySearchId = recordSearch(db, {
-          project,
-          query: upsFtsQuery(promptText) || '',
-          surface: 'user_prompt_hook',
-          searchMode,
-          matchedCount: 0,
-          results: [],
-          client: 'user_prompt_hook',
-        });
-      } catch (e) {
-        recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
-      }
-    }
     const dedupSkip = shouldSkipByDedup(candidateIds, injectedIdsFile, hookData.session_id);
 
     const output = !dedupSkip
@@ -1104,26 +1077,7 @@ async function main() {
         : formatPromptResults(promptRows)
       : null;
     if (output) {
-      let rendered = output;
-      try {
-        const telemetryRows =
-          rows.length > 0
-            ? rows.map((r) => ({ ...r, source: 'obs' }))
-            : promptRows.map((r) => ({ ...r, source: 'prompt', text: r.prompt_text }));
-        telemetrySearchId = recordSearch(db, {
-          project,
-          query: upsFtsQuery(promptText) || '',
-          surface: 'user_prompt_hook',
-          searchMode,
-          matchedCount: telemetryRows.length,
-          results: telemetryRows,
-          client: 'user_prompt_hook',
-        });
-        rendered += `\nSearch ${telemetrySearchId} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For retrieval-quality investigations, assess contribution separately; this tool stores relevance only.`;
-      } catch (e) {
-        recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
-      }
-      process.stdout.write(rendered + '\n');
+      process.stdout.write(output + '\n');
       // Write injected IDs for dedup with hook.mjs handleUserPrompt + self-dedup
       // replace, NOT union: this leg writes the prompt's own result set wholesale, and it
       // is the ONE writer that puts raw observation numbers (mixed with `P<id>` strings)
@@ -1158,19 +1112,6 @@ async function main() {
             } catch {}
           }
         } catch {}
-      }
-    }
-
-    // Diagnostic scans must not delay or suppress output and functional state writes.
-    if (telemetrySearchId !== null) {
-      try {
-        updateSearchCorpusCounts(
-          db,
-          telemetrySearchId,
-          countHookEligibleCorpus(db, project, Date.now() - LOOKBACK_MS),
-        );
-      } catch (e) {
-        recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
       }
     }
   } catch (e) {

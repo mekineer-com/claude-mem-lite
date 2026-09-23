@@ -92,6 +92,7 @@ describe('schema v45 — per-surface citation funnel table', () => {
     db.pragma('foreign_keys = OFF');
     db.exec(`
       DROP TABLE citation_surface_log;
+      ALTER TABLE search_runs DROP COLUMN producer_version;
       ALTER TABLE observations DROP COLUMN decay_seen_at_first_cite;
       UPDATE schema_version SET version = 45;
     `);
@@ -107,6 +108,7 @@ describe('schema v45 — per-surface citation funnel table', () => {
         .get().c,
     ).toBe(1);
     expect(db.prepare('SELECT query FROM search_runs').get().query).toBe('q');
+    expect(db.prepare('SELECT producer_version FROM search_runs').get().producer_version).toBeNull();
     expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(49);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
     db.close();

@@ -348,7 +348,7 @@ surface — reach them through the CLI column in the second table.
 | Tool | Description |
 |------|-------------|
 | `mem_search` | FTS5 full-text search with BM25 ranking. Filters by type, project, date range, importance level. |
-| `mem_search_feedback` | Record sparse relevance labels for results from a search that printed a Search ID. |
+| `mem_search_feedback` | Record sparse relevance labels for `mem_search` results when search telemetry is enabled. |
 | `mem_recent` | Show most recent observations, ordered by time. Quick snapshot of latest activity. |
 | `mem_recall` | Recall observations related to a file. Use before editing to surface past bugfixes and context. |
 | `mem_timeline` | Browse observations chronologically around an anchor point. |
@@ -944,6 +944,7 @@ benchmark and A/B harness are calibrated against — changing them invalidates t
 | `CLAUDE_MEM_CITATION_RELEVANCE_GATE` | Stop credits an `access_count` to a memory the session cited only when something made that memory relevant to the session — it was injected, or you typed its `#NN` yourself. `off` restores the pre-v3.84.0 behaviour of crediting every `#NN` the assistant wrote, which over-counts sessions that discuss memories in prose (release notes, audit reports): measured on real transcripts, 267 of 859 credited (id, session) pairs — 31.1% — were mentions nothing had put in front of the model. Superseded citations are redirected to their keeper on both settings. | _(on)_ |
 | `CLAUDE_MEM_SUBAGENT_DECAY` | The `subagent` injection face feeds the decay loop: memories handed to a dispatched agent enter the denominator, and the citation that agent makes in its own transcript counts as the numerator. `0` returns the face to metered-but-never-decaying (v3.77–v3.82). | _(on)_ |
 | `CLAUDE_MEM_METRICS` | `1` records feature-injection counters surfaced by `claude-mem-lite stats`. | _(off)_ |
+| `CLAUDE_MEM_SEARCH_TELEMETRY` | `1` records MCP `mem_search` queries and results, prints Search IDs for optional `mem_search_feedback`, and stamps each search with the running claude-mem-lite version. | _(off)_ |
 
 ### Background work
 

@@ -198,7 +198,7 @@ const LATEST_MIGRATION_COLUMNS = [
   { table: 'observations', column: 'last_access_session_id' }, // v48
   { table: 'observations', column: 'decay_seen_at_first_cite' }, // v46
   { table: 'citation_surface_log', column: 'surface' }, // v45
-  { table: 'search_runs', column: 'search_id' }, // local search telemetry
+  { table: 'search_runs', column: 'producer_version' }, // local search telemetry
   { table: 'search_results', column: 'relevance' }, // local search telemetry
   { table: 'observations', column: 'scope' }, // v44
   { table: 'observation_files', column: 'last_cited_session_id' }, // v43
@@ -346,6 +346,7 @@ const CORE_SCHEMA = `
     matched_count INTEGER NOT NULL DEFAULT 0,
     returned_count INTEGER NOT NULL DEFAULT 0,
     client TEXT NOT NULL,
+    producer_version TEXT,
     created_at TEXT NOT NULL,
     created_at_epoch INTEGER NOT NULL
   );
@@ -372,6 +373,7 @@ const CORE_SCHEMA = `
 
 // Column migrations (idempotent — only swallow "duplicate column" errors)
 const MIGRATIONS = [
+  'ALTER TABLE search_runs ADD COLUMN producer_version TEXT',
   'ALTER TABLE observations ADD COLUMN importance INTEGER DEFAULT 1',
   "ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT '[]'",
   'ALTER TABLE observations ADD COLUMN minhash_sig TEXT',

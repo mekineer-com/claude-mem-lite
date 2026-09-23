@@ -9,9 +9,15 @@ import {
   formatSearchTelemetryReport,
   rateSearchResults,
   recordSearch,
-  updateSearchCorpusCounts,
 } from '../lib/search-telemetry.mjs';
-import { handleSearchFeedbackForTest, handleSearchForTest } from '../server.mjs';
+import { handleSearchFeedbackForTest, handleSearchForTest as rawHandleSearchForTest } from '../server.mjs';
+
+const handleSearchForTest = (db, args, options = {}) =>
+  rawHandleSearchForTest(db, args, {
+    telemetryEnabled: true,
+    producerVersion: 'test-version',
+    ...options,
+  });
 
 const openDb = (path = ':memory:') => {
   const db = new Database(path);
@@ -56,7 +62,11 @@ describe('search telemetry on schema v49', () => {
       query: 'alpha',
       surface: 'mcp_search',
       client: 'test',
+      producerVersion: '6.9.1-test',
       results: [{ source: 'obs', id: 1, title: 'Alpha' }],
+    });
+    expect(db.prepare('SELECT producer_version FROM search_runs WHERE search_id = ?').get(id)).toEqual({
+      producer_version: '6.9.1-test',
     });
     db.prepare('DELETE FROM search_runs WHERE search_id = ?').run(id);
     expect(db.prepare('SELECT COUNT(*) c FROM search_results').get().c).toBe(0);
@@ -246,29 +256,6 @@ describe('search telemetry on schema v49', () => {
     db.close();
   });
 
-  it('updates hook corpus counts without waiting on a locked writer', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mem-search-telemetry-counts-'));
-    tempDirs.push(dir);
-    const path = join(dir, 'test.db');
-    const writer = openDb(path);
-    const contender = new Database(path);
-    contender.pragma('busy_timeout = 4321');
-    const searchId = recordSearch(contender, {
-      query: 'alpha',
-      surface: 'user_prompt_hook',
-      client: 'test',
-      results: [],
-    });
-    writer.exec('BEGIN IMMEDIATE');
-    const started = Date.now();
-    expect(() => updateSearchCorpusCounts(contender, searchId, { obs: 4 })).toThrow(/locked|busy/i);
-    expect(Date.now() - started).toBeLessThan(500);
-    expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
-    writer.exec('ROLLBACK');
-    contender.close();
-    writer.close();
-  });
-
   it('records MCP results, leaves the reminder last, and reports relevance', async () => {
     const db = openDb();
     const obsId = seedObservation(db);
@@ -282,6 +269,9 @@ describe('search telemetry on schema v49', () => {
       { clientIdentity: 'codex/1' },
     );
     expect(result.search_id).toBeGreaterThan(0);
+    expect(
+      db.prepare('SELECT producer_version FROM search_runs WHERE search_id = ?').get(result.search_id),
+    ).toEqual({ producer_version: 'test-version' });
     expect(
       result.content[0].text
         .trim()
@@ -302,6 +292,20 @@ describe('search telemetry on schema v49', () => {
     expect(report.relevance_distribution.relevant).toBe(1);
     expect(formatSearchTelemetryReport(report)).toContain('Relevance coverage: 1/1 (100.0%)');
     expect(formatSearchTelemetryReport(report)).toContain('recording failures (last 14d): 0');
+    db.close();
+  });
+
+  it('does not record or append a feedback reminder unless telemetry is enabled', async () => {
+    const db = openDb();
+    seedObservation(db);
+    const result = await rawHandleSearchForTest(db, {
+      query: 'alpha telemetry lesson',
+      project: 'telemetry-test',
+      deep: false,
+    });
+    expect(result.search_id).toBeNull();
+    expect(result.content[0].text).not.toContain('mem_search_feedback');
+    expect(db.prepare('SELECT COUNT(*) c FROM search_runs').get().c).toBe(0);
     db.close();
   });
 

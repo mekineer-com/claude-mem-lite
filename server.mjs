@@ -143,6 +143,7 @@ import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require('./package.json');
+const SEARCH_TELEMETRY_ENABLED = process.env.CLAUDE_MEM_SEARCH_TELEMETRY === '1';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
@@ -503,11 +504,37 @@ function formatSearchOutput(
 // calls this with the module db and the default llm.
 // v3.42 F3: resolveProject now runs against the injected `db` param (not the module db), so
 // a project: arg through this seam resolves against the TEST db — real test isolation.
-export async function handleSearchForTest(db, args, { llm, rerankLlm, clientIdentity = 'test-client' } = {}) {
-  return runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity });
+export async function handleSearchForTest(
+  db,
+  args,
+  {
+    llm,
+    rerankLlm,
+    clientIdentity = 'test-client',
+    telemetryEnabled = SEARCH_TELEMETRY_ENABLED,
+    producerVersion = PKG_VERSION,
+  } = {},
+) {
+  return runSearchPipeline(db, args, {
+    llm,
+    rerankLlm,
+    clientIdentity,
+    telemetryEnabled,
+    producerVersion,
+  });
 }
 
-async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'unknown-mcp-client' } = {}) {
+async function runSearchPipeline(
+  db,
+  args,
+  {
+    llm,
+    rerankLlm,
+    clientIdentity = 'unknown-mcp-client',
+    telemetryEnabled = SEARCH_TELEMETRY_ENABLED,
+    producerVersion = PKG_VERSION,
+  } = {},
+) {
   if (args.project) args = { ...args, project: _resolveProjectShared(db, args.project) };
   // CLI-flag aliases: --source/--from/--to/--since. Folded before any read of the
   // canonical names below, so every downstream filter sees them.
@@ -688,36 +715,39 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
   appendDeferredTrailer(output);
 
   let searchId = null;
-  try {
-    const corpusCounts = countMcpEligibleCorpus(db, {
-      effectiveSource: r.effectiveSource,
-      obsTypeScoped,
-      project: args.project ?? null,
-      obsType: args.obs_type ?? null,
-      importance: args.importance ?? null,
-      branch: args.branch ?? null,
-      includeNoise: args.include_noise === true,
-      epochFrom,
-      epochTo,
-      tier: args.tier ?? null,
-      currentProject: args.project || currentProject,
-    });
-    searchId = recordSearch(db, {
-      project: args.project || currentProject,
-      query: stripPrivate(args.query || ''),
-      surface: 'mcp_search',
-      searchMode: r.isDeep ? (r.escalated ? 'auto_deep' : 'deep') : 'normal',
-      corpusCounts,
-      matchedCount: r.total,
-      results: r.page,
-      pageOffset: offset,
-      client: clientIdentity,
-    });
-    if (r.page.length > 0 && output.content?.[0]?.type === 'text') {
-      output.content[0].text += `\n\nSearch ${searchId} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For retrieval-quality investigations, assess contribution separately; this tool stores relevance only.`;
+  if (telemetryEnabled) {
+    try {
+      const corpusCounts = countMcpEligibleCorpus(db, {
+        effectiveSource: r.effectiveSource,
+        obsTypeScoped,
+        project: args.project ?? null,
+        obsType: args.obs_type ?? null,
+        importance: args.importance ?? null,
+        branch: args.branch ?? null,
+        includeNoise: args.include_noise === true,
+        epochFrom,
+        epochTo,
+        tier: args.tier ?? null,
+        currentProject: args.project || currentProject,
+      });
+      searchId = recordSearch(db, {
+        project: args.project || currentProject,
+        query: stripPrivate(args.query || ''),
+        surface: 'mcp_search',
+        searchMode: r.isDeep ? (r.escalated ? 'auto_deep' : 'deep') : 'normal',
+        corpusCounts,
+        matchedCount: r.total,
+        results: r.page,
+        pageOffset: offset,
+        client: clientIdentity,
+        producerVersion,
+      });
+      if (r.page.length > 0 && output.content?.[0]?.type === 'text') {
+        output.content[0].text += `\n\nSearch ${searchId} — call mem_search_feedback for any result you can judge (query relevance, not novelty). For retrieval-quality investigations, assess contribution separately; this tool stores relevance only.`;
+      }
+    } catch (e) {
+      recordHookError('search-telemetry:mcp_search', e, RUNTIME_DIR);
     }
-  } catch (e) {
-    recordHookError('search-telemetry:mcp_search', e, RUNTIME_DIR);
   }
 
   // Expose structured fields for tests + the MCP content blob.
