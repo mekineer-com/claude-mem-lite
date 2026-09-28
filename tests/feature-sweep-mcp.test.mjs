@@ -60,6 +60,7 @@ const SERVER_PATH = join(REPO, 'server.mjs');
 // appearing in — or vanishing from — every agent's startup context a test failure.
 const PUBLIC_TOOLS = [
   'mem_search',
+  'mem_search_feedback',
   'mem_recent',
   'mem_recall',
   'mem_get',
@@ -178,6 +179,7 @@ beforeAll(async () => {
     ANTHROPIC_API_KEY: '',
     OPENROUTER_API_KEY: '',
     CLAUDE_MEM_AUTO_DEEP: '0',
+    CLAUDE_MEM_SEARCH_TELEMETRY: '1',
     CLAUDE_MEM_SKIP_SAVE_ENRICH: '1',
     CLAUDE_MEM_SKIP_REPOS: '1',
     MEM_QUIET_HOOKS: '1',
@@ -251,7 +253,7 @@ afterAll(async () => {
 // ─── Surface guards ─────────────────────────────────────────────────────────
 
 describe('MCP feature sweep: registered surface', () => {
-  it('tools/list returns exactly the 9 public tools, and no hidden one', async () => {
+  it('tools/list returns exactly the 10 public tools, and no hidden one', async () => {
     const { tools: listed } = await client.listTools();
     const names = listed.map((t) => t.name).sort();
     // Exact set BOTH ways: a missing tool and an extra tool are equally a failure.
@@ -273,11 +275,11 @@ describe('MCP feature sweep: registered surface', () => {
     const declared = DECLARED_TOOLS.map((t) => t.name).sort();
     expect(declared).toEqual([...SWEPT_TOOLS].sort());
     expect(declared).toEqual([...PUBLIC_TOOLS, ...HIDDEN_TOOLS].sort());
-    expect(declared).toHaveLength(18);
+    expect(declared).toHaveLength(19);
   });
 });
 
-// ─── Public tools (the 9 in tools/list) ─────────────────────────────────────
+// ─── Public tools (the 10 in tools/list) ────────────────────────────────────
 
 describe('MCP feature sweep: public tools', () => {
   itTool('mem_search', async () => {
@@ -290,6 +292,15 @@ describe('MCP feature sweep: public tools', () => {
     const narrowed = await call('mem_search', { query: 'widget', project: PROJECT, obs_type: 'decision' });
     const narrowedIds = [...narrowed.matchAll(/^#(\d+) /gm)].map((m) => Number(m[1]));
     expect(narrowedIds).toEqual([SEED_DECISION_ID]);
+  });
+
+  itTool('mem_search_feedback', async () => {
+    const search = await call('mem_search', { query: 'widget', project: PROJECT });
+    const searchId = Number(search.match(/Search (\d+)/)?.[1]);
+    expect(searchId).toBeGreaterThan(0);
+    expect(
+      await call('mem_search_feedback', { search_id: searchId, relevant: [`#${SEED_BUGFIX_ID}`] }),
+    ).toContain('Recorded relevance for 1 result');
   });
 
   itTool('mem_recent', async () => {

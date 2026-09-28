@@ -1,6 +1,6 @@
 // Guards the MCP tool surface against silent drift:
-//   - Core set must be exactly the 9 tools promised by the invited-memory
-//     contract (6 retrieval/save + 3 defer, v2.70+); extending it bloats every
+//   - Core set must be exactly the 10 tools promised by the invited-memory
+//     contract; extending it bloats every
 //     agent's startup context.
 //   - "Equivalent CLI:" lines in descriptions must match the actual CLI
 //     (caught by issue: maintain/compress/optimize doc drift, fixed with
@@ -12,6 +12,7 @@ import { tools } from '../tool-schemas.mjs';
 
 const CORE_TOOLS = [
   'mem_search',
+  'mem_search_feedback',
   'mem_recent',
   'mem_timeline',
   'mem_get',
@@ -23,7 +24,7 @@ const CORE_TOOLS = [
 ];
 
 describe('MCP tools surface', () => {
-  it('exposes exactly 9 core tools via tools/list', () => {
+  it('exposes exactly 10 core tools via tools/list', () => {
     const exposed = tools
       .filter((t) => !t.hidden)
       .map((t) => t.name)
@@ -97,6 +98,7 @@ describe('MCP tools surface', () => {
     expect(exposed).toMatchInlineSnapshot(`
       [
         "mem_search",
+        "mem_search_feedback",
         "mem_recent",
         "mem_timeline",
         "mem_get",

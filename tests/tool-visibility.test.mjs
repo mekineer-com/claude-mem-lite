@@ -1,6 +1,5 @@
-// v2.34.0 tool-visibility split (expanded v2.70.0): only 9 core tools appear
-// in tools/list (the original 6 + mem_defer/mem_defer_list/mem_defer_drop); the
-// 11 hidden maintenance/admin tools stay callable by exact name. This test
+// v2.34.0 tool-visibility split: only 10 core tools appear in tools/list; the
+// 9 hidden maintenance/admin tools stay callable by exact name. This test
 // spawns the real server over stdio and drives the MCP handshake so it
 // catches regressions in both the filter and the registration wiring.
 
@@ -22,6 +21,7 @@ const EXPECTED_CORE = [
   'mem_recent',
   'mem_save',
   'mem_search',
+  'mem_search_feedback',
   'mem_timeline',
 ];
 
@@ -93,7 +93,7 @@ describe('MCP tools/list filter (v2.34.0 hidden-but-callable)', () => {
     }
   });
 
-  it('tools/list returns exactly the 9 core names', async () => {
+  it('tools/list returns exactly the 10 core names', async () => {
     await rpc(proc, 1, 'initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
@@ -105,7 +105,7 @@ describe('MCP tools/list filter (v2.34.0 hidden-but-callable)', () => {
     expect(names).toEqual(EXPECTED_CORE);
   });
 
-  it('CLAUDE_MEM_ALL_TOOLS=1 restores all 18 tools in tools/list (opt-out)', async () => {
+  it('CLAUDE_MEM_ALL_TOOLS=1 restores all 19 tools in tools/list (opt-out)', async () => {
     // Spin up a dedicated server with the env var set — the default fixture
     // runs without it, so we need a separate process for this case.
     try {
@@ -123,7 +123,7 @@ describe('MCP tools/list filter (v2.34.0 hidden-but-callable)', () => {
     const resp = await rpc(proc, 2, 'tools/list', {});
     expect(resp.error, 'tools/list error').toBeUndefined();
     const names = resp.result.tools.map((t) => t.name);
-    expect(names).toHaveLength(18);
+    expect(names).toHaveLength(19);
     // Spot-check hidden names are present
     expect(names).toContain('mem_stats');
     expect(names).toContain('mem_browse');

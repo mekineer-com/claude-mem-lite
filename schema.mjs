@@ -202,6 +202,8 @@ const LATEST_MIGRATION_COLUMNS = [
   { table: 'observations', column: 'last_access_session_id' }, // v48
   { table: 'observations', column: 'decay_seen_at_first_cite' }, // v46
   { table: 'citation_surface_log', column: 'surface' }, // v45
+  { table: 'search_runs', column: 'producer_version' }, // opt-in search telemetry
+  { table: 'search_results', column: 'relevance' }, // opt-in search telemetry
   { table: 'observations', column: 'scope' }, // v44
   { table: 'observation_files', column: 'last_cited_session_id' }, // v43
 ];
@@ -337,10 +339,45 @@ const CORE_SCHEMA = `
     name TEXT PRIMARY KEY,
     done_at_epoch INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS search_runs (
+    search_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT,
+    query TEXT NOT NULL,
+    surface TEXT NOT NULL CHECK(surface IN ('user_prompt_hook', 'mcp_search')),
+    search_mode TEXT NOT NULL,
+    corpus_counts_json TEXT NOT NULL DEFAULT '{}',
+    matched_count INTEGER NOT NULL DEFAULT 0,
+    returned_count INTEGER NOT NULL DEFAULT 0,
+    client TEXT NOT NULL,
+    producer_version TEXT,
+    created_at TEXT NOT NULL,
+    created_at_epoch INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS search_results (
+    search_id INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('obs', 'session', 'prompt', 'event')),
+    result_id INTEGER NOT NULL,
+    returned_rank INTEGER NOT NULL,
+    page_offset INTEGER NOT NULL DEFAULT 0,
+    snapshot_label TEXT,
+    relevance TEXT CHECK(relevance IN ('relevant', 'partial', 'irrelevant')),
+    rated_by TEXT,
+    rated_at TEXT,
+    rated_at_epoch INTEGER,
+    PRIMARY KEY (search_id, source, result_id),
+    FOREIGN KEY(search_id) REFERENCES search_runs(search_id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_search_runs_time ON search_runs(created_at_epoch DESC);
+  CREATE INDEX IF NOT EXISTS idx_search_runs_project_time ON search_runs(project, created_at_epoch DESC);
+  CREATE INDEX IF NOT EXISTS idx_search_results_identity ON search_results(source, result_id);
 `;
 
 // Column migrations (idempotent — only swallow "duplicate column" errors)
 const MIGRATIONS = [
+  'ALTER TABLE search_runs ADD COLUMN producer_version TEXT',
   'ALTER TABLE observations ADD COLUMN importance INTEGER DEFAULT 1',
   "ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT '[]'",
   'ALTER TABLE observations ADD COLUMN minhash_sig TEXT',

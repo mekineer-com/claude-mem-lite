@@ -69,7 +69,7 @@ function textOf(result) {
 }
 
 describe('MCP protocol surface', () => {
-  it('tools/list exposes exactly the 9 promised core tools', async () => {
+  it('tools/list exposes exactly the 10 promised core tools', async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual([
@@ -81,6 +81,7 @@ describe('MCP protocol surface', () => {
       'mem_recent',
       'mem_save',
       'mem_search',
+      'mem_search_feedback',
       'mem_timeline',
     ]);
   });
