@@ -194,7 +194,7 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 ### What happens during installation
 
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
-2. **Register MCP server** -- `mem-lite` server with 19 tools (10 core exposed via `tools/list` + 9 hidden-but-callable; see the Usage section for the full table). The pre-v2.78 generic server name `mem` is renamed to `mem-lite` for namespace hygiene; the tool names themselves (`mem_search`, `mem_recall`, ...) are unchanged.
+2. **Register MCP server** -- `mem-lite` server with 19 tool definitions (10 core + 9 hidden-but-callable; `mem_search_feedback` is registered only when search telemetry is enabled). The pre-v2.78 generic server name `mem` is renamed to `mem-lite` for namespace hygiene; the tool names themselves (`mem_search`, `mem_recall`, ...) are unchanged.
 3. **Configure hooks** -- all seven lifecycle events: `SessionStart`, `PreCompact`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `UserPromptSubmit`
 4. **Create data directory** -- `~/.claude-mem-lite/` (hidden) for database, runtime, and managed resource files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) or `~/claude-mem-lite/` (pre-v0.5 unhidden) exists, migrates database and runtime files to `~/.claude-mem-lite/`, preserving the original untouched
@@ -467,8 +467,9 @@ are lost; only the derived vector index is.
 
 ### MCP Tools (used automatically by Claude)
 
-The server registers 19 tools in total but only the 10 **core**
-tools appear in `tools/list`. The 9 **hidden** tools remain callable at the
+The server defines 19 tools but registers `mem_search_feedback` only when
+`CLAUDE_MEM_SEARCH_TELEMETRY=1`. The other 9 **core** tools appear in `tools/list`
+by default. The 9 **hidden** tools remain callable at the
 protocol layer (`tools/call` by exact name still routes normally); they're
 omitted from the list response so Claude Code sessions don't load 9 extra
 tool schemas at startup. (It read 20 / 11 until v5.0.0 removed the two skill-registry
@@ -477,7 +478,7 @@ tools — `tool-schemas.mjs` is the source of truth, and
 `README.zh-CN.md`, `llms.txt` and `docs/ARCHITECTURE.md` to it.) Hidden tools are the maintenance / admin / browser
 surface — reach them through the CLI column in the second table.
 
-**Core (10, exposed to Claude Code)**
+**Core (10 definitions; `mem_search_feedback` requires search telemetry)**
 
 | Tool | Description |
 |------|-------------|
@@ -1028,7 +1029,7 @@ claude-mem-lite.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CLAUDE_MEM_ALL_TOOLS` | `1` exposes all 19 MCP tools in `tools/list` instead of the 10 core ones (pre-v2.34.0 behavior). The 9 hidden tools stay callable by exact name either way. | _(10 core)_ |
+| `CLAUDE_MEM_ALL_TOOLS` | `1` exposes every registered MCP tool in `tools/list` instead of only the core ones (pre-v2.34.0 behavior). The 9 hidden tools stay callable by exact name either way; `mem_search_feedback` is registered only when search telemetry is enabled. | _(9 core)_ |
 | `CLAUDE_MEM_FILE_INTEL` | `0` disables the file-intel block injected before `Read` (past observations about the file you are about to open). | _(on)_ |
 | `CLAUDE_MEM_FILE_INTEL_MIN_TOKENS` | Files smaller than this stay silent — file-intel only pays for itself on large files. | `800` |
 | `CLAUDE_MEM_REREAD_GUARD` | `0` disables the warning when the same file is read twice in a session. Never fires on `offset`/`limit` paging. | _(on)_ |

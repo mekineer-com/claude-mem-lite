@@ -29,7 +29,7 @@ sessions and events. Three **faces** expose it:
 | Face | Entry | Transport |
 |---|---|---|
 | Hooks | `hooks/hooks.json` → `scripts/hook-launcher.mjs` → `hook.mjs` / `scripts/*.js` | Claude Code hook events, stdin JSON → stdout text / `additionalContext` |
-| MCP server | `server.mjs` | stdio JSON-RPC, 10 listed + 9 hidden tools (`tool-schemas.mjs`) |
+| MCP server | `server.mjs` | stdio JSON-RPC, 10 core definitions + 9 hidden tools; search feedback is telemetry-only (`tool-schemas.mjs`) |
 | CLI | `cli.mjs` → `mem-cli.mjs` (data) / `install.mjs` (lifecycle) | `claude-mem-lite <cmd>` |
 
 The faces share logic through `lib/*-core.mjs` (87 modules under `lib/`); the engines

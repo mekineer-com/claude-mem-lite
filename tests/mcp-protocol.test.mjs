@@ -42,6 +42,7 @@ beforeAll(async () => {
       CLAUDE_PROJECT_DIR: '/test/project',
       PWD: '/test/project',
       CLAUDE_MEM_AUTO_DEEP: '0',
+      CLAUDE_MEM_SEARCH_TELEMETRY: '1',
     },
   });
   client = new Client({ name: 'mem-test-client', version: '0.0.0' });

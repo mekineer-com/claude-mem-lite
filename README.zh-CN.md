@@ -152,7 +152,7 @@ node install.mjs install
 ### 安装过程
 
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
-2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 19 个工具（10 个核心通过 `tools/list` 暴露 + 9 个隐藏但可调；完整表见 Usage 段）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
+2. **注册 MCP 服务器** -- `mem-lite` 服务器定义 19 个工具（10 个核心 + 9 个隐藏但可调；`mem_search_feedback` 仅在启用搜索遥测时注册）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
 
 > **自动 adopt 会写进你的项目，且每次 SessionStart 都跑（v3.13+）。** 插件向**项目自己的 `<cwd>/CLAUDE.md`**（通常是会进 git 的文件）写入一个 slug 限定的**托管块**，外加 `<cwd>/.claude/plugin_claude_mem_lite.md` 详情文件。该块是一条提升 Claude 主动调用 `mem_recall` / `mem_save` 的 system-authority 指针；块以外的内容逐字保留，也能与其它插件的块共存于同一文件。这是**每次** SessionStart 都做的幂等同步，不只是第一次——块被删掉会重新写回，出货模板变了会刷新。**任何安装路径都生效**（npm、npx、`/plugin`、手动），**无需再手动跑 `/adopt`**。
 >
@@ -381,8 +381,8 @@ v48"*。想继续用向量臂，请在**升级之前**锁定 `claude-mem-lite@5.
 
 ### MCP 工具
 
-v2.34.0 起服务端只把一部分工具暴露给 `tools/list`。当前是 19 个工具，其中 10 个
-**核心** 工具出现在列表里，另外 9 个 **隐藏** 工具仍然注册在 MCP 层（按名
+v2.34.0 起服务端只把一部分工具暴露给 `tools/list`。服务端定义 19 个工具，其中 9 个
+**核心** 工具默认出现在列表里，`mem_search_feedback` 仅在启用搜索遥测时加入；另外 9 个 **隐藏** 工具仍然注册在 MCP 层（按名
 `tools/call` 仍命中），只是不出现在列表响应里，以避免 Claude Code 会话启动时
 多加载 9 份工具 schema。隐藏工具走下面表格的 CLI 入口。
 
@@ -390,7 +390,7 @@ v2.34.0 起服务端只把一部分工具暴露给 `tools/list`。当前是 19 �
 `tool-schemas.mjs` 是唯一事实来源，`tests/tool-count-docs.test.mjs` 现在把两份
 README 和 `docs/ARCHITECTURE.md` 都钉在它上面。）
 
-**核心（10 个，暴露给 Claude Code）**
+**核心（10 个定义；`mem_search_feedback` 需要启用搜索遥测）**
 
 | 工具 | 描述 |
 |------|------|

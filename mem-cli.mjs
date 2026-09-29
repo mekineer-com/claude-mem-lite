@@ -3312,8 +3312,8 @@ Commands:
     --project P         Filter by project
     --days N            Lookback window (default 30)
     --quality           Quality dashboard: lesson rate, LOW_SIGNAL rate, per-type
-    --search-telemetry  Search exposure, relevance coverage, rank, and entry report
                         hit/lesson %, top-accessed lessons, R-2 watchdog targets
+    --search-telemetry  Search exposure, relevance coverage, rank, and entry report
     --json              Output as JSON: nested by section
                         ({totals,recent,type_distribution,top_projects,
                           daily_activity,data_health,tier_distribution})

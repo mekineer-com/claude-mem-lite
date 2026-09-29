@@ -793,21 +793,23 @@ export function handleSearchFeedbackForTest(db, args, { clientIdentity = 'test-c
   });
 }
 
-server.registerTool(
-  'mem_search_feedback',
-  {
-    description: descriptionOf('mem_search_feedback'),
-    inputSchema: memSearchFeedbackSchema,
-  },
-  safeHandler(async (args) => {
-    const count = handleSearchFeedbackForTest(db, args, { clientIdentity: mcpClientIdentity() });
-    return {
-      content: [
-        { type: 'text', text: `Recorded relevance for ${count} result(s) from search ${args.search_id}.` },
-      ],
-    };
-  }),
-);
+if (SEARCH_TELEMETRY_ENABLED) {
+  server.registerTool(
+    'mem_search_feedback',
+    {
+      description: descriptionOf('mem_search_feedback'),
+      inputSchema: memSearchFeedbackSchema,
+    },
+    safeHandler(async (args) => {
+      const count = handleSearchFeedbackForTest(db, args, { clientIdentity: mcpClientIdentity() });
+      return {
+        content: [
+          { type: 'text', text: `Recorded relevance for ${count} result(s) from search ${args.search_id}.` },
+        ],
+      };
+    }),
+  );
+}
 
 // ─── Tool: mem_recent ────────────────────────────────────────────────────────
 
@@ -2025,10 +2027,9 @@ server.registerTool(
 // response. Hiding the maintenance/admin tools keeps Claude Code's startup
 // context small while preserving the contract that the plugin dogfoods (see
 // the CLAUDE.md managed block + adopt-content.mjs detail doc).
-// Surface counts as of v2.70.0: 9 core (mem_search/recent/timeline/get/save/
-// recall + mem_defer/mem_defer_list/mem_defer_drop) + 11 hidden (maintenance/
-// admin/specialized) = 20 registered; tests/tool-schemas.test.mjs is the
-// authoritative count.
+// Surface definitions: 10 core + 9 hidden. mem_search_feedback is registered
+// only when search telemetry is enabled; tests/tool-schemas.test.mjs is the
+// authoritative definition count.
 //
 // Safe because:
 //   - Protocol-layer override: we replace the mcp.js default ListTools
@@ -2037,6 +2038,8 @@ server.registerTool(
 //     mcp.js line 106, a `disabled` tool would reject calls too.
 
 const HIDDEN_TOOL_NAMES = new Set(TOOL_DEFS.filter((t) => t.hidden === true).map((t) => t.name));
+const REGISTERED_TOOL_COUNT = TOOL_DEFS.length - (SEARCH_TELEMETRY_ENABLED ? 0 : 1);
+const LISTED_TOOL_COUNT = REGISTERED_TOOL_COUNT - HIDDEN_TOOL_NAMES.size;
 
 // Opt-out: setting CLAUDE_MEM_ALL_TOOLS=1 restores pre-v2.34.0 behavior where
 // every registered tool is visible in `tools/list`. Users who relied on Claude
@@ -2064,8 +2067,8 @@ if (!EXPOSE_ALL_TOOLS) {
 // harnesses stay silent.
 if (!effectiveQuiet()) {
   const status = EXPOSE_ALL_TOOLS
-    ? `all ${TOOL_DEFS.length} tools exposed via CLAUDE_MEM_ALL_TOOLS=1`
-    : `tools/list narrowed to ${TOOL_DEFS.length - HIDDEN_TOOL_NAMES.size} core tools (${HIDDEN_TOOL_NAMES.size} hidden but callable by exact name; unset CLAUDE_MEM_ALL_TOOLS to keep, set =1 to restore all)`;
+    ? `all ${REGISTERED_TOOL_COUNT} registered tools exposed via CLAUDE_MEM_ALL_TOOLS=1`
+    : `tools/list narrowed to ${LISTED_TOOL_COUNT} core tools (${HIDDEN_TOOL_NAMES.size} hidden but callable by exact name; unset CLAUDE_MEM_ALL_TOOLS to keep, set =1 to restore all)`;
   process.stderr.write(`[claude-mem-lite v${PKG_VERSION}] ${status}\n`);
 }
 

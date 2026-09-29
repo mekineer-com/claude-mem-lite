@@ -7,8 +7,8 @@
 //     core/hidden split, descriptions, CLI-parity of the doc lines. Never spawns.
 //   tests/mcp-protocol.test.mjs        — protocol-level regression museum: the
 //     specific bugs that shipped (purge without confirm, sort=time no-op, single-
-//     source totals, pagination double-offset, update validation parity). Ten of
-//     the twenty tools are never called there.
+//     source totals, pagination double-offset, update validation parity). Some
+//     tools are never called there.
 //   tests/server-defer.test.mjs        — schema/handler-shape unit tests for the
 //     defer family, plus a CLI proxy for the closes_deferred transaction.
 //   tests/mcp-export-parity-r5.test.mjs— one tool (mem_export) via an in-process seam.
@@ -54,7 +54,7 @@ import { tools as DECLARED_TOOLS } from '../tool-schemas.mjs';
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = join(REPO, 'server.mjs');
 
-// The 9 tools `tools/list` promises. Pinned as a literal ON PURPOSE: comparing the
+// The telemetry-enabled tools `tools/list` promises. Pinned as a literal ON PURPOSE: comparing the
 // wire response against tool-schemas' own `hidden` flags would pass right through a
 // flag flip (both sides move together). This literal is what makes a tool silently
 // appearing in — or vanishing from — every agent's startup context a test failure.
@@ -70,7 +70,7 @@ const PUBLIC_TOOLS = [
   'mem_defer_list',
   'mem_defer_drop',
 ];
-// The 11 hidden-but-callable tools: absent from tools/call-time discovery, still
+// The 9 hidden-but-callable tools: absent from tools/call-time discovery, still
 // routable by exact name (Claude Code agents reach them via the CLI).
 const HIDDEN_TOOLS = [
   'mem_delete',
