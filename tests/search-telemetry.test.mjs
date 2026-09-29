@@ -331,6 +331,45 @@ describe('search telemetry on schema v49', () => {
     db.close();
   });
 
+  it('defaults MCP search to three-result pages', async () => {
+    const db = openDb();
+    seedObservation(db, { title: 'Paging token entry 0' });
+    const insert = db.prepare(`
+      INSERT INTO observations
+        (memory_session_id, project, text, type, title, created_at, created_at_epoch, importance)
+      VALUES ('memory-1', 'telemetry-test', ?, 'decision', ?, ?, ?, 3)
+    `);
+    for (let i = 1; i < 7; i++) {
+      const title = `Paging token entry ${i}`;
+      const now = Date.now();
+      insert.run(title, title, new Date(now).toISOString(), now);
+    }
+    const first = await handleSearchForTest(db, {
+      query: 'paging token',
+      project: 'telemetry-test',
+      deep: false,
+    });
+    const second = await handleSearchForTest(db, {
+      query: 'paging token',
+      project: 'telemetry-test',
+      offset: 3,
+      deep: false,
+    });
+    const third = await handleSearchForTest(db, {
+      query: 'paging token',
+      project: 'telemetry-test',
+      offset: 6,
+      deep: false,
+    });
+    expect(first.results).toHaveLength(3);
+    expect(second.results).toHaveLength(3);
+    expect(third.results).toHaveLength(1);
+    expect(new Set([...first.results, ...second.results, ...third.results].map((row) => row.id)).size).toBe(
+      7,
+    );
+    db.close();
+  });
+
   it('does not record or append a feedback reminder unless telemetry is enabled', async () => {
     const db = openDb();
     seedObservation(db);

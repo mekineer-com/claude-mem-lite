@@ -229,7 +229,7 @@ async function cmdSearch(db, args, { llm } = {}) {
     return;
   }
 
-  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
+  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 3, max: 1000 });
   const type = flags.type || null;
   const validObsTypes = OBS_TYPE_SET;
   if (type && !validObsTypes.has(type)) {
@@ -3145,7 +3145,7 @@ Commands:
     --query Q           Query as a flag (alias for the positional; use one, not both)
     --source S          Table: observations|sessions|prompts|events (default: all)
     --type T            Filter obs type (bugfix|decision|discovery|feature|refactor|change)
-    --limit N           Max results (default 20)
+    --limit N           Max results (default 3)
     --project P         Filter by project
     --from DATE         Start date (YYYY-MM-DD or ISO 8601)
     --to DATE           End date (YYYY-MM-DD or ISO 8601)
@@ -3157,7 +3157,7 @@ Commands:
     --no-deep           Force normal search, overriding any env/default that enables deep
     --rerank            LLM-rerank the fused top 20. Requires --deep; ignored without it
     --branch B          Filter by git branch
-    --offset N          Skip first N results (pagination)
+    --offset N          Skip first N results (3 = next 3, then 6, etc.)
     --tier T            Filter by tier (working|active|archive, observations only)
     --sort S            Sort: relevance (default), time, importance
     --or                Use OR instead of AND between search terms

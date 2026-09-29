@@ -159,8 +159,10 @@ export const memSearchSchema = {
     .describe(
       'Filter by memory tier (working=current session, active=within decay window, archive=old/compressed)',
     ),
-  limit: boundedInt(z.number().int().min(1).max(100)).optional().describe('Max results (default 20)'),
-  offset: boundedInt(z.number().int().min(0)).optional().describe('Offset for pagination'),
+  limit: boundedInt(z.number().int().min(1).max(100)).optional().describe('Max results (default 3)'),
+  offset: boundedInt(z.number().int().min(0))
+    .optional()
+    .describe('Offset for pagination; use 3 for the next 3 results, then 6, etc.'),
   sort: z
     .enum(['relevance', 'time', 'importance'])
     .optional()

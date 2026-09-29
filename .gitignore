@@ -21,6 +21,7 @@
 # It was listed here once; the entry did nothing (gitignore does not apply to tracked
 # files) except make `git add CLAUDE.md` need -f and hide an accidental untracking.
 /node_modules
+/.data/
 # Bumping a native dep on a FUSE filesystem can leave one behind: `npm ci` cannot rmdir
 # `better-sqlite3/build/Release` while a long-running process still has the old `.node`
 # open, so the tree gets renamed aside and reinstalled. What is left is a ~2 MB

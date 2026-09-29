@@ -258,6 +258,20 @@ describe('CLI search command', () => {
     expect(resultLines.length).toBeLessThanOrEqual(3);
   });
 
+  it('defaults search output to three results', async () => {
+    for (let i = 0; i < 7; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1',
+        project: 'test--project',
+        type: 'discovery',
+        title: `Default page widget ${i}`,
+        text: `default page widget details ${i}`,
+      });
+    }
+    const output = await captureStdout(() => run(['search', 'default page widget']));
+    expect(output.split('\n').filter((line) => line.startsWith('#'))).toHaveLength(3);
+  });
+
   it('shows lesson_learned when present', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1',
