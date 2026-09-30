@@ -83,6 +83,12 @@ describe('scrubSecrets stays linear on crafted input (D#130)', () => {
       'MIIEabcdefghijklmnop\n'
     ).repeat(N / 532),
     pemBeginChunksOneLine: '-----BEGIN RSA PRIVATE KEY----- ' + 'MIIEabcdefghijklmnop '.repeat(N / 21),
+    // D#160 (open): code or a string opener around the line prefix on every BEGIN line, raw and
+    // escaped. The fix withdrawn from 6.19.4 read these lines twice; a next attempt must fit here.
+    pemCodeBeforeBegin: CHAIN + ' ' + "-KEY = '''-----BEGIN RSA PRIVATE KEY-----\n-abc def\n".repeat(N / 52),
+    pemOpenerBeforeBegin: CHAIN + ' ' + "'+-----BEGIN RSA PRIVATE KEY-----\n+\n".repeat(N / 37),
+    pemEscapedQuotesBeforeBegin:
+      CHAIN + ' ' + JSON.stringify("a'a'a'a'a'a'-----BEGIN RSA PRIVATE KEY-----\n-abc def\n".repeat(N / 55)),
     // v6.19.2 pre-tag defect review F1: a quote then a whitespace run after an escaped break; the
     // continuation pattern split the run between two quantifiers (200k: 16-19 s).
     pemEscapedQuoteSpaces: '-----BEGIN RSA PRIVATE KEY-----\\n"' + ' '.repeat(N) + 'x',

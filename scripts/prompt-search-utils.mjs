@@ -2,27 +2,11 @@
 // Extracted to eliminate code duplication between the hook script and test file.
 
 import { readFileSync } from 'fs';
+import { isNoTopicShape } from '../lib/prompt-admission.mjs';
 
-// ─── Skip Patterns ──────────────────────────────────────────────────────────
-
-const CONFIRM_RE = /^(y(es)?|no?|ok|done|go|sure|lgtm|thanks?|ty|继续|确认|好的|是的|对|嗯|行|可以|没问题)$/i;
-const SLASH_CMD_RE = /^\//;
-const PURE_OP_RE = /^(git\s+(commit|push|merge)|npm\s+(publish|deploy))\b/i;
-
-// v2.43.x: pure continuation directives — "keep going on what you were doing"
-// with no new topic. Long enough to evade CONFIRM_RE / length gate but
-// semantically empty for memory-recall purposes; injecting [mem] context
-// here reads like a turn boundary and can prematurely end the model's
-// in-flight tool chain. Conservative match: must be SOLELY the directive,
-// not directive + new instruction (those keep getting injection).
-const CONTINUATION_RE =
-  /^(继续|接着|继续做|接着做|继续干|继续做下一步|接着做下一步|别停|不要停|next|continue|go\s*on|keep\s+going|carry\s+on|proceed|more(?:\s+please)?)\s*[?？!！。.，,]*\s*$/i;
-
-// v2.43.x: meta-pause questions — user is asking the model to reflect on
-// its own pause/stop, then continue. No new topic = no useful memory hit;
-// injection just adds reminder noise on top of an already-reflective turn.
-const META_PAUSE_RE =
-  /(怎么停|为什么停|为何停|你怎么停|工作停下来|刚才停|why\s+(?:did\s+you\s+)?(?:stop|pause|halt))/i;
+// The no-topic shape rules (confirmation / slash command / pure op / continuation /
+// meta-pause) live in lib/prompt-admission.mjs, shared with path B (`hook.mjs
+// user-prompt`), which applied none of them until issue #39.
 
 /**
  * CJK-weighted effective length. CJK characters (CJK Unified Ideographs
@@ -41,13 +25,7 @@ export function computeEffectiveLen(text) {
 export function shouldSkip(text) {
   if (!text) return true;
   if (computeEffectiveLen(text) < 8) return true;
-  const trimmed = text.trim();
-  if (CONFIRM_RE.test(trimmed)) return true;
-  if (SLASH_CMD_RE.test(trimmed)) return true;
-  if (PURE_OP_RE.test(trimmed)) return true;
-  if (CONTINUATION_RE.test(trimmed)) return true;
-  if (META_PAUSE_RE.test(trimmed)) return true;
-  return false;
+  return isNoTopicShape(text);
 }
 
 // ─── Intent Detection ───────────────────────────────────────────────────────

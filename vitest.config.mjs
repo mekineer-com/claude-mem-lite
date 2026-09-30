@@ -86,6 +86,11 @@ export default defineConfig({
       MEM_QUIET_HOOKS: '',
       CLAUDE_MEM_DIR: '',
       CLAUDE_MEM_TEST_GUARD: '1',
+      // D14: Claude Code exports its pid to every shell it starts, and hook-shared.mjs keys the
+      // session file and episode buffer on it. A suite run from inside a Claude Code session
+      // would otherwise use per-process names where CI uses per-project ones. Tests of the
+      // per-process names set it explicitly.
+      CLAUDE_PID: '',
     },
     // Reap test-fixture dirs leaked by prior interrupted/SIGKILL'd runs (afterEach
     // never reached). Runs once before the suite; 1h age guard never touches the

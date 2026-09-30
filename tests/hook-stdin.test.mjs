@@ -146,7 +146,17 @@ describe('readHookStdin', () => {
         tool_input: { file_path: '/a/b.mjs', content: 'x'.repeat(5000) },
       };
       const got = salvageTruncatedHookEvent(prefix(full, 140));
-      expect(got).toEqual({ filePath: '/a/b.mjs', sessionId: 's1', toolName: 'Write' });
+      expect(got).toEqual({ filePath: '/a/b.mjs', sessionId: 's1', toolName: 'Write', agentId: null });
+    });
+
+    it("recovers a subagent's agent_id too (D15: recall dedup is per thread)", () => {
+      const full = {
+        session_id: 's1',
+        agent_id: 'a-7',
+        tool_name: 'Write',
+        tool_input: { file_path: '/a/b.mjs', content: 'x'.repeat(5000) },
+      };
+      expect(salvageTruncatedHookEvent(prefix(full, 160)).agentId).toBe('a-7');
     });
 
     it('un-escapes a JSON-escaped path rather than handing back the raw capture', () => {
@@ -163,9 +173,9 @@ describe('readHookStdin', () => {
       expect(salvageTruncatedHookEvent('{"tool_input":{"file_path":""')).toBeNull();
     });
 
-    it('reports the two optional scalars as null rather than inventing them', () => {
+    it('reports the optional scalars as null rather than inventing them', () => {
       const got = salvageTruncatedHookEvent('{"tool_input":{"file_path":"/a/b.mjs","content":"zz');
-      expect(got).toEqual({ filePath: '/a/b.mjs', sessionId: null, toolName: null });
+      expect(got).toEqual({ filePath: '/a/b.mjs', sessionId: null, toolName: null, agentId: null });
     });
   });
 

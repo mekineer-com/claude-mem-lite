@@ -2,6 +2,7 @@
 // Checks for new versions on SessionStart, downloads and installs automatically.
 // Skips in dev mode (symlinked installs). Silent on network failure.
 
+import { isOurMcpRegistration } from './lib/mcp-ownership.mjs';
 import { execSync, execFileSync } from 'node:child_process';
 import {
   readFileSync,
@@ -1053,14 +1054,16 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
     // Post-update migration: clean stale global MCPs if plugin handles it.
     // Both "mem" (legacy, pre-v2.78) and "mem-lite" (current) are purged so a
     // user who manually ran `claude mcp add` in either era doesn't end up with
-    // duplicate global + plugin registrations after the rename.
+    // duplicate global + plugin registrations after the rename — "mem" only when it runs
+    // our server (lib/mcp-ownership.mjs): the name is generic, and a user's own `mem`
+    // server was deleted on every plugin update that re-synced a direct install.
     try {
       if (isPluginMode()) {
         const claudeJsonPath = join(homedir(), '.claude.json');
         const cfg = JSON.parse(readFileSync(claudeJsonPath, 'utf8'));
         let changed = false;
         for (const k of ['mem', 'mem-lite']) {
-          if (cfg.mcpServers?.[k]) {
+          if (cfg.mcpServers?.[k] && isOurMcpRegistration(k, cfg.mcpServers[k])) {
             delete cfg.mcpServers[k];
             changed = true;
             debugLog('DEBUG', 'hook-update', `Post-update: removed stale global MCP "${k}"`);

@@ -786,9 +786,25 @@ describe('T2 CLI fixes', () => {
       .prepare("SELECT compressed_into FROM observations WHERE title = 'MARKED THIS RUN'")
       .get();
     expect(row).toBeDefined(); // SURVIVED (pre-fix: deleted same run)
-    expect(row.compressed_into).toBe(COMPRESSED_PENDING_PURGE); // marked, to be purged on a LATER run
+    // D12: the first run HIDES it; it is queued only once it has stayed idle through the grace.
+    expect(row.compressed_into).toBe(-1);
+    // Age the hide past the grace (as a run a week later would find it), then: the next run
+    // queues it — and purge, running first, does not delete what it queues in the same run —
+    expect(
+      testDb
+        .prepare("UPDATE observations SET hidden_at = ? WHERE title = 'MARKED THIS RUN'")
+        .run(Date.now() - 8 * 86_400_000).changes,
+    ).toBe(1);
+    const queued = await captureStdout(() =>
+      run(['maintain', 'execute', '--ops', 'decay,purge_stale', '--confirm', '--retain-days', '7']),
+    );
+    expect(queued).toMatch(/Purged 0 stale observations/);
+    expect(
+      testDb.prepare("SELECT compressed_into FROM observations WHERE title = 'MARKED THIS RUN'").get()
+        .compressed_into,
+    ).toBe(COMPRESSED_PENDING_PURGE);
 
-    // Next run: the row is now PRE-EXISTING pending → purge deletes it (with the snapshot guard live).
+    // …and the run after that deletes the PRE-EXISTING pending row (with the snapshot guard live).
     const out2 = await captureStdout(() =>
       run(['maintain', 'execute', '--ops', 'decay,purge_stale', '--confirm', '--retain-days', '7']),
     );
@@ -1113,6 +1129,46 @@ describe('Fuzzy auto-dedup (hook auto-maintain)', () => {
       // Control row must be untouched
       const ctrl = rows.find((r) => r.title === 'Modified hook.mjs');
       expect(ctrl.superseded_at).toBeNull();
+    } finally {
+      db2.close();
+    }
+  });
+
+  // E2E round 2026-09-29: the scan never selected `project` and the pure core never
+  // compared it, so two checkouts of one repo (a worktree) saving the same observation had the
+  // OLDER project's row tombstoned — `recent` there read "No recent observations". The exact
+  // channel already joins on project; CLAUDE.md: cross-project ops must compare both rows'
+  // projects first.
+  it('never supersedes a row because ANOTHER project holds a near-copy', () => {
+    const { db, dbPath } = initHomeDb(tmpHome);
+    const now = Date.now();
+    for (const [sess, proj] of [
+      ['xp-a', 'audit--t4'],
+      ['xp-b', 'audit--t4-worktree'],
+    ]) {
+      db.prepare(
+        `INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+         VALUES (?, ?, ?, ?, ?, 'active')`,
+      ).run(sess, `${sess}-mem`, proj, new Date().toISOString(), now);
+      db.prepare(
+        `INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+           files_read, files_modified, importance, compressed_into, access_count, created_at, created_at_epoch)
+         VALUES (?, ?, '', 'change', 'Added title validation to addTodo in server.js', '', 'same body', '', '',
+           '[]', '[]', 2, NULL, 0, ?, ?)`,
+      ).run(`${sess}-mem`, proj, new Date(now - DAY_MS).toISOString(), now - DAY_MS);
+    }
+    db.close();
+    runHookCmd('session-start', {
+      home: tmpHome,
+      cwd: projDir,
+      stdin: JSON.stringify({ session_id: 'cc-xp' }),
+    });
+    runHookCmd('auto-maintain', { home: tmpHome, cwd: projDir });
+    const db2 = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db2.prepare('SELECT project, superseded_at FROM observations ORDER BY id').all();
+      expect(rows).toHaveLength(2); // premise: both near-copies are in the scan window
+      expect(rows.map((r) => r.superseded_at)).toEqual([null, null]);
     } finally {
       db2.close();
     }

@@ -1243,6 +1243,16 @@ describe('makeEntryDesc', () => {
       expect(desc).toContain(HEAD.slice(0, 30));
     });
 
+    // D13 made `<private reason="…">` a tag, and an unclosed one hides everything after it; the
+    // head-only guard still looked for the bare `<private>`, so an UNCLOSED attributed opener in a
+    // long output (no `</private>` for the guard to find) was shown through the tail window.
+    it('shows no tail after an unclosed ATTRIBUTED <private> opener in a long output', () => {
+      const resp = `start ${'log line ok\n'.repeat(900)}<private reason="pii">${'q'.repeat(9000)} SECRET-PIN-4412`;
+      const desc = makeEntryDesc('Bash', { command: 'c' }, resp, { isError: false });
+      expect(desc).not.toMatch(/SECRET|4412|qqqq/);
+      expect(desc).toContain('start log line ok');
+    });
+
     it('shows no tail when a <private> block opened between the two windows ends the output', () => {
       const resp = `${HEAD}\n${'log line ok\n'.repeat(400)}<private>${'p'.repeat(5000)} MY-PRIVATE-TOTP 481-992 </private>`;
       const desc = makeEntryDesc('Bash', { command: 'c' }, resp, { isError: false });
@@ -1267,7 +1277,9 @@ describe('makeEntryDesc', () => {
     it('shows nothing after an unclosed <private> opener', () => {
       const resp = `start <private>${'q'.repeat(5000)} SECRET-PIN-4412`;
       const desc = makeEntryDesc('Bash', { command: 'c' }, resp, { isError: false });
-      expect(desc).toBe('c → start');
+      // stripPrivate fails closed since D13 and redacts to the end itself.
+      expect(desc).toBe('c → start [redacted]');
+      expect(desc).not.toMatch(/SECRET-PIN|qqq/);
     });
 
     it('shows no tail when a PEM key ends the output from outside the tail window', () => {
@@ -1348,7 +1360,10 @@ describe('makeEntryDesc', () => {
         'x CLOSERLEAK2</private> y <private>z</private>',
       ]) {
         const desc = makeEntryDesc('Bash', { command: 'c' }, resp, { isError: false });
-        expect(desc, resp).toBe('c → ');
+        expect(desc, resp).not.toMatch(/LEAK/);
+        // A nested block now pairs by depth in stripPrivate (D13), so the first shape is a
+        // closed region followed by visible text; the other two keep a stray close.
+        expect(desc, resp).toBe(resp.startsWith('<private>') ? 'c → [redacted] ok' : 'c → ');
       }
     });
 

@@ -956,17 +956,23 @@ export function buildSummaryLines(latestSummary) {
   if (latestSummary.completed) lines.push(`Completed: ${truncate(latestSummary.completed, 120)}`);
   if (latestSummary.remaining_items) lines.push(`Remaining: ${truncate(latestSummary.remaining_items, 120)}`);
   if (latestSummary.next_steps) lines.push(`Next: ${truncate(latestSummary.next_steps, 120)}`);
-  if (latestSummary.lessons) {
+  // String items only: rows written before the summary worker filtered its reply can hold
+  // [123, null, {…}] and rendered as "Lessons: 123; ; [object Object]".
+  const textItems = (json) => {
     try {
-      const lessons = JSON.parse(latestSummary.lessons);
-      if (lessons.length > 0) lines.push(`Lessons: ${lessons.slice(0, 3).join('; ')}`);
-    } catch {}
+      const v = JSON.parse(json);
+      return Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()) : [];
+    } catch {
+      return [];
+    }
+  };
+  if (latestSummary.lessons) {
+    const lessons = textItems(latestSummary.lessons);
+    if (lessons.length > 0) lines.push(`Lessons: ${lessons.slice(0, 3).join('; ')}`);
   }
   if (latestSummary.key_decisions) {
-    try {
-      const decisions = JSON.parse(latestSummary.key_decisions);
-      if (decisions.length > 0) lines.push(`Decisions: ${decisions.slice(0, 3).join('; ')}`);
-    } catch {}
+    const decisions = textItems(latestSummary.key_decisions);
+    if (decisions.length > 0) lines.push(`Decisions: ${decisions.slice(0, 3).join('; ')}`);
   }
   lines.push('');
   return lines;

@@ -5,7 +5,7 @@ import { resolve, join } from 'path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
-import { cooldownPathFor } from '../lib/cooldown-path.mjs';
+import { cooldownPathFor, threadKey } from '../lib/cooldown-path.mjs';
 
 // Session ids that actually EXERCISE the sanitizer. The first version of this file seeded
 // 's1'/'s2'/'s3' — pure alphanumerics, which EVERY plausible sanitizer maps to itself — so
@@ -74,6 +74,23 @@ describe('post-tool-recall (bind component 2)', () => {
     expect(ctx).toContain('dropped `recoverChildrenOf`');
     expect(ctx).toContain('#42');
   });
+  // D15 keyed the WRITER per thread (session_id + agent_id); this reader kept session_id alone,
+  // so a subagent's edit read a file nobody wrote and the check went silent for exactly the
+  // thread that edits (v6.21.0 pre-tag claims review).
+  it('warns a subagent that dropped an identifier its own recall flagged', async () => {
+    // A real (36-char UUID) session id: the long SIDs above are cut at 64 characters, which
+    // would map the thread key and the session key to one file and hide the defect.
+    const sid = '9f3c2a1e-4b5d-4e6f-8a7b-0c1d2e3f4a5b';
+    seed(threadKey(sid, 'agent-7'), { 42: ['recoverChildrenOf'] });
+    writeFileSync(fp, 'function purgeStale() { db.delete(); }');
+    const out = await run(
+      { tool_name: 'Edit', session_id: sid, agent_id: 'agent-7', tool_input: { file_path: fp } },
+      env(),
+    );
+    expect(out, 'the subagent got no warning').not.toBe('');
+    expect(JSON.parse(out).hookSpecificOutput.additionalContext).toContain('dropped `recoverChildrenOf`');
+  });
+
   it('silent when the identifier is still present', async () => {
     seed(SID2, { 42: ['recoverChildrenOf'] });
     writeFileSync(fp, 'function purgeStale() { recoverChildrenOf(); db.delete(); }');

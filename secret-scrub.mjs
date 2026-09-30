@@ -204,9 +204,12 @@ export const SECRET_PATTERNS = [
   // scrubber wrote: on a later pass, a BEGIN that a scrubbed key used to block reached a far END
   // and erased the prose between (v6.19.2 pre-tag defect review F5).
   // Text that names a BEGIN and, later, an END with no key between them loses the text between
-  // (D#155, open). Keeping such a block was tried for 6.19.3 and withdrawn before the tag: each of
-  // the three keep rules measured stored keys this pattern erases, either a key it took for text
+  // (D#155, accepted). Keeping such a block was tried for 6.19.3 and withdrawn before the tag: each
+  // of the three keep rules measured stored keys this pattern erases, either a key it took for text
   // or a key tail the kept markers hid from scrubKeyTails (docs/audits/20260928-v6.19.3-pretag-*.md).
+  // On this machine (2026-09-28) all 967 such blocks in 1,064 transcripts came from this
+  // repository's scrubber work; the other projects' transcripts held 6 BEGIN markers and no END.
+  // That shows the shape is rare here, not that text about PEM markers elsewhere keeps its words.
   [
     /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?:(?!-----BEGIN [A-Z0-9 ]*PRIVATE KEY|\*\*\*PEM_KEY\*\*\*)[\s\S])*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g,
     '***PEM_KEY***',

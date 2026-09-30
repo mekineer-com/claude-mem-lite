@@ -41,13 +41,14 @@
 
 import { describe, it, expect } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
+import { COMPRESSED_PENDING_PURGE, COMPRESSED_AUTO } from '../utils.mjs';
 import {
   decayAndMarkIdle,
   maintenanceStats,
   purgeStale,
   boostAccessed,
   demotePinned,
+  HIDE_GRACE_MS,
 } from '../lib/maintain-core.mjs';
 import { runIdleCleanup } from '../search-scoring.mjs';
 import { redirectSupersededIds } from '../lib/citation-tracker.mjs';
@@ -86,15 +87,20 @@ describe('decayAndMarkIdle: a tombstone is not auto-marked for purge', () => {
     const tomb = add(db, { title: 'idle imp1 retired', importance: 1, injectionCount: 0 });
     retire(db, tomb, successor);
 
-    const { idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+    const { idleHidden } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
 
     // The live twin proves the fixture qualifies; without it, "the tombstone was not
     // marked" could equally mean the fixture never satisfied the predicate at all.
-    expect(get(db, live, 'compressed_into'), 'fixture does not reach mark-idle at all').toBe(
+    // D12: the first step is a HIDE; the queue for hard delete comes a grace later.
+    expect(get(db, live, 'compressed_into'), 'fixture does not reach mark-idle at all').toBe(COMPRESSED_AUTO);
+    expect(get(db, tomb, 'compressed_into'), 'a retired row was hidden by the idle pass').toBeNull();
+    expect(idleHidden).toBe(1);
+    // …and a grace later the live row is queued while the retired one still is not.
+    decayAndMarkIdle(db, { ...ctx(Date.now() - 30 * DAY), now: Date.now() + HIDE_GRACE_MS + DAY });
+    expect(get(db, live, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+    expect(get(db, tomb, 'compressed_into'), 'a retired row was queued for hard delete').not.toBe(
       COMPRESSED_PENDING_PURGE,
     );
-    expect(get(db, tomb, 'compressed_into'), 'a retired row was queued for hard delete').toBeNull();
-    expect(idleMarked).toBe(1);
     db.close();
   });
 
@@ -109,7 +115,7 @@ describe('decayAndMarkIdle: a tombstone is not auto-marked for purge', () => {
 
     const stats = maintenanceStats(db, ctx(Date.now() - 30 * DAY));
     expect(stats.stale, 'scan still forecasts the tombstone as stale').toBe(1);
-    expect(decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY)).idleMarked).toBe(stats.stale);
+    expect(decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY)).idleHidden).toBe(stats.stale);
     db.close();
   });
 
@@ -169,8 +175,9 @@ describe('runIdleCleanup (MCP idle timer): the same exemption on the sibling wri
 
     runIdleCleanup(db);
 
+    // D12: this pass HIDES (COMPRESSED_AUTO + hidden_at); decayAndMarkIdle queues later.
     expect(get(db, live, 'compressed_into'), 'fixture does not reach the mark pass at all').toBe(
-      COMPRESSED_PENDING_PURGE,
+      COMPRESSED_AUTO,
     );
     // NOT `toBeNull()`. The invariant is "never queued for HARD DELETE", and this function
     // has a second pass that writes COMPRESSED_AUTO (-1) — which still claims the tombstone

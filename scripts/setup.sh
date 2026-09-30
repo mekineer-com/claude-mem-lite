@@ -310,14 +310,17 @@ if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" && ! -f "$MCP_MIGRATION" ]]; then
     const fs = require("fs");
     let changed = false;
     // Remove stale global MCP registrations (plugin .mcp.json handles it).
-    // Both "mem" (legacy, pre-v2.78) and "mem-lite" (current) are purged from
-    // user-global scope when running inside the plugin — the plugin manifest
-    // is the single source of truth.
+    // "mem-lite" (current) always; "mem" (legacy, pre-v2.78) only when it runs our
+    // server — the name is generic, and a user`s own "mem" server was deleted here.
+    // Same pattern as install.mjs OUR_MCP_SERVER_RE (tests/mcp-legacy-name-ownership).
+    const OURS = /claude-mem-lite[\w.-]*[\\/]+(?:scripts[\\/]+launch|server)\.mjs/;
+    const ours = (k, e) =>
+      k === "mem-lite" || (!!e && OURS.test([e.command, ...(Array.isArray(e.args) ? e.args : [])].join(" ")));
     try {
       const p = process.env.CLAUDE_JSON;
       const d = JSON.parse(fs.readFileSync(p, "utf8"));
       for (const k of ["mem", "mem-lite"]) {
-        if (d.mcpServers?.[k]) {
+        if (d.mcpServers?.[k] && ours(k, d.mcpServers[k])) {
           delete d.mcpServers[k];
           process.stderr.write(`✓ Removed stale global MCP "${k}" (plugin handles it)\n`);
           changed = true;

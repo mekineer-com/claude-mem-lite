@@ -6,7 +6,7 @@
 
 import { describe, test, expect } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
+import { COMPRESSED_PENDING_PURGE, COMPRESSED_AUTO } from '../utils.mjs';
 import {
   cleanupBroken,
   decayAndMarkIdle,
@@ -298,6 +298,9 @@ describe('recoverChildrenOf (shared hard-delete guard — CLI + MCP + maintain)'
   });
 });
 
+// Since D12 (2026-09-29) the idle pass HIDES a live idle row (COMPRESSED_AUTO + hidden_at) and
+// counts it as idleHidden; queuing for purge (idleMarked) is a later, grace-gated step — see
+// tests/maintain-hide-then-purge.test.mjs. These cases pin the guards on the hide step.
 describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
   test('protects injected rows; decays/marks only never-injected stale rows', () => {
     const db = freshDb();
@@ -306,14 +309,14 @@ describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
     const C = add(db, { title: 'injected imp1', importance: 1, injectionCount: 8 }); // protected from mark-idle
     const D = add(db, { title: 'idle imp1', importance: 1, injectionCount: 0 }); // marked pending-purge
 
-    const { decayed, idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+    const { decayed, idleHidden } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
 
     expect(decayed).toBe(1);
-    expect(idleMarked).toBe(1);
+    expect(idleHidden).toBe(1);
     expect(get(db, A, 'importance')).toBe(2); // injection protected
     expect(get(db, B, 'importance')).toBe(2); // decayed 3->2
     expect(get(db, C, 'compressed_into')).toBeNull(); // injection protected
-    expect(get(db, D, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+    expect(get(db, D, 'compressed_into')).toBe(COMPRESSED_AUTO);
   });
 
   test('MED-1: marks only PRE-EXISTING imp-1 rows, NOT freshly-decayed imp-2 (per-tier grace)', () => {
@@ -325,13 +328,13 @@ describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
     const two = add(db, { title: 'stale imp2', importance: 2, injectionCount: 0 }); // decays 2->1 this pass
     const one = add(db, { title: 'stale imp1', importance: 1, injectionCount: 0 }); // marked pending this pass
 
-    const { decayed, idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+    const { decayed, idleHidden } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
 
     expect(decayed).toBe(1); // the imp-2 row stepped down
-    expect(idleMarked).toBe(1); // ONLY the pre-existing imp-1, not the freshly-decayed one
+    expect(idleHidden).toBe(1); // ONLY the pre-existing imp-1, not the freshly-decayed one
     expect(get(db, two, 'importance')).toBe(1); // decayed 2->1
     expect(get(db, two, 'compressed_into')).toBeNull(); // NOT marked this pass (grace cycle)
-    expect(get(db, one, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+    expect(get(db, one, 'compressed_into')).toBe(COMPRESSED_AUTO);
   });
 
   test('v3.23: never marks a lesson-bearing imp-1 row idle — lessons are not auto-GC-able', () => {
@@ -344,10 +347,10 @@ describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
       lessonLearned: 'strip the query string before parsing the branch name',
     });
 
-    const { idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+    const { idleHidden } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
 
-    expect(idleMarked).toBe(1); // only the no-lesson row
-    expect(get(db, noLesson, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+    expect(idleHidden).toBe(1); // only the no-lesson row
+    expect(get(db, noLesson, 'compressed_into')).toBe(COMPRESSED_AUTO);
     expect(get(db, withLesson, 'compressed_into')).toBeNull(); // lesson protected from purge
   });
 });
@@ -368,8 +371,8 @@ describe('maintenanceStats (scan preview must match what execute does)', () => {
     expect(stats.stale).toBe(1); // only the never-injected row (was 2 pre-fix)
 
     // The parity claim itself: scan's stale count == rows decay actually marks idle.
-    const { idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
-    expect(idleMarked).toBe(stats.stale);
+    const { idleHidden } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+    expect(idleHidden).toBe(stats.stale);
   });
 
   test('stale + broken counts exclude lesson-bearing rows (parity with the execute lesson guard)', () => {
@@ -388,7 +391,7 @@ describe('maintenanceStats (scan preview must match what execute does)', () => {
     expect(stats.broken).toBe(1); // only the lesson-less broken row (was 2 pre-fix)
 
     // Parity: scan forecast == what execute actually touches.
-    expect(decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY)).idleMarked).toBe(stats.stale);
+    expect(decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY)).idleHidden).toBe(stats.stale);
     expect(cleanupBroken(db, ctx(0))).toBe(stats.broken);
   });
 });
@@ -578,11 +581,69 @@ describe('selectFuzzyDedupeIds — title + body fuzzy dedup (audit #8)', () => {
     expect(selectFuzzyDedupeIds(rows)).toEqual([]);
   });
 
+  test('does NOT dedupe a near-copy held by another project', () => {
+    const body = 'identical body text shared by both candidate rows';
+    const rows = [
+      { ...row(1, TITLE_A, body), project: 'a--app' },
+      { ...row(2, TITLE_A, body), project: 'a--app-worktree' },
+    ];
+    expect(selectFuzzyDedupeIds(rows)).toEqual([]);
+    rows[1].project = 'a--app';
+    expect(selectFuzzyDedupeIds(rows)).toEqual([2]); // same project still dedupes
+  });
+
   test('keeps the higher-importance row and removes the lower-importance peer', () => {
     const rows = [
       row(1, 'Fix the auth bug in login', 'identical body text shared by both candidate rows', 1),
       row(2, 'Fix the auth bug in login', 'identical body text shared by both candidate rows', 3),
     ];
     expect(selectFuzzyDedupeIds(rows)).toEqual([1]);
+  });
+});
+
+// E2E round 2026-09-29: auto-compress backdates a weekly summary to its members' median time,
+// so it was already past every age gate — the next maintenance passes decayed it and hid it
+// (markAutoCompressible → COMPRESSED_AUTO), and hiding a keeper hides every row compressed
+// into it: search for the week's content and for "Weekly summary" both answered No results.
+// The five writers of COMPRESSED_AUTO / COMPRESSED_PENDING_PURGE now skip group keepers.
+describe('a compression keeper is never auto-hidden or idle-marked', () => {
+  function seedWeek(db) {
+    const keeper = add(db, { title: 'Weekly summary: 4 discovery observations', importance: 1 });
+    const loner = add(db, { title: 'stale loner with no group', importance: 1 });
+    for (let i = 0; i < 2; i++) add(db, { title: `member ${i}`, importance: 1, compressedInto: keeper });
+    return { keeper, loner };
+  }
+
+  test('markAutoCompressible (both passes) leaves the keeper live', async () => {
+    const { markAutoCompressible } = await import('../lib/maintain-core.mjs');
+    const db = freshDb();
+    const { keeper, loner } = seedWeek(db);
+    markAutoCompressible(db, 'proj-a');
+    expect(get(db, keeper, 'compressed_into')).toBeNull();
+    expect(get(db, loner, 'compressed_into')).toBe(-1); // premise: the pass does fire
+  });
+
+  test('decayAndMarkIdle does not hide or queue the keeper', () => {
+    const db = freshDb();
+    const { keeper, loner } = seedWeek(db);
+    decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+    expect(get(db, keeper, 'compressed_into')).toBeNull();
+    expect(get(db, loner, 'compressed_into')).toBe(COMPRESSED_AUTO);
+  });
+
+  test('runIdleCleanup (MCP idle path) leaves the keeper live', async () => {
+    const { runIdleCleanup } = await import('../search-scoring.mjs');
+    const db = freshDb();
+    const keeper = add(db, {
+      title: 'Weekly summary',
+      importance: 1,
+      type: 'change',
+      epochOffset: -20 * DAY,
+    });
+    add(db, { title: 'member', importance: 1, type: 'change', compressedInto: keeper });
+    const loner = add(db, { title: 'loner', importance: 1, type: 'change', epochOffset: -20 * DAY });
+    runIdleCleanup(db);
+    expect(get(db, keeper, 'compressed_into')).toBeNull();
+    expect(get(db, loner, 'compressed_into')).not.toBeNull();
   });
 });

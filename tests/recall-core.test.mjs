@@ -333,3 +333,61 @@ describe('recall-core — ranking, not just reachability', () => {
     expect(tied[0].title, 'a tie must resolve to the higher id, not ascending rowid').toBe('tie-b');
   });
 });
+
+// D11 (2026-09-29): recall matched on the basename across every project and ordered by
+// importance alone, so `recall packages/alpha/index.mjs` led with packages/BETA's lesson, and
+// from project B it returned project A's rows first. Now: the current project first, then rows
+// whose stored path IS the path asked for (not just its basename), then importance; and an
+// explicit `project` keeps only that project.
+describe('recall-core — current project and full path first (D11)', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    for (const p of ['proj-a', 'proj-b']) insertSession(db, { id: `s-${p}`, project: p });
+  });
+  afterEach(() => db.close());
+
+  const seed = () => {
+    const add = (project, title, file, importance) =>
+      Number(
+        insertObs(db, {
+          sessionId: `s-${project}`,
+          project,
+          type: 'bugfix',
+          importance,
+          title,
+          lessonLearned: `${title} lesson`,
+          filesModified: JSON.stringify([file]),
+        }).lastInsertRowid,
+      );
+    return {
+      alpha: add('proj-a', 'alpha index', 'packages/alpha/index.mjs', 1),
+      beta: add('proj-a', 'beta index', 'packages/beta/index.mjs', 3),
+      other: add('proj-b', 'other project index', 'index.mjs', 3),
+    };
+  };
+
+  it('orders the current project first, and an exact path before a basename-only match', () => {
+    const ids = seed();
+    const { rows } = recallByFile(db, 'packages/alpha/index.mjs', { currentProject: 'proj-a' });
+    expect(rows.map((r) => r.id)).toEqual([ids.alpha, ids.beta, ids.other]);
+  });
+
+  it('an absolute path matches a stored relative one as exact', () => {
+    const ids = seed();
+    const { rows } = recallByFile(db, '/home/u/repo/packages/alpha/index.mjs', { currentProject: 'proj-a' });
+    expect(rows[0].id).toBe(ids.alpha);
+  });
+
+  it('from another project, that project comes first', () => {
+    const ids = seed();
+    const { rows } = recallByFile(db, 'index.mjs', { currentProject: 'proj-b' });
+    expect(rows[0].id).toBe(ids.other);
+  });
+
+  it('an explicit project keeps only that project', () => {
+    const ids = seed();
+    const { rows } = recallByFile(db, 'index.mjs', { project: 'proj-b' });
+    expect(rows.map((r) => r.id)).toEqual([ids.other]);
+  });
+});

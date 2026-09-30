@@ -71,6 +71,13 @@ describe('deferred_work CRUD', () => {
     db.close();
   });
 
+  it('insertDeferred refuses a whitespace-only title (the shared choke point)', () => {
+    const db = createTestDb();
+    expect(() => insertDeferred(db, { project: 'proj-a', title: '  \t ' })).toThrow(/title required/);
+    expect(db.prepare('SELECT COUNT(*) c FROM deferred_work').get().c).toBe(0);
+    db.close();
+  });
+
   it('listOpenWithOrdinal returns priority DESC, created_at ASC with sequential ordinal', () => {
     const db = createTestDb();
     const _a = insertDeferred(db, { project: 'p', title: 'A', priority: 2 });

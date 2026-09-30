@@ -68,6 +68,8 @@ const SHAPES = {
   diff: (ls) => ls.map((l) => `-${l}`).join('\n'),
   jsConcat: (ls) => `const k =\n${ls.map((l) => `  "${l.replace(/\\/g, '\\\\')}\\n" +`).join('\n')}\n  "";`,
   jsonReadTool: (ls) => `{"content":${J(numbered(ls))}}`,
+  // An escaped CRLF is one break (v6.19.4 pre-tag defect review F4: nothing pinned it).
+  jsonCrlf: (ls) => `{"content":${J(ls.join('\r\n'))}}`,
 };
 
 const PROSE = 'Thanks, that was the key.';
@@ -552,5 +554,16 @@ describe('v6.19.2 pre-tag round-5 review', () => {
     ['a repr with more fields', `{'stdout': '$ tail -n 2 k.pem\\n${L30}\\n${E}', 'rc': 0}`],
   ])('a key tail in %s', (_name, input) => {
     expect(scrubSecrets(input)).not.toContain(L30);
+  });
+});
+
+describe('v6.19.4 pre-tag reviews', () => {
+  // Read as a break and then an empty line, an escaped CRLF put a blank line before the key's short
+  // last line, which a blank line ends the key before (defect review F4, mutant M34).
+  it('an escaped CRLF before the short last line of a cut key', () => {
+    const [l1, l2, last] = [`MIIE${b64(60)}`, b64(64), b64(14)];
+    const lines = ['-----BEGIN RSA PRIVATE KEY-----', l1, l2, last];
+    const out = scrubSecrets(JSON.stringify({ content: `${lines.join('\r\n')}\r\n` }));
+    expect(out).not.toContain(last);
   });
 });

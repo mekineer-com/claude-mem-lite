@@ -1,7 +1,7 @@
 // claude-mem-lite episode buffer management
 // Handles file-based episode storage with advisory locking and pending entry recovery
 
-import { join } from 'path';
+import { join, basename } from 'path';
 import {
   readFileSync,
   writeFileSync,
@@ -12,10 +12,13 @@ import {
   writeSync,
   renameSync,
   statSync,
+  existsSync,
   constants as fsConstants,
 } from 'fs';
 import { inferProject, isEditEntry } from './utils.mjs';
-import { RUNTIME_DIR } from './hook-shared.mjs';
+import { RUNTIME_DIR, hostScopeSuffix, deadHostFiles, isOtherLiveHost } from './hook-shared.mjs';
+import { inferProjectDir } from './project-utils.mjs';
+import { legacyProjectNameFromDir } from './lib/project-rekey.mjs';
 
 /**
  * Read the episode buffer WITHOUT holding the lock: the dying-process salvage in hook.mjs's
@@ -39,11 +42,70 @@ export function readEpisodeRaw() {
 }
 
 /**
- * Get the path to the current project's episode buffer file.
+ * Get the path to the episode buffer of this project AND this Claude Code process
+ * (`hostScopeSuffix`, D14): two sessions open in one project each buffer their own work.
+ * The parameters exist for orphanEpisodeFiles, which must name buffers of OTHER processes
+ * without a second spelling of the name; every other caller takes the defaults.
+ * @param {string} [host] a hostScopeSuffix() value; '' is the per-project name
+ * @param {string} [project]
  * @returns {string} Absolute path to the episode JSON file
  */
-export function episodeFile() {
-  return join(RUNTIME_DIR, `ep-${inferProject()}.json`);
+export function episodeFile(host = hostScopeSuffix(), project = inferProject()) {
+  return join(RUNTIME_DIR, `ep-${project}${host}.json`);
+}
+
+/**
+ * The file scripts/post-tool-use.sh appends a Read's path to, which the next saving flush
+ * collects into `files_read`. With a host pid it is the process's own and names no project
+ * (the process pins CLAUDE_PROJECT_DIR), which is what lets bash spell it for a project in any
+ * script; without one it is the project's. The bash spelling of the same rule is in
+ * post-tool-use.sh (tests/reads-file-name-cross-language.test.mjs).
+ * @param {string} [project]
+ * @returns {string}
+ */
+export function readsFile(project = inferProject(), host = hostScopeSuffix()) {
+  return join(RUNTIME_DIR, `reads-${host || project}.txt`);
+}
+
+/**
+ * The reads file that went with an orphan buffer (orphanEpisodeFiles), named by the same rule
+ * as readsFile: `ep-<id>@h<pid>.json` read into `reads-@h<pid>.txt`, a per-project
+ * `ep-<id>.json` into `reads-<id>.txt`. `@` never occurs in a project id.
+ * @param {string} orphanPath
+ * @returns {string}
+ */
+export function orphanReadsFile(orphanPath) {
+  const key = basename(orphanPath).slice('ep-'.length, -'.json'.length);
+  const at = key.indexOf('@h');
+  return at === -1 ? readsFile(key, '') : readsFile(key.slice(0, at), key.slice(at));
+}
+
+/**
+ * Episode buffers of this project that no live session will ever flush: the per-project
+ * buffer an older version wrote, and the buffer of a Claude Code process that has exited —
+ * a host closed mid-turn never reaches Stop. Before D14 the next session in the project
+ * flushed the one shared buffer at SessionStart; with per-process buffers nobody else reads
+ * these, so SessionStart adopts them instead of leaving them to the 7-day sweep.
+ *
+ * Without a host pid the per-project buffer is this process's own, so only the pre-D9 one is
+ * an orphan.
+ *
+ * @param {string} [project]
+ * @returns {string[]} absolute paths
+ */
+export function orphanEpisodeFiles(project = inferProject()) {
+  const own = hostScopeSuffix();
+  const out = [];
+  // Per-project buffers: this id's (an older version's, unless it is this process's own because
+  // there is no host pid), and the pre-D9 id's — a non-Latin project buffered under
+  // `ep-projects----.json` before its id changed, and nothing looks under that name again.
+  for (const id of new Set([project, legacyProjectNameFromDir(inferProjectDir())])) {
+    if (!own && id === project) continue;
+    const file = episodeFile('', id);
+    if (existsSync(file)) out.push(file);
+  }
+  if (own) out.push(...deadHostFiles(basename(episodeFile('', project)).slice(0, -'.json'.length), '.json'));
+  return out;
 }
 
 /**
@@ -237,7 +299,10 @@ export function writePendingEntry(entry, sessionId, project) {
   const pendingFile = join(RUNTIME_DIR, `pending-${ts}-${rand}.json`);
   const tmp = pendingFile + '.tmp';
   try {
-    writeFileSync(tmp, JSON.stringify({ entry, sessionId, project, ts }), { mode: 0o600 });
+    // `host`: the process whose buffer this entry belongs to (D14) — merged only into that one.
+    writeFileSync(tmp, JSON.stringify({ entry, sessionId, project, ts, host: hostScopeSuffix() }), {
+      mode: 0o600,
+    });
     renameSync(tmp, pendingFile);
   } catch {
     try {
@@ -282,8 +347,11 @@ export function mergePendingEntries(episode) {
         } catch {}
         continue;
       }
-      // Only merge entries belonging to the same project
+      // Only merge entries belonging to the same project, and not another RUNNING process's
+      // (D14): its own next flush takes those. A gone process's spill is merged here, as the
+      // shared buffer's was before D14. An entry written before `host` existed merges as ever.
       if (pending.project && episode.project && pending.project !== episode.project) continue;
+      if (typeof pending.host === 'string' && isOtherLiveHost(pending.host)) continue;
       if (pending.entry) {
         unlinkSync(fp);
         episode.entries.push(pending.entry);

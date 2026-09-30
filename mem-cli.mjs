@@ -2,7 +2,6 @@
 // claude-mem-lite CLI — lightweight command layer for direct memory access
 // No MCP SDK or heavy deps — only imports schema.mjs and utils.mjs
 
-import { homedir } from 'os';
 import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, CODE_DIR } from './schema.mjs';
 import { resolveRuntimeDir } from './lib/resolve-data-dir.mjs';
 import { isFtsCorruptionError, FTS_CORRUPTION_REMEDY } from './lib/db-unusable.mjs';
@@ -114,6 +113,7 @@ import {
   formatObsFieldValue,
   obsFieldLabel,
   formatPendingPurgeLine,
+  formatHiddenLine,
 } from './cli/common.mjs';
 import {
   saveObservation,
@@ -658,6 +658,13 @@ function cmdRecent(db, args) {
   // Positional [N] wins for backward-compat; --limit is sibling-parity alias
   // (search/recall/browse/stats all accept --limit). Pre-2.69 `recent --limit N`
   // was silently ignored — surprising users extrapolating from siblings.
+  // --limit is read BEFORE the contest, like search's --deep/--no-deep: the ternary below
+  // never touched it when the count won, so the inert-flag notice told `recent 3 --limit 5`
+  // that `recent` "does not filter on" --limit and the rows were UNFILTERED. Name the winner.
+  const flagLimit = flags.limit;
+  if (isValid && flagLimit !== undefined && String(flagLimit) !== rawArg) {
+    process.stderr.write(`[mem] Both a count (${rawArg}) and --limit ${flagLimit} given — using ${rawArg}\n`);
+  }
   const limit = isValid
     ? rawLimit
     : parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: RECENT_MAX });
@@ -731,7 +738,7 @@ function cmdRecall(db, args) {
   if (file === null) return;
   if (!file) {
     fail(
-      '[mem] Usage: claude-mem-lite recall <file> [--limit N] [--include-noise] [--json] — file may also be passed via --file <file>',
+      '[mem] Usage: claude-mem-lite recall <file> [--limit N] [--project P] [--include-noise] [--json] — file may also be passed via --file <file>',
     );
     return;
   }
@@ -741,7 +748,12 @@ function cmdRecall(db, args) {
   const jsonOutput = flags.json === true || flags.json === 'true';
 
   // Shared core with MCP mem_recall: query + escaping + access bump (lib/recall-core.mjs)
-  const { filename, rows } = recallByFile(db, file, { limit, includeNoise });
+  const { filename, rows } = recallByFile(db, file, {
+    limit,
+    includeNoise,
+    project: flags.project ? resolveProject(db, flags.project) : null,
+    currentProject: cliProject(db),
+  });
 
   if (jsonOutput) {
     out(
@@ -1939,7 +1951,12 @@ function cmdBrowse(db, args) {
   }
 
   if (grandTotal === 0) {
-    out('No observations found. Start a coding session to build memory.');
+    // Under a tier filter grandTotal counts that tier alone: an empty tier is not an empty store.
+    out(
+      tierFilter
+        ? `No observations in the ${tierFilter} tier.`
+        : 'No observations found. Start a coding session to build memory.',
+    );
     return;
   }
 
@@ -1990,7 +2007,7 @@ function cmdDelete(db, args) {
 
   const confirm = flags.confirm === true || flags.confirm === 'true';
   // Shared preview body (lib/delete-core, P2-12) — single source with mem_delete.
-  const { rows, lines: previewLines, missing } = previewDeleteRows(db, ids);
+  const { rows, lines: previewLines, missing, alsoLine } = previewDeleteRows(db, ids);
 
   if (rows.length === 0) {
     fail('[mem] No observations found for given IDs');
@@ -2000,6 +2017,7 @@ function cmdDelete(db, args) {
   if (!confirm) {
     out(`[mem] Preview: ${rows.length} observation(s) will be deleted:`);
     for (const line of previewLines) out(line);
+    if (alsoLine) out(`[mem] ${alsoLine}`);
     if (missing.length > 0) out(`[mem] Note: ID(s) ${missing.join(', ')} not found and will be skipped.`);
     out('[mem] Run with --confirm to execute deletion.');
     return;
@@ -2013,8 +2031,12 @@ function cmdDelete(db, args) {
     result.recoveredChildren > 0
       ? ` Recovered ${result.recoveredChildren} merged/compressed child observation(s) to live.`
       : '';
+  const restoredNote =
+    result.restoredSuperseded > 0
+      ? ` Restored ${result.restoredSuperseded} observation(s) it had superseded to live.`
+      : '';
   out(
-    `[mem] Deleted ${result.deleted} observation(s).${recoveredNote}${missing.length > 0 ? ` Note: ID(s) ${missing.join(', ')} not found.` : ''}`,
+    `[mem] Deleted ${result.deleted} observation(s).${recoveredNote}${restoredNote}${missing.length > 0 ? ` Note: ID(s) ${missing.join(', ')} not found.` : ''}`,
   );
 }
 
@@ -2365,7 +2387,7 @@ function cmdRestore(db, argv) {
       subtitle = ?, concepts = ?, facts = ?, search_aliases = ?, files_read = ?, branch = COALESCE(?, branch),
       scope = ?,
       access_count = ?, cited_count = ?, uncited_streak = ?, injection_count = ?,
-      decay_seen_count = ?, last_accessed_at = ?
+      decay_seen_count = ?, last_accessed_at = ?, importance_set_at = ?
     WHERE id = ?`);
 
   let restored = 0,
@@ -2425,6 +2447,11 @@ function cmdRestore(db, argv) {
         files,
         lesson_learned: r.lesson_learned || null,
         now: new Date(createdEpoch),
+        // A backup's rows all coexisted in the store it came from; the only duplicates restore
+        // may skip are rows the target already holds (dupCheck above). The near-duplicate
+        // window, run with this PAST `now`, had no upper bound: 25 distinct rows restored as
+        // 1, and an old row vanished for resembling a newer live one.
+        force: true,
         sessionId: isAutoWritten(r.memory_session_id)
           ? writerSessionId(RESTORE_SESSION_ID_PREFIX, project)
           : undefined,
@@ -2432,7 +2459,7 @@ function cmdRestore(db, argv) {
       if (res.kind !== 'saved') {
         skipped++;
         continue;
-      } // saveObservation Jaccard dedup
+      }
       // Re-apply the fields saveObservation zeros/derives so the backup is faithful.
       // `text` is the observation BODY and its own FTS5 column — import-jsonl / cold-start
       // rows keep the body there with an empty narrative, so saveObservation (content =
@@ -2463,6 +2490,9 @@ function cmdRestore(db, argv) {
         num(r.injection_count),
         num(r.decay_seen_count),
         r.last_accessed_at ?? null,
+        Number.isFinite(Number(r.importance_set_at)) && r.importance_set_at !== null
+          ? Number(r.importance_set_at)
+          : null,
         res.id,
       );
       // The FTS `text` column re-syncs through the observations _au trigger.
@@ -2489,17 +2519,10 @@ function cmdRestore(db, argv) {
       `, ${skipped} duplicate(s) ${dryRun ? 'would be skipped' : 'skipped'}${tombstoneNote}` +
       `, ${totalMalformed} malformed/failed from ${totalLines} row(s).`,
   );
-  if (dryRun) {
-    // The preview applies the durable exact-dup guard (project+title+created_at) but NOT
-    // saveObservation's Jaccard near-duplicate collapse, which only exists once rows are
-    // being written. Measured: a backup holding two same-titled weekly summaries previewed
-    // 10 and restored 9. Simulating Jaccard here would mean a second copy of the dedup rule
-    // — the drift class this codebase keeps paying for — so the number is labelled an upper
-    // bound instead. Run without --dry-run for the exact count.
-    out(
-      '[mem] Note: the preview does not simulate near-duplicate collapse, so the real run may restore fewer.',
-    );
-  }
+  // Nothing restorable, and not because it was all already here: the same verdict the
+  // all-lines-unparseable JSONL case gives. A JSON array of malformed rows exited 0, so
+  // `restore backup.json && …` read a restore of nothing as success.
+  if (restored === 0 && totalMalformed > 0) process.exitCode = 1;
   // Name the lossiness where the user meets it. Export omits related_ids and drops
   // superseded rows, and restore re-inserts under fresh AUTOINCREMENT ids — so no
   // cross-link can survive the round-trip. That is a deliberate format tradeoff (stored
@@ -2652,6 +2675,7 @@ function cmdMaintain(db, args) {
     out(
       `  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, above floor): ${stats.pinned} — floored by the default maintain set since v3.76.0, no lesson → 1, lesson → 2 (opt out: CLAUDE_MEM_SKIP_DEMOTE_PINNED=1)`,
     );
+    out(formatHiddenLine(stats.hidden));
     out(formatPendingPurgeLine(stats.pendingPurge));
     if (duplicates.length > 0) {
       const autoMergeable = duplicates.filter((d) => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
@@ -2795,7 +2819,7 @@ function _resolveMemdirsForAudit(flags) {
     return [flags.memdir];
   }
   if (flags.all === true || flags.all === 'true') {
-    const projectsRoot = join(homedir(), '.claude', 'projects');
+    const projectsRoot = join(claudeConfigDir(), 'projects');
     if (!existsSync(projectsRoot)) return [];
     let entries;
     try {
@@ -3171,9 +3195,11 @@ Commands:
     --type T            Filter obs type (bugfix|decision|discovery|feature|refactor|change)
     --json              Output as JSON: {project,limit,type,total,results:[…]}
 
-  recall <file>         Show observations related to a file
+  recall <file>         Show observations related to a file (current project first,
+                        then exact-path matches before same-name files elsewhere)
     --file F            File as a flag (alias for the positional)
     --limit N           Max results (default 10)
+    --project P         Only this project
     --include-noise     Include hook-llm fallback titles ("Modified X", raw error logs)
     --json              Output as JSON: {file,limit,include_noise,total,results:[…]}
 
@@ -3213,6 +3239,7 @@ Commands:
     --force             Save even if it looks like a near-duplicate of something
                         saved in the last 5 minutes (that guard is on by default)
     --closes-deferred 1,D#42  Close deferred items in same transaction
+    --supersedes 12,E#34 Retire memories this save corrects (E#<n> = an event)
 
   defer <action>        First-class deferred work (v2.70+)
     add "<title>"       Mark deferred work for next session (≤200 chars)
@@ -3357,7 +3384,9 @@ Commands:
     --all               Legacy sweep: strip old memory-dir (MEMORY.md) sentinels from
                         known projects. Does NOT adopt — CLAUDE.md adoption is
                         per-project, on each project's next SessionStart.
-    --force             Overwrite a manually-edited managed block
+    --force             Also remove a legacy memory-dir block that has no state
+                        sidecar. (The CLAUDE.md block is always rewritten to the
+                        current template, edits inside it included.)
     --dry-run           Print intended writes without touching disk
     --status            List adopted projects + version
 
@@ -3667,6 +3696,7 @@ import { cmdDoctor } from './cli/doctor.mjs';
 // cmdActivity (T7 v2.31) extracted to cli/activity.mjs (v2.41 split).
 import { cmdActivity } from './cli/activity.mjs';
 import { cmdVerifyApply } from './cli/verify-apply.mjs';
+import { claudeConfigDir } from './lib/data-paths.mjs';
 
 import { DAY_MS } from './lib/time-constants.mjs';
 import { HOOK_TEXT_CAP } from './lib/hook-text-cap.mjs';

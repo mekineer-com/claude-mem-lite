@@ -127,6 +127,22 @@ describe('cluster-merge preserve-on-empty for keeper metadata (R3 L-M1)', () => 
     expect(keeper.facts, 'keeper facts must not be blanked').toContain('TTL');
     expect(keeper.narrative, 'keeper narrative must not be blanked').toContain('must survive');
   });
+
+  // E2E round 2026-09-29: the title was the one field without the fallback, so
+  // `{"should_merge":true}` alone blanked the keeper's title — search and recent then showed
+  // "(untitled)". smart-compress refuses a title-less reply; here the verdict is kept and the
+  // keeper's own title stands, like narrative/concepts/facts above.
+  it('keeps the keeper title when the LLM omits merged_title', async () => {
+    const { findMergeCandidates, executeMergeCluster } = await import('../hook-optimize.mjs');
+    insertObs(db, { type: 'decision', importance: 2, title: 'alpha beta gamma delta keeper' });
+    insertObs(db, { type: 'decision', importance: 1, title: 'alpha beta gamma delta other' });
+    const keeperId = db.prepare('SELECT id FROM observations ORDER BY id LIMIT 1').get().id;
+    callModelJSONAsync.mockResolvedValue({ should_merge: true });
+    const result = await executeMergeCluster(db, findMergeCandidates(db, 5)[0]);
+    expect(result.merged).toBe(true);
+    const keeper = db.prepare('SELECT title FROM observations WHERE id = ?').get(keeperId);
+    expect(keeper.title).toBe('alpha beta gamma delta keeper');
+  });
 });
 
 describe('distributeBudget never exceeds total (R3 L-L1)', () => {

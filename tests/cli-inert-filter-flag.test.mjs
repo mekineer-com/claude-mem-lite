@@ -187,6 +187,16 @@ describe('a selection flag the command never reads is reported', () => {
     expect(r.stderr, `search --deep --no-deep warned:\n${r.stderr}`).not.toMatch(/was ignored/);
   });
 
+  // Same shape on `recent` (E2E round 2026-09-29): `recent 3 --limit 5` returned 3 rows — the
+  // positional count wins — and then claimed `recent` "does not filter on" --limit, which it
+  // reads, and that the rows were UNFILTERED. It now names the winner instead.
+  it('recent: a --limit that lost to the positional count is named, not called inert', () => {
+    const r = cli(['recent', '2', '--limit', '5']);
+    expect(r.stderr).not.toMatch(/was ignored/);
+    expect(r.stderr).toMatch(/Both a count \(2\) and --limit 5 given — using 2/);
+    expect(cli(['recent', '2', '--limit', '2']).stderr).not.toMatch(/Both a count/);
+  });
+
   it('stays quiet for doctor, which selects its mode off raw argv', () => {
     const r = cli(['doctor', '--metrics']);
     expect(r.stderr, `stderr was:\n${r.stderr}`).not.toMatch(/ignored|UNFILTERED/);

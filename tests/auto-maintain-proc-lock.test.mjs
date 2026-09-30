@@ -6,7 +6,8 @@
 // idle rows BEFORE it decays, so that an imp-2 row cannot be decayed 2→1 and then hidden as
 // COMPRESSED_PENDING_PURGE by the same pass (each importance tier is supposed to buy a
 // grace cycle). Across two processes that ordering does not exist — worker A decays 2→1,
-// worker B's mark-idle sees a qualifying imp-1 row and hides it, 37 days from a hard delete.
+// worker B's mark-idle sees a qualifying imp-1 row and hides it (since D12: queued for a
+// hard delete a grace later).
 //
 // Every case here is deterministic: the "peer is mid-pass" state is created by writing the
 // lock file with THIS process's pid rather than by racing two workers, so nothing depends
@@ -32,7 +33,10 @@ import { AUTO_MAINTAIN_LOCK } from '../hook-shared.mjs';
 
 const REPO = fileURLToPath(new URL('..', import.meta.url));
 const HOOK = join(REPO, 'hook.mjs');
-const COMPRESSED_PENDING_PURGE = -2;
+// What the idle pass leaves on a row it reaches. Since D12 (2026-09-29) that is a HIDE
+// (COMPRESSED_AUTO + hidden_at), queued for purge only after the grace — still hidden from
+// every read face, which is the hazard these cases are about.
+const IDLE_HIDDEN = -1;
 const PROJECT = 'work--flow1';
 
 let dataDir, runtimeDir, dbPath, lockPath, gateFile;
@@ -124,7 +128,7 @@ describe('auto-maintain — cross-process mutex', () => {
     runAutoMaintain();
     // This is the damage a second overlapping worker inflicts. Establishing that it
     // happens here is what makes the next case's negative assertion evidence.
-    expect(compressedInto(id)).toBe(COMPRESSED_PENDING_PURGE);
+    expect(compressedInto(id)).toBe(IDLE_HIDDEN);
     expect(existsSync(gateFile)).toBe(true);
   });
 
@@ -144,14 +148,14 @@ describe('auto-maintain — cross-process mutex', () => {
     const id = seedRow();
     runAutoMaintain();
     expect(existsSync(lockPath)).toBe(false);
-    expect(compressedInto(id)).toBe(COMPRESSED_PENDING_PURGE);
+    expect(compressedInto(id)).toBe(IDLE_HIDDEN);
   });
 
   it('reclaims a stale lock (aged out) instead of wedging maintenance forever', () => {
     const id = seedRow();
     holdLock({ ageMs: 20 * 60 * 1000 }); // older than the 10-minute staleMs
     runAutoMaintain();
-    expect(compressedInto(id)).toBe(COMPRESSED_PENDING_PURGE);
+    expect(compressedInto(id)).toBe(IDLE_HIDDEN);
     expect(existsSync(gateFile)).toBe(true);
   });
 
@@ -160,7 +164,7 @@ describe('auto-maintain — cross-process mutex', () => {
     // 0x7ffffffe: above Linux's default pid_max, so process.kill(pid, 0) reports ESRCH.
     holdLock({ ageMs: 0, pid: 0x7ffffffe });
     runAutoMaintain();
-    expect(compressedInto(id)).toBe(COMPRESSED_PENDING_PURGE);
+    expect(compressedInto(id)).toBe(IDLE_HIDDEN);
   });
 
   // ── The FLOW-1 damage itself, reproduced without racing anything ──
@@ -178,8 +182,8 @@ describe('auto-maintain — cross-process mutex', () => {
 
     rmSync(gateFile, { force: true }); // what "both workers saw due" produces
     runAutoMaintain();
-    // Ordering gone: the row is now hidden from every read face, 37 days from hard delete.
-    expect(compressedInto(id)).toBe(COMPRESSED_PENDING_PURGE);
+    // Ordering gone: the row is now hidden from every read face, and a grace from a hard delete.
+    expect(compressedInto(id)).toBe(IDLE_HIDDEN);
   });
 
   it('the lock closes that window: the overlapping worker never reaches the pass', () => {

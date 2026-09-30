@@ -2,6 +2,255 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v6.21.0 — non-ASCII project names and concurrent sessions stop sharing memory
+
+**Upgrade note: projects whose names are not plain ASCII get a new id, and what they stored moves once.** No schema-version
+change: 6.20.0 still opens the database after this release has (the two columns it adds are
+listed under Changed).
+
+- **Which projects.** A project's id is `<parent>--<directory>`, and every character outside
+  ASCII letters, digits and `_.-` used to become `-` (a character outside the Basic Multilingual
+  Plane, such as an emoji, became two), so `~/projects/博客` and `~/projects/商城` were both
+  `projects----`: two projects' memories, handoffs, startup context and file recall were one
+  pool. Letters, marks and digits of every script are now kept (`projects--博客`,
+  `Projekte--Übung`); punctuation, symbols and invisible format characters are still replaced.
+  An id whose parent and directory names are both plain ASCII keeps its id byte for byte, and so
+  does one whose only other characters are replaced both before and after (`⚡app`, `app—v2`).
+  A name with letters, marks or digits of another script changes id, and so does one with a
+  character outside the Basic Multilingual Plane, such as `🚀`, which used to become two `-`
+  and now becomes one.
+- **What moves, once per project, at its first session start.**
+  - When nothing shows another directory using the old id (no stored file path inside one, and
+    no other directory that has already moved off it), the project takes everything under it:
+    memories, sessions, summaries, handoffs, events and deferred items. A sibling whose memories
+    carry no file path and that has not started a session since the upgrade is invisible to that
+    check, so the first of two such directories to start a session takes both.
+  - Otherwise only the memories whose recorded file paths lie inside the directory move, with
+    the rest of their compression groups. Memories with no path, or only relative ones, stay
+    under the old id.
+  - A one-time notice says what moved and, when memories stayed, how to list them:
+    `claude-mem-lite recent 50 --project <old id>`.
+- **Reverting.** Pin `claude-mem-lite@6.20.0` before upgrading to avoid the move. After it,
+  6.20.0 opens the database but names these directories by their old ids again, so their moved
+  rows are listed only with `--project <new id>`.
+- **Not in this release:** directories with the same parent and name in different repositories
+  (`~/a/packages/api` and `~/b/packages/api`, two repositories' `.claude/worktrees/fix`) still
+  share one id.
+
+**Changed**
+
+- **Two sessions open in one project keep separate memory sessions.** The second session's start
+  used to take over the first one's session id: the first session's handoff described the
+  second one's prompt, one summary stood for both, and one session's end of turn saved the
+  other's tool activity (and gave it the other's "unsaved bugfix" reminder). Session state and
+  the tool-activity buffer are now kept per Claude Code process, from the `CLAUDE_PID` the host
+  sets on hooks; without it the per-project behaviour is unchanged. A buffer left by a session
+  that exited mid-turn is still saved by the next session in the project.
+- **A session's follow-up prompts no longer resume another session.** Within a session's first
+  three prompts, a short follow-up such as `ok do it` could inject, and use up, a different
+  session's handoff. A session now resumes at most one handoff, and after it has finished a turn
+  only a prompt that names a past session (`上次`, `resume`, `where we left off`,
+  `last session`) resumes one; a bare `继续` / `continue` then means "go on". A session's first
+  prompt and the hand-back after `/clear` work as before. The one-resume limit is per project:
+  once any session in the project has resumed a handoff, a session already running there does
+  not resume another.
+- **Maintenance hides idle memories before it deletes them, in every project.** Only the project
+  that started the session had its old idle memories hidden (kept, and reachable by id); every
+  other project's identical ones were queued for deletion directly. Every project's are now
+  hidden first, stamped in a new nullable `hidden_at` column, and queued for deletion only if 7
+  days later they are still idle, have no lesson, are not superseded and do not hold a
+  compression group. Memories hidden before this release are never queued; memories an earlier
+  version had already queued for deletion stay queued. `maintain scan` reports how many
+  maintenance has hidden.
+- **An importance you set is no longer changed by reads, the access boost or re-enrich.**
+  `update --importance` and `mem_update` were undone by the next read (a memory read twice at
+  importance 1 is raised to 2), by maintenance's access boost, and by re-enrich, which raised a
+  lowered importance to the model's score and hid the row when the model scored it 0. All three
+  now leave a memory whose importance was set alone, stamped in a new nullable
+  `importance_set_at` column. Decay, the demotion of often-injected, never-cited memories and
+  cluster-merge (which can raise a merged group's keeper) still change it. export / restore and `verify-apply --undo` carry the stamp.
+- **`recall` and `mem_recall` rank the current project and the exact path first**, then
+  importance and recency. They matched a file by its name in every project, so another
+  package's or project's `index.mjs` could lead. `--project` (CLI) and a new optional `project`
+  argument (MCP) keep one project.
+- **`<private>` fails closed.** An unclosed `<private>` now hides everything after it, nested
+  blocks pair by depth, and `<private reason="…">` is recognised, also when a long command
+  output is stored as a head and a tail (an attribute value containing `<` is not read as a
+  tag). Text in those shapes used to be stored, sent to the
+  background model and injected later.
+- **A subagent and its parent each get a file's recorded lesson once.** Claude Code gives a
+  subagent's hooks the parent's session id, and the "already shown" record was per session, so
+  whichever thread touched a file first used the lesson up for the other — usually the subagent
+  that then edited it. The record is now per thread, and the check after an edit (under
+  `CLAUDE_MEM_SALIENCE=bind`) reads the same per-thread record.
+- **The `<memory-context>` search on each prompt skips prompts with no topic** (continuations,
+  confirmations, slash commands, `git commit` / `push` / `merge`, `npm publish` / `deploy`), as
+  the other prompt search already does, and its events half gets the minimum length its memory
+  half already had (issue #39).
+
+**Fixed**
+
+- Install: `--help` and unknown flags no longer run install-family commands (`uninstall
+  --dry-run` and `uninstall --help` uninstalled, `install --help` installed, `cleanup-hooks
+  --dry-run` removed hooks); an unknown flag on a writing command now exits 1 without acting.
+  install / uninstall / cleanup-hooks keep hooks you wrote that mention claude-mem-lite, and
+  hooks you added under the plugin's matchers. A user-scope MCP server named `mem` is removed
+  (by install, uninstall, the plugin's first session start or a plugin update) only when it runs
+  this plugin's server. `cleanup` no longer deletes other programs' `mem-*`,
+  `cite-*` and `adopt-*` temp directories. An unparseable `settings.json` is refused before
+  install or uninstall changes anything. An inaccessible data directory is reported as such:
+  install exits 1 with a chmod / chown remedy instead of "another install is in progress", and
+  doctor leads with a ✗ Data directory line carrying the remedy (the checks below it still read
+  the directory as missing). A failed `repair` removes its staging directory.
+  `cleanup-hooks` warns when it leaves an enabled plugin with no hooks. The unadopt advice
+  printed by uninstall names a command that still runs. With no API key set, doctor checks
+  that the `claude` CLI the background worker spawns resolves.
+- Data: `restore` restores every distinct row of a backup (25 rows had come back as 1) and exits
+  1 when it restores nothing because rows were malformed or failed (an all-duplicate re-run
+  still exits 0). Deleting a correction brings back the memory it had superseded, and the delete
+  preview says how many rows a delete brings back. `fts-check` and doctor
+  compare each full-text index with its content, so a stale index is no longer reported
+  healthy. Maintenance and re-enrich never hide a compression group's keeper (which hid the
+  whole group), fuzzy auto-dedup never merges across projects, and `maintain --ops dedup` names
+  the reason for a missing row, a self-merge or a cross-project pair. A cluster merge keeps the keeper's title when the model's reply has none, and
+  session summaries keep only text lessons and decisions.
+- Output: `mem_search` no longer heads a recency listing as matches (an `obs_type` with no match;
+  a query that sanitizes to nothing). `mem_timeline` says when its query anchored nothing.
+  `browse --tier` says the tier is empty rather than the store. `recent N --limit M` names the
+  count it used. A decision saved without a lesson is asked for its constraint and tradeoff.
+  `mem_defer` refuses a blank title.
+- Docs: the READMEs no longer promise a hash guard on the managed `CLAUDE.md` block (`adopt`
+  rewrites it; keep notes outside the markers or set `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`), and say
+  which episodes the LLM-failure path keeps instead of "zero data loss".
+
+## v6.20.0 — memory guidance moves out of CLAUDE.md; recalled memories are checked and corrected
+
+**Upgrade note: auto-adopt no longer adds its block to your project's `CLAUDE.md`.**
+
+- **What changes.** Until now the first session in a project added a managed block to
+  `<project>/CLAUDE.md` and wrote `<project>/.claude/plugin_claude_mem_lite.md`, so the plugin's
+  files ended up in your next commit. From 6.20.0, in a git repository that does not already
+  carry the block, the same guidance goes to `CLAUDE.local.md` at the repository root. Claude
+  Code loads that file like `CLAUDE.md`, and the plugin adds it to the repository's
+  `.git/info/exclude` (unless your ignore rules already cover it), so git does not list or
+  commit it. Claude Code reads its instruction files before the plugin's startup hook runs, so
+  the session that creates the file gets the guidance added to its context instead, once;
+  subagents started in that session do not see it. Nothing is written, and the guidance is added
+  to each session's context, outside git, in a repository rooted at `$HOME`, where
+  `CLAUDE.local.md` is tracked or is a symbolic link, and where the repository root is an npm
+  package that `npm publish` would ship the file with (no `"private": true`, no `files` list
+  that leaves it out, and, without a `files` list, no `.npmignore` naming it). A block written
+  before the root became such a package is taken out at the next session start. Where a tracked
+  or linked `CLAUDE.local.md` already carries the block, the plugin leaves it as it is and does
+  not add the guidance to the context as well.
+- **Projects an earlier version adopted keep the block in `CLAUDE.md`.** That is every project
+  an earlier version opened, unless auto-adopt was off there or the block was removed. The
+  first 6.20.0 session there refreshes the block, because the guidance text changed (see Changed
+  below), which shows up as changes to `CLAUDE.md` and to two files under `.claude/`; commit
+  them, or move the project off `CLAUDE.md`: run `claude-mem-lite unadopt` there and commit the
+  removal, and the next session writes `CLAUDE.local.md` instead, except where the previous
+  bullet says nothing is written. A session started in a subdirectory of such a repository adds
+  no local copy.
+- **The plugin does not write back a local file you removed.** Once it has created
+  `CLAUDE.local.md` in a repository, deleting the file or its block, or running
+  `claude-mem-lite unadopt`, leaves it out; the guidance is then added to each session's
+  context. `claude-mem-lite adopt --enable` lets it write the file again, and
+  `claude-mem-lite adopt` puts the block in `CLAUDE.md` instead. If you added your own notes to
+  a file the plugin created, removing the block leaves the file, and git still ignores it. The
+  plugin never edits a `CLAUDE.local.md` that is a symbolic link.
+- **Turning the guidance off.** `claude-mem-lite adopt --disable` stops auto-adopt for the
+  project, including sessions started in its subdirectories when you run it at the repository
+  root, and removes the local block; a block in `CLAUDE.md` stays until `unadopt`.
+  `MEM_NO_AUTO_ADOPT=1` stops auto-adopt everywhere, but leaves blocks already written, which
+  keep loading without being refreshed.
+- **Packaging.** `.git/info/exclude` is read by git only. The plugin does not keep the file in
+  a publishable npm package root (above), but docker build contexts, archives and other
+  packagers can include `CLAUDE.local.md`. It holds the guidance text and a `~/`-relative path
+  to the plugin's detail doc, nothing about your project. Worktrees of one repository share the
+  exclude entry, and it stays while any of them still has the block.
+- **How you notice.** The first time a project gets the local file, or gets the guidance added
+  to its context, you see a one-time notice saying which and how to undo it.
+  `MEM_NO_ADOPT_HINT=1` silences both notices.
+- **Why not add it to the context everywhere.** In a sandbox evaluation on one project
+  (4 runs of 8 sessions per setup, Claude Opus 5.5), the agent saved plans, decisions and bug
+  lessons 1.5 times per run with the guidance in the context, and 5.25 times with it in
+  `CLAUDE.md` or in a `CLAUDE.local.md` present from the start. When the work was handed to a
+  subagent, the subagent never saw guidance from the context (0 of 12 sessions) and saw either
+  file every time. The completed work was the same in every setup (64 of 64 checks). Details:
+  `docs/audits/20260929-sandbox-usage-eval.md` §8.5–§8.7.
+
+**Changed**
+
+- **The guidance asks the agent to check a recalled memory before relying on it, and to correct
+  one the code contradicts.** Memories written automatically (all `E#` ids and many `#` ids) can
+  be wrong, and a lesson an agent saved can claim more than its change did. The guidance now says so, asks for a check in the
+  code or `git log` before a memory drives an answer or a design choice, and names
+  `mem_save(..., supersedes=[N])` (`["E#N"]` for an event) as the correction; the replaced
+  memory is no longer recalled. With two false memories planted, answers were right with the old
+  and the new guidance alike, but the old guidance corrected 0 of 16 while the new one replaced
+  14 of 16 with notes that matched the code (§8.6). `claude-mem-lite help` and the detail doc now
+  list `save --supersedes`.
+- **Citations are a bare `(#NN)` tag at the end of the sentence.** The guidance no longer asks
+  the agent to name ids elsewhere, and asks it not to report saves or discuss the memory store in
+  replies.
+- **The "unsaved bugfix" reminder is shown at most once per session, and not when a test that
+  was just written fails before its implementation lands.** Background summaries type that
+  red-then-green sequence as a feature or refactor, not a bugfix (an instruction in their
+  prompt; its effect on the stored types was not measured).
+- **Old events stop being recalled on files they only read.** A one-time pass in the daily
+  maintenance removes `package.json`, lock files, `README*`, `CLAUDE.md`, `AGENTS.md` and
+  `.gitignore` links from an event that keeps a link to some other file, and removes links to
+  Claude Code's own per-project files, scratch space, `node_modules` and tool results. It takes a
+  database snapshot first when it can (and proceeds if the snapshot fails), and runs once.
+
+**Fixed**
+
+- A passing `node:test` run and a printed diff were stored as errors, so the next session was told
+  about failures that never happened.
+- Claude Code's own per-project files (`~/.claude/projects/<dir>/`, including its `MEMORY.md`)
+  were recorded as project files and recalled as such.
+- The automatic lessons of a session that edited files were attached to every file it read;
+  they are attached to the files it edited.
+- A Bash command with no output was stored as its raw JSON envelope; it is stored as the command.
+  A silent command that writes a file is still recorded as an edit.
+- The resumed-session summary listed passing commands as errors, and edits made through Bash as
+  bare commands; it now lists failures and edits by file name. It keeps the first 600 characters
+  of the first task statement instead of 200, and when the session edited files its key files
+  are those files.
+- The startup summary counted the plugin's own files as your uncommitted work.
+- With `CLAUDE_CONFIG_DIR` set, the per-project opt-out, `adopt --status`, `unadopt --all`,
+  `memdir-audit --all` and the task and plan lists looked in `~/.claude` instead of the
+  configured directory. An opt-out that an earlier version wrote under `~/.claude` still
+  counts. (The installer, the post-update clean-up and the check for a plugin
+  switched off in `settings.json` still use `~/.claude/settings.json` and `~/.claude.json`.)
+
+**Performance**
+
+- Background summaries that go through the `claude` CLI (neither `ANTHROPIC_API_KEY` nor
+  `OPENROUTER_API_KEY` set) no longer load your Claude Code configuration and no longer use
+  extended thinking. Replaying real summaries on our test machine: about 8,000 instead of 32,000
+  context tokens, $0.002–0.007 instead of $0.009–0.044, and 5–6 seconds instead of 16–76 seconds
+  per call, with the same summary type in 7 of 7 paired replays. The saving depends on how much
+  configuration your Claude Code loads; a `claude` too old for the isolation flags falls back to
+  the previous call.
+
+## v6.19.4 — ip-address security floor
+
+Fixes only; no schema change, no migration, no new setting.
+
+- **`ip-address` up to 10.5.0 has two moderate advisories**: GHSA-rpw4-54j3-4h4q (`isLinkLocal()`
+  recognises only `fe80::/64` of the `fe80::/10` range) and GHSA-2vr4-cq9g-pvrc (the NAT64
+  local-use range `64:ff9b:1::/48` is not recognised). It comes in through the MCP SDK's rate
+  limiter, which only the SDK's HTTP authorization router loads; claude-mem-lite runs its MCP
+  server over stdio and never loads either. 6.19.4 requires `ip-address` 10.6.0 or later:
+  - an install from the npm registry uses the package's lock file and gets 10.7.2, where 6.19.3's
+    lock file pinned 10.5.0;
+  - `npx claude-mem-lite` sets up `~/.claude-mem-lite` without a lock file and takes the newest
+    version allowed when it runs (a 6.19.3 set-up made after the fixed versions came out already
+    has one);
+  - a plugin whose dependencies are linked from `~/.claude-mem-lite/node_modules` keeps the tree
+    that is already there.
+
 ## v6.19.3 — capture in uuid-shaped projects; browse and restore provenance
 
 Fixes only; no schema change, no migration, no new setting.

@@ -578,6 +578,20 @@ describe('undoVerifyBackup — only undoes what the apply left untouched', () =>
     ).not.toBeNull();
   });
 
+  // D10 added importance_set_at to what an apply changes. A backup written before that has
+  // no key for it in either the row or the recorded after-state; undo must still go through.
+  it('undoes a backup written before importance_set_at existed', () => {
+    const { run } = threeActions();
+    for (const b of run.backup.rows) delete b.row.importance_set_at;
+    for (const a of run.backup.applied) {
+      if (a.after) delete a.after.importance_set_at;
+      if (a.replacementAfter) delete a.replacementAfter.importance_set_at;
+    }
+    // …and an apply made then left no stamp on the rows it edited.
+    expect(db.prepare('UPDATE observations SET importance_set_at = NULL').run().changes).toBeGreaterThan(0);
+    expect(undoVerifyBackup(db, run.backup).errors).toEqual([]);
+  });
+
   it('refuses — writing nothing — when a row was edited after the apply', () => {
     const { e, run } = threeActions();
     db.prepare("UPDATE observations SET title = 'user retitled after verify' WHERE id = ?").run(e);

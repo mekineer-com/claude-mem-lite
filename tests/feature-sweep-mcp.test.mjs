@@ -633,10 +633,11 @@ describe('MCP feature sweep: hidden tools', () => {
       );
 
       const executed = await call('mem_maintain', { action: 'execute', operations: ['decay'], project: P });
-      expect(executed).toMatch(/marked 3 idle as pending-purge/);
+      expect(executed).toMatch(/hid 3 idle ones/); // D12: hidden first, queued after the grace
       const after = await call('mem_maintain', { action: 'scan', project: P });
       expect(after).toContain('Total active observations: 0');
-      expect(after).toMatch(/Pending purge \(idle-marked\): 3/);
+      expect(after).toMatch(/Hidden by maintenance: 3/);
+      expect(after).toMatch(/Pending purge \(idle-marked\): 0/);
     },
     30000,
   );

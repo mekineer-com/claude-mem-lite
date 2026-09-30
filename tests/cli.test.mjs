@@ -1517,6 +1517,62 @@ describe('CLI delete command', () => {
     expect(child).toBeDefined(); // child row survived
     expect(child.compressed_into).toBeNull(); // and was resurfaced as live
   });
+
+  // E2E round 2026-09-29: deleting a CORRECTION left the row it retired behind
+  // "⚠ RETRACTED — superseded by #2. Read #2 instead" with #2 gone, hidden from search for
+  // good — the compressed-child dangle above, through the superseded_by pointer. Same
+  // remedy: bring the retired row back live and say so.
+  it('restores a row the deleted observation had superseded', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
+      title: 'Budget per request',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      type: 'decision',
+      title: 'Budget per shard',
+    });
+    testDb
+      .prepare('UPDATE observations SET superseded_at = ?, superseded_by = 2 WHERE id = 1')
+      .run(Date.now());
+    const output = await captureStdout(() => run(['delete', '2', '--confirm']));
+    expect(output).toMatch(/Restored 1 observation\(s\) it had superseded/);
+    const old = testDb.prepare('SELECT superseded_at, superseded_by FROM observations WHERE id = 1').get();
+    expect(old).toEqual({ superseded_at: null, superseded_by: null });
+  });
+
+  // The preview is the one place a user can see a side effect before it happens, and it named
+  // only the rows being deleted: a weekly summary previewed as "1 observation(s) will be
+  // deleted" and then answered "Recovered 44 merged/compressed child observation(s) to live".
+  it('preview names the rows the delete will bring back, and the counts match the run', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Weekly summary' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      title: 'Member A',
+      compressedInto: 1,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1',
+      project: 'test--project',
+      title: 'Member B',
+      compressedInto: 1,
+    });
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Old claim' });
+    testDb
+      .prepare('UPDATE observations SET superseded_at = ?, superseded_by = 1 WHERE id = 4')
+      .run(Date.now());
+    const preview = await captureStdout(() => run(['delete', '1']));
+    expect(preview).toMatch(
+      /also brings back 2 merged\/compressed child observation\(s\) and 1 observation\(s\) it superseded/,
+    );
+    const done = await captureStdout(() => run(['delete', '1', '--confirm']));
+    expect(done).toMatch(/Recovered 2 merged\/compressed/);
+    expect(done).toMatch(/Restored 1 observation\(s\)/);
+  });
 });
 
 // ─── update command ─────────────────────────────────────────────────────────

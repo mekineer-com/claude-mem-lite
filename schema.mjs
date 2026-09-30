@@ -199,6 +199,10 @@ const LATEST_MIGRATION_COLUMNS = [
   // what makes the ALTER reachable at all. Pinned by the legacy-upgrade case in
   // tests/handoff-consume.test.mjs rather than left as an assertion in a comment.
   { table: 'session_handoffs', column: 'consumed_at' },
+  // D10, same no-bump reasoning (tests/importance-human-set.test.mjs pins the upgrade).
+  { table: 'observations', column: 'importance_set_at' },
+  // D12, same again (tests/maintain-hide-then-purge.test.mjs).
+  { table: 'observations', column: 'hidden_at' },
   { table: 'observations', column: 'last_access_session_id' }, // v48
   { table: 'observations', column: 'decay_seen_at_first_cite' }, // v46
   { table: 'citation_surface_log', column: 'surface' }, // v45
@@ -651,6 +655,29 @@ export function initSchema(db) {
     // mislabel the one field in this row that a human actually wrote.
     if (!handoffCols.includes('next_steps')) {
       db.exec(`ALTER TABLE session_handoffs ADD COLUMN next_steps TEXT DEFAULT NULL`);
+    }
+  } catch {
+    /* non-critical — migration retries on next open */
+  }
+
+  // D10 (2026-09-29): when a PERSON last set this row's importance (update --importance /
+  // mem_update). The passes that promote on access (search-scoring autoBoostIfNeeded,
+  // maintain boostAccessed) skip a row carrying it, so `importance 1` from a user is not
+  // undone by the next read. Additive + nullable, no CURRENT_SCHEMA_VERSION bump — the
+  // consumed_at reasoning above: an older build opening this DB just ignores the column.
+  try {
+    const obsCols = db
+      .prepare(`PRAGMA table_info(observations)`)
+      .all()
+      .map((c) => c.name);
+    if (!obsCols.includes('importance_set_at')) {
+      db.exec(`ALTER TABLE observations ADD COLUMN importance_set_at INTEGER DEFAULT NULL`);
+    }
+    // D12: when maintenance HID the row (COMPRESSED_AUTO). A hidden row that stays idle for
+    // HIDE_GRACE_MS is queued for purge; before this the idle pass queued live rows directly,
+    // with a grace measured from created_at (one day for anything past 37 days).
+    if (!obsCols.includes('hidden_at')) {
+      db.exec(`ALTER TABLE observations ADD COLUMN hidden_at INTEGER DEFAULT NULL`);
     }
   } catch {
     /* non-critical — migration retries on next open */
@@ -1504,7 +1531,11 @@ export function checkFTSIntegrity(db) {
         healthy = false;
         continue;
       }
-      db.exec(`INSERT INTO ${fts}(${fts}) VALUES('integrity-check')`);
+      // rank = 1: all four tables are EXTERNAL-content, and FTS5 compares the index with
+      // its content table only when asked to. Without it an index gone stale behind its
+      // content — what `fts-check` exists for — passed. Measured on a 5.3k-event DB copy:
+      // 46 ms for all four tables vs 28 ms without (2026-09-29).
+      db.exec(`INSERT INTO ${fts}(${fts}, rank) VALUES('integrity-check', 1)`);
       details.push(`${fts}: ok`);
     } catch (e) {
       details.push(`${fts}: CORRUPT (${e.message})`);

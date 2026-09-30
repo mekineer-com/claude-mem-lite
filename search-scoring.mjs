@@ -5,7 +5,7 @@
 // testability (server.mjs has top-level side effects), hence the former
 // "server-internals" name — renamed in audit P3 since it is not server-only.
 
-import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from './utils.mjs';
+import { debugCatch, COMPRESSED_AUTO, NOT_COMPRESSION_KEEPER_SQL, OBS_BM25 } from './utils.mjs';
 import { BASE_STOP_WORDS } from './stop-words.mjs';
 import { porterStem } from './tfidf.mjs';
 import { CLI_INVOKE } from './cli-path.mjs';
@@ -377,6 +377,8 @@ export function autoBoostIfNeeded(db, ids) {
     UPDATE observations SET importance = 2
     WHERE id IN (${placeholders})
       AND COALESCE(importance, 1) = 1
+      -- D10: not an importance a person set (update --importance / mem_update).
+      AND importance_set_at IS NULL
       AND COALESCE(access_count, 0) >= 2
       -- Exactly the rows demotePinned would floor to 1 (see the docblock above).
       AND NOT (
@@ -393,7 +395,8 @@ export function autoBoostIfNeeded(db, ids) {
 /**
  * Run type-differentiated idle cleanup on stale observations.
  * Higher-value types (decision, discovery) survive longer than ephemeral types (change).
- * - Marks low-quality (importance<=1, never accessed) as pending-purge (COMPRESSED_PENDING_PURGE).
+ * - Hides low-quality (importance<=1, never accessed) rows (COMPRESSED_AUTO + hidden_at); since D12
+ *   maintain-core decayAndMarkIdle queues one for purge only after HIDE_GRACE_MS idle.
  * - Marks importance=1 accessed observations as auto-compressed (COMPRESSED_AUTO).
  * @param {object} db better-sqlite3 database handle
  * @returns {{ marked: number, compressed: number }}
@@ -417,7 +420,9 @@ export function runIdleCleanup(db) {
       const marked = db
         .prepare(
           `
-        UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
+        -- D12: HIDE (COMPRESSED_AUTO + hidden_at), no longer queue for purge directly —
+        -- maintain-core decayAndMarkIdle queues a hidden row only after HIDE_GRACE_MS idle.
+        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}, hidden_at = ?
         WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
           -- injection_count=0, the second half of decayAndMarkIdle's engagement guard
           -- (audit 2026-09-02 P0-4). Since v2.56 an injected-but-never-accessed row counts
@@ -442,15 +447,16 @@ export function runIdleCleanup(db) {
           -- SAME "lessons never auto-GC" guard; without it a lesson demoted to imp≤1
           -- by citation-decay gets pending-purge'd here and hard-deleted by purgeStale.
           AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
+          AND ${NOT_COMPRESSION_KEEPER_SQL}
       `,
         )
-        .run(cutoff);
+        .run(Date.now(), cutoff);
       totalMarked += marked.changes;
 
       const compressed = db
         .prepare(
           `
-        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
+        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}, hidden_at = ?
         WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
           -- Same engagement guard as the mark-idle pass above: COMPRESSED_AUTO also hides
           -- the row from every retrieval surface, so an injected row must not reach it.
@@ -461,9 +467,10 @@ export function runIdleCleanup(db) {
           -- recoverBuriedLessons only re-floors live (compressed_into=0) rows, so a
           -- compressed lesson is unrecoverable. Parity with selectCompressionCandidates.
           AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
+          AND ${NOT_COMPRESSION_KEEPER_SQL}
       `,
         )
-        .run(cutoff);
+        .run(Date.now(), cutoff);
       totalCompressed += compressed.changes;
     }
   })();

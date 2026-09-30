@@ -19,7 +19,7 @@ import {
 import { liveObsFilterSql } from '../lib/inject-search-core.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
-import { cooldownPathFor as sharedCooldownPathFor } from '../lib/cooldown-path.mjs';
+import { cooldownPathFor as sharedCooldownPathFor, threadKey } from '../lib/cooldown-path.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
 import {
   fileMatchClause,
@@ -159,7 +159,7 @@ const SALIENCE_BRIDGE = process.env.CLAUDE_MEM_SALIENCE === 'bridge';
 const VERDICT_DIRECTIVE =
   "apply each lesson to this edit or rule it out — state '#NN applied' or '#NN n/a — <reason>' in your next user-facing message.";
 const ACK_DIRECTIVE =
-  'apply each lesson to this edit or rule it out. If one changes the edit, name its #NN once where you describe that change; a lesson that did not apply needs no mention.';
+  'apply each lesson to this edit or rule it out. If one changes the edit, add its bare tag (#NN) once at the end of the sentence describing that change; a lesson that did not apply needs no mention, and memory ids get no other mention in your reply.';
 // v-bind salience forcing-function (#8771 audit: ack ≠ act). Instead of a cheap
 // '#NN applied / n/a' verdict, demand the model bind the lesson to the concrete
 // line it's editing and quote the satisfying edit line. Selected by
@@ -430,6 +430,7 @@ try {
   // Parse event
   let filePath;
   let sessionId;
+  let agentId = null;
   let toolName;
   let toolInput;
   // isFullRead: a Read with no offset/limit reads the whole file. The reread
@@ -446,6 +447,7 @@ try {
     // `case 'NotebookEdit'` already knew the shape differs; this leg did not.
     filePath = toolEditPath(event.tool_input);
     sessionId = event.session_id || null;
+    agentId = typeof event.agent_id === 'string' && event.agent_id ? event.agent_id : null;
     toolName = event.tool_name || null;
     bashCwd = typeof event.cwd === 'string' ? event.cwd : null;
     const off = event.tool_input?.offset;
@@ -460,7 +462,7 @@ try {
       recordHookError('pre-recall:json', e, RUNTIME_DIR, { inputLen: input.length, truncated });
       process.exit(0);
     }
-    ({ filePath, sessionId, toolName } = salvaged);
+    ({ filePath, sessionId, toolName, agentId } = salvaged);
     toolInput = {};
     isFullRead = true;
   }
@@ -530,7 +532,12 @@ try {
   // v2.33.1: session-scoped cooldown. Within one session, same file recalls
   // once; cross-session, each session gets fresh nudges. Legacy 5-min global
   // cooldown only applies when no session_id is present.
-  const cooldownPath = cooldownPathFor(sessionId);
+  // D15: one dedup scope per THREAD. A subagent's payload carries the parent's session_id plus
+  // its own agent_id, and the two threads share no context — keyed on session_id alone, the
+  // thread that touched a file first used up the recall (and the UPS-injected ids) for the
+  // other, often the subagent that then edited it. The framing arm below stays per session.
+  const dedupKey = threadKey(sessionId, agentId);
+  const cooldownPath = cooldownPathFor(dedupKey);
   const isSessionScoped = Boolean(sessionId);
   const cooldown = readCooldown(cooldownPath);
   const now = Date.now();
@@ -679,7 +686,7 @@ try {
     // a cross-hook union over the staleness window and was measured at up to 16 ids on
     // this machine, so with the slack saturated a Read can still fetch fewer rows than
     // the seen-set holds and go silent. See the constant's docblock.
-    const crossHookSeen = readCrossHookInjected(project, sessionId);
+    const crossHookSeen = readCrossHookInjected(project, dedupKey);
     const dedupSlack = Math.min(crossHookSeen.size, CROSS_HOOK_DEDUP_SLACK_MAX);
     const obsLimit = (isRead ? 1 : 2) + dedupSlack;
     // A1.5 (v2.83.2): cite_factor as a tertiary sort key. When multiple file-
@@ -1007,7 +1014,7 @@ try {
     mergeCrossHookInjected(
       project,
       allRows.map((r) => injectedIdKey(r.id, r.src)),
-      sessionId,
+      dedupKey,
     );
   } catch (e) {
     // Silent failure — never block editing, but record for self-observation.

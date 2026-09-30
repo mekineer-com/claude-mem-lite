@@ -637,7 +637,9 @@ describe('install lifecycle checks', () => {
         join(home, '.claude.json'),
         JSON.stringify(
           {
-            mcpServers: { mem: { command: 'node', args: ['old-server.mjs'] } },
+            // A legacy (pre-v2.78) registration of OUR server — a `mem` that runs anything
+            // else is the user's and must survive (tests/mcp-legacy-name-ownership.test.mjs).
+            mcpServers: { mem: { command: 'node', args: [join(home, '.claude-mem-lite', 'server.mjs')] } },
           },
           null,
           2,
@@ -693,7 +695,9 @@ describe('install lifecycle checks', () => {
         join(home, '.claude.json'),
         JSON.stringify(
           {
-            mcpServers: { mem: { command: 'node', args: ['old-server.mjs'] } },
+            // A legacy (pre-v2.78) registration of OUR server — a `mem` that runs anything
+            // else is the user's and must survive (tests/mcp-legacy-name-ownership.test.mjs).
+            mcpServers: { mem: { command: 'node', args: [join(home, '.claude-mem-lite', 'server.mjs')] } },
           },
           null,
           2,

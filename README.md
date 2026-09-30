@@ -88,7 +88,7 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 - **Observation relations** -- Bidirectional links between related observations based on file overlap
 - **User prompt capture** -- Records user prompts via UserPromptSubmit hook for intent tracking
 - **Read file tracking** -- Tracks files read during sessions for richer episode context
-- **Zero data loss** -- If LLM fails, observations are saved with degraded (inferred) metadata instead of being discarded
+- **Degraded fallback when the LLM fails** -- An episode the deterministic rules already rate notable (an error fixed, a config or schema file changed) is saved with inferred metadata instead of being discarded. A routine edit the rules rate as noise (`Modified a.js, b.js` with no lesson) is dropped — as it is when the model answers without a lesson — so a failing provider loses those episodes; `claude-mem-lite doctor` warns when the `claude` CLI it would call does not resolve
 - **Two-tier dedup** -- Jaccard similarity (5-minute window) + MinHash signatures (7-day cross-session window) prevent duplicates
 - **Synonym expansion** -- Abbreviations like `K8s`, `DB`, `auth` automatically expand to full forms in FTS5 search (100+ pairs including CJK↔EN cross-language mappings)
 - **CJK synonym extraction** -- Unsegmented Chinese text is scanned for known vocabulary words (数据库→database, 搜索→search, etc.) enabling cross-language memory recall
@@ -167,9 +167,9 @@ Plugin mode manages its own hooks/runtime. On session start it only **checks and
 
 > **The plugin install is complete on its own** — hooks, MCP tools, and the bundled slash commands (`/mem`, `/lesson`, `/bug`, `/adopt`) all run from the plugin with no second step. The slash commands invoke the bundled CLI by an absolute path resolved from the plugin directory (`node "${CLAUDE_PLUGIN_ROOT}/cli.mjs" <cmd>`), so they work without anything on your `PATH`. A global `claude-mem-lite` **shell** command (for running queries yourself in a terminal) is **optional** — `npm i -g claude-mem-lite` — and is a *separate* npm install: the plugin's auto-update does **not** refresh it, so re-run `npm i -g claude-mem-lite@latest` if you want that shell command kept in sync. You do **not** need it for the plugin to be fully functional.
 
-> **Auto-adopt writes into your project, on every SessionStart (v3.13+).** The plugin adds a slug-scoped **managed block** to your project's own **`<cwd>/CLAUDE.md`** — a file that is normally committed to git — plus a `<cwd>/.claude/plugin_claude_mem_lite.md` detail file. The block is a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`. Everything outside the block is preserved verbatim, and it coexists with other plugins' blocks in the same file ([details](#invited-memory-v232)). This happens on **every** SessionStart, not just the first: the sync is idempotent and re-applies the block if it is edited away, and refreshes it when the shipped template changes. It applies regardless of install path (npm, npx, `/plugin`, manual), so **no manual `/adopt` is needed**.
+> **Auto-adopt no longer adds its block to your project's `CLAUDE.md` (next release after 6.19.4).** On every SessionStart the plugin delivers its steering text — the trigger table that boosts Claude's proactive use of `mem_recall` / `mem_save`. In a git repository that does not already carry the block it keeps a managed block in `CLAUDE.local.md` at the repository root (Claude Code loads that file like `CLAUDE.md`, subagents included) and adds the file to the repository's `.git/info/exclude` unless your ignore rules already cover it, so git does not list or commit it; you get a **one-time notice** the first time it is written. Claude Code reads instruction files before the plugin's startup hook runs, so the session that creates the file gets the text added to its context instead, once (its subagents do not see it). Outside git, in a repository rooted at `$HOME`, where `CLAUDE.local.md` is tracked or a symbolic link, or where the repository root is an npm package that `npm publish` would ship it with (no `"private": true`, no `files` list leaving it out, and without one no `.npmignore` naming it), nothing is written and the text is **injected** into each session's context, with a one-time notice suggesting `/adopt` (not at `$HOME`). The detail file the block points at lives in the plugin's data directory, named with a `~/` path. `.git/info/exclude` is read by git only: docker build contexts, archives and other packagers can pick `CLAUDE.local.md` up (a publishable npm package root does not keep it: a block written before the directory became a package is taken out at the next session start). Earlier versions added the block to your project's own `<cwd>/CLAUDE.md` (a file that is normally committed) plus a `<cwd>/.claude/plugin_claude_mem_lite.md` detail file, unasked, in every project you opened; those projects keep the block, and the first session of this version refreshes it because the text changed — to move one to the local file, run `claude-mem-lite unadopt` there and commit the removal. Why not inject everywhere: in our sandbox evaluation (one project, Claude Opus 5.5) the agent made 1.5 proactive memory saves per 8-session run with injected steering against 5.25 with the block in `CLAUDE.local.md` or `CLAUDE.md`, and subagents never saw injected text. It applies regardless of install path (npm, npx, `/plugin`, manual); silence both notices with `MEM_NO_ADOPT_HINT=1`.
 >
-> Opt out per project with `claude-mem-lite adopt --disable` (`--enable` to re-arm), globally with `export MEM_NO_AUTO_ADOPT=1`, or freeze an already-adopted block against template refreshes with `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`. `claude-mem-lite unadopt` removes the block and the detail file. Manual `/adopt` remains available for re-applying after edits and for the `--all` batch path.
+> **Want the block in `CLAUDE.md` instead** (for example to share it with your team)? Run `claude-mem-lite adopt`: it writes the slug-scoped managed block into `<cwd>/CLAUDE.md` plus the detail file, preserving everything outside the block, and removes the `CLAUDE.local.md` copy. A project that carries the block is kept in sync on **every SessionStart** — refreshed when the shipped template changes — and gets no local or injected copy on top of it, also in sessions started from a subdirectory. A `CLAUDE.local.md` block the plugin created and you deleted (or `claude-mem-lite unadopt` removed) is not written back — the text is injected instead — until `claude-mem-lite adopt --enable`. Turn steering off per project with `claude-mem-lite adopt --disable` (it also removes the `CLAUDE.local.md` block; a `CLAUDE.md` block stays until `unadopt`; `--enable` re-arms) or globally with `export MEM_NO_AUTO_ADOPT=1` (blocks already written stay and keep loading until `unadopt`); freeze the blocks against template refreshes with `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`. `claude-mem-lite unadopt` removes the `CLAUDE.md` block, the detail file, and the `CLAUDE.local.md` block with its exclude entry.
 
 ### Method 2: npx (one-liner)
 
@@ -236,6 +236,35 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
   managed/
     repos/               # Shallow-cloned source repos
 ```
+
+## Upgrading to 6.21.0
+
+**Projects whose names are not plain ASCII get a new id, and what they stored moves once.** No
+schema-version change: 6.20.0 still opens the database after this release has. Pin
+`claude-mem-lite@6.20.0` before upgrading to avoid the move; after it, 6.20.0 names these
+directories by their old ids again, so their moved rows are listed only with
+`--project <new id>`.
+
+- **Which projects.** Every character outside ASCII letters, digits and `_.-` used to become `-`,
+  so `~/projects/博客` and `~/projects/商城` were both `projects----` and shared one memory.
+  Letters, marks and digits of every script are now kept (`projects--博客`). An id whose parent
+  and directory names are both plain ASCII keeps its id byte for byte; a name with letters,
+  marks or digits of another script, or with a character outside the Basic Multilingual Plane
+  such as `🚀`, changes id.
+- **At a project's first session start its data moves.** When no stored file path shows another
+  directory using the old id, the project takes everything under it, deferred items and session
+  history included. Otherwise only the memories whose file paths lie inside the directory move;
+  the rest stay under the old id. A one-time notice says what moved and how to list what stayed
+  (`claude-mem-lite recent 50 --project <old id>`).
+- **Not in this release:** directories with the same parent and name in different repositories
+  (`~/a/packages/api` and `~/b/packages/api`) still share one id.
+- **Also changed:** two sessions open in one project keep separate memory sessions (handoffs,
+  summaries and unsaved tool activity no longer mix); a session's follow-up prompts no longer
+  resume another session; maintenance hides idle memories for 7 days before queuing them for
+  deletion, in every project; an importance you set is no longer changed by reads, the access
+  boost or re-enrich; `recall` / `mem_recall` rank the current project and the exact path first
+  (`--project` / `project` keep one project); `<private>` fails closed on an unclosed, nested or
+  attributed tag. Full list: CHANGELOG.md.
 
 ## Upgrading to 6.19.0
 
@@ -545,12 +574,12 @@ automatically on the next SessionStart.
 
 ```bash
 claude-mem-lite adopt              # install for current project
-claude-mem-lite adopt --all        # install for every project under ~/.claude/projects/
+claude-mem-lite adopt --all        # legacy clean-up: strip the old memory-dir sentinel in every project
 claude-mem-lite adopt --status     # list adopted/disabled projects + current gating snapshot
 claude-mem-lite adopt --dry-run    # preview without writing
 claude-mem-lite adopt --disable    # opt out of auto-adopt for current project (writes .mem-no-auto-adopt sentinel)
 claude-mem-lite adopt --enable     # re-arm auto-adopt for current project (deletes the sentinel)
-claude-mem-lite unadopt            # remove sentinel + doc (runtime marker stays to honor the explicit removal)
+claude-mem-lite unadopt            # remove the CLAUDE.md block + doc, and the CLAUDE.local.md block (not written again)
 ```
 
 Slash commands `/adopt` and `/unadopt` wrap the same CLI.
@@ -582,24 +611,31 @@ Slash commands `/adopt` and `/unadopt` wrap the same CLI.
   `/exit` + fresh session is enough. Same caveat applies to `unadopt`.
 
 **Safety:**
-- Hash-guarded: editing the managed-block body yourself blocks automatic
-  rewrites unless you pass `--force`.
+- Regenerated, not hand-edit-safe: `adopt` rewrites the managed block to the shipped
+  template, and so does every SessionStart whenever the block differs from it — hand edits
+  included. Keep your own notes outside the `claude-mem-lite:begin…end` markers, or set
+  `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1` to freeze the block.
 - Slug-scoped & dedup-guarded: only the `claude-mem-lite:begin…end` region is
   ever rewritten, and duplicate / CRLF-orphaned copies are collapsed to one.
   Unlike the legacy `MEMORY.md` scheme there is no line-budget gate — `CLAUDE.md`
   has no truncation cap.
-- **Auto-adopt runs on EVERY SessionStart, for any install path (v2.82.1+;
-  target moved from the memdir to `<cwd>/CLAUDE.md` in v3.13).** The sync is
-  idempotent — it re-applies the managed block if it was edited away and
-  refreshes it when the shipped template changes (freeze with
-  `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`). Per-project opt-out: `claude-mem-lite adopt --disable`
-  (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker
-  deletion / plugin reinstalls). Global opt-out: `MEM_NO_AUTO_ADOPT=1`.
-  Pre-v2.82.1 the `CLAUDE_PLUGIN_ROOT` gate left auto-adopt unreachable for
-  every `install.mjs`-written hook (the common path) — see CHANGELOG v2.82.1.
+- **Auto-adopt runs on EVERY SessionStart, for any install path, and no longer adds
+  the block to `CLAUDE.md` (next release after 6.19.4).** A git project without the
+  block gets it in `CLAUDE.local.md` at the git root (kept out of git via
+  `.git/info/exclude`), or in SessionStart context outside git; a project that
+  carries the `CLAUDE.md` block (explicit `adopt`, or an older version's auto-adopt)
+  has it kept in sync — refreshed when the shipped template changes (freeze with
+  `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`) — and gets no local or injected copy, also in
+  sessions started from a subdirectory. A `CLAUDE.local.md` block the plugin created
+  and you (or `unadopt`) removed is not written back; `adopt --enable` re-arms it.
+  Per-project opt-out: `claude-mem-lite adopt --disable` (writes a durable
+  `<memdir>/.mem-no-auto-adopt` sentinel that survives marker deletion / plugin
+  reinstalls; run at the repository root it also covers sessions started in its
+  subdirectories; it removes the local block).
+  Global opt-out: `MEM_NO_AUTO_ADOPT=1` (blocks already written stay until `unadopt`).
 - The fallback hook layer is never removed from source — conditional trim is
-  runtime-gated on sentinel presence, so projects without adoption get the
-  full verbose output.
+  runtime-gated on steering being delivered (block present, or injection on), so
+  projects that opted out get the full verbose output.
 
 See [the invited-memory design][invited-memory] for the full design (including the
 reusable template other plugins can follow). It is a development-time document and
@@ -705,7 +741,7 @@ Episodes are batched related operations (edits to the same file group) that get 
 Episode buffer -> Flush to JSON -> claude -p --model haiku -> Structured observation -> SQLite
 ```
 
-Each observation includes type, title, narrative, concepts, facts, importance (1-3), and is automatically deduplicated via two tiers: Jaccard similarity (>70% within 5 minutes) and MinHash signatures (>80% within 7 days across sessions). If the LLM call fails, a degraded observation is saved with inferred metadata (zero data loss). Related observations are linked via `related_ids` based on FTS5 title similarity and file overlap.
+Each observation includes type, title, narrative, concepts, facts, importance (1-3), and is automatically deduplicated via two tiers: Jaccard similarity (>70% within 5 minutes) and MinHash signatures (>80% within 7 days across sessions). If the LLM call fails, an episode the rules rate notable is saved with inferred metadata; a routine edit the rules rate as noise is dropped. Related observations are linked via `related_ids` based on FTS5 title similarity and file overlap.
 
 ## Management Commands
 
@@ -1022,8 +1058,8 @@ claude-mem-lite.
 | `CLAUDE_MEM_BASH_RECALL` | File recall before a Bash command that views (`cat`, `sed -n`, `head`…) or writes (`sed -i`, `cat > f`, a python patch…) a file, like the Read / Edit recall. A bash prefilter keeps Node from starting for other commands. `off` disables this leg only. | _(on)_ |
 | `CLAUDE_MEM_LESSON_GROUNDING` | An auto-captured event keeps its lesson only when the lesson quotes the window's own diagnosis (a failing output line, a comment the edit added, or the commit message); otherwise the row is kept without it at importance 1, below every injection face. `off` keeps unquoted lessons. | _(on)_ |
 | `CLAUDE_MEM_LESSON_OUTPUT_CAP` | An auto-captured lesson that shares four consecutive words with TOOL OUTPUT (a command's printed text or a tool's response, which whoever controls that output can write) is kept off the injection faces: an event keeps its row and lesson, searchable, at importance 1; a `change` observation, whose importance later reads can raise, loses the lesson, and the lesson-less row is then dropped like any other (kept only with `CLAUDE_MEM_KEEP_LOW_SIGNAL=1`). Four shared words of filler ("is not in the") count too, so a lesson quoting your own comment or commit message is demoted when it also happens to share such a run with output in the same window. The row's title is not checked. `off` restores the model's importance and the lesson. | _(on)_ |
-| `MEM_NO_AUTO_ADOPT` | Global opt-out for auto-adopt (v2.82.0+). `1` prevents the per-SessionStart auto-write of the `CLAUDE.md` managed block across **all** projects. For per-project opt-out use `claude-mem-lite adopt --disable` instead (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker deletion). | _(disabled)_ |
-| `MEM_NO_ADOPT_HINT` | Silences the one-line "Invited-memory 未启用：`claude-mem-lite adopt`…" hint that SessionStart appends when the current project hasn't been adopted. Since v2.82.1 auto-adopt runs on every SessionStart for any install path, so this hint typically surfaces only when you've explicitly opted out (`MEM_NO_AUTO_ADOPT=1` or `claude-mem-lite adopt --disable`). | _(disabled)_ |
+| `MEM_NO_AUTO_ADOPT` | Global opt-out for auto-adopt (v2.82.0+). `1` stops auto-adopt across **all** projects — no injected steering, no new `CLAUDE.local.md`, and no sync of an existing `CLAUDE.md` or `CLAUDE.local.md` block (those stay, and keep loading, until `claude-mem-lite unadopt`). For per-project opt-out use `claude-mem-lite adopt --disable` instead (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker deletion). | _(disabled)_ |
+| `MEM_NO_ADOPT_HINT` | Silences the one-time notices shown to you the first time a project gets `CLAUDE.local.md` or is steered by injection (the latter suggests `/adopt`, except at `$HOME`), and the one-line "Invited-memory 未启用：`claude-mem-lite adopt`…" hint that SessionStart appends when the current project hasn't been adopted. Since v2.82.1 auto-adopt runs on every SessionStart for any install path, so this hint typically surfaces only when you've explicitly opted out (`MEM_NO_AUTO_ADOPT=1` or `claude-mem-lite adopt --disable`). | _(disabled)_ |
 
 ### What gets injected into your context
 

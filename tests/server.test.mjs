@@ -1759,7 +1759,7 @@ describe('type-aware idle cleanup', () => {
     expect(row.compressed_into).toBeNull();
   });
 
-  it('marks decision observations as pending-purge at 90+ days', () => {
+  it('hides decision observations at 90+ days', () => {
     insertSession(db, { id: 'sess-idle-dec90', project: 'test' });
     const result = insertObs(db, {
       sessionId: 'sess-idle-dec90',
@@ -1772,10 +1772,10 @@ describe('type-aware idle cleanup', () => {
     const id = Number(result.lastInsertRowid);
     runIdleCleanup(db);
     const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
-    expect(row.compressed_into).toBe(-2);
+    expect(row.compressed_into).toBe(-1); // D12: hidden first, queued for purge after the grace
   });
 
-  it('marks change observations as pending-purge at 14+ days', () => {
+  it('hides change observations at 14+ days', () => {
     insertSession(db, { id: 'sess-idle2', project: 'test' });
     const result = insertObs(db, {
       sessionId: 'sess-idle2',
@@ -1788,7 +1788,7 @@ describe('type-aware idle cleanup', () => {
     const id = Number(result.lastInsertRowid);
     runIdleCleanup(db);
     const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
-    expect(row.compressed_into).toBe(-2);
+    expect(row.compressed_into).toBe(-1); // D12: hidden first, queued for purge after the grace
   });
 
   it('does not mark change observations before 14 days', () => {
@@ -1807,7 +1807,7 @@ describe('type-aware idle cleanup', () => {
     expect(row.compressed_into).toBeNull();
   });
 
-  it('marks feature observations as pending-purge at 60+ days', () => {
+  it('hides feature observations at 60+ days', () => {
     insertSession(db, { id: 'sess-idle-feat', project: 'test' });
     const result = insertObs(db, {
       sessionId: 'sess-idle-feat',
@@ -1820,10 +1820,10 @@ describe('type-aware idle cleanup', () => {
     const id = Number(result.lastInsertRowid);
     runIdleCleanup(db);
     const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
-    expect(row.compressed_into).toBe(-2);
+    expect(row.compressed_into).toBe(-1); // D12: hidden first, queued for purge after the grace
   });
 
-  it('marks bugfix observations as pending-purge at 30+ days', () => {
+  it('hides bugfix observations at 30+ days', () => {
     insertSession(db, { id: 'sess-idle-bug', project: 'test' });
     const result = insertObs(db, {
       sessionId: 'sess-idle-bug',
@@ -1836,7 +1836,7 @@ describe('type-aware idle cleanup', () => {
     const id = Number(result.lastInsertRowid);
     runIdleCleanup(db);
     const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
-    expect(row.compressed_into).toBe(-2);
+    expect(row.compressed_into).toBe(-1); // D12: hidden first, queued for purge after the grace
   });
 
   it('does not mark accessed or high-importance observations', () => {
@@ -1943,7 +1943,7 @@ describe('type-aware idle cleanup', () => {
     expect(row.compressed_into).toBeNull();
   });
 
-  it('still marks a "none"-sentinel row — the guard must not over-protect noise', () => {
+  it('still hides a "none"-sentinel row — the guard must not over-protect noise', () => {
     insertSession(db, { id: 'sess-idle-none', project: 'test' });
     const result = insertObs(db, {
       sessionId: 'sess-idle-none',
@@ -1957,7 +1957,7 @@ describe('type-aware idle cleanup', () => {
     const id = Number(result.lastInsertRowid);
     runIdleCleanup(db);
     const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
-    expect(row.compressed_into).toBe(-2);
+    expect(row.compressed_into).toBe(-1); // D12: hidden first, queued for purge after the grace
   });
 });
 
@@ -2389,6 +2389,33 @@ describe('mem_fts_check', () => {
     expect(result.details).toHaveLength(4); // observations + session_summaries + user_prompts + events
     expect(result.details.every((d) => d.endsWith(': ok'))).toBe(true);
     expect(result.details.some((d) => d.startsWith('events_fts'))).toBe(true);
+  });
+
+  // E2E round 2026-09-29: every FTS table here is EXTERNAL-content, and FTS5's
+  // integrity-check compares the index against that content only when rank = 1. With the
+  // default rank the index was checked against itself, so an index gone stale behind its
+  // content — the case `fts-check` is documented for ("when search results seem wrong") —
+  // read "healthy" while search kept returning a row for a word it no longer holds.
+  it('reports an index that drifted from its content table', async () => {
+    const { checkFTSIntegrity, rebuildFTS } = await import('../schema.mjs');
+    insertSession(db, { id: 'sess-drift', project: 'test' });
+    const id = Number(
+      insertObs(db, { sessionId: 'sess-drift', title: 'race condition in writer' }).lastInsertRowid,
+    );
+    const triggers = db
+      .prepare("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name='observations'")
+      .all();
+    expect(triggers.length).toBeGreaterThan(0); // premise: the drift below bypasses real triggers
+    for (const t of triggers) db.exec(`DROP TRIGGER ${t.name}`);
+    db.prepare(
+      "UPDATE observations SET title = 'zzz', text = 'nothing', narrative = 'nothing' WHERE id = ?",
+    ).run(id);
+    for (const t of triggers) db.exec(t.sql);
+    const drifted = checkFTSIntegrity(db);
+    expect(drifted.healthy).toBe(false);
+    expect(drifted.details.find((d) => d.startsWith('observations_fts'))).toMatch(/CORRUPT/);
+    rebuildFTS(db);
+    expect(checkFTSIntegrity(db).healthy).toBe(true);
   });
 
   it('should rebuild FTS indexes', async () => {

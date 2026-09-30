@@ -849,8 +849,10 @@ describe('A4 — the pending-purge line says what the counted rows actually are'
   // the count to 2 in the first assertion, or decayAndMarkIdle would stop moving it in the
   // second.
   it('pendingPurge counts decay-marked rows and not compression leftovers', async () => {
-    const [{ maintenanceStats, decayAndMarkIdle, STALE_AGE_MS }, { createTestDb, insertObs, insertSession }] =
-      await Promise.all([import('../lib/maintain-core.mjs'), import('./test-helpers.mjs')]);
+    const [
+      { maintenanceStats, decayAndMarkIdle, STALE_AGE_MS, HIDE_GRACE_MS },
+      { createTestDb, insertObs, insertSession },
+    ] = await Promise.all([import('../lib/maintain-core.mjs'), import('./test-helpers.mjs')]);
     const db = createTestDb();
     try {
       insertSession(db, { id: 'a4-unit', project: 'a4-unit' });
@@ -883,7 +885,13 @@ describe('A4 — the pending-purge line says what the counted rows actually are'
         epochOffset: -(STALE_AGE_MS + 86400000),
       });
       expect(maintenanceStats(db, mctx).pendingPurge).toBe(0);
-      expect(decayAndMarkIdle(db, mctx).idleMarked).toBe(1);
+      // D12: the first decay pass HIDES it (counted as hidden, not pending); the pass a grace
+      // later queues it — still the decay pass filling the bucket, which is what the label says.
+      expect(decayAndMarkIdle(db, mctx).idleHidden).toBe(1);
+      expect(maintenanceStats(db, mctx)).toMatchObject({ pendingPurge: 0, hidden: 1 });
+      expect(decayAndMarkIdle(db, { ...mctx, now: Date.now() + HIDE_GRACE_MS + 86400000 }).idleMarked).toBe(
+        1,
+      );
       expect(
         maintenanceStats(db, mctx).pendingPurge,
         'the decay pass is what fills the pending-purge bucket — that is what the label must say',

@@ -22,7 +22,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { createTestDb } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { runMaintainOps, PINNED_INJ_THRESHOLD, OP_CAP, STALE_AGE_MS } from '../lib/maintain-core.mjs';
 
 // D#207: join(), never new URL('../X.mjs', import.meta.url).
@@ -233,5 +233,52 @@ describe('the surface dialects still differ', () => {
   it('each face names its own merge-ids flag', () => {
     expect(read('mem-cli.mjs')).toContain("mergeIdsFlagName: '--merge-ids'");
     expect(read('server.mjs')).toContain("mergeIdsFlagName: 'merge_ids'");
+  });
+});
+
+// E2E round 2026-09-29: dedup answered "Merged 0 duplicate observations" for a keeper that
+// does not exist, a self-merge and a cross-project pair alike, and printed nothing at all
+// for `--ops dedup` without merge ids — the op silently did nothing. Each skipped pair now
+// says why, and a merge-id-less dedup says what it needs.
+describe('runMaintainOps — dedup says why it merged nothing', () => {
+  const run = (groups, provided = true) =>
+    runMaintainOps(db, ctx(), ['dedup'], {
+      mergeGroups: groups,
+      mergeIdsProvided: provided,
+      mergeIdsFlagName: '--merge-ids',
+      renderPurgePreview: preview,
+    }).join('\n');
+  const sessions = new Set();
+  beforeEach(() => sessions.clear());
+  const obs = (project, title) => {
+    if (!sessions.has(project)) insertSession(db, { id: `s-${project}`, project, memoryId: `s-${project}` });
+    sessions.add(project);
+    return Number(insertObs(db, { sessionId: `s-${project}`, project, title }).lastInsertRowid);
+  };
+
+  it('names a missing row, a self-merge and a cross-project pair', () => {
+    const a = obs('p', 'A');
+    const b = obs('q', 'B');
+    const out = run([
+      [a, 99999],
+      [a, a],
+      [a, b],
+    ]);
+    expect(out).toMatch(/Merged 0 duplicate observations/);
+    expect(out).toMatch(new RegExp(`${a}:99999 \\(no live row #99999\\)`));
+    expect(out).toMatch(new RegExp(`${a}:${a} \\(same id\\)`));
+    expect(out).toMatch(new RegExp(`${a}:${b} \\(different projects\\)`));
+  });
+
+  it('a clean merge adds no skip note', () => {
+    const a = obs('p', 'A');
+    const b = obs('p', 'A again');
+    const out = run([[a, b]]);
+    expect(out).toMatch(/Merged 1 duplicate observations/);
+    expect(out).not.toMatch(/skipped/);
+  });
+
+  it('dedup without merge ids says it needs them', () => {
+    expect(run(null, false)).toMatch(/dedup merged nothing: it needs --merge-ids keepId:removeId/);
   });
 });

@@ -19,6 +19,19 @@ describe('buildLessonNudge', () => {
     expect(out).toContain('decision #7');
   });
 
+  // The module header says the lesson is "root cause + fix / constraint + tradeoff" by type,
+  // and mem_save's own guidance asks decisions for "<constraint + tradeoff>"; the nudge asked
+  // every type for a root cause and a fix, which a decision does not have (E2E 2026-09-29).
+  it('asks a decision for its constraint + tradeoff, a bugfix for root cause + fix', () => {
+    for (const surface of ['mcp', 'cli']) {
+      const d = buildLessonNudge({ type: 'decision', id: 9, lessonCaptured: false, surface });
+      expect(d).toContain('constraint + tradeoff');
+      expect(d).not.toContain('root cause');
+      const b = buildLessonNudge({ type: 'bugfix', id: 9, lessonCaptured: false, surface });
+      expect(b).toContain('root cause + fix');
+    }
+  });
+
   it('stays silent once the lesson is captured', () => {
     expect(buildLessonNudge({ type: 'bugfix', id: 1, lessonCaptured: true, surface: 'mcp' })).toBe('');
   });

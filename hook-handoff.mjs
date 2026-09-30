@@ -11,6 +11,7 @@ import {
   scrubSecrets,
   LOW_SIGNAL_TITLE,
   isEditEntry,
+  splitEpisodeFiles,
   isMetaTriggerPrompt,
   notLowSignalTitleClause,
   safeText,
@@ -24,6 +25,7 @@ import {
   CONTINUE_KEYWORDS,
   UNCONSUMED_HANDOFF_SQL,
 } from './hook-shared.mjs';
+import { RESUME_PAST_KEYWORDS } from './lib/handoff-constants.mjs';
 // T10d: import the whole module (not a named export) so tests can spy on
 // gitStateModule.readGitState via vi.spyOn. Named-import bindings are
 // immutable in ESM and cannot be mocked after the fact.
@@ -34,6 +36,49 @@ import * as taskReaderModule from './lib/task-reader.mjs';
 import * as pausedReaderModule from './lib/paused-reader.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { summarySourceLabel } from './lib/fast-summary.mjs';
+
+/** How much of the first subject prompt `working_on` keeps (see buildAndSaveHandoff). */
+export const WORKING_ON_FIRST_MAX = 600;
+
+/**
+ * Which episode entries the handoff replays as "Recent activity": failures and edits.
+ *
+ * A failure is `isHardError` when the entry carries it, `isError` only for entries buffered
+ * before that field existed. `isError` fires on any "error"/"fail" word in exit-0 output —
+ * in the sandbox usage evaluation (docs/audits/20260929-sandbox-usage-eval.md) it put
+ * passing test runs and printed diffs under Recent activity as "→ ERROR".
+ *
+ * An edit must have touched a file the capture kept: an Edit/Write whose `files` came back
+ * EMPTY wrote only to a path the capture drops (the host's auto-memory, the scratchpad), so
+ * "Created MEMORY.md" is not the user's work. An entry with no `files` field at all predates
+ * the field and is kept as before.
+ * @param {object} e episode entry
+ * @returns {boolean}
+ */
+function isPendingActivity(e) {
+  if (!e) return false;
+  const failed = e.isHardError !== undefined ? e.isHardError : e.isError;
+  if (failed) return true;
+  if (!isEditEntry(e)) return false;
+  return !(Array.isArray(e.files) && e.files.length === 0);
+}
+
+/**
+ * The line an entry contributes. A Bash edit is named by the files it wrote: its command is
+ * usually a heredoc script (`python3 - <<'EOF' p='…`), and the first 50 characters of that
+ * say nothing about what changed.
+ * @param {object} e episode entry
+ * @returns {string}
+ */
+function pendingActivityLine(e) {
+  const failed = e.isHardError !== undefined ? e.isHardError : e.isError;
+  if (e.tool === 'Bash' && !failed && Array.isArray(e.bashWrites) && e.bashWrites.length > 0) {
+    const names = [...new Set(e.bashWrites.map((f) => basename(f)))];
+    const shown = names.slice(0, 4).join(', ') + (names.length > 4 ? ` +${names.length - 4} more` : '');
+    return `Edited ${shown} (Bash)`;
+  }
+  return e.desc;
+}
 
 /**
  * Build and save a handoff snapshot to session_handoffs table.
@@ -148,15 +193,26 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   // pre-reorder code: two prompts differing only in their credential both render as
   // `deploy with key ***`, and keying on the raw text would replay that identical sentence
   // twice. The key is what the resuming session is actually shown. Pinned by a case.
+  //
+  // The FIRST subject prompt keeps WORKING_ON_FIRST_MAX characters, the rest 200. The first
+  // prompt is usually the task statement, and its tail is where a multi-step request puts
+  // the later steps: in the sandbox usage evaluation (docs/audits/20260929-sandbox-usage-eval.md)
+  // "…3. CLI 的 create 命令加 --coup…" was cut at 200, and on the live DB 63 of 115 stored
+  // handoffs sit at the cap. `match_keywords` is still derived from the 200-character form
+  // (`matchPromptLines`), so which later prompt counts as a continuation does not move.
   const seen = new Set();
   const safePromptLines = [];
+  const matchPromptLines = [];
   for (const p of sourcePrompts) {
-    const line = truncate(scrubSecrets(normalizeInline(p.prompt_text)), 200);
+    const scrubbed = scrubSecrets(normalizeInline(p.prompt_text));
+    const line = truncate(scrubbed, 200);
     if (seen.has(line)) continue;
     seen.add(line);
-    safePromptLines.push(line);
+    safePromptLines.push(safePromptLines.length === 0 ? truncate(scrubbed, WORKING_ON_FIRST_MAX) : line);
+    matchPromptLines.push(line);
   }
   let workingOn = safePromptLines.join(' → ');
+  let workingOnForMatch = matchPromptLines.join(' → ');
 
   if (subjectPrompts.length === 0) {
     const fallback = db
@@ -175,6 +231,7 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       // defense-in-depth for rows that predate that — which is not hypothetical: D#49 still
       // has three bare credential-shaped values backfilled in a sibling column.
       workingOn = `(carry-forward subject) ${truncate(scrubSecrets(normalizeInline(fallback.title)), 180)}`;
+      workingOnForMatch = workingOn;
     }
   }
 
@@ -263,8 +320,8 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   if (episodeSnapshot?.entries) {
     const seenDescs = new Set();
     const pendingDescs = episodeSnapshot.entries
-      .filter((e) => e.isError || isEditEntry(e))
-      .map((e) => e.desc)
+      .filter(isPendingActivity)
+      .map(pendingActivityLine)
       .filter((d) => {
         if (seenDescs.has(d)) return false;
         seenDescs.add(d);
@@ -346,7 +403,15 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
     !f.startsWith('/dev/') &&
     !f.startsWith('/proc/') &&
     !f.startsWith('/tmp/');
-  if (episodeSnapshot?.files) episodeSnapshot.files.filter(isValidFile).forEach((f) => fileSet.add(f));
+  // The files the episode EDITED when it edited any (splitEpisodeFiles), everything it
+  // touched only when it edited nothing — the rule the episode's lesson edges follow. A
+  // `cat package.json` is not a key file of the session (docs/audits/20260929-sandbox-usage-eval.md).
+  if (episodeSnapshot?.files) {
+    const { modified } = splitEpisodeFiles(episodeSnapshot);
+    (modified.length > 0 ? modified : episodeSnapshot.files)
+      .filter(isValidFile)
+      .forEach((f) => fileSet.add(f));
+  }
   // Same namespace widening as `completed` above — see the reasoning there. Measured
   // 2026-09-21: 8 of the 17 live handoff rows stored key_files as the empty array.
   //
@@ -513,7 +578,7 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   // The nullish guard mirrors what join() already did with a nullish element. Without it
   // String(undefined) would put the literal token "undefined" into the term set — a behaviour
   // change smuggled in by the per-element rewrite rather than chosen.
-  const allText = [workingOn, ...completed.map((c) => c.title).filter(Boolean), unfinished]
+  const allText = [workingOnForMatch, ...completed.map((c) => c.title).filter(Boolean), unfinished]
     .map((t) => (t === null || t === undefined ? '' : scrubSecrets(String(t))))
     .join(' ');
   const keywords = extractMatchKeywords(allText, safeFiles);
@@ -639,6 +704,31 @@ export function detectContinuationIntent(db, promptText, project, currentCcSessi
   // The bug was a single-char 'a' + fresh clear handoff → Stage 0 auto-match.
   if (!promptText || typeof promptText !== 'string') return false;
   if (promptText.trim().length < 2) return false;
+
+  // A session's own follow-ups are not a resume of ANOTHER session. The stages below counted
+  // this session's OWN exit handoff (written by its previous Stop) as evidence, while
+  // pickHandoffToInject excludes own exit rows and returns another session's newest one — so
+  // `ok do it` after a `继续` injected (and consumed) a second, unrelated session's handoff,
+  // and a session that had started a new task got yesterday's on a short follow-up.
+  if (currentCcSessionId) {
+    const firstPromptAt = db
+      .prepare('SELECT MIN(created_at_epoch) AS m FROM user_prompts WHERE cc_session_id = ?')
+      .get(currentCcSessionId)?.m;
+    // One resume per session: a handoff consumed in this PROJECT since this session's first
+    // prompt ends this session's resumes — by this session, or by a concurrent one (the table has
+    // no consumed-by column; a known limit, deferred).
+    if (
+      typeof firstPromptAt === 'number' &&
+      db
+        .prepare('SELECT 1 FROM session_handoffs WHERE project = ? AND consumed_at >= ?')
+        .get(project, firstPromptAt)
+    )
+      return false;
+    const endedATurn = db
+      .prepare(`SELECT 1 FROM session_handoffs WHERE project = ? AND type = 'exit' AND session_id = ?`)
+      .get(project, currentCcSessionId);
+    if (endedATurn) return RESUME_PAST_KEYWORDS.test(promptText);
+  }
 
   // T10d Stage -1: Git-commit anchor — current HEAD == a stored
   // git_sha_at_handoff ⇒ working tree hasn't moved since the handoff.
@@ -994,7 +1084,8 @@ function renderHandoffFromRow(handoff, db, project) {
       // (Linux allows almost any char but '/'), and this is the one field in this block
       // that was rendered raw while working_on/unfinished/key_decisions all neutralize.
       if (files.length > 0)
-        lines.push('## Key Files', safeText(files.map((f) => basename(f)).join(', ')), '');
+        // One name once: an absolute and a relative spelling of the same file both render as it.
+        lines.push('## Key Files', safeText([...new Set(files.map((f) => basename(f)))].join(', ')), '');
     } catch {}
   }
   // Next steps, from the project's newest paused note. Placed after Key Files and before

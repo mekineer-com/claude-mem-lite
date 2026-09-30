@@ -561,7 +561,17 @@ export function obsFieldLabel(field) {
  * @returns {string} the full indented line, identical on both surfaces.
  */
 export function formatPendingPurgeLine(n) {
-  return `  Pending purge (idle-marked): ${n} (live originals marked idle by decay — purge_stale deletes them)`;
+  return `  Pending purge (idle-marked): ${n} (rows maintenance queued: hidden and still idle 7 days later, or queued by an earlier version — purge_stale deletes them)`;
+}
+
+/**
+ * D12: the step before pending-purge. Maintenance HIDES an idle row first (kept, reachable by
+ * id) and queues it for purge only once it stays idle through the grace.
+ * @param {number} n stats.hidden
+ * @returns {string} the full indented line, identical on both surfaces.
+ */
+export function formatHiddenLine(n) {
+  return `  Hidden by maintenance: ${n} (idle rows kept for 7 days; still idle then → pending purge)`;
 }
 
 // Pure formatter — null/undefined/non-time pass through; integer time fields

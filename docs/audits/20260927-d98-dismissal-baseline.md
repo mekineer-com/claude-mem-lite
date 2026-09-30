@@ -80,3 +80,13 @@ console.log(JSON.stringify({
   crediting: { p25: q(gate.map(g=>g.noD),.25), median: q(gate.map(g=>g.noD),.5), p75: q(gate.map(g=>g.noD),.75), fireAt04: fire('noD', 0.4), fireAt03: fire('noD',0.3), fireAt025: fire('noD',0.25), fireAt02: fire('noD',0.2) },
 }, null, 1));
 ```
+
+## Confound for the `ups` row (added 2026-09-29)
+
+8e5efa3 (issue #39) stops path B searching on no-topic prompts — slash commands, continuations,
+confirmations — whose blocks were almost never cited (9 pairs, 0 cited on 245 transcripts,
+2026-09-29T16:50Z). Removing them lifts the `ups` face's cite rate with no change in adoption, so a
+`--since T0` window that spans the release carrying 8e5efa3 can hide exactly the fall this readout
+looks for. Read the `ups` row one of two ways, and say which: end the window before that release, or
+use `citation-live-replay --by-admission` and compare the `admitted` + `short-8-14` arms, whose
+population the change does not touch. The `pretool` row is unaffected.

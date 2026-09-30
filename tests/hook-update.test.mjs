@@ -219,6 +219,36 @@ describe('hook update lifecycle', () => {
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 
+  // 600e84d made install, uninstall and setup.sh remove a user-scope `mem` only when it runs
+  // OUR server; the post-update migration here kept deleting any `mem` on every plugin update
+  // that re-syncs a direct install (v6.21.0 pre-tag claims review, reproduced).
+  it("a plugin update keeps a user's own `mem` MCP server and removes ours", async () => {
+    const dataDir = makeDataDir();
+    const releaseDir = makeReleaseDir();
+    const home = makeDir('mem-update-mcp-home');
+    const foreign = { command: 'npx', args: ['-y', '@modelcontextprotocol/server-memory'] };
+    writeFileSync(
+      join(home, '.claude.json'),
+      JSON.stringify({
+        mcpServers: { mem: foreign, 'mem-lite': { command: 'node', args: ['/x/server.mjs'] } },
+      }),
+    );
+    mockedExecSync.mockImplementation((cmd, opts = {}) => {
+      if (String(cmd).startsWith('npm install'))
+        mkdirSync(join(opts.cwd, 'node_modules'), { recursive: true });
+      return '';
+    });
+    const { installExtractedRelease } = await loadModule({
+      CLAUDE_MEM_DIR: dataDir,
+      HOME: home,
+      CLAUDE_PLUGIN_ROOT: releaseDir,
+    });
+    expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    const after = JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8')).mcpServers;
+    expect(after.mem, "the user's own `mem` server was deleted").toEqual(foreign);
+    expect(after['mem-lite']).toBeUndefined();
+  });
+
   it('staged install swaps files only after npm install succeeds', async () => {
     const dataDir = makeDataDir();
     const releaseDir = makeReleaseDir();

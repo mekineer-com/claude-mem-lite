@@ -17,12 +17,13 @@ import {
   aggregate,
   assertFaceCoverage,
   assertRulerCanSayNo,
+  byAdmission,
   byScope,
   mentionVsApplication,
   pollutionSensitivity,
 } from '../benchmark/citation-live-replay.mjs';
 import { wilson95 } from '../benchmark/wilson.mjs';
-import { CITATION_SURFACES } from '../lib/citation-tracker.mjs';
+import { CITATION_SURFACES, hookPromptOf } from '../lib/citation-tracker.mjs';
 import { TASK_IMPERATIVE_PREFIX } from '../lib/task-imperative.mjs';
 
 // D#207: join(), not `new URL('../…mjs', …)` — the URL form makes knip drop the named
@@ -686,5 +687,125 @@ describe('mentionVsApplication (D#179)', () => {
 
   it('ignores faces with no hits at all', () => {
     expect(mentionVsApplication([rec({ ups: { inj: [1], hit: [], applied: 0 } })])).toBeNull();
+  });
+});
+
+// ── issue #39: the ups face split by path A's verdict on the triggering prompt ──────
+
+describe('--by-admission (issue #39)', () => {
+  const T = '2026-09-29T10:00:00.000Z';
+  const user = (content, extra = {}) =>
+    JSON.stringify({ type: 'user', timestamp: T, message: { role: 'user', content }, ...extra });
+  const ups = (...ids) =>
+    attach(
+      'node "/x/hook.mjs" user-prompt',
+      `<memory-context relevance="high">\n${ids.map((id) => `- [lesson] row ${id} | Lesson: l (#${id})`).join('\n')}\n</memory-context>`,
+      T,
+    );
+  let admRoot;
+
+  beforeAll(() => {
+    admRoot = mkdtempSync(join(tmpdir(), 'cite-replay-adm-'));
+    const proj = join(admRoot, 'proj-adm');
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(
+      join(proj, 'a1.jsonl'),
+      [
+        user('continue'),
+        ups(801),
+        user('发版'),
+        ups(802),
+        user('tell me about the ranking change'),
+        // A local command's echoed output is not a prompt: the next block still belongs to
+        // the no-signal prompt above it. (The echo itself would classify as `admitted` —
+        // `local-command-stdout` reads as a kebab identifier — so taking it moves the pair.)
+        user('<local-command-stdout>done</local-command-stdout>'),
+        ups(803),
+        user('fix the bug'),
+        ups(804),
+        user([{ type: 'text', text: 'fix the flaky ranking test in scoring' }]),
+        ups(805, 806),
+        // The shape the first scratch version of this split got wrong: Claude Code writes
+        // the command in tag form, then the skill's expanded body as an isMeta user entry,
+        // THEN the hook's attachment. Taking the body for the prompt files a slash command
+        // under `admitted` — it is topical text.
+        user(
+          '<command-message>converge</command-message>\n<command-name>/converge</command-name>\n<command-args></command-args>',
+        ),
+        user(
+          [
+            {
+              type: 'text',
+              text: 'Skill body: fix the flaky ranking test in scoring, review every finding.',
+            },
+          ],
+          {
+            isMeta: true,
+          },
+        ),
+        ups(807),
+        assistant('Applied #802 and #805.', T),
+      ].join('\n') + '\n',
+    );
+    // A block with no prompt before it at all.
+    writeFileSync(join(proj, 'a2.jsonl'), [ups(809), assistant('Used #809.', T)].join('\n') + '\n');
+  });
+
+  afterAll(() => {
+    if (admRoot) rmSync(admRoot, { recursive: true, force: true });
+  });
+
+  // FAILS IF: a verdict is computed from anything but path A's own gates, the tag form is
+  // not mapped back, the isMeta body is taken for the prompt, a local-command echo resets
+  // the prompt, or a cited id is credited to the wrong arm.
+  it('files every ups pair under path A’s verdict on the prompt that triggered it', () => {
+    const out = execFileSync(process.execPath, [SCRIPT, '--json', '--by-admission'], {
+      env: { ...process.env, CLAUDE_MEM_TRANSCRIPT_ROOT: admRoot },
+      encoding: 'utf8',
+    });
+    const rows = Object.fromEntries(
+      JSON.parse(out).by_admission.map((r) => [r.verdict, { pairs: r.pairs, cited: r.cited }]),
+    );
+    expect(rows).toEqual({
+      admitted: { pairs: 2, cited: 1 },
+      'short-8-14': { pairs: 1, cited: 0 },
+      'no-signal': { pairs: 1, cited: 0 },
+      'length<8': { pairs: 1, cited: 1 },
+      shape: { pairs: 2, cited: 0 },
+      unlinked: { pairs: 1, cited: 1 },
+    });
+  });
+
+  const rec = (inj, hit, upsAdmission) => ({
+    project: 'p',
+    session: 's',
+    faces: { ups: { inj, hit } },
+    ...(upsAdmission ? { upsAdmission } : {}),
+  });
+
+  // The ruler saying NO: the split and the face share one matcher, so a pair the split
+  // cannot place is an attribution defect and must not print as a table.
+  it('throws when the per-prompt split misses an id the ups face injected', () => {
+    expect(() => byAdmission([rec([1, 2], [], { admitted: [1] })])).toThrow(/disagrees with the ups face/);
+  });
+
+  it('throws when the split carries an id the ups face never injected', () => {
+    expect(() => byAdmission([rec([1], [], { admitted: [1, 9] })])).toThrow(/disagrees with the ups face/);
+  });
+
+  it('returns null — not zeros — for records that predate the field', () => {
+    expect(byAdmission([rec([1], [1])])).toBeNull();
+  });
+
+  it('hookPromptOf maps the tag form back to what the hook received and skips non-prompts', () => {
+    const e = (content, extra = {}) => ({ type: 'user', message: { content }, ...extra });
+    expect(
+      hookPromptOf(e('<command-name>/code-review</command-name>\n<command-args>high main</command-args>')),
+    ).toBe('/code-review high main');
+    expect(hookPromptOf(e('plain prompt'))).toBe('plain prompt');
+    expect(hookPromptOf(e('body', { isMeta: true }))).toBeNull();
+    expect(hookPromptOf(e('side', { isSidechain: true }))).toBeNull();
+    expect(hookPromptOf(e([{ type: 'tool_result', content: 'x' }]))).toBeNull();
+    expect(hookPromptOf(e('<local-command-stdout>ok</local-command-stdout>'))).toBeNull();
   });
 });

@@ -69,6 +69,15 @@ import { resolveDataDir } from './lib/resolve-data-dir.mjs';
 export const COMPRESSED_AUTO = -1;
 /** compressed_into sentinel: pending user-confirmed purge (marked by idle cleanup) */
 export const COMPRESSED_PENDING_PURGE = -2;
+/**
+ * SQL clause: this row is not the KEEPER of a compression group. Every writer of the two
+ * sentinels above carries it. Auto-compress backdates a weekly summary to its members' median
+ * time, so the age-based hide passes reached it within two runs — and hiding a keeper hides
+ * every member compressed into it, so the week went unsearchable (E2E round 2026-09-29).
+ * Non-correlated on purpose: SQLite materializes the list once instead of scanning per row.
+ */
+export const NOT_COMPRESSION_KEEPER_SQL =
+  'id NOT IN (SELECT compressed_into FROM observations WHERE compressed_into > 0)';
 
 // ─── Path Safety ──────────────────────────────────────────────────────────
 
@@ -160,6 +169,34 @@ export function entryEditedFiles(e) {
 /** @param {object} e episode entry @returns {boolean} the entry edited a file */
 export function isEditEntry(e) {
   return Boolean(e) && (EDIT_TOOLS.has(e.tool) || entryEditedFiles(e).length > 0);
+}
+
+/**
+ * The files an episode EDITED, and everything else it touched. `episode.files` is every
+ * path any entry mentioned — `cat package.json`, `ls src`, a README it skimmed — and it is
+ * not the right edge set for a lesson: `files` becomes `files_modified` and the
+ * observation_files / events.file_paths recall keys, and the
+ * handoff's Key Files. In the sandbox usage evaluation
+ * (docs/audits/20260929-sandbox-usage-eval.md) the episode summarizer stored that whole
+ * list, so 21 of 79 PreToolUse lesson injections fired on `package.json` and none of the
+ * 21 concerned it.
+ * @param {{entries?: object[], files?: string[], filesRead?: string[]}} episode
+ * @returns {{modified: string[], read: string[]}}
+ */
+export function splitEpisodeFiles(episode) {
+  const modified = new Set();
+  const searched = new Set();
+  for (const entry of episode?.entries || []) {
+    if (!entry?.files) continue;
+    // A Bash entry can do both: `cp a b` reads a and writes b.
+    const edited = new Set(entryEditedFiles(entry));
+    for (const f of entry.files) (edited.has(f) ? modified : searched).add(f);
+  }
+  // Merge bash-tracked reads and search tool files into filesRead
+  const read = new Set([...(episode?.filesRead || []), ...searched]);
+  // Remove files that were both searched AND modified — they're modified
+  for (const f of modified) read.delete(f);
+  return { modified: [...modified], read: [...read] };
 }
 
 // Stdin caps for the hook entry points (G19). Two DELIBERATE tiers, not drift:
@@ -333,7 +370,10 @@ function scrubTruncate(str, max, window = DESC_SCRUB_WINDOW) {
 // window, which cannot see a span that crosses its edge, and pairing the markers per window
 // stored span text two ways in the v6.19.0 pre-tag review (a cut inside a closed `<private>`, a
 // key with no END more than 4096 characters back).
-const PRIVATE_TAG_HINT_RE = /<\/?private>/i;
+// Any `<private` or `</private` followed by whitespace or `>`: the tag grammar
+// lib/private-strip.mjs accepts, attributes included (D13), and a little more. Broader only costs
+// a shorter description; narrower showed an unclosed `<private reason="…">`'s content in the tail.
+const PRIVATE_TAG_HINT_RE = /<\/?private[\s>]/i;
 const HEAD_ONLY_MAX = 60;
 // The tail window is scrubbed with TAIL_CONTEXT characters before it, which are then dropped: a
 // label cut by the window's edge (`pass|word: <value>`) is seen whole, so its value is not left
@@ -391,6 +431,8 @@ export function makeEntryDesc(toolName, input, resp, opts) {
       const isErr =
         opts?.isError ??
         (/\berror\b|\bfail(ed|ure)?\b|\bexception\b|\bpanic\b/i.test(resp) && resp.length > 30);
+      // A silent command (a `sed -i`, a heredoc write) has no output to show.
+      if (!resp) return cmd;
       const snippet = scrubTruncateEnds(resp, 100);
       return isErr ? `${cmd} → ERROR: ${snippet}` : `${cmd} → ${snippet}`;
     }

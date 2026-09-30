@@ -31,11 +31,34 @@ describe('llmProviderStatus', () => {
     vi.stubEnv('ANTHROPIC_API_KEY', '');
     vi.stubEnv('OPENROUTER_API_KEY', '');
     const probe = vi.fn();
-    const s = await llmProviderStatus({ _probe: probe });
+    const s = await llmProviderStatus({ _probe: probe, _claudePath: process.execPath });
     expect(s.mode).toBe('cli');
     expect(s.level).toBe('ok');
     expect(probe).not.toHaveBeenCalled();
     expect(s.message).toMatch(/claude CLI/);
+  });
+
+  // E2E round 2026-09-29: with no key and CLAUDE_CODE_PATH=/nonexistent/claude, doctor still
+  // printed "✓ LLM provider: claude CLI" while every background summary failed — and a failed
+  // summary drops an episode that is not already notable. Still no network: a PATH lookup.
+  it('warns when the claude CLI it would spawn does not resolve', async () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', '');
+    vi.stubEnv('OPENROUTER_API_KEY', '');
+    for (const p of ['/nonexistent/claude', 'no-such-claude-binary-xyz']) {
+      const s = await llmProviderStatus({ _claudePath: p });
+      expect(s.level, p).toBe('warn');
+      expect(s.message).toMatch(/not found/);
+      expect(s.message).toContain(p);
+    }
+  });
+
+  it('finds a bare command name on PATH', async () => {
+    const { dirname, basename } = await import('node:path');
+    vi.stubEnv('ANTHROPIC_API_KEY', '');
+    vi.stubEnv('OPENROUTER_API_KEY', '');
+    vi.stubEnv('PATH', dirname(process.execPath));
+    const s = await llmProviderStatus({ _claudePath: basename(process.execPath) });
+    expect(s.level).toBe('ok');
   });
 
   it('probes api.anthropic.com when ANTHROPIC_API_KEY is set', async () => {

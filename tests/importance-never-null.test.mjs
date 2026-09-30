@@ -27,7 +27,7 @@ import { auditSessionConsistency } from '../schema.mjs';
 import { insertObservationRow, applyObsUpdate } from '../lib/observation-write.mjs';
 import { decayAndMarkIdle } from '../lib/maintain-core.mjs';
 import { runIdleCleanup } from '../search-scoring.mjs';
-import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
+import { COMPRESSED_AUTO } from '../utils.mjs';
 
 const PROJECT = 'proj-imp';
 const DAY = 86400000;
@@ -139,12 +139,12 @@ describe('the divergence this closes, pinned as it stands today', () => {
     expect(
       db.prepare('SELECT compressed_into v FROM observations WHERE id = ?').get(forMcp).v,
       'runIdleCleanup started marking NULL-importance rows',
-    ).not.toBe(COMPRESSED_PENDING_PURGE);
+    ).toBeNull();
 
     decayAndMarkIdle(db, { projectFilter: '', baseParams: [], staleAge: Date.now() - 30 * DAY, opCap: 1000 });
     expect(
       db.prepare('SELECT compressed_into v FROM observations WHERE id = ?').get(forCli).v,
       'decayAndMarkIdle stopped treating NULL as importance 1',
-    ).toBe(COMPRESSED_PENDING_PURGE);
+    ).toBe(COMPRESSED_AUTO); // D12: the idle pass hides first
   });
 });

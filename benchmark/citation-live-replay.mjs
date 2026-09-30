@@ -54,6 +54,7 @@
  *   node benchmark/citation-live-replay.mjs --corpus c.json     # re-score a frozen one
  *   node benchmark/citation-live-replay.mjs --by-project --json
  *   node benchmark/citation-live-replay.mjs --since 2026-09-28 --by-framing   # A1 recall-framing A/B
+ *   node benchmark/citation-live-replay.mjs --by-admission   # ups face by path A's verdict (#39)
  *
  * `--split` cuts on the session START timestamp (the first parsable one in the
  * transcript), so a session that began before the boundary and ran for hours after it
@@ -74,8 +75,18 @@ import {
   classifyCitationContext,
   collectSubagentSurface,
   pretoolFramingOf,
+  extractUpsInjectionsByPrompt,
 } from '../lib/citation-tracker.mjs';
 import { readTranscriptEntries } from '../lib/transcript-scan.mjs';
+import { isNoTopicShape } from '../lib/prompt-admission.mjs';
+import { stripPrivate } from '../lib/private-strip.mjs';
+import {
+  computeEffectiveLen,
+  detectIntent,
+  extractErrorSignature,
+  extractFiles,
+} from '../scripts/prompt-search-utils.mjs';
+import { hasExplicitSignal } from '../scripts/user-prompt-search.js';
 import { wilson95 } from './wilson.mjs';
 import Database from 'better-sqlite3';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
@@ -213,6 +224,9 @@ function scanSession(project, path) {
   const ctx = classifyCitationContext(path, { mainOnly: true });
   // A1 A/B arm, read off the injected text (lib/recall-framing.mjs). Same memo as above.
   const framing = pretoolFramingOf(path, { mainOnly: true });
+  // Issue #39: the `ups` face per triggering prompt, classified by path A's front door.
+  // Same memo as above, so it too runs before collectSubagentSurface.
+  const upsAdmission = admissionSplit(extractUpsInjectionsByPrompt(path, { mainOnly: true }));
   const faces = {};
   for (const face of ATTACHMENT_FACES) {
     const inj = [...bySurface[face]];
@@ -244,6 +258,7 @@ function scanSession(project, path) {
     citedTotal: cited.size,
     framing,
     faces,
+    ...(upsAdmission ? { upsAdmission } : {}),
   };
 }
 
@@ -551,6 +566,7 @@ function main() {
             by_face: pollution.rows,
           },
           ...(has('--by-project') ? { by_project: byProject(inWindow) } : {}),
+          ...(has('--by-admission') ? { by_admission: byAdmission(inWindow) } : {}),
           ...(has('--by-scope') ? { by_scope: byScope(inWindow, scopeLookup()) } : {}),
           // Review S2: the `applied` field is computed in scanSession from the transcript,
           // and until this was exposed nothing exercised that path — setting it to a
@@ -625,6 +641,29 @@ function main() {
     console.log(`sessions by arm: ${JSON.stringify(counts)}`);
     for (const arm of ['legacy', 'factual']) {
       report(`framing = ${arm}`, aggregate(inWindow.filter((r) => r.framing === arm)));
+    }
+  }
+
+  if (has('--by-admission')) {
+    console.log("\n─── ups face by path A's verdict on the triggering prompt (issue #39) ───");
+    const rows = byAdmission(inWindow);
+    if (!rows) {
+      console.log('unavailable: these records carry no `upsAdmission` field (a frozen corpus dumped');
+      console.log('before the split existed). Re-walk live, or re-dump — an absent field is not a zero.');
+    } else {
+      console.log("Arms are path A's gates in path A's order (admissionVerdict). An id that rode in on two");
+      console.log('verdicts in one session is a pair in both. D#183 reads `no-signal`, D#184 `length<8`,');
+      console.log('each against `admitted`; `shape` empties after the release carrying 8e5efa3.');
+      console.table(
+        rows.map((r) => ({
+          verdict: r.verdict,
+          sessions: r.sessions,
+          pairs: r.pairs,
+          cited: r.cited,
+          rate: pct(r.cited, r.pairs),
+          ci95: `[${(r.ci95[0] * 100).toFixed(1)}, ${(r.ci95[1] * 100).toFixed(1)}]%`,
+        })),
+      );
     }
   }
 
@@ -758,6 +797,101 @@ export function byScope(records, scopeOf) {
         ci95: `[${(lo * 100).toFixed(1)}, ${(hi * 100).toFixed(1)}]%`,
       };
     });
+}
+
+// ─── Admission split (issue #39) ─────────────────────────────────────────────
+
+/**
+ * Path A's verdict on a prompt, from path A's own functions — the question is whether
+ * path B (the `ups` face) should admit what path A rejects, so the arms must be path A's
+ * gates exactly, in path A's order (scripts/user-prompt-search.js main()):
+ *
+ *   shape       a no-topic shape (lib/prompt-admission.mjs). Path B stops searching these
+ *               from 8e5efa3 on, so this arm empties in sessions after that release.
+ *   length<8    CJK-weighted effective length under 8: path A's shouldSkip length arm.
+ *               Path B admits 2-char CJK / 5-char other on purpose — D#184's arm.
+ *   no-signal   no error signature, file, intent, identifier or CJK run — D#183's arm.
+ *   short-8-14  admitted by path A only in a follow-up session (FOLLOWUP_PROMPT_MIN_LENGTH);
+ *               the session state is not in the transcript, so it is its own arm.
+ *   admitted    path A admits it in every session.
+ *
+ * `unlinked` (no prompt precedes the block) is assigned by the caller, not here.
+ */
+export function admissionVerdict(prompt) {
+  const text = stripPrivate(prompt);
+  if (isNoTopicShape(text)) return 'shape';
+  if (computeEffectiveLen(text) < 8) return 'length<8';
+  const signal = hasExplicitSignal(text, {
+    errSig: extractErrorSignature(text),
+    files: extractFiles(text),
+    intent: detectIntent(text),
+  });
+  if (!signal) return 'no-signal';
+  if (computeEffectiveLen(text.trim()) < 15) return 'short-8-14';
+  return 'admitted';
+}
+
+export const ADMISSION_VERDICTS = ['admitted', 'short-8-14', 'no-signal', 'length<8', 'shape', 'unlinked'];
+
+/** One transcript's per-block ups injections → { verdict: ids[] }, or null when it has none. */
+function admissionSplit(blocks) {
+  if (!blocks.length) return null;
+  const by = {};
+  for (const { prompt, ids } of blocks) {
+    const v = prompt === null ? 'unlinked' : admissionVerdict(prompt);
+    const set = (by[v] ||= new Set());
+    for (const id of ids) set.add(id);
+  }
+  return Object.fromEntries(Object.entries(by).map(([v, set]) => [v, [...set]]));
+}
+
+/**
+ * The `ups` face's cite rate per path-A verdict. Caliber is the face's own: (session, id)
+ * pairs, cited = the id in `faces.ups.hit`. An id that rode in on prompts of two verdicts in
+ * one session is a pair in BOTH arms, so the arms can sum past the face total; they can
+ * never cover less of it.
+ *
+ * THE COVERAGE CHECK IS THE RULER SAYING NO. The per-prompt walk and the per-session face
+ * extractor share one matcher, so every `ups` id must land in some arm; one that does not
+ * means the split is misattributing, and this throws rather than print a table built on
+ * it. Returns null for records that predate the field (a frozen dump) — an absent split
+ * is unavailable, never a zero.
+ */
+export function byAdmission(records) {
+  const withUps = records.filter((r) => r.faces.ups);
+  if (withUps.some((r) => !r.upsAdmission)) return null;
+  const per = new Map(ADMISSION_VERDICTS.map((v) => [v, { verdict: v, sessions: 0, pairs: 0, cited: 0 }]));
+  for (const rec of withUps) {
+    const inj = new Set(rec.faces.ups.inj);
+    const hit = new Set(rec.faces.ups.hit);
+    const covered = new Set();
+    for (const [v, ids] of Object.entries(rec.upsAdmission)) {
+      const row = per.get(v);
+      if (!row) throw new Error(`byAdmission: unknown verdict "${v}" in ${rec.session}`);
+      // A block carrying only the events leg has no obs ids: no pair, so no session.
+      if (!ids.length) continue;
+      row.sessions++;
+      for (const id of ids) {
+        row.pairs++;
+        if (hit.has(id)) row.cited++;
+        covered.add(id);
+      }
+    }
+    const missed = [...inj].filter((id) => !covered.has(id));
+    const extra = [...covered].filter((id) => !inj.has(id));
+    if (missed.length || extra.length) {
+      throw new Error(
+        `byAdmission: the per-prompt split disagrees with the ups face in ${rec.project}/${rec.session} ` +
+          `(missed ${missed.join(',') || '-'}; not in the face ${extra.join(',') || '-'}). ` +
+          'Both come from one matcher, so this is an attribution defect, not data.',
+      );
+    }
+  }
+  return [...per.values()].map((r) => ({
+    ...r,
+    rate: r.pairs ? r.cited / r.pairs : 0,
+    ci95: wilson95(r.cited, r.pairs),
+  }));
 }
 
 /** id → scope bucket, read once from the live DB. */

@@ -29,7 +29,7 @@ import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { queueHookContext, flushHookStdout } from '../lib/hook-stdout.mjs';
 // P1-9: one bounded stdin reader. Import-free, like hook-stdout.mjs beside it.
 import { readHookStdin, TOOL_INPUT_FILE_MAX_BYTES } from '../lib/hook-stdin.mjs';
-import { cooldownPathFor as sharedCooldownPathFor } from '../lib/cooldown-path.mjs';
+import { cooldownPathFor as sharedCooldownPathFor, threadKey } from '../lib/cooldown-path.mjs';
 import { toolEditPath } from '../lib/file-edge-match.mjs';
 import { recallFramingLine } from '../lib/recall-framing.mjs';
 
@@ -53,7 +53,7 @@ async function main() {
   // Bounded stdin (P1-9) — was an unbounded `for await` accumulate with no cap or timeout.
   // Same payload class as pre-tool-recall: a PostToolUse on `Write` carries the whole file.
   const { text: input } = await readHookStdin({ maxBytes: TOOL_INPUT_FILE_MAX_BYTES });
-  let filePath, sessionId;
+  let filePath, sessionId, agentId;
   try {
     const e = JSON.parse(input);
     // Both spellings — this file's PostToolUse matcher includes NotebookEdit, whose
@@ -63,12 +63,14 @@ async function main() {
     // review of that very round.
     filePath = toolEditPath(e.tool_input);
     sessionId = e.session_id || null;
+    agentId = typeof e.agent_id === 'string' && e.agent_id ? e.agent_id : null;
   } catch {
     return;
   }
   if (!filePath) return;
 
-  const cdPath = cooldownPathFor(sessionId);
+  // The writer keys the cooldown per thread (D15): a subagent's recall is in its own file.
+  const cdPath = cooldownPathFor(threadKey(sessionId, agentId));
   if (!existsSync(cdPath)) return;
   let entry;
   try {

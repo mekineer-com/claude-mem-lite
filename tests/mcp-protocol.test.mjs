@@ -413,3 +413,47 @@ describe('mem_stats names the data dir', () => {
     expect(text).toMatch(/Data dir: \S+/);
   });
 });
+
+// ─── mem_timeline query that anchors nothing (E2E round 2026-09-29) ─────────
+// The CLI says `No anchor found for "<q>", showing recent timeline`; the MCP face fell back
+// to the recency window with only `Timeline (most recent N):`, so the model read the rows as
+// the neighbourhood of what it asked about. Same "listing presented as an answer" shape the
+// mem_search header fix closed.
+describe('mem_timeline says when its query anchored nothing', () => {
+  it('names the miss before the recency window', async () => {
+    await client.callTool({
+      name: 'mem_save',
+      arguments: { content: 'timeline anchor probe row about widgets', type: 'discovery' },
+    });
+    const res = await client.callTool({ name: 'mem_timeline', arguments: { query: 'zzqqxxnomatch' } });
+    const text = textOf(res);
+    expect(text).toMatch(/Timeline \(most recent \d+\)/); // premise: the fallback still ran
+    expect(text).toMatch(
+      /No anchor found for "zzqqxxnomatch" — showing the most recent observations instead/,
+    );
+  });
+});
+
+// ─── mem_defer refuses a blank title (E2E round 2026-09-29) ─────────────────
+// `{"title":"   "}` was accepted — "Deferred as D#N" — and the item then printed as an empty
+// line in every SessionStart banner and defer list. The CLI (`defer add "   "`) refuses it,
+// and mem_save / mem_update refuse blank text the same way.
+describe('mem_defer refuses a whitespace-only title', () => {
+  it('isError, and nothing is stored', async () => {
+    const before = textOf(await client.callTool({ name: 'mem_defer_list', arguments: { limit: 50 } }));
+    const res = await client.callTool({ name: 'mem_defer', arguments: { title: '   ' } });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/title cannot be empty/);
+    const after = textOf(await client.callTool({ name: 'mem_defer_list', arguments: { limit: 50 } }));
+    expect(after).toBe(before);
+  });
+});
+
+// ─── mem_browse on an empty tier (E2E round 2026-09-29) — see tests/browse-empty-tier ───
+describe('mem_browse names an empty tier', () => {
+  it('does not call a non-empty store empty', async () => {
+    const res = await client.callTool({ name: 'mem_browse', arguments: { tier: 'archive' } });
+    expect(textOf(res)).not.toMatch(/Start a coding session/);
+    expect(textOf(res)).toMatch(/No observations in the archive tier/);
+  });
+});

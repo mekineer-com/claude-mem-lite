@@ -79,7 +79,9 @@ describe('the episode buffer path is spelled once, in episodeFile()', () => {
       `${ACCESSOR} spells the episode buffer's name more than once; every reader and every ` +
         `unlink must go through episodeFile() so the name has a single home`,
     ).toBe(1);
-    const start = src.indexOf('export function episodeFile()');
+    // `episodeFile(` rather than `episodeFile()`: D14 gave the accessor (host, project)
+    // parameters so orphan buffers of other processes are named through it too.
+    const start = src.indexOf('export function episodeFile(');
     expect(start, 'episodeFile() is gone — this guard now describes nothing').toBeGreaterThan(-1);
     const body = src.slice(start, src.indexOf('\n}', start));
     expect(countMatches(body, BUFFER_NAME)).toBe(1);

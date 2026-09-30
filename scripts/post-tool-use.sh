@@ -77,28 +77,54 @@ if [[ "$tool" == "Read" ]]; then
       *) exit 0 ;;
     esac
   fi
+  _mem_read_to_node=0
+  file_path=''
   if [[ "$input" =~ \"file_path\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
     file_path="${BASH_REMATCH[1]}"
-    _dir="${CLAUDE_PROJECT_DIR:-$PWD}"
-    # Strip trailing slashes so ${_dir##*/} / ${_dir%/*} match Node's path.basename /
-    # path.dirname in inferProject(). Without this, CLAUDE_PROJECT_DIR="/org/proj/"
-    # gave bash "proj--" (empty base) while JS gave "org--proj" — a name mismatch that
-    # made flushEpisode read a DIFFERENT reads-<project>.txt, silently dropping this
-    # session's Read context AND orphaning the bash-named file (nothing ever collects it).
-    while [[ "$_dir" == */ && ${#_dir} -gt 1 ]]; do _dir="${_dir%/}"; done
-    _base="${_dir##*/}"
-    _parent="${_dir%/*}"; _parent="${_parent##*/}"
-    if [[ -n "$_parent" && "$_parent" != "." && "$_parent" != "/" ]]; then
-      project="${_parent}--${_base}"
+    # D14/D9: with a host pid the reads file belongs to the process (hook-episode.mjs
+    # readsFile), which pins CLAUDE_PROJECT_DIR, so no project name is needed at all — and a
+    # project name in a non-Latin script is exactly what bash cannot spell like Node.
+    if [[ "${CLAUDE_PID:-}" =~ ^[1-9][0-9]{0,9}$ ]]; then
+      _reads_key="@h${CLAUDE_PID}"
     else
-      project="${_base}"
+      _dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+      # Strip trailing slashes so ${_dir##*/} / ${_dir%/*} match Node's path.basename /
+      # path.dirname in inferProject(). Without this, CLAUDE_PROJECT_DIR="/org/proj/"
+      # gave bash "proj--" (empty base) while JS gave "org--proj" — a name mismatch that
+      # made flushEpisode read a DIFFERENT reads-<project>.txt, silently dropping this
+      # session's Read context AND orphaning the bash-named file (nothing ever collects it).
+      while [[ "$_dir" == */ && ${#_dir} -gt 1 ]]; do _dir="${_dir%/}"; done
+      _base="${_dir##*/}"
+      _parent="${_dir%/*}"; _parent="${_parent##*/}"
+      if [[ -n "$_parent" && "$_parent" != "." && "$_parent" != "/" ]]; then
+        project="${_parent}--${_base}"
+      else
+        project="${_base}"
+      fi
+      # Byte semantics for the test below. Not load-bearing on bash 5.3, which detected a
+      # CJK name in C, C.UTF-8, en_US.UTF-8 and POSIX alike (probed 2026-09-29); set because
+      # what a byte range means in a multibyte locale is up to the bash build, and bash 3.2
+      # (macOS) could not be probed. Before D9 the sanitizer below turned one CJK character
+      # into one '-' or three depending on the locale.
+      _mem_lc_all_set="${LC_ALL+x}"; _mem_lc_all="${LC_ALL:-}"
+      LC_ALL=C
+      if [[ "$project" == *[$'\x80'-$'\xff']* ]]; then
+        # Non-ASCII: Node's rule keeps letters and digits of every script (project-utils.mjs
+        # projectNameFromDir), which needs Unicode tables. Hand the Read to hook.mjs.
+        _mem_read_to_node=1
+      else
+        # Sanitize + truncate to 100 to match projectNameFromDir() for ASCII, where it is
+        # exactly raw.replace(/[^a-zA-Z0-9_.-]/g,'-').slice(0,100). A >100-char parent--base
+        # otherwise diverges from the JS side (same reads-file mismatch as above).
+        project="${project//[^a-zA-Z0-9_.-]/-}"
+        project="${project:0:100}"
+        project="${project:-unknown}"
+        _reads_key="$project"
+      fi
+      if [[ -n "$_mem_lc_all_set" ]]; then LC_ALL="$_mem_lc_all"; else unset LC_ALL; fi
     fi
-    # Sanitize + truncate to 100 to match utils.mjs inferProject() EXACTLY
-    # (raw.replace(/[^a-zA-Z0-9_.-]/g,'-').slice(0,100)). A >100-char parent--base
-    # otherwise diverges from the JS side (same reads-file mismatch as above).
-    project="${project//[^a-zA-Z0-9_.-]/-}"
-    project="${project:0:100}"
-    project="${project:-unknown}"
+  fi
+  if [[ $_mem_read_to_node == 0 && -n "${file_path:-}" ]]; then
     # Honor CLAUDE_MEM_DIR relocation (mirrors schema.mjs DB_DIR → hook-shared RUNTIME_DIR).
     # hook.mjs flushEpisode reads reads-<project>.txt from CLAUDE_MEM_DIR/runtime; if this
     # bash fast-path wrote to $HOME unconditionally, a relocated install would drop all
@@ -161,9 +187,9 @@ if [[ "$tool" == "Read" ]]; then
     umask 077
     mkdir -p "$runtime_dir" 2>/dev/null
     # Use printf to avoid shell interpretation of special characters in file paths
-    printf '%s\n' "$file_path" >> "${runtime_dir}/reads-${project}.txt"
+    printf '%s\n' "$file_path" >> "${runtime_dir}/reads-${_reads_key}.txt"
   fi
-  exit 0
+  [[ $_mem_read_to_node == 1 ]] || exit 0
 fi
 
 # SYNC: Must match SKIP_TOOLS and SKIP_PREFIXES in skip-tools.mjs

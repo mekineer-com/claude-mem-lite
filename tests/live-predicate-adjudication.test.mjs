@@ -118,7 +118,13 @@ describe('live-row predicate adjudication', () => {
     expect(writeStart, 'the PENDING_PURGE write left decayAndMarkIdle').toBeGreaterThan(-1);
     const stmtEnd = src.indexOf('.run(', writeStart);
     expect(stmtEnd, 'could not find the end of the mark-idle statement').toBeGreaterThan(writeStart);
-    expect(src.slice(writeStart, stmtEnd)).toContain("liveObsFilterSql('')");
+    // D12: the PENDING_PURGE write now queues rows the idle pass already HID (compressed_into
+    // = COMPRESSED_AUTO), so liveObsFilterSql — which requires compressed_into = 0 — cannot be
+    // its predicate; it names the tombstone half explicitly. The HIDE write keeps the full one.
+    expect(src.slice(writeStart, stmtEnd)).toContain('superseded_at IS NULL');
+    const hideStart = src.indexOf('SET compressed_into = ${COMPRESSED_AUTO}, hidden_at = ?', fnStart);
+    expect(hideStart, 'the hide write left decayAndMarkIdle').toBeGreaterThan(-1);
+    expect(src.slice(hideStart, src.indexOf('.run(', hideStart))).toContain("liveObsFilterSql('')");
     expect(src).toContain(
       "`UPDATE observations SET compressed_into = ? WHERE id = ? AND ${liveObsFilterSql('')}`",
     );

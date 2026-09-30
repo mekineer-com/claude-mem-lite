@@ -69,6 +69,7 @@ export const SOURCE_FILES = [
   'lib/paused-reader.mjs',
   'lib/plan-reader.mjs',
   'lib/git-state.mjs',
+  'lib/local-steering.mjs',
   'lib/startup-dashboard.mjs',
   'lib/doctor-benchmark.mjs',
   'lib/doctor-drift.mjs',
@@ -81,6 +82,8 @@ export const SOURCE_FILES = [
   'lib/stats-quality.mjs',
   'lib/low-signal-patterns.mjs',
   'lib/private-strip.mjs',
+  'lib/mcp-ownership.mjs',
+  'lib/project-rekey.mjs',
   // Which writer produced an observation (explicit save vs machine-written); search + get marks.
   'lib/provenance.mjs',
   'lib/citation-tracker.mjs',
@@ -227,6 +230,9 @@ export const SOURCE_FILES = [
   // Shared UserPromptSubmit query caps — imported by BOTH hooks that event fires
   // (scripts/user-prompt-search.js and hook.mjs user-prompt via hook-memory.mjs).
   'lib/ups-query.mjs',
+  // Shared UserPromptSubmit admission: no-topic shapes (path A's shouldSkip + path B) and
+  // path B's length floor (hook-memory.mjs + hook.mjs events arm). Issue #39.
+  'lib/prompt-admission.mjs',
   // P2-12 twin cores: get/browse shared data collection for the CLI/MCP pairs
   // (update lives in observation-write, delete-preview in delete-core).
   'lib/get-core.mjs',

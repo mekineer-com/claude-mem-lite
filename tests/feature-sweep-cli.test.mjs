@@ -778,7 +778,8 @@ describe('CLI feature sweep: maintenance commands', () => {
     );
 
     const executed = ok(['maintain', 'execute', '--ops', 'decay', '--project', 'sweep-maintain']);
-    expect(executed.stdout).toMatch(/marked 3 idle as pending-purge/);
+    // D12: decay HIDES idle rows first; they are queued for purge only after the grace.
+    expect(executed.stdout).toMatch(/hid 3 idle ones/);
 
     const after = ok(['maintain', 'scan', '--project', 'sweep-maintain']);
     expect(after.stdout).toContain('Total active: 0');
@@ -787,7 +788,8 @@ describe('CLI feature sweep: maintenance commands', () => {
     // sentinel — these 3 rows were marked by the DECAY pass one line above
     // ("marked 3 idle as pending-purge"), not by compression. Same string on both surfaces
     // now (tests/feature-sweep-mcp.test.mjs:480 pins the twin).
-    expect(after.stdout).toMatch(/Pending purge \(idle-marked\): 3/);
+    expect(after.stdout).toMatch(/Hidden by maintenance: 3/);
+    expect(after.stdout).toMatch(/Pending purge \(idle-marked\): 0/);
     expect(after.stdout).not.toMatch(/compressed originals/);
   });
 

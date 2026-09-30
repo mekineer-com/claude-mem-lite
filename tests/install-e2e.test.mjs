@@ -225,7 +225,9 @@ describe('E2E: Plugin install mode', () => {
         join(home, '.claude.json'),
         JSON.stringify(
           {
-            mcpServers: { mem: { command: 'node', args: ['old-server.mjs'] } },
+            // A legacy registration of OUR server; a foreign `mem` survives
+            // (tests/mcp-legacy-name-ownership.test.mjs).
+            mcpServers: { mem: { command: 'node', args: [join(home, '.claude-mem-lite', 'server.mjs')] } },
           },
           null,
           2,

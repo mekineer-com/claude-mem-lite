@@ -73,7 +73,12 @@ import {
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
-import { formatObsFieldValue, obsFieldLabel, formatPendingPurgeLine } from './cli/common.mjs';
+import {
+  formatObsFieldValue,
+  obsFieldLabel,
+  formatPendingPurgeLine,
+  formatHiddenLine,
+} from './cli/common.mjs';
 import { countMcpEligibleCorpus, rateSearchResults, recordSearch } from './lib/search-telemetry.mjs';
 import { recordHookError } from './lib/hook-telemetry.mjs';
 import { stripPrivate } from './lib/private-strip.mjs';
@@ -416,6 +421,7 @@ function formatSearchOutput(
   totalCount,
   orFallbackFired = false,
   isDeepSearch = false,
+  listing = null,
 ) {
   if (paginatedResults.length === 0) {
     const hint = [];
@@ -467,8 +473,17 @@ function formatSearchOutput(
   // query actually matched only a subset of the terms. Suppressed when the caller
   // explicitly requested OR semantics — there's no "fallback" in that path.
   const fallbackHint = orFallbackFired && !args.or ? ' (relaxed AND→OR)' : '';
+  // A LISTING is never headed as matches: `Found 2 result(s) for "segfault"` over two unrelated
+  // bugfixes is how the calling model read the type-list fallback (E2E round 2026-09-29).
+  const what = args.obs_type ? `${args.obs_type} observation(s)` : 'row(s) matching the filters';
+  const header =
+    listing === 'type'
+      ? `No match for "${queryLabel(args.query)}" — the ${countLabel} most recent ${what} instead`
+      : listing === 'dropped'
+        ? `Query "${queryLabel(args.query)}" was filtered (FTS5 keywords/special chars only) — the ${countLabel} most recent ${what} instead`
+        : `Found ${countLabel} result(s)${qLabel}${fallbackHint}`;
   lines.push(
-    `Found ${countLabel} result(s)${qLabel}${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt, E# event)' : ''}${autoLegend(paginatedResults)}\n`,
+    `${header}:${hasMixed ? ' (# observation, S# session, P# prompt, E# event)' : ''}${autoLegend(paginatedResults)}\n`,
   );
 
   // `~Nt` = estimated tokens to fetch this row's full body via mem_get (attachBodyTokens).
@@ -675,7 +690,23 @@ async function runSearchPipeline(
   if (r.escalated)
     process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${r.escalatedObsCount} hits)\n`);
 
-  const output = formatSearchOutput(r.page, args, ftsQuery, r.total, r.orFallbackFired, r.isDeep);
+  // The literal query sanitized to nothing and deep search did not rewrite it, so the rows are
+  // a recency listing. AUTO mode (the MCP default) skips the early return above because deep
+  // MAY rewrite such a query; it practically never does (a recency listing is never "weak"),
+  // and the listing was then printed as `Found 20 of 57 result(s) for "C"`. With no filter,
+  // answer exactly as normal mode does; under a filter, label the listing as one.
+  const queryDropped = !!args.query && !ftsQuery && !r.isDeep;
+  if (queryDropped && !epochFrom && !epochTo && !args.obs_type && !args.importance) {
+    return {
+      ...appendDeferredTrailer(formatSearchOutput([], args, ftsQuery, 0)),
+      escalated: r.escalated,
+      results: [],
+      total: 0,
+      variants: null,
+    };
+  }
+  const listing = r.typeFallbackFired ? 'type' : queryDropped ? 'dropped' : null;
+  const output = formatSearchOutput(r.page, args, ftsQuery, r.total, r.orFallbackFired, r.isDeep, listing);
   // Surface the rewrite to the calling agent (F13) + the rerank signal (D#43).
   if (r.isDeep && r.variants && output.content?.[0]?.type === 'text') {
     output.content[0].text +=
@@ -914,7 +945,12 @@ server.registerTool(
         return { content: [{ type: 'text', text: 'No observations found.' }] };
       }
 
-      const lines = [`Timeline (most recent ${rows.length}):\n`];
+      // A query that anchored nothing says so, as the CLI does: without it the recency window
+      // read as the neighbourhood of what the caller asked about.
+      const miss = args.query
+        ? `No anchor found for "${queryLabel(args.query)}" — showing the most recent observations instead.\n`
+        : '';
+      const lines = [`${miss}Timeline (most recent ${rows.length}):\n`];
       for (const r of rows.reverse()) {
         lines.push(
           `#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}`,
@@ -1170,7 +1206,7 @@ server.registerTool(
   },
   safeHandler(async (args) => {
     // Shared preview body (lib/delete-core, P2-12) — single source with CLI delete.
-    const { rows, lines: previewLines, missing } = previewDeleteRows(db, args.ids);
+    const { rows, lines: previewLines, missing, alsoLine } = previewDeleteRows(db, args.ids);
 
     if (rows.length === 0) {
       return { content: [{ type: 'text', text: 'No observations found for given IDs.' }] };
@@ -1178,6 +1214,7 @@ server.registerTool(
 
     if (!args.confirm) {
       const lines = [`Preview: ${rows.length} observation(s) will be deleted:\n`, ...previewLines];
+      if (alsoLine) lines.push(`\n${alsoLine}`);
       if (missing.length > 0)
         lines.push(`\nNote: ID(s) ${missing.join(', ')} not found and will be skipped.`);
       lines.push(`\nCall mem_delete(ids=[...], confirm=true) to execute.`);
@@ -1192,6 +1229,8 @@ server.registerTool(
     const msg = [`Deleted ${result.deleted} observation(s).`];
     if (result.recoveredChildren > 0)
       msg.push(`Recovered ${result.recoveredChildren} merged/compressed child observation(s) to live.`);
+    if (result.restoredSuperseded > 0)
+      msg.push(`Restored ${result.restoredSuperseded} observation(s) it had superseded to live.`);
     if (missing.length > 0) msg.push(`Note: ID(s) ${missing.join(', ')} not found.`);
     return { content: [{ type: 'text', text: msg.join(' ') }] };
   }),
@@ -1563,6 +1602,7 @@ server.registerTool(
         `  Stale (>30d, imp=1, no access, never injected): ${stats.stale}`,
         `  Broken (no title/narrative): ${stats.broken}`,
         `  Boostable (accessed>3, imp<3): ${stats.boostable}`,
+        formatHiddenLine(stats.hidden),
         formatPendingPurgeLine(stats.pendingPurge),
       ];
       if (duplicates.length > 0) {
@@ -1919,6 +1959,8 @@ server.registerTool(
     const { filename, rows } = recallByFile(db, args.file, {
       limit: args.limit ?? 10,
       includeNoise: args.include_noise === true,
+      project: args.project ? resolveProject(args.project) : null,
+      currentProject: inferProject(),
     });
 
     if (rows.length === 0) {
@@ -2007,9 +2049,11 @@ server.registerTool(
     }
 
     if (grandTotal === 0) {
-      return {
-        content: [{ type: 'text', text: 'No observations found. Start a coding session to build memory.' }],
-      };
+      // Under a tier filter grandTotal counts that tier alone: an empty tier is not an empty store.
+      const text = tierFilter
+        ? `No observations in the ${tierFilter} tier.`
+        : 'No observations found. Start a coding session to build memory.';
+      return { content: [{ type: 'text', text }] };
     }
 
     if (!tierFilter) {
@@ -2099,7 +2143,12 @@ const idleTimer = setInterval(() => {
   try {
     // Type-differentiated cleanup: higher-value types survive longer
     const { marked, compressed } = runIdleCleanup(db);
-    if (marked > 0) debugLog('INFO', 'idle-cleanup', `Marked ${marked} stale observations as pending-purge`);
+    if (marked > 0)
+      debugLog(
+        'INFO',
+        'idle-cleanup',
+        `Hid ${marked} stale observations (queued for purge if still idle 7 days later)`,
+      );
     if (compressed > 0) debugLog('INFO', 'idle-cleanup', `Compressed ${compressed} old observations`);
 
     // FTS5 index optimization (outside transaction — WAL-friendly)

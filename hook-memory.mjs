@@ -11,6 +11,7 @@ import {
   neutralizeContextDelimiters,
 } from './utils.mjs';
 import { upsFtsQuery, upsQueryTerms } from './lib/ups-query.mjs';
+import { meetsRecallLengthFloor } from './lib/prompt-admission.mjs';
 import { citeFactorJs, TYPE_QUALITY, TYPE_QUALITY_DEFAULT } from './scoring-sql.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { recordMetric } from './lib/metrics.mjs';
@@ -280,14 +281,9 @@ export function searchRelevantMemories(
   excludeIds = [],
   { counterfactual = false } = {},
 ) {
-  // Min-length guard is English-centric: 5 chars ≈ one short English word. A CJK
-  // query is meaningful at 2 chars (状态/架构) and most real Chinese queries are
-  // 2-4 chars (状态管理, 召回率, 熔断降级) — the bare `.length < 5` silently
-  // rejected ALL of them, so a Chinese-primary user got zero memory injection.
-  // Apply the 5-char floor only to non-CJK queries; CJK needs ≥2.
-  if (!db || !userPrompt) return [];
-  const queryHasCjk = /[一-鿿㐀-䶿]/.test(userPrompt);
-  if (userPrompt.length < (queryHasCjk ? 2 : 5)) return [];
+  // Min-length guard: 5 chars for non-CJK, 2 for CJK. The rationale and the one definition
+  // are in lib/prompt-admission.mjs, shared with hook.mjs's events arm (issue #39).
+  if (!db || !meetsRecallLengthFloor(userPrompt)) return [];
   // CJK-DOMINANT (not merely CJK-containing) gates the OR-fallback bypass below.
   // A substring test would let one incidental CJK char — an IME-leaked particle,
   // a 中文 noun in an otherwise-English prompt — flip OR-fallback on and inject

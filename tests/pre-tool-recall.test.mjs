@@ -460,6 +460,27 @@ describe('pre-tool-recall', () => {
       );
     });
 
+    // D15 (2026-09-29): a subagent's payload carries the PARENT's session_id plus its own
+    // agent_id, but the two threads share no context. Keyed on session_id alone, whichever
+    // thread touched the file first used up the recall, and the other — often the subagent
+    // that actually edits — got nothing. Each thread now has its own cooldown.
+    it('D15: a subagent and its parent each get the recall once', async () => {
+      const filePath = join(projectDir, 'thread.py');
+      const call = (agent) =>
+        runWithEnv({
+          tool_name: 'Edit',
+          session_id: 'session-gamma',
+          ...(agent ? { agent_id: agent } : {}),
+          tool_input: { file_path: filePath },
+        });
+      const ctxOf = (r) => (r.stdout ? JSON.parse(r.stdout).hookSpecificOutput.additionalContext : '');
+      expect(ctxOf(await call(null))).toContain('No prior lessons for thread.py'); // main thread
+      expect(ctxOf(await call('agent-1'))).toContain('No prior lessons for thread.py'); // its subagent
+      expect((await call('agent-1')).stdout).toBe(''); // the subagent's own second call
+      expect((await call(null)).stdout).toBe(''); // and the main thread's
+      expect(ctxOf(await call('agent-2'))).toContain('No prior lessons for thread.py'); // a sibling
+    });
+
     // v2.34.6 Gap 3: Read-side recall. Tighter filter (lesson_learned required),
     // single-row limit, 120-char truncation, zero empty-nudge. Scope discipline:
     // planning Reads get surfaced; pure-exploration Reads cost near-zero tokens.

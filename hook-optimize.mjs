@@ -13,6 +13,7 @@ import {
   debugLog,
   debugCatch,
   COMPRESSED_AUTO,
+  NOT_COMPRESSION_KEEPER_SQL,
   computeMinHash,
   estimateJaccardFromMinHash,
   jaccardSimilarity,
@@ -481,7 +482,24 @@ scope: ${SCOPE_PROMPT_LEGEND}`;
       // reachable by no auto-recovery pass — so one Haiku "importance 0" misjudgment would
       // hide a real observation until manual surgery. In wide scope, fall through and let
       // clampImportance floor it to 1 (kept visible, low-ranked) instead of hiding.
-      if ((parsed.importance === 0 || parsed.importance === '0') && scope !== 'wide') {
+      // A compression keeper is never hidden: hiding it hides every member compressed into it
+      // (the same rule NOT_COMPRESSION_KEEPER_SQL enforces on the maintenance writers). It falls
+      // through to the normal update instead: floored to importance 1 and stamped, so it is not
+      // re-sent. In narrow scope that update still replaces its title and narrative.
+      const isKeeper = !!db
+        .prepare('SELECT 1 FROM observations WHERE compressed_into = ? LIMIT 1')
+        .get(cand.id);
+      // D10: an importance a person set (importance_set_at) is theirs — neither hidden on a
+      // model's 0 nor re-scored below.
+      const humanSet =
+        (db.prepare('SELECT importance_set_at FROM observations WHERE id = ?').get(cand.id)
+          ?.importance_set_at ?? null) !== null;
+      if (
+        (parsed.importance === 0 || parsed.importance === '0') &&
+        scope !== 'wide' &&
+        !isKeeper &&
+        !humanSet
+      ) {
         // D#12, and this one is not a stale-write guard — it is a POINTER guard.
         // `compressed_into` is the child -> keeper link, and COMPRESSED_AUTO is -1. If a
         // concurrent cluster-merge or smart-compress adopts this row during the 45 s Haiku
@@ -493,7 +511,7 @@ scope: ${SCOPE_PROMPT_LEGEND}`;
         const res = db
           .prepare(
             `UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}, optimized_at = ?
-             WHERE id = ? AND ${liveObsFilterSql('')} AND optimized_at IS NULL`,
+             WHERE id = ? AND ${liveObsFilterSql('')} AND optimized_at IS NULL AND ${NOT_COMPRESSION_KEEPER_SQL}`,
           )
           .run(Date.now(), cand.id);
         if (res.changes === 0) {
@@ -552,8 +570,10 @@ scope: ${SCOPE_PROMPT_LEGEND}`;
           : cand.narrative || '';
       // Floor at the stored importance: re-enrich adds a lesson, it must never silently downgrade
       // a user-set/promoted importance (the UPDATE also sets optimized_at → the loss is permanent).
-      // Upgrades are still honored.
-      const importance = Math.max(clampImportance(parsed.importance), cand.importance || 1);
+      // Upgrades are still honored — except over an importance a person set (D10), which stays.
+      const importance = humanSet
+        ? cand.importance
+        : Math.max(clampImportance(parsed.importance), cand.importance || 1);
 
       const bigramText = cjkBigrams((title || '') + ' ' + (narrative || ''));
       const textField = [conceptsText, factsText, searchAliases || '', bigramText].filter(Boolean).join(' ');
@@ -1250,7 +1270,9 @@ Return ONLY valid JSON:
     const factsText = facts.length ? facts.join(' ') : keeper.facts || '';
     // Scrub BEFORE truncate (see re-enrich note): keep the boundary cut on
     // already-scrubbed text so a straddling secret can't leak a sub-floor head.
-    const title = truncate(scrubSecrets(parsed.merged_title || ''), 120);
+    // Preserve-on-empty for the title too, like narrative/concepts/facts: `{"should_merge":true}`
+    // alone blanked the keeper's title and it listed as "(untitled)".
+    const title = truncate(scrubSecrets(parsed.merged_title || keeper.title || ''), 120);
     const narrative = truncate(scrubSecrets(parsed.merged_narrative || keeper.narrative || ''), 800);
     // Preserve-on-empty. The merge overwrites the keeper in place and hides every non-keeper
     // member (compressed_into=keeper.id), so if the LLM returns merged_lesson:null (the prompt

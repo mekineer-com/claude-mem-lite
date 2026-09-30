@@ -9,8 +9,13 @@
 // outcome: the preview applies the durable exact-dup guard (project+title+created_at) but not
 // saveObservation's Jaccard near-duplicate collapse, which only exists on the writing path.
 // Measured on a backup holding two same-titled weekly summaries: previewed 10, restored 9.
-// Simulating Jaccard in the preview would be a second copy of the dedup rule, so the number
-// is labelled an upper bound instead of being made exact.
+//
+// That collapse was the defect, not the preview (E2E round 2026-09-29): a backup's rows all
+// coexisted in the source store, so restore has nothing to deduplicate but rows the target
+// already holds (the exact project+title+created_at guard). With the near-duplicate window —
+// which restore ran with a PAST `now` and so no upper bound — 25 distinct `--force`d rows
+// restored into an empty store as 1, and an old backup row was dropped for resembling a
+// newer live row. Restore now saves with `force`, so the preview is the outcome.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
@@ -96,18 +101,19 @@ describe('restore --dry-run — reports a preview, not an outcome', () => {
     expect(cli(['recent', '5'], target)).toMatch(/No recent observations/);
   });
 
-  it('flags the count as an upper bound, and the real run proves why', () => {
+  it('previews exactly what the real run restores — every distinct row comes back', () => {
     const total = makeBackup();
     const dryOut = cli(['restore', backup, '--dry-run'], join(dir, 'data-a'));
     const realOut = cli(['restore', backup], join(dir, 'data-b'));
     const n = (s, re) => Number((s.match(re) || [])[1]);
-    const previewed = n(dryOut, /: (\d+) would be restored/);
-    const actual = n(realOut, /: (\d+) restored/);
-    expect(previewed).toBe(total);
-    // The fixture is built so near-duplicate collapse bites: preview overstates.
-    expect(actual).toBeLessThan(previewed);
-    // Which is exactly why the preview must say so rather than present the number as fact.
-    expect(dryOut).toMatch(/does not simulate near-duplicate collapse/);
-    expect(realOut).not.toMatch(/does not simulate/);
+    // Premise: two rows share a title and body, so the near-duplicate window would bite.
+    expect(total).toBe(3);
+    expect(n(dryOut, /: (\d+) would be restored/)).toBe(total);
+    expect(n(realOut, /: (\d+) restored/)).toBe(total);
+    expect(dryOut).not.toMatch(/near-duplicate/);
+    // Re-running the same restore is still a no-op: the exact guard is what dedups a backup.
+    const again = cli(['restore', backup], join(dir, 'data-b'));
+    expect(n(again, /: (\d+) restored/)).toBe(0);
+    expect(n(again, /, (\d+) duplicate\(s\) skipped/)).toBe(total);
   });
 });

@@ -67,9 +67,9 @@
 //      scripts/mock-claude.mjs instead — a local deterministic stub, still no network.
 //      CLAUDE_MEM_SKIP_UPDATE=1 disables the GitHub release check on both the SessionStart
 //      banner and the update-check worker.
-//   4. Nothing writes into this repo. SessionStart auto-adopts, which writes <cwd>/CLAUDE.md
-//      — the `hook.mjs session-start` case asserts that write landed in ITS sandbox dir, and
-//      afterAll asserts this repo's own CLAUDE.md is byte-identical.
+//   4. Nothing writes into this repo. SessionStart no longer writes <cwd>/CLAUDE.md (§9-A: it
+//      injects the steering instead) — the `hook.mjs session-start` case asserts no file in
+//      ITS sandbox dir, and afterAll asserts this repo's own CLAUDE.md is byte-identical.
 //   5. afterAll removes the sandbox in a `finally` (so a failing assertion cannot leak it),
 //      after a short grace period for the detached llm-summary worker Stop spawns. The dir
 //      prefix is `mem-` so tests/global-setup.mjs reaps it even after a SIGKILL.
@@ -81,7 +81,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 import Database from 'better-sqlite3';
-import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
+import { COMPRESSED_AUTO } from '../utils.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const HOOK_PATH = join(REPO, 'hook.mjs');
@@ -534,9 +534,11 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
       withDb((db) => db.prepare('SELECT status FROM sdk_sessions WHERE project = ?').get(project)),
     ).toMatchObject({ status: 'active' });
     expect(existsSync(join(RUNTIME_DIR, `session-${project}`))).toBe(true);
-    // SessionStart auto-adopts, which writes <cwd>/CLAUDE.md — here, and never the repo's
-    // (afterAll asserts the negative half).
-    expect(readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')).toContain('<!-- claude-mem-lite:begin');
+    // §9-A (docs/audits/20260929-sandbox-usage-eval.md): SessionStart no longer writes the
+    // managed block into <cwd> — it injects the steering into this same envelope. Neither the
+    // sandbox cwd nor this repo gets a file (afterAll asserts the repo half).
+    expect(existsSync(join(cwd, 'CLAUDE.md'))).toBe(false);
+    expect(ctx).toContain('## claude-mem-lite — persistent memory');
 
     await expectMalformedResilience(
       'hook.mjs session-start',
@@ -1409,12 +1411,12 @@ describe('hook feature sweep: hook.mjs background workers', () => {
 
     const r = await hookEvent('auto-maintain', { cwd, stdin: '', env: BG, timeout: 60000 });
     expectSilentWorker('hook.mjs auto-maintain', r);
-    // Functional: the idle row is marked pending-purge, and the 24h gate file is stamped so
-    // the next SessionStart does not re-run the sweep.
+    // Functional: the idle row is hidden (D12: queued for purge only after the grace), and the
+    // 24h gate file is stamped so the next SessionStart does not re-run the sweep.
     expect(
       withDb((db) => db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id))
         .compressed_into,
-    ).toBe(COMPRESSED_PENDING_PURGE);
+    ).toBe(COMPRESSED_AUTO);
     const gate = JSON.parse(readFileSync(join(RUNTIME_DIR, 'last-auto-maintain.json'), 'utf8'));
     expect(Date.now() - gate.epoch).toBeLessThan(120000);
 
