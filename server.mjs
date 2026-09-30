@@ -530,7 +530,7 @@ export async function handleSearchForTest(
     llm,
     rerankLlm,
     clientIdentity = 'test-client',
-    telemetryEnabled = SEARCH_TELEMETRY_ENABLED,
+    telemetryEnabled = false,
     producerVersion = PKG_VERSION,
   } = {},
 ) {
@@ -802,6 +802,8 @@ function mcpClientIdentity() {
   return client?.name ? `${client.name}${client.version ? `/${client.version}` : ''}` : 'unknown-mcp-client';
 }
 
+const issuedTelemetrySearchIds = new Set();
+
 server.registerTool(
   'mem_search',
   {
@@ -810,6 +812,7 @@ server.registerTool(
   },
   safeHandler(async (args) => {
     const result = await runSearchPipeline(db, args, { clientIdentity: mcpClientIdentity() });
+    if (result.search_id) issuedTelemetrySearchIds.add(result.search_id);
     return { content: result.content };
   }),
 );
@@ -832,6 +835,9 @@ if (SEARCH_TELEMETRY_ENABLED) {
       inputSchema: memSearchFeedbackSchema,
     },
     safeHandler(async (args) => {
+      if (!issuedTelemetrySearchIds.has(args.search_id)) {
+        throw new Error(`Search ${args.search_id} was not issued by this server process`);
+      }
       const count = handleSearchFeedbackForTest(db, args, { clientIdentity: mcpClientIdentity() });
       return {
         content: [

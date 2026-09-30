@@ -1127,7 +1127,9 @@ benchmark and A/B harness are calibrated against — changing them invalidates t
 
 Search telemetry rows are retained until you delete them. Inspect their volume with
 `claude-mem-lite stats --search-telemetry`; clear them from the configured SQLite
-database with `DELETE FROM search_results; DELETE FROM search_runs;`.
+database (normally `~/.claude-mem-lite/claude-mem-lite.db`) with
+`DELETE FROM search_results; DELETE FROM search_runs; VACUUM;`. Pre-delete snapshots
+beside that database retain their earlier contents until those `.bak` files are removed.
 
 ### Background work
 
