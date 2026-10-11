@@ -49,8 +49,10 @@ they skip model work, not synchronous prompt/summary/episode capture.
 `MEM_QUIET_HOOKS` and `MEM_NO_AUTO_ADOPT` likewise do not disable capture.
 
 The versioned recipe preserves this setup without committing personal client
-settings. The live database and cleanup backups stay in ignored `.data/`, not
-Git; upgrading source must preserve the client registration and data directory.
+settings. [Sanitized user settings](mcp-only-settings.example.md) show the exact
+Claude and Codex configuration fragments with placeholder paths. The live
+database and cleanup backups stay in ignored `.data/`, not Git; upgrading source
+must preserve the client registration and data directory.
 
 ## Why claude-mem-lite?
 
