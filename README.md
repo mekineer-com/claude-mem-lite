@@ -11,6 +11,47 @@ Compared to general-purpose LLM memory frameworks like [`mem0`](https://github.c
 
 Zero external services. Single SQLite database. Minimal overhead.
 
+## OpenAlma Fork: Curated MCP-Only Memory
+
+OpenAlma uses this fork on `live/v6.19.3-kiss` as curated shared memory, not an
+automatic session/work diary. Keep important decisions, their reasons, hidden
+traps and short searchable pointers to authoritative files. Forgetting routine
+activity protects the context budget and retrieval quality; zero data loss is
+not the goal. Individual compact summaries provide short-term continuity, and
+PLAN files organize group work.
+
+This is a client configuration, not a change to the package's capture defaults.
+If the Claude plugin is installed, disable it at user scope:
+
+```sh
+claude plugin disable --scope user claude-mem-lite@sdsrss
+```
+
+Keep explicit save/search/get through a separate MCP registration. From this
+repository's root, with dependencies already installed:
+
+```sh
+mem_lite_root="$(pwd -P)"
+claude mcp add --scope user --transport stdio mem-lite \
+  -e "CLAUDE_MEM_DIR=$mem_lite_root/.data" -- \
+  node "$mem_lite_root/scripts/launch.mjs"
+```
+
+Codex uses the same launcher and data directory through its independent MCP
+registration; disabling Claude's plugin does not remove it. New Claude sessions
+load the standalone tools. Plugin recall and automatic journaling are off;
+explicit retrieval and MCP idle retention maintenance remain. Automatic deep
+search can still invoke a model; this profile stops capture, not every background
+operation.
+
+Do not substitute `CLAUDE_MEM_SKIP_SUMMARY` or `CLAUDE_MEM_SKIP_EPISODE_LLM`:
+they skip model work, not synchronous prompt/summary/episode capture.
+`MEM_QUIET_HOOKS` and `MEM_NO_AUTO_ADOPT` likewise do not disable capture.
+
+The versioned recipe preserves this setup without committing personal client
+settings. The live database and cleanup backups stay in ignored `.data/`, not
+Git; upgrading source must preserve the client registration and data directory.
+
 ## Why claude-mem-lite?
 
 A ground-up redesign of [claude-mem](https://github.com/thedotmack/claude-mem), replacing its heavyweight architecture with a smarter, leaner approach.
