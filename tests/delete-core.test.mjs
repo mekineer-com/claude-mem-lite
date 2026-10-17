@@ -10,6 +10,7 @@ import { join } from 'path';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
 import { deleteObservations } from '../lib/delete-core.mjs';
+import { recordSearch } from '../lib/search-telemetry.mjs';
 
 // observations.memory_session_id is an FK to sdk_sessions; seed the default session
 // so insertObs (which defaults sessionId → 'sess-1') satisfies it under FK-ON tests.
@@ -42,6 +43,16 @@ describe('deleteObservations (shared delete-core)', () => {
     insertObs(db, { title: 'Keeper', text: 'keeper', importance: 3 }); // #1
     insertObs(db, { title: 'Child', text: 'child', compressedInto: 1 }); // #2 merged into #1
 
+    recordSearch(db, {
+      query: 'fixture',
+      surface: 'mcp_search',
+      client: 'test',
+      results: [
+        { source: 'obs', id: 1, title: 'Keeper' },
+        { source: 'obs', id: 2, title: 'Child' },
+        { source: 'event', id: 1, title: 'Unrelated event' },
+      ],
+    });
     const result = deleteObservations(db, [1]);
 
     expect(result.deleted).toBe(1);
@@ -49,6 +60,14 @@ describe('deleteObservations (shared delete-core)', () => {
     const child = db.prepare('SELECT compressed_into FROM observations WHERE id = 2').get();
     expect(child).toBeDefined(); // child survived the keeper's deletion
     expect(child.compressed_into).toBeNull(); // and was resurfaced as live
+    expect(
+      db.prepare('SELECT source, result_id, snapshot_label FROM search_results ORDER BY returned_rank').all(),
+    ).toEqual([
+      { source: 'obs', result_id: 1, snapshot_label: null },
+      { source: 'obs', result_id: 2, snapshot_label: 'Child' },
+      { source: 'event', result_id: 1, snapshot_label: 'Unrelated event' },
+    ]);
+    db.close();
   });
 
   it('does not count a child that is itself being deleted in the same call as recovered', () => {

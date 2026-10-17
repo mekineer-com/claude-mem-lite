@@ -12,6 +12,7 @@ import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
 import { createTestDb } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
+import { recordSearch } from '../lib/search-telemetry.mjs';
 import { saveEvent, searchEvents, recentEvents, getEvent, EVENT_TYPES } from '../lib/activity.mjs';
 
 describe('activity store', () => {
@@ -282,9 +283,33 @@ describe('cmdActivity CLI: --type validation', () => {
       const save = runCli(['activity', 'save', '--type', 'bugfix', 'will be deleted']);
       const { id } = JSON.parse(save.stdout.trim());
 
+      const db = new Database(join(dataDir, 'claude-mem-lite.db'));
+      recordSearch(db, {
+        query: 'fixture',
+        surface: 'mcp_search',
+        client: 'test',
+        results: [
+          { source: 'event', id, title: 'will be deleted' },
+          { source: 'event', id: id + 1, title: 'Kept event label' },
+          { source: 'obs', id, title: 'Kept observation label' },
+        ],
+      });
+      db.close();
       const del = runCli(['activity', 'delete', String(id), '--confirm']);
       expect(del.exitCode).toBe(0);
       expect(del.stdout).toContain('Deleted 1 event');
+      const check = new Database(join(dataDir, 'claude-mem-lite.db'));
+      try {
+        expect(
+          check.prepare('SELECT snapshot_label FROM search_results ORDER BY returned_rank').all(),
+        ).toEqual([
+          { snapshot_label: null },
+          { snapshot_label: 'Kept event label' },
+          { snapshot_label: 'Kept observation label' },
+        ]);
+      } finally {
+        check.close();
+      }
 
       const show = runCli(['activity', 'show', String(id)]);
       // Deleted row is gone → not-found contract: stderr + non-zero exit (see the

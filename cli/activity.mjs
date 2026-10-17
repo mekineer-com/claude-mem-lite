@@ -188,7 +188,14 @@ export async function cmdActivity(db, args) {
       return;
     }
 
-    const result = db.prepare(`DELETE FROM events WHERE id IN (${placeholders})`).run(...ids);
+    const result = db.transaction(() => {
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'search_results'").get()) {
+        db.prepare(
+          `UPDATE search_results SET snapshot_label = NULL WHERE source = 'event' AND result_id IN (${placeholders})`,
+        ).run(...ids);
+      }
+      return db.prepare(`DELETE FROM events WHERE id IN (${placeholders})`).run(...ids);
+    })();
     out(`[mem] Deleted ${result.changes} event(s).`);
     return;
   }

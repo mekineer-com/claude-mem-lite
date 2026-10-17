@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
+import { spawn } from 'child_process';
+import { createRequire } from 'module';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { CURRENT_SCHEMA_VERSION, initSchema } from '../schema.mjs';
@@ -205,7 +207,7 @@ describe('search telemetry on schema v49', () => {
     db.close();
   });
 
-  it('scrubs and caps persisted queries, result labels, and client identity', () => {
+  it('scrubs and caps persisted queries, result labels, client and rater identity', () => {
     const db = openDb();
     const searchId = recordSearch(db, {
       query: `deploy with api_key=sk-mykey123 ${'q'.repeat(600)}`,
@@ -224,7 +226,96 @@ describe('search telemetry on schema v49', () => {
     const client = db.prepare('SELECT client FROM search_runs WHERE search_id = ?').get(searchId).client;
     expect(client).toHaveLength(500);
     expect(client).toContain('token=***');
+    rateSearchResults(db, {
+      searchId,
+      relevant: ['#7'],
+      ratedBy: `  rater token=abc123xyz ${'r'.repeat(600)}  `,
+    });
+    const rater = () => db.prepare('SELECT rated_by FROM search_results').get().rated_by;
+    expect(rater()).toHaveLength(500);
+    expect(rater()).toMatch(/^rater token=\*\*\*/);
+    rateSearchResults(db, { searchId, relevant: ['#7'], ratedBy: '  fixture  ' });
+    expect(rater()).toBe('fixture');
+    rateSearchResults(db, { searchId, relevant: ['#7'] });
+    expect(rater()).toBeNull();
     db.close();
+  });
+
+  it('reports stored totals across all dates and projects, not just the report window', () => {
+    const db = openDb();
+    const now = 100 * 86400000;
+    for (const [age, project] of [
+      [0, 'p'],
+      [40, 'p'],
+      [0, 'other'],
+    ]) {
+      recordSearch(db, {
+        project,
+        query: `q${age}`,
+        surface: 'mcp_search',
+        client: 'test',
+        results: [{ source: 'obs', id: 1, title: 'Fixture' }],
+        now: now - age * 86400000,
+      });
+    }
+    const report = computeSearchTelemetry(db, { days: 30, project: 'p', now });
+    expect(report).toMatchObject({
+      search_count: 1,
+      returned_count: 1,
+      stored_search_count: 3,
+      stored_result_count: 3,
+    });
+    expect(formatSearchTelemetryReport(report)).toContain('Stored rows: searches 3 | results 3');
+    db.close();
+  });
+
+  it('waits briefly for a rating writer while search recording stays nonblocking', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-search-telemetry-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'test.db');
+    const seed = openDb(path);
+    seed.pragma('journal_mode = WAL');
+    const searchId = recordSearch(seed, {
+      query: 'alpha',
+      surface: 'mcp_search',
+      client: 'test',
+      results: [{ source: 'obs', id: 7, title: 'Alpha' }],
+    });
+    seed.close();
+    const holder = spawn(
+      process.execPath,
+      [
+        '-e',
+        `const D = require(process.argv[1]); const db = new D(process.argv[2]);
+       db.exec('BEGIN IMMEDIATE'); process.stdout.write('locked\\n');
+       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80);
+       db.exec('COMMIT'); db.close();`,
+        createRequire(import.meta.url).resolve('better-sqlite3'),
+        path,
+      ],
+      { stdio: ['ignore', 'pipe', 'inherit'] },
+    );
+    const exited = new Promise((r) => holder.on('exit', r));
+    await new Promise((r) => holder.stdout.once('data', r));
+    const contender = new Database(path);
+    contender.pragma('busy_timeout = 4321');
+    try {
+      expect(() =>
+        recordSearch(contender, {
+          query: 'b',
+          surface: 'mcp_search',
+          client: 'test',
+          results: [],
+        }),
+      ).toThrow(/locked|busy/i);
+      expect(rateSearchResults(contender, { searchId, relevant: ['#7'], ratedBy: 'test' })).toBe(1);
+      expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
+      expect(() => rateSearchResults(contender, { searchId, relevant: ['#8'] })).toThrow(/was not returned/);
+      expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
+    } finally {
+      contender.close();
+      await exited;
+    }
   });
 
   it('rejects malformed, duplicate, and foreign result IDs without partial updates', () => {
@@ -253,6 +344,12 @@ describe('search telemetry on schema v49', () => {
     tempDirs.push(dir);
     const path = join(dir, 'test.db');
     const writer = openDb(path);
+    const searchId = recordSearch(writer, {
+      query: 'fixture',
+      surface: 'mcp_search',
+      client: 'test',
+      results: [{ source: 'obs', id: 7, title: 'Fixture' }],
+    });
     const contender = new Database(path);
     contender.pragma('busy_timeout = 4321');
     writer.exec('BEGIN IMMEDIATE');
@@ -266,6 +363,11 @@ describe('search telemetry on schema v49', () => {
       }),
     ).toThrow(/locked|busy/i);
     expect(Date.now() - started).toBeLessThan(500);
+    expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
+    const ratingStarted = Date.now();
+    expect(() => rateSearchResults(contender, { searchId, relevant: ['#7'] })).toThrow(/locked|busy/i);
+    expect(Date.now() - ratingStarted).toBeGreaterThanOrEqual(150);
+    expect(Date.now() - ratingStarted).toBeLessThan(1000);
     expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
     writer.exec('ROLLBACK');
     contender.close();
