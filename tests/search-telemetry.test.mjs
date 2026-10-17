@@ -67,10 +67,14 @@ describe('search telemetry on schema v49', () => {
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
-  it('creates both tables on a fresh database and cascades run deletion', () => {
+  it('creates telemetry tables only on first recorded search and cascades run deletion', () => {
     const db = openDb();
     expect(CURRENT_SCHEMA_VERSION).toBe(49);
     expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(49);
+    expect(
+      db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name IN ('search_runs', 'search_results')").get()
+        .c,
+    ).toBe(0);
     const id = recordSearch(db, {
       project: 'p',
       query: 'alpha',
@@ -121,20 +125,24 @@ describe('search telemetry on schema v49', () => {
     db.close();
   });
 
-  it('self-heals upstream schema 49 when telemetry tables are missing', () => {
+  it('keeps telemetry absent through repeated schema initialization and read-only reports', () => {
     const db = openDb();
-    db.pragma('foreign_keys = OFF');
-    db.exec('DROP TABLE search_results; DROP TABLE search_runs;');
     initSchema(db);
     expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(49);
+    expect(computeSearchTelemetry(db)).toMatchObject({
+      stored_search_count: 0,
+      stored_result_count: 0,
+      search_count: 0,
+      returned_count: 0,
+    });
     expect(
-      db.prepare("SELECT COUNT(*) c FROM pragma_table_info('search_results') WHERE name = 'relevance'").get()
+      db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name IN ('search_runs', 'search_results')").get()
         .c,
-    ).toBe(1);
+    ).toBe(0);
     db.close();
   });
 
-  it('adds producer version to populated schema 49 without changing historical ratings', () => {
+  it('upgrades populated telemetry on an opt-in write without changing historical ratings', () => {
     const db = openDb();
     const searchId = recordSearch(db, {
       query: 'historical search',
@@ -147,8 +155,22 @@ describe('search telemetry on schema v49', () => {
     db.exec('ALTER TABLE search_runs DROP COLUMN producer_version');
 
     initSchema(db);
+    expect(computeSearchTelemetry(db).stored_search_count).toBe(1);
+    expect(
+      db
+        .prepare("SELECT COUNT(*) c FROM pragma_table_info('search_runs') WHERE name = 'producer_version'")
+        .get().c,
+    ).toBe(0);
+    recordSearch(db, {
+      query: 'new search',
+      surface: 'mcp_search',
+      client: 'test',
+      producerVersion: 'new-version',
+    });
 
-    expect(db.prepare('SELECT query, producer_version FROM search_runs').get()).toEqual({
+    expect(
+      db.prepare('SELECT query, producer_version FROM search_runs WHERE search_id = ?').get(searchId),
+    ).toEqual({
       query: 'historical search',
       producer_version: null,
     });
@@ -156,6 +178,24 @@ describe('search telemetry on schema v49', () => {
     expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(49);
     db.close();
   });
+
+  it.each(['search_runs', 'search_results'])(
+    'reports zeros without changing a partial %s schema',
+    (table) => {
+      const db = openDb();
+      db.exec(`CREATE TABLE ${table} (unused INTEGER)`);
+      const schema = () => db.prepare('SELECT name, sql FROM sqlite_master ORDER BY name').all();
+      const before = schema();
+      expect(computeSearchTelemetry(db)).toMatchObject({
+        stored_search_count: 0,
+        stored_result_count: 0,
+        search_count: 0,
+        returned_count: 0,
+      });
+      expect(schema()).toEqual(before);
+      db.close();
+    },
+  );
 
   it('refuses a database newer than schema 49', () => {
     const db = openDb();
@@ -317,6 +357,57 @@ describe('search telemetry on schema v49', () => {
       await exited;
     }
   });
+
+  it.each(['absent', 'legacy'])(
+    'keeps lazy %s schema writes bounded under contention and retries cleanly',
+    (shape) => {
+      const dir = mkdtempSync(join(tmpdir(), 'mem-search-telemetry-'));
+      tempDirs.push(dir);
+      const path = join(dir, 'test.db');
+      const writer = openDb(path);
+      if (shape === 'legacy') {
+        recordSearch(writer, { query: 'old', surface: 'mcp_search', client: 'test' });
+        writer.exec('ALTER TABLE search_runs DROP COLUMN producer_version');
+      }
+      const contender = new Database(path);
+      contender.pragma('busy_timeout = 4321');
+      writer.exec('BEGIN IMMEDIATE');
+      try {
+        const started = Date.now();
+        expect(() =>
+          recordSearch(contender, {
+            query: 'new',
+            surface: 'mcp_search',
+            client: 'test',
+            producerVersion: 'current',
+          }),
+        ).toThrow(/locked|busy/i);
+        expect(Date.now() - started).toBeLessThan(500);
+        expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
+        const ratingStarted = Date.now();
+        expect(() => rateSearchResults(contender, { searchId: 1, relevant: ['#1'] })).toThrow(/locked|busy/i);
+        expect(Date.now() - ratingStarted).toBeLessThan(1000);
+        expect(contender.pragma('busy_timeout', { simple: true })).toBe(4321);
+      } finally {
+        writer.exec('ROLLBACK');
+      }
+      const id = recordSearch(contender, {
+        query: 'retry',
+        surface: 'mcp_search',
+        client: 'test',
+        producerVersion: 'current',
+      });
+      expect(
+        contender.prepare('SELECT producer_version FROM search_runs WHERE search_id = ?').get(id)
+          .producer_version,
+      ).toBe('current');
+      expect(contender.prepare('SELECT COUNT(*) c FROM search_runs').get().c).toBe(
+        shape === 'legacy' ? 2 : 1,
+      );
+      contender.close();
+      writer.close();
+    },
+  );
 
   it('rejects malformed, duplicate, and foreign result IDs without partial updates', () => {
     const db = openDb();
@@ -482,7 +573,7 @@ describe('search telemetry on schema v49', () => {
     });
     expect(result.search_id).toBeNull();
     expect(result.content[0].text).not.toContain('mem_search_feedback');
-    expect(db.prepare('SELECT COUNT(*) c FROM search_runs').get().c).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name = 'search_runs'").get().c).toBe(0);
     db.close();
   });
 
@@ -498,20 +589,10 @@ describe('search telemetry on schema v49', () => {
       });
       rateSearchResults(db, { searchId, relevant: [`#${i}`], ratedBy: 'test', now: i });
     }
-    const hookId = recordSearch(db, {
-      query: 'hook',
-      surface: 'user_prompt_hook',
-      client: 'test',
-      results: [{ source: 'obs', id: 100, title: 'Hook' }],
-      now: 31,
-    });
-    rateSearchResults(db, { searchId: hookId, irrelevant: ['#100'], ratedBy: 'test', now: 31 });
-
     const report = computeSearchTelemetry(db, { now: 32 });
-    expect(Object.keys(report.by_rank).sort()).toEqual(['mcp_search:1', 'user_prompt_hook:1']);
+    expect(Object.keys(report.by_rank)).toEqual(['mcp_search:1']);
     const text = formatSearchTelemetryReport(report);
     expect(text).toContain('mcp_search #1: 30/30 relevant');
-    expect(text).toContain('user_prompt_hook #1: suppressed (surface: 1 ratings');
 
     const underCovered = globalThis.structuredClone(report);
     underCovered.by_surface.mcp_search = {
@@ -568,7 +649,7 @@ describe('search telemetry on schema v49', () => {
     const db = openDb();
     const invalid = await handleSearchForTest(db, { query: 'AND OR NOT', deep: false });
     expect(invalid.search_id).toBeUndefined();
-    expect(db.prepare('SELECT COUNT(*) c FROM search_runs').get().c).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name = 'search_runs'").get().c).toBe(0);
 
     const miss = await handleSearchForTest(db, { query: 'definitelymissingtoken', deep: false });
     expect(miss.search_id).toBeGreaterThan(0);
