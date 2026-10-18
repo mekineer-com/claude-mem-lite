@@ -13,12 +13,8 @@ Zero external services. Single SQLite database. Minimal overhead.
 
 ## OpenAlma Fork: Curated MCP-Only Memory
 
-OpenAlma uses this fork on `live/v6.19.3-kiss` as curated shared memory, not an
-automatic session/work diary. Keep important decisions, their reasons, hidden
-traps and short searchable pointers to authoritative files. Forgetting routine
-activity protects the context budget and retrieval quality; zero data loss is
-not the goal. Individual compact summaries provide short-term continuity, and
-PLAN files organize group work.
+OpenAlma uses this fork as curated shared memory with explicit MCP save and
+search, rather than automatic session capture.
 
 This is a client configuration, not a change to the package's capture defaults.
 If the Claude plugin is installed, disable it at user scope:
